@@ -1,0 +1,20 @@
+[package]
+name = "pam_rustwebrtc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pam_rustwebrtc"
+crate-type = ["cdylib"]
+
+[dependencies]
+bytes = "1.10.0"
+pyo3 = { version = "0.23.4", features = ["extension-module", "abi3-py37"] }
+tokio = { version = "1.42.0", features = ["full", "rt-multi-thread"] }
+webrtc = "0.12.0"
+lazy_static = "1.5.0"
+crossbeam-channel = "0.5.14"
+
+[package.metadata.maturin]
+name = "pam_rustwebrtc"
+python-source = "python"

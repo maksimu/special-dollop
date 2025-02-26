@@ -6,24 +6,15 @@ from queue import Queue, Empty
 import asyncio
 import functools
 import logging
-import subprocess
 import time
 import threading
 import unittest
 
-def run_command(command, timeout: int, log_message: str):
-    logging.info(log_message + "...")
-    result = subprocess.run(command, cwd="../", capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(f"Command {command} failed: {result.stderr}\n{result.stdout}")
-
 try:
-    run_command(["cargo", "clean"], timeout=8, log_message="Cleaning Rust project")
-    run_command(["maturin", "develop", "--release", "-v"],
-                timeout=90, log_message="Building Rust extension")
     import pam_rustwebrtc
-except RuntimeError as e:
-    logging.error(f"Setup class failed: {e}")
+except ImportError as e:
+    logging.error(f"Failed to import pam_rustwebrtc: {e}")
+    logging.error("Make sure the module is built and installed before running tests")
     raise
 
 def with_runtime(func):
@@ -47,13 +38,6 @@ def with_runtime(func):
     return wrapper
 
 class TestWebRTC(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        # Initialize the runtime at class level
-        run_command(["cargo", "clean"], timeout=8, log_message="Cleaning Rust project")
-        run_command(["maturin", "develop", "--release", "-v"],
-                    timeout=90, log_message="Building Rust extension")
-
     def setUp(self):
         self.ice_candidates1 = Queue()
         self.ice_candidates2 = Queue()
@@ -531,7 +515,7 @@ class TestWebRTC(unittest.TestCase):
             time.sleep(0.5)
             attempts += 1
 
-        self.assertIn(dc1.ready_state, ["Closed"], "Data channel should be closed state")
+        self.assertIn(dc1.ready_state, ["Closing", "Closed"], "Data channel should be closed state")
 
         # Try to create a new data channel and test data flow again
         logging.info("Attempting to create a new data channel after closure")

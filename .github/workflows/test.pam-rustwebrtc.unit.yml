@@ -1,0 +1,83 @@
+name: Test pam-rustwebrtc
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Install dependencies for WebRTC
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install openssl@3
+
+      # Setup pip and dependencies
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest
+
+      # Check code formatting
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      # Run clippy
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
+
+      # Run Rust unit tests
+      - name: Run Rust tests
+        run: cargo test --verbose
+        env:
+          CXXFLAGS: "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+          LDFLAGS: "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib"
+
+      # Build and install the package (alternative to maturin develop)
+      - name: Build and install package
+        run: |
+          # Build the wheel
+          maturin build --release
+          
+          # Find and install the built wheel
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            pip install $(ls target/wheels/*.whl | head -1)
+          else
+            pip install $(find target/wheels -name "*.whl" | head -1)
+          fi
+          
+          # Verify the installation worked
+          python -c "import pam_rustwebrtc; print('Successfully imported pam_rustwebrtc')"
+        shell: bash
+
+      # Run Python tests
+      - name: Run tests
+        run: |
+          cd tests
+          python -m pytest test_webrtc.py -v

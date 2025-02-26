@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyDict, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -13,8 +13,8 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
+use webrtc::peer_connection::RTCPeerConnection;
 
 lazy_static! {
     static ref RUNTIME: Arc<Runtime> = Arc::new(Runtime::new().unwrap());
@@ -45,7 +45,13 @@ struct PyRTCPeerConnection {
 #[pymethods]
 impl PyRTCPeerConnection {
     #[new]
-    fn new(py: Python<'_>, config: Py<PyDict>, on_ice_candidate: PyObject, on_data_channel: PyObject, trickle_ice: bool) -> PyResult<Self> {
+    fn new(
+        py: Python<'_>,
+        config: Py<PyDict>,
+        on_ice_candidate: PyObject,
+        on_data_channel: PyObject,
+        trickle_ice: bool,
+    ) -> PyResult<Self> {
         // Enter the runtime context before doing async operations
         let _guard = RUNTIME.enter();
 
@@ -57,21 +63,24 @@ impl PyRTCPeerConnection {
             rtc_config.ice_servers = servers
                 .iter()
                 .filter_map(|server| {
-                    server.extract::<IceServer>().ok().map(|server| RTCIceServer {
-                        urls: server.urls,
-                        username: server.username.unwrap_or_default(),
-                        credential: server.credential.unwrap_or_default(),
-                        ..Default::default()
-                    })
+                    server
+                        .extract::<IceServer>()
+                        .ok()
+                        .map(|server| RTCIceServer {
+                            urls: server.urls,
+                            username: server.username.unwrap_or_default(),
+                            credential: server.credential.unwrap_or_default(),
+                            // Removed redundant ..Default::default()
+                        })
                 })
                 .collect();
         }
 
         let api = APIBuilder::new().build();
 
-        let pc = RUNTIME.block_on(async {
-            api.new_peer_connection(rtc_config).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let pc = RUNTIME
+            .block_on(async { api.new_peer_connection(rtc_config).await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         let pc = Arc::new(pc);
 
@@ -86,24 +95,22 @@ impl PyRTCPeerConnection {
         let event_task = {
             tokio::task::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
-                    Python::with_gil(|py| {
-                        match event {
-                            WebRTCEvent::IceCandidate(candidate) => {
-                                if let Err(e) = ice_callback.call1(py, (candidate,)) {
-                                    eprintln!("Error calling ice candidate callback: {:?}", e);
-                                }
+                    Python::with_gil(|py| match event {
+                        WebRTCEvent::IceCandidate(candidate) => {
+                            if let Err(e) = ice_callback.call1(py, (candidate,)) {
+                                eprintln!("Error calling ice candidate callback: {:?}", e);
                             }
-                            WebRTCEvent::DataChannel(dc) => {
-                                let py_dc = PyRTCDataChannel::new(dc.clone());
+                        }
+                        WebRTCEvent::DataChannel(dc) => {
+                            let py_dc = PyRTCDataChannel::new(dc.clone());
 
-                                match Py::new(py, py_dc) {
-                                    Ok(py_dc_obj) => {
-                                        if let Err(e) = dc_callback.call1(py, (py_dc_obj,)) {
-                                            eprintln!("Error calling data channel callback: {:?}", e);
-                                        }
-                                    },
-                                    Err(e) => eprintln!("Error creating PyRTCDataChannel: {:?}", e),
+                            match Py::new(py, py_dc) {
+                                Ok(py_dc_obj) => {
+                                    if let Err(e) = dc_callback.call1(py, (py_dc_obj,)) {
+                                        eprintln!("Error calling data channel callback: {:?}", e);
+                                    }
                                 }
+                                Err(e) => eprintln!("Error creating PyRTCDataChannel: {:?}", e),
                             }
                         }
                     });
@@ -120,40 +127,42 @@ impl PyRTCPeerConnection {
         // Set up WebRTC callbacks
         if trickle_ice {
             let tx = event_tx.clone();
-            instance.pc.on_ice_candidate(Box::new(move |candidate_option| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    if let Some(candidate) = candidate_option {
-                        let candidate_str = if !candidate.related_address.is_empty() {
-                            format!(
-                                "candidate:{} {} {} {} {} {} typ {} raddr {} rport {}",
-                                candidate.foundation,
-                                candidate.component,
-                                candidate.protocol.to_string().to_lowercase(),
-                                candidate.priority,
-                                candidate.address,
-                                candidate.port,
-                                candidate.typ.to_string().to_lowercase(),
-                                candidate.related_address,
-                                candidate.related_port
-                            )
-                        } else {
-                            format!(
-                                "candidate:{} {} {} {} {} {} typ {}",
-                                candidate.foundation,
-                                candidate.component,
-                                candidate.protocol.to_string().to_lowercase(),
-                                candidate.priority,
-                                candidate.address,
-                                candidate.port,
-                                candidate.typ.to_string().to_lowercase()
-                            )
-                        };
+            instance
+                .pc
+                .on_ice_candidate(Box::new(move |candidate_option| {
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        if let Some(candidate) = candidate_option {
+                            let candidate_str = if !candidate.related_address.is_empty() {
+                                format!(
+                                    "candidate:{} {} {} {} {} {} typ {} raddr {} rport {}",
+                                    candidate.foundation,
+                                    candidate.component,
+                                    candidate.protocol.to_string().to_lowercase(),
+                                    candidate.priority,
+                                    candidate.address,
+                                    candidate.port,
+                                    candidate.typ.to_string().to_lowercase(),
+                                    candidate.related_address,
+                                    candidate.related_port
+                                )
+                            } else {
+                                format!(
+                                    "candidate:{} {} {} {} {} {} typ {}",
+                                    candidate.foundation,
+                                    candidate.component,
+                                    candidate.protocol.to_string().to_lowercase(),
+                                    candidate.priority,
+                                    candidate.address,
+                                    candidate.port,
+                                    candidate.typ.to_string().to_lowercase()
+                                )
+                            };
 
-                        let _ = tx.send(WebRTCEvent::IceCandidate(candidate_str)).await;
-                    }
-                })
-            }));
+                            let _ = tx.send(WebRTCEvent::IceCandidate(candidate_str)).await;
+                        }
+                    })
+                }));
         }
 
         let tx = event_tx;
@@ -170,16 +179,16 @@ impl PyRTCPeerConnection {
     fn create_data_channel(&self, py: Python<'_>, label: &str) -> PyResult<Py<PyRTCDataChannel>> {
         // Create default data channel configuration
         let config = RTCDataChannelInit {
-            ordered: Some(true),           // Guarantee message order
-            max_retransmits: Some(0),      // Don't retransmit lost messages
-            max_packet_life_time: None,    // No timeout for packets
-            protocol: None,                // No specific protocol
-            negotiated: None,              // Let WebRTC handle negotiation
+            ordered: Some(true),        // Guarantee message order
+            max_retransmits: Some(0),   // Don't retransmit lost messages
+            max_packet_life_time: None, // No timeout for packets
+            protocol: None,             // No specific protocol
+            negotiated: None,           // Let WebRTC handle negotiation
         };
 
-        let dc = RUNTIME.block_on(async {
-            self.pc.create_data_channel(label, Some(config)).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let dc = RUNTIME
+            .block_on(async { self.pc.create_data_channel(label, Some(config)).await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Py::new(py, PyRTCDataChannel::new(dc.clone()))
     }
@@ -188,11 +197,15 @@ impl PyRTCPeerConnection {
         let _guard = RUNTIME.enter();
         RUNTIME.block_on(async {
             // Create offer
-            let offer = self.pc.create_offer(None).await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let offer =
+                self.pc.create_offer(None).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
 
             // Store the offer by setting local description first
-            self.pc.set_local_description(offer.clone()).await
+            self.pc
+                .set_local_description(offer.clone())
+                .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             // For non-trickle, wait for gathering to complete
@@ -212,14 +225,13 @@ impl PyRTCPeerConnection {
                     })
                 }));
 
-                // Wait for ICE gathering to complete
-                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                    Ok(Ok(())) => {
-                        if let Some(desc) = self.pc.local_description().await {
-                            return Ok(desc.sdp);
-                        }
-                    },
-                    _ => {}
+                // Wait for ICE gathering to complete - converted to if let
+                if let Ok(Ok(())) =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), rx).await
+                {
+                    if let Some(desc) = self.pc.local_description().await {
+                        return Ok(desc.sdp);
+                    }
                 }
             }
 
@@ -232,11 +244,15 @@ impl PyRTCPeerConnection {
         let _guard = RUNTIME.enter();
         RUNTIME.block_on(async {
             // Create answer
-            let answer = self.pc.create_answer(None).await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let answer =
+                self.pc.create_answer(None).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
 
             // Store the answer by setting local description first
-            self.pc.set_local_description(answer.clone()).await
+            self.pc
+                .set_local_description(answer.clone())
+                .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             // For non-trickle, wait for gathering to complete
@@ -256,14 +272,13 @@ impl PyRTCPeerConnection {
                     })
                 }));
 
-                // Wait for ICE gathering to complete
-                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                    Ok(Ok(())) => {
-                        if let Some(desc) = self.pc.local_description().await {
-                            return Ok(desc.sdp);
-                        }
-                    },
-                    _ => {}
+                // Wait for ICE gathering to complete - converted to if let
+                if let Ok(Ok(())) =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), rx).await
+                {
+                    if let Some(desc) = self.pc.local_description().await {
+                        return Ok(desc.sdp);
+                    }
                 }
             }
 
@@ -297,9 +312,12 @@ impl PyRTCPeerConnection {
         RUNTIME.block_on(async {
             let init = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
                 candidate,
-                ..Default::default()
+                sdp_mid: None,
+                sdp_mline_index: None,
+                username_fragment: None,
             };
-            self.pc.add_ice_candidate(init)
+            self.pc
+                .add_ice_candidate(init)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
@@ -338,7 +356,8 @@ impl PyRTCDataChannel {
                             if let Some(cb) = callback_ref.lock().unwrap().as_ref() {
                                 if let Err(e) = cb.call1(py, (msg,)) {
                                     if let Some(err_cb) = error_ref.lock().unwrap().as_ref() {
-                                        let _ = err_cb.call1(py, (format!("Callback error: {}", e),));
+                                        let _ =
+                                            err_cb.call1(py, (format!("Callback error: {}", e),));
                                     }
                                 }
                             }
@@ -430,15 +449,16 @@ impl PyRTCDataChannel {
     #[pyo3(signature = (data, timeout=None))]
     fn send(&self, data: &[u8], timeout: Option<f64>) -> PyResult<()> {
         let bytes = Bytes::copy_from_slice(data);
-        let timeout_duration = timeout.map(|t| Duration::from_secs_f64(t))
+        let timeout_duration = timeout
+            .map(Duration::from_secs_f64)
             .unwrap_or(Duration::from_secs(30));
 
         RUNTIME.block_on(async {
-            tokio::time::timeout(
-                timeout_duration,
-                self.dc.send(&bytes)
-            ).await
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyTimeoutError, _>("Send operation timed out"))?
+            tokio::time::timeout(timeout_duration, self.dc.send(&bytes))
+                .await
+                .map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyTimeoutError, _>("Send operation timed out")
+                })?
                 .map(|_| ())
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
@@ -446,14 +466,13 @@ impl PyRTCDataChannel {
 
     #[getter]
     fn buffered_amount(&self) -> PyResult<u64> {
-        Ok(RUNTIME.block_on(async {
-            self.dc.buffered_amount().await
-        }) as u64)
+        Ok(RUNTIME.block_on(async { self.dc.buffered_amount().await }) as u64)
     }
 
     #[pyo3(signature = (timeout=None))]
     fn wait_for_channel_open(&self, timeout: Option<f64>) -> PyResult<bool> {
-        let timeout_duration = timeout.map(|t| Duration::from_secs_f64(t))
+        let timeout_duration = timeout
+            .map(Duration::from_secs_f64)
             .unwrap_or(Duration::from_secs(30));
 
         RUNTIME.block_on(async {
@@ -475,9 +494,9 @@ impl PyRTCDataChannel {
             }
         }
 
-        RUNTIME.block_on(async {
-            self.dc.close().await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        RUNTIME
+            .block_on(async { self.dc.close().await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     #[getter]
@@ -501,12 +520,14 @@ fn pam_rustwebrtc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{Mutex as TokioMutex};
+    use tokio::sync::Mutex as TokioMutex;
     use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
     use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
     // Helper function to create a peer connection
-    async fn create_peer_connection(config: RTCConfiguration) -> webrtc::error::Result<RTCPeerConnection> {
+    async fn create_peer_connection(
+        config: RTCConfiguration,
+    ) -> webrtc::error::Result<RTCPeerConnection> {
         let api = APIBuilder::new().build();
         api.new_peer_connection(config).await
     }
@@ -514,7 +535,6 @@ mod tests {
     #[test]
     fn test_webrtc_connection_creation() {
         let result = RUNTIME.block_on(async {
-
             let config = RTCConfiguration::default();
             create_peer_connection(config).await
         });
@@ -538,10 +558,7 @@ mod tests {
     }
 
     // Helper function to exchange ICE candidates
-    async fn exchange_ice_candidates(
-        peer1: Arc<RTCPeerConnection>,
-        peer2: Arc<RTCPeerConnection>,
-    ) {
+    async fn exchange_ice_candidates(peer1: Arc<RTCPeerConnection>, peer2: Arc<RTCPeerConnection>) {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let _ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
         println!("Starting exchange_ice_candidates");
@@ -583,7 +600,9 @@ mod tests {
             while let Some(candidate) = ice_rx1.recv().await {
                 let init = RTCIceCandidateInit {
                     candidate,
-                    ..Default::default()
+                    sdp_mid: None,
+                    sdp_mline_index: None,
+                    username_fragment: None,
                 };
                 if let Err(err) = peer2_clone.add_ice_candidate(init).await {
                     eprintln!("Error adding ICE candidate to peer2: {:?}", err);
@@ -596,7 +615,9 @@ mod tests {
             while let Some(candidate) = ice_rx2.recv().await {
                 let init = RTCIceCandidateInit {
                     candidate,
-                    ..Default::default()
+                    sdp_mid: None,
+                    sdp_mline_index: None,
+                    username_fragment: None,
                 };
                 if let Err(err) = peer1_clone.add_ice_candidate(init).await {
                     eprintln!("Error adding ICE candidate to peer1: {:?}", err);
@@ -685,7 +706,10 @@ mod tests {
             }));
 
             println!("Creating data channel");
-            let dc1 = peer1.create_data_channel("test-channel", None).await.unwrap();
+            let dc1 = peer1
+                .create_data_channel("test-channel", None)
+                .await
+                .unwrap();
             println!("Data channel created successfully");
 
             // Monitor ICE gathering state
@@ -725,9 +749,10 @@ mod tests {
             println!("Waiting for connection to establish");
             let mut retries = 50;
             while retries > 0 && !*done_signal.lock().await {
-                println!("Connection state - peer1: {:?}, peer2: {:?}",
-                         peer1.connection_state(),
-                         peer2.connection_state()
+                println!(
+                    "Connection state - peer1: {:?}, peer2: {:?}",
+                    peer1.connection_state(),
+                    peer2.connection_state()
                 );
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 retries -= 1;
@@ -758,10 +783,10 @@ mod tests {
                     })
                 }));
 
-                let received = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    msg_rx.recv()
-                ).await.unwrap();
+                let received =
+                    tokio::time::timeout(tokio::time::Duration::from_secs(5), msg_rx.recv())
+                        .await
+                        .unwrap();
 
                 assert_eq!(received.unwrap(), message);
             }
@@ -774,12 +799,10 @@ mod tests {
         RUNTIME.block_on(async {
             // Create config with STUN servers first
             let config = RTCConfiguration {
-                ice_servers: vec![
-                    RTCIceServer {
-                        urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                        ..Default::default()
-                    }
-                ],
+                ice_servers: vec![RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                }],
                 ..Default::default()
             };
 
@@ -803,7 +826,10 @@ mod tests {
             }));
 
             println!("Creating data channel");
-            let dc1 = peer1.create_data_channel("test-channel", None).await.unwrap();
+            let dc1 = peer1
+                .create_data_channel("test-channel", None)
+                .await
+                .unwrap();
             println!("Data channel created successfully");
 
             // Create channels for ICE gathering completion
@@ -844,12 +870,17 @@ mod tests {
             peer1.set_local_description(offer).await.unwrap();
 
             // Wait for peer1's ICE gathering to complete
-            match tokio::time::timeout(std::time::Duration::from_secs(30), gather_rx1).await {
+            match tokio::time::timeout(Duration::from_secs(30), gather_rx1).await {
                 Ok(Ok(())) => {
                     if let Some(complete_offer) = peer1.local_description().await {
-                        println!("Complete offer with ICE candidates:\n{}", complete_offer.sdp);
-                        assert!(complete_offer.sdp.contains("a=candidate:"),
-                                "Offer should contain ICE candidates");
+                        println!(
+                            "Complete offer with ICE candidates:\n{}",
+                            complete_offer.sdp
+                        );
+                        assert!(
+                            complete_offer.sdp.contains("a=candidate:"),
+                            "Offer should contain ICE candidates"
+                        );
 
                         // Set the complete offer on peer2
                         peer2.set_remote_description(complete_offer).await.unwrap();
@@ -860,21 +891,26 @@ mod tests {
                         peer2.set_local_description(answer).await.unwrap();
 
                         // Wait for peer2's ICE gathering to complete
-                        match tokio::time::timeout(std::time::Duration::from_secs(30), gather_rx2).await {
+                        match tokio::time::timeout(Duration::from_secs(30), gather_rx2).await {
                             Ok(Ok(())) => {
                                 if let Some(complete_answer) = peer2.local_description().await {
-                                    println!("Complete answer with ICE candidates:\n{}", complete_answer.sdp);
-                                    assert!(complete_answer.sdp.contains("a=candidate:"),
-                                            "Answer should contain ICE candidates");
+                                    println!(
+                                        "Complete answer with ICE candidates:\n{}",
+                                        complete_answer.sdp
+                                    );
+                                    assert!(
+                                        complete_answer.sdp.contains("a=candidate:"),
+                                        "Answer should contain ICE candidates"
+                                    );
 
                                     // Set the complete answer on peer1
                                     peer1.set_remote_description(complete_answer).await.unwrap();
                                 }
-                            },
+                            }
                             _ => panic!("Timeout waiting for peer2 ICE gathering"),
                         }
                     }
-                },
+                }
                 _ => panic!("Timeout waiting for peer1 ICE gathering"),
             }
 
@@ -882,11 +918,12 @@ mod tests {
             println!("Waiting for connection to establish");
             let mut retries = 150; // 30 seconds total
             while retries > 0 && !*done_signal.lock().await {
-                println!("Connection state - peer1: {:?}, peer2: {:?}",
-                         peer1.connection_state(),
-                         peer2.connection_state()
+                println!(
+                    "Connection state - peer1: {:?}, peer2: {:?}",
+                    peer1.connection_state(),
+                    peer2.connection_state()
                 );
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 retries -= 1;
             }
 
@@ -898,7 +935,7 @@ mod tests {
             dc1.send(&message).await.unwrap();
 
             // Wait for message echo
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         });
     }
 }

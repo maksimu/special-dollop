@@ -215,7 +215,6 @@ impl PyRTCPeerConnection {
 
                 self.pc.on_ice_gathering_state_change(Box::new(move |s| {
                     let tx = tx.clone();
-                    println!("ICE gathering state changed to: {:?}", s);
                     Box::pin(async move {
                         if s == RTCIceGathererState::Complete {
                             if let Some(tx) = tx.lock().await.take() {
@@ -262,7 +261,6 @@ impl PyRTCPeerConnection {
 
                 self.pc.on_ice_gathering_state_change(Box::new(move |s| {
                     let tx = tx.clone();
-                    println!("ICE gathering state changed to: {:?}", s);
                     Box::pin(async move {
                         if s == RTCIceGathererState::Complete {
                             if let Some(tx) = tx.lock().await.take() {

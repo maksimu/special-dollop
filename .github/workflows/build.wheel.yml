@@ -16,85 +16,114 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         include:
-          # Add ARM64 builds for macOS and Linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            arch: x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
             arch: arm64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             arch: arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+            alpine: true
 
     steps:
       - uses: actions/checkout@v4
 
+      # Set up QEMU for ARM64 emulation (only needed for the ARM64 Linux build)
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64' && matrix.os == 'ubuntu-latest'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # Set up Python (needed for testing and native builds)
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"  # Using a single Python version with PyO3
+          python-version: "3.11"
 
+      # Install Rust (needed for native builds)
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # Setup cross-compilation for ARM64 Linux
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'arm64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
-
-      # Install dependencies for WebRTC (especially on Linux)
-      - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev
-
+      # Install dependencies for macOS (only needed for macOS builds)
       - name: Install dependencies (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           brew install openssl@3
 
-      # Install specific version of maturin
+      # Install maturin (for native builds)
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
           pip install maturin==0.15.1
-          maturin --version
         shell: bash
 
-      # For non-ARM64 builds
-      - name: Build wheels (standard)
-        if: matrix.arch != 'arm64'
-        env:
-          OPENSSL_DIR: ${{ matrix.os == 'macos-latest' && '$(brew --prefix openssl@3)' || '' }}
+      # Consolidated build step for all platforms EXCEPT Alpine
+      - name: Build wheels
+        if: ${{ !matrix.alpine }}
         run: |
-          if [ "${{ runner.os }}" == "macOS" ]; then
+          # macOS builds (Intel & ARM)
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             export OPENSSL_DIR=$(brew --prefix openssl@3)
+          
+            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+              echo "Building for macOS x86_64"
+              maturin build --release --target x86_64-apple-darwin
+            elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
+              echo "Building for macOS ARM64"
+              maturin build --release --target aarch64-apple-darwin
+            fi
+          
+          # Linux builds (x86_64 & ARM64)
+          elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+              echo "Building for Linux x86_64"
+              docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin build --release --manylinux 2014
+            elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
+              echo "Building for Linux ARM64 using QEMU emulation"
+              # Run in an ARM64 container with QEMU
+              docker run --rm --platform linux/arm64 -v "$(pwd)":/io quay.io/pypa/manylinux2014_aarch64 bash -c "
+                # Install Rust
+                curl --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                source \$HOME/.cargo/env
+          
+                # Install maturin
+                /opt/python/cp311-cp311/bin/pip install maturin==0.15.1
+          
+                # Build the wheel (native ARM64 build)
+                cd /io
+                /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
+              "
+            fi
+          
+          # Windows build
+          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            echo "Building for Windows x86_64"
+            maturin build --release
           fi
-          maturin build --release
-        shell: bash
-
-      # For ARM64 builds
-      - name: Build wheels (ARM64)
-        if: matrix.arch == 'arm64'
-        env:
-          OPENSSL_DIR: ${{ matrix.os == 'macos-latest' && '$(brew --prefix openssl@3)' || '' }}
-        run: |
-          if [ "${{ runner.os }}" == "macOS" ]; then
-            export OPENSSL_DIR=$(brew --prefix openssl@3)
-          fi
-          maturin build --release --target ${{ matrix.target }}
+          
+          # Debug - list the wheels that were built
+          echo "Wheels built for ${{ matrix.os }}-${{ matrix.arch }}:"
+          find target/wheels -type f -name "*.whl" | sort
         shell: bash
 
       # Setup virtual environment for testing
       - name: Setup test environment
-        if: matrix.arch != 'arm64'
+        if: matrix.arch != 'arm64' && !(matrix.os == 'macos-latest' && matrix.arch == 'x86_64') && !matrix.alpine
         run: |
           pip install virtualenv pytest
           python -m virtualenv venv
@@ -111,10 +140,19 @@ jobs:
 
       # Run tests only on native architecture (not cross-compiled)
       - name: Run tests
-        if: matrix.arch != 'arm64'
+        if: matrix.arch != 'arm64' && !(matrix.os == 'macos-latest' && matrix.arch == 'x86_64') && !matrix.alpine
         run: |
-          # Build already happened earlier in the workflow
-          # Just install the wheel
+          # Activate the virtual environment properly
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            . venv/Scripts/activate
+          else
+            . venv/bin/activate
+          fi
+          
+          # Install pytest in the virtual environment
+          pip install pytest
+          
+          # Install the wheel
           if [ "${{ runner.os }}" == "Windows" ]; then
             pip install $(ls target/wheels/*.whl | head -1)
           else
@@ -124,22 +162,118 @@ jobs:
           # Verify import works
           python -c "import pam_rustwebrtc; print('Import successful')"
           
-          # Run tests (continue even if they fail)
-          cd tests && python -m pytest test_webrtc.py -v || echo "Tests failed but continuing"
+          # Run tests
+          cd tests && python -m pytest test_webrtc.py -v
         shell: bash
 
-      # Get version from Cargo.toml for naming the artifacts
-      - name: Get package version
-        id: get_version
-        shell: bash
+      # Alpine Linux build (x86_64 with musl)
+      - name: Build Alpine Linux wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.alpine == true
         run: |
-          VERSION=$(grep -m 1 version Cargo.toml | cut -d '"' -f2)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Building wheel for Alpine Linux"
+          
+          # Use a pure Alpine container for building the musllinux wheel
+          docker run --rm -v "$(pwd)":/io alpine:3.16 sh -c "
+            # Install build dependencies including patchelf
+            apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf
+          
+            # Install Rust
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+          
+            # Install maturin with patchelf support
+            pip3 install 'maturin[patchelf]==0.15.1'
+          
+            # Build the wheel directly in Alpine (with correct flags for maturin 0.15.1)
+            cd /io
+            maturin build --release --strip
+          
+            # Create wheels directory if it doesn't exist
+            mkdir -p /io/target/wheels
+          
+            # Find the built wheel and copy it to target/wheels
+            WHEEL=\$(find /io/target -name '*.whl' | head -1)
+            if [ -n \"\$WHEEL\" ]; then
+              cp \$WHEEL /io/target/wheels/
+              echo \"Copied wheel to /io/target/wheels/\"
+            else
+              echo \"No wheel was built!\"
+              exit 1
+            fi
+          
+            # List all generated wheels
+            echo 'Wheels built in Alpine environment:'
+            find /io/target -name '*.whl' | sort
+          "
+          
+          # Create wheels directory if it doesn't exist
+          mkdir -p target/wheels
+          
+          # Check if we have any wheels built
+          WHEEL_COUNT=$(find target -type f -name "*.whl" | wc -l)
+          if [ $WHEEL_COUNT -eq 0 ]; then
+            echo "ERROR: No wheels were built in Alpine container!"
+            exit 1
+          fi
+          
+          # Make sure wheels are in target/wheels directory
+          for wheel in $(find target -type f -name "*.whl"); do
+            if [[ "$wheel" != "target/wheels/"* ]]; then
+              cp "$wheel" target/wheels/
+              echo "Copied $wheel to target/wheels/"
+            fi
+          done
+          
+          # List all wheels
+          echo "Final wheels in target directory:"
+          find target -type f -name "*.whl" | sort
+        shell: bash
+
+      # Test Alpine wheel
+      - name: Test Alpine wheel
+        if: matrix.alpine == true
+        run: |
+          echo "Testing wheel in Alpine container"
+          
+          # Find any wheel to test
+          WHEEL_PATH=$(find target -type f -name "*.whl" | head -1)
+          
+          if [ -z "$WHEEL_PATH" ]; then
+            echo "ERROR: No wheels found at all!"
+            echo "Contents of target directory:"
+            find target -type f | sort
+            exit 1
+          fi
+          
+          echo "Testing wheel: $WHEEL_PATH"
+          
+          # Test in a clean Alpine container
+          docker run --rm -v "$(pwd)":/io alpine:latest sh -c "
+            # Install Python and pip
+            apk add --no-cache python3 py3-pip
+          
+            # Create a virtual environment as required by PEP 668
+            python3 -m venv /tmp/venv
+            . /tmp/venv/bin/activate
+          
+            # Install the wheel
+            pip install /io/$WHEEL_PATH
+          
+            # Verify import works
+            python -c 'import pam_rustwebrtc; print(\"Import successful\")'
+          
+            # Install test dependencies
+            pip install pytest
+          
+            # Run tests
+            cd /io/tests && python -m pytest test_webrtc.py -v
+          "
+        shell: bash
 
       # Upload all wheels as artifacts
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-${{ matrix.os }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }}
+          name: pam-rustwebrtc-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.alpine && '-alpine' || '' }}
           path: target/wheels/*.whl
           retention-days: 14
 
@@ -166,6 +300,17 @@ jobs:
           pattern: pam-rustwebrtc-*
           merge-multiple: true
 
+      - name: Debug wheel files
+        run: |
+          echo "Listing all wheel files in dist/"
+          find dist -type f -name "*.whl" | sort
+          echo "Contents of each directory:"
+          find dist -type d | while read dir; do
+            echo "Contents of $dir:"
+            ls -la "$dir"
+          done
+        shell: bash
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -178,6 +323,7 @@ jobs:
             - Linux (x86_64, aarch64)
             - macOS (x86_64, arm64)
             - Windows (x86_64)
+            - Alpine Linux (x86_64)
             
             Built with abi3 for maximum Python version compatibility (Python 3.7+).
           tag_name: v${{ env.VERSION }}

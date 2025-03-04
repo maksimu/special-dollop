@@ -234,7 +234,15 @@ class TestWebRTC(unittest.TestCase):
         """Test peer connection without trickle ICE"""
         logging.info("Starting P2P connection test without trickle ICE")
 
-        config = {"iceServers": []}
+        config = {
+            "iceServers": [
+                {
+                    "urls": ["stun:stun.l.google.com:19302"],
+                    "username": "",
+                    "credential": ""
+                }
+            ]
+        }
         peer1 = pam_rustwebrtc.PyRTCPeerConnection(
             config,
             None,  # No ICE candidate callback for non-trickle

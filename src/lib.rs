@@ -226,7 +226,7 @@ impl PyRTCPeerConnection {
 
                 // Wait for ICE gathering to complete - converted to if let
                 if let Ok(Ok(())) =
-                    tokio::time::timeout(std::time::Duration::from_secs(30), rx).await
+                    tokio::time::timeout(Duration::from_secs(30), rx).await
                 {
                     if let Some(desc) = self.pc.local_description().await {
                         return Ok(desc.sdp);
@@ -272,7 +272,7 @@ impl PyRTCPeerConnection {
 
                 // Wait for ICE gathering to complete - converted to if let
                 if let Ok(Ok(())) =
-                    tokio::time::timeout(std::time::Duration::from_secs(30), rx).await
+                    tokio::time::timeout(Duration::from_secs(30), rx).await
                 {
                     if let Some(desc) = self.pc.local_description().await {
                         return Ok(desc.sdp);

@@ -23,6 +23,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             arch: x86_64
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            arch: x86
           - os: macos-latest
             target: x86_64-apple-darwin
             arch: x86_64
@@ -52,6 +55,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          architecture: ${{ matrix.arch == 'x86' && 'x86' || 'x64' }}
 
       # Install Rust (needed for native builds)
       - name: Install Rust toolchain
@@ -112,8 +116,13 @@ jobs:
           
           # Windows build
           elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            echo "Building for Windows x86_64"
-            maturin build --release
+            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+              echo "Building for Windows x86_64"
+              maturin build --release --target x86_64-pc-windows-msvc
+            elif [[ "${{ matrix.arch }}" == "x86" ]]; then
+              echo "Building for Windows x86"
+              maturin build --release --target i686-pc-windows-msvc
+            fi
           fi
           
           # Debug - list the wheels that were built

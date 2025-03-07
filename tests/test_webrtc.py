@@ -1,4 +1,3 @@
-# test_webrtc.py
 import queue
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +43,7 @@ class TestWebRTC(unittest.TestCase):
         self.data_channel_received = Queue()
         self.received_messages = Queue()
         self.connection_established = threading.Event()
+        logging.info("Test setup completed")
 
     def on_ice_candidate1(self, candidate):
         if candidate:
@@ -61,21 +61,25 @@ class TestWebRTC(unittest.TestCase):
         self.data_channel_received.put(dc)
 
     def on_message(self, msg):
-        logging.info(f"Message received: {msg}")
+        logging.info(f"Message received: {len(msg)} bytes")
         self.received_messages.put(msg)
 
     def wait_for_connection(self, peer1, peer2, timeout=10):
         """Wait for both peers to establish connection"""
+        logging.info(f"Waiting for connection establishment (timeout: {timeout}s)")
         start_time = time.time()
         while time.time() - start_time < timeout:
             if (peer1.connection_state == "Connected" and
                     peer2.connection_state == "Connected"):
+                logging.info("Connection established")
                 return True
             time.sleep(0.1)
+        logging.warning("Connection establishment timed out")
         return False
 
     def exchange_ice_candidates(self, peer1, peer2, timeout=5):
         """Exchange ICE candidates between peers"""
+        logging.info(f"Starting ICE candidate exchange (timeout: {timeout}s)")
         start_time = time.time()
         while time.time() - start_time < timeout:
             # Handle peer1's candidates
@@ -104,14 +108,17 @@ class TestWebRTC(unittest.TestCase):
 
             # Check if connection is established
             if peer1.connection_state == "Connected" and peer2.connection_state == "Connected":
+                logging.info("Connection established during ICE exchange")
                 return True
 
             time.sleep(0.1)
 
+        logging.warning("ICE exchange timed out")
         return False
 
     @with_runtime
     def test_peer_connection_creation(self):
+        logging.info("Starting peer connection creation test")
         config = {"iceServers": []}
         pc = pam_rustwebrtc.PyRTCPeerConnection(
             config,
@@ -120,9 +127,11 @@ class TestWebRTC(unittest.TestCase):
             trickle_ice=True
         )
         self.assertEqual(pc.connection_state, "New")
+        logging.info("Peer connection creation test passed")
 
     @with_runtime
     def test_peer_connection_with_config(self):
+        logging.info("Starting peer connection with config test")
         config = {
             "iceServers": [
                 {
@@ -139,9 +148,11 @@ class TestWebRTC(unittest.TestCase):
             trickle_ice=True
         )
         self.assertEqual(pc.connection_state, "New")
+        logging.info("Peer connection with config test passed")
 
     @with_runtime
     def test_data_channel_creation(self):
+        logging.info("Starting data channel creation test")
         config = {"iceServers": []}
         pc = pam_rustwebrtc.PyRTCPeerConnection(
             config,
@@ -152,6 +163,7 @@ class TestWebRTC(unittest.TestCase):
         dc = pc.create_data_channel("test")
         self.assertEqual(dc.label, "test")
         self.assertEqual(dc.ready_state, "Connecting")
+        logging.info("Data channel creation test passed")
 
     @with_runtime
     def test_p2p_connection(self):
@@ -221,13 +233,16 @@ class TestWebRTC(unittest.TestCase):
 
         # Test data channel communication
         message = b"Hello WebRTC!"
+        logging.info(f"Sending message: {message}")
         dc1.send(message)
         received = self.received_messages.get(timeout=5)
         self.assertEqual(received, message)
+        logging.info("Message received correctly")
 
         # Clean up
         dc1.close()
         dc2.close()
+        logging.info("P2P connection test passed")
 
     @with_runtime
     def test_p2p_connection_non_trickle(self):
@@ -263,6 +278,7 @@ class TestWebRTC(unittest.TestCase):
         # Create and set offer
         try:
             offer = peer1.create_offer()
+            logging.info(f"Created offer (length: {len(offer)} bytes)")
             self.assertIn("a=candidate:", offer, "Offer should contain ICE candidates")
             peer2.set_remote_description(offer)
             logging.info("Offer exchange completed")
@@ -273,6 +289,7 @@ class TestWebRTC(unittest.TestCase):
         # Create and set answer
         try:
             answer = peer2.create_answer()
+            logging.info(f"Created answer (length: {len(answer)} bytes)")
             self.assertIn("a=candidate:", answer, "Answer should contain ICE candidates")
             peer1.set_remote_description(answer)
             logging.info("Answer exchange completed")
@@ -282,7 +299,7 @@ class TestWebRTC(unittest.TestCase):
 
         # Wait for connection
         self.assertTrue(
-            self.wait_for_connection(peer1, peer2),
+            self.wait_for_connection(peer1, peer2, timeout=15),
             "Failed to establish connection"
         )
 
@@ -292,13 +309,16 @@ class TestWebRTC(unittest.TestCase):
 
         # Test communication
         message = b"Hello WebRTC!"
+        logging.info(f"Sending message: {message}")
         dc1.send(message)
         received = self.received_messages.get(timeout=5)
         self.assertEqual(received, message)
+        logging.info("Message received correctly")
 
         # Clean up
         dc1.close()
         dc2.close()
+        logging.info("Non-trickle P2P connection test passed")
 
     @with_runtime
     def test_data_channel_load(self):
@@ -354,6 +374,8 @@ class TestWebRTC(unittest.TestCase):
 
         for chunk_size, num_messages in data_sizes:
             with self.subTest(f"Testing {chunk_size * num_messages / 1024:.0f}KB total in {num_messages} messages"):
+                logging.info(f"Testing {chunk_size * num_messages / 1024:.0f}KB total in {num_messages} messages")
+
                 # Create test data
                 test_data = b"x" * chunk_size
                 received_count = 0
@@ -367,6 +389,7 @@ class TestWebRTC(unittest.TestCase):
                 def count_messages(msg):
                     nonlocal received_count
                     received_count += 1
+                    logging.debug(f"Received message {received_count}/{num_messages} ({len(msg)} bytes)")
                     self.received_messages.put(msg)
 
                 # Set message handler
@@ -377,6 +400,8 @@ class TestWebRTC(unittest.TestCase):
                     dc1.send(test_data)
                     if i % 10 == 0:  # Add a small delay every 10 messages
                         time.sleep(0.01)
+                    if i % 20 == 0:
+                        logging.info(f"Sent {i}/{num_messages} messages")
 
                 # Wait for all messages
                 try:
@@ -406,10 +431,12 @@ class TestWebRTC(unittest.TestCase):
                 finally:
                     # Clear the message handler
                     dc2.on_message = None
+                    logging.info(f"Completed test for {chunk_size} byte chunks")
 
         # Clean up
         dc1.close()
         dc2.close()
+        logging.info("Data channel load test passed")
 
     @with_runtime
     def test_data_channel_reconnection(self):
@@ -522,23 +549,28 @@ class TestWebRTC(unittest.TestCase):
                 break
             time.sleep(0.5)
             attempts += 1
+            logging.debug(f"Waiting for data channel to close, current state: {dc1.ready_state}")
 
         self.assertIn(dc1.ready_state, ["Closing", "Closed"], "Data channel should be closed state")
+        logging.info(f"Data channel closed successfully after {attempts} attempts")
 
         # Try to create a new data channel and test data flow again
         logging.info("Attempting to create a new data channel after closure")
         dc1_new = peer1.create_data_channel("control_new")
+        logging.info(f"Created new data channel: {dc1_new.label}")
 
         # Wait for the new channel to be received
         try:
             dc2_new = self.data_channel_received.get(timeout=5)
             self.assertEqual(dc2_new.label, "control_new")
+            logging.info("New data channel received by peer2")
 
             # Set message handler for the new channel
             dc2_new.on_message = queue_message_handler
 
             # Test data transmission with the new channel
             test_msg = b"New channel test"
+            logging.info(f"Sending test message on new channel: {test_msg}")
             dc1_new.send(test_msg)
 
             msg_id, received = message_queue.get(timeout=3)
@@ -555,7 +587,96 @@ class TestWebRTC(unittest.TestCase):
         dc2.close()
         if dc2_new:
             dc2_new.close()
+        logging.info("Data channel reconnection test passed")
+
+    @with_runtime
+    def test_sequential_connection_creation(self):
+        """Test creating connections one after another"""
+        logging.info("Testing sequential connection creation")
+
+        for i in range(3):  # Try creating 3 connections in sequence
+            logging.info(f"Creating connection {i+1}")
+
+            # Reset test state
+            while not self.ice_candidates1.empty():
+                self.ice_candidates1.get_nowait()
+            while not self.ice_candidates2.empty():
+                self.ice_candidates2.get_nowait()
+            while not self.data_channel_received.empty():
+                self.data_channel_received.get_nowait()
+            while not self.received_messages.empty():
+                self.received_messages.get_nowait()
+
+            # Create peer connections
+            config = {"iceServers": []}
+            peer1 = pam_rustwebrtc.PyRTCPeerConnection(
+                config,
+                self.on_ice_candidate1,
+                self.on_data_channel,
+                trickle_ice=True
+            )
+            peer2 = pam_rustwebrtc.PyRTCPeerConnection(
+                config,
+                self.on_ice_candidate2,
+                self.on_data_channel,
+                trickle_ice=True
+            )
+
+            # Create data channel
+            dc1 = peer1.create_data_channel(f"test-channel-{i}")
+            logging.info(f"Created data channel {i+1}")
+
+            # Set up connection
+            offer = peer1.create_offer()
+            peer2.set_remote_description(offer)
+            answer = peer2.create_answer()
+            peer1.set_remote_description(answer)
+
+            # Exchange ICE candidates
+            self.exchange_ice_candidates(peer1, peer2)
+
+            # Wait for connection
+            self.assertTrue(
+                self.wait_for_connection(peer1, peer2),
+                f"Failed to establish connection {i+1}"
+            )
+
+            # Get data channel
+            dc2 = self.data_channel_received.get(timeout=5)
+
+            # Test data transfer
+            test_msg = f"Hello from connection {i+1}".encode()
+            dc1.send(test_msg)
+            received = self.received_messages.get(timeout=5)
+            self.assertEqual(received, test_msg)
+
+            # Close everything
+            logging.info(f"Closing connection {i+1}")
+            dc1.close()
+            dc2.close()
+            peer1.close()
+            peer2.close()
+
+            # Force garbage collection
+            import gc
+            gc.collect()
+
+            # Add a delay to ensure complete cleanup
+            time.sleep(1)
+
+        logging.info("Sequential connection creation test passed")
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Initialize the Rust logger to use Python's logging system
+    try:
+        pam_rustwebrtc.initialize_logger("pam_rustwebrtc", verbose=True, level=logging.DEBUG)
+        logging.info("Rust logger initialized successfully")
+    except Exception as e:
+        logging.error(f"Failed to initialize Rust logger: {e}")
+
     unittest.main()

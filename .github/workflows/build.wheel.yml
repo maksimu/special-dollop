@@ -5,7 +5,6 @@ on:
     branches:
       - main
     paths:
-      - 'src/lib.rs'
       - 'Cargo.toml'
   workflow_dispatch:
 
@@ -23,9 +22,6 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             arch: x86_64
-          - os: windows-latest
-            target: i686-pc-windows-msvc
-            arch: x86
           - os: macos-latest
             target: x86_64-apple-darwin
             arch: x86_64
@@ -119,9 +115,6 @@ jobs:
             if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
               echo "Building for Windows x86_64"
               maturin build --release --target x86_64-pc-windows-msvc
-            elif [[ "${{ matrix.arch }}" == "x86" ]]; then
-              echo "Building for Windows x86"
-              maturin build --release --target i686-pc-windows-msvc
             fi
           fi
           

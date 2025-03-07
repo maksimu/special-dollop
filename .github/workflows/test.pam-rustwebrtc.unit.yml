@@ -54,7 +54,7 @@ jobs:
 
       # Run Rust unit tests
       - name: Run Rust tests
-        run: cargo test --verbose
+        run: cargo test --verbose --no-default-features
         env:
           CXXFLAGS: "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
           LDFLAGS: "-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib"

@@ -46,12 +46,48 @@ jobs:
         with:
           platforms: arm64
 
+      - name: Install Python 3.11 using pyenv (Linux ARM64)
+        if: matrix.arch == 'arm64' && contains(matrix.target, 'linux')
+        run: |
+          # Install dependencies for pyenv and Python building
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev zlib1g-dev \
+            libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm \
+            libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev \
+            liblzma-dev libgdbm-dev libnss3-dev libedit-dev git
+          
+          # Install pyenv
+          curl https://pyenv.run | bash
+          
+          # Add pyenv to PATH
+          export PYENV_ROOT="$HOME/.pyenv"
+          export PATH="$PYENV_ROOT/bin:$PATH"
+          eval "$(pyenv init -)"
+          eval "$(pyenv init --path)"
+          
+          # Install Python 3.11
+          pyenv install 3.11.8
+          pyenv global 3.11.8
+          
+          # Verify installation
+          python --version
+          pip --version
+          
+          # Make pyenv settings persist in subsequent steps
+          echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
+          echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
+          echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+          echo 'eval "$(pyenv init --path)"' >> ~/.bashrc
+        shell: bash
+
+
       # Set up Python (needed for testing and native builds)
       - name: Set up Python
+        if: ${{ matrix.arch != 'arm64' || !contains(matrix.os, 'ubuntu') }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          architecture: ${{ matrix.arch }}
+          architecture: ${{ matrix.arch == 'x86' && 'x86' || 'x64' }}
 
       # Install Rust (needed for native builds)
       - name: Install Rust toolchain

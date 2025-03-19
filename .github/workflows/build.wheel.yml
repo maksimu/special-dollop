@@ -1,4 +1,4 @@
-name: Build Wheel
+name: Build and Release 🛞Wheels 🛞
 
 on:
   push:
@@ -152,7 +152,7 @@ jobs:
 
   # macOS builds (x86_64 and arm64)
   build_macos:
-    name: Build macOS
+    name: Build macOS (x86_64 and arm64)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -203,7 +203,7 @@ jobs:
 
   # Windows build
   build_windows:
-    name: Build Windows
+    name: Build Windows (x86_64)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -262,7 +262,7 @@ jobs:
 
   # Alpine Linux build
   build_alpine:
-    name: Build Alpine Linux
+    name: Build Alpine Linux (x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

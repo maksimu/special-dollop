@@ -28,7 +28,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             arch: arm64
-          - os: ubuntu-latest
+          - os: ubuntu-latest-arm64
             target: aarch64-unknown-linux-gnu
             arch: arm64
           - os: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
 
       # Set up QEMU for ARM64 emulation (only needed for the ARM64 Linux build)
       - name: Set up QEMU
-        if: matrix.arch == 'arm64' && matrix.os == 'ubuntu-latest'
+        if: matrix.arch == 'arm64' && matrix.os == 'ubuntu-latest' && !contains(matrix.os, 'arm64')
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
@@ -89,25 +89,33 @@ jobs:
             fi
           
           # Linux builds (x86_64 & ARM64)
-          elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          elif [[ "${{ matrix.os }}" == "ubuntu-latest"* ]]; then
             if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
               echo "Building for Linux x86_64"
               docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin build --release --manylinux 2014
             elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
-              echo "Building for Linux ARM64 using QEMU emulation"
-              # Run in an ARM64 container with QEMU
-              docker run --rm --platform linux/arm64 -v "$(pwd)":/io quay.io/pypa/manylinux2014_aarch64 bash -c "
-                # Install Rust
-                curl --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-                source \$HOME/.cargo/env
+              if [[ "${{ matrix.os }}" == *"arm64" ]]; then
+                echo "Building for Linux ARM64 natively"
+                # Install dependencies for manylinux compatibility
+                pip install manylinux2014-policy auditwheel
+                # Build directly without Docker since we're already on ARM64
+                maturin build --release --manylinux 2014
+              else
+                echo "Building for Linux ARM64 using QEMU emulation"
+                # Run in an ARM64 container with QEMU (existing code)
+                docker run --rm --platform linux/arm64 -v "$(pwd)":/io quay.io/pypa/manylinux2014_aarch64 bash -c "
+                  # Install Rust
+                  curl --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                  source \$HOME/.cargo/env
           
-                # Install maturin
-                /opt/python/cp311-cp311/bin/pip install maturin==0.15.1
+                  # Install maturin
+                  /opt/python/cp311-cp311/bin/pip install maturin==0.15.1
           
-                # Build the wheel (native ARM64 build)
-                cd /io
-                /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
-              "
+                  # Build the wheel (native ARM64 build)
+                  cd /io
+                  /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
+                "
+              fi
             fi
           
           # Windows build

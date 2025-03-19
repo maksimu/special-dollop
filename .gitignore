@@ -2,3 +2,13 @@
 /venv
 /.venv
 
+# IntelliJ project files
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+out/
+
+# Distribution folder
+/dist/

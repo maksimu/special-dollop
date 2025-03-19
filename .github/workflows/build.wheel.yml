@@ -64,7 +64,6 @@ jobs:
         with:
           name: pam-rustwebrtc-linux-x86_64
           path: target/wheels/*.whl
-          retention-days: 14
 
   # Linux ARM64 build
   build_linux_arm64:
@@ -148,7 +147,6 @@ jobs:
         with:
           name: pam-rustwebrtc-linux-arm64
           path: target/wheels/*.whl
-          retention-days: 14
 
   # macOS builds (x86_64 and arm64)
   build_macos:
@@ -170,7 +168,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install openssl@3
+          brew list openssl@3 &>/dev/null || brew install openssl@3
 
       - name: Install maturin
         run: |
@@ -199,7 +197,6 @@ jobs:
         with:
           name: pam-rustwebrtc-macos
           path: target/wheels/*.whl
-          retention-days: 14
 
   # Windows build
   build_windows:
@@ -258,7 +255,6 @@ jobs:
         with:
           name: pam-rustwebrtc-windows-x86_64
           path: target/wheels/*.whl
-          retention-days: 14
 
   # Alpine Linux build
   build_alpine:
@@ -394,7 +390,6 @@ jobs:
         with:
           name: pam-rustwebrtc-alpine-x86_64
           path: target/wheels/*.whl
-          retention-days: 14
 
   # Create release with all wheels if on main branch
   create_release:

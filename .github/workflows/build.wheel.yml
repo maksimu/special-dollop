@@ -9,180 +9,284 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_wheels:
-    name: Build 🛞 on ${{ matrix.os }} (${{ matrix.arch }}${{ matrix.alpine && '-alpine' || '' }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            arch: x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            arch: x86_64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            arch: x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            arch: arm64
-          - os: UbuntuArm64
-            target: aarch64-unknown-linux-gnu
-            arch: arm64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            arch: x86_64
-            alpine: true
-
+  # Linux x86_64 build
+  build_linux_x86_64:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Set up QEMU for ARM64 emulation (only needed for the ARM64 Linux build)
-      - name: Set up QEMU
-        if: matrix.arch == 'arm64' && matrix.os == 'ubuntu-latest' && !contains(matrix.os, 'arm64')
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      # Set up Python (needed for testing and native builds)
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          architecture: ${{ matrix.arch }}
+          architecture: 'x64'
 
-      # Install Rust (needed for native builds)
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
-      # Install dependencies for macOS (only needed for macOS builds)
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install openssl@3
-
-      # Install maturin (for native builds)
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
           pip install maturin==0.15.1
         shell: bash
 
-      # Consolidated build step for all platforms EXCEPT Alpine
-      - name: Build wheels
-        if: ${{ !matrix.alpine }}
+      - name: Build wheel
         run: |
-          # macOS builds (Intel & ARM)
-          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            export OPENSSL_DIR=$(brew --prefix openssl@3)
-          
-            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-              echo "Building for macOS x86_64"
-              maturin build --release --target x86_64-apple-darwin
-            elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
-              echo "Building for macOS ARM64"
-              maturin build --release --target aarch64-apple-darwin
-            fi
-          
-          # Linux builds (x86_64 & ARM64)
-          elif [[ "${{ matrix.os }}" == "ubuntu-latest"* ]]; then
-            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-              echo "Building for Linux x86_64"
-              docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin build --release --manylinux 2014
-            elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
-              if [[ "${{ matrix.os }}" == *"arm64" ]]; then
-                echo "Building for Linux ARM64 natively"
-                # Install dependencies for manylinux compatibility
-                pip install manylinux2014-policy auditwheel
-                # Build directly without Docker since we're already on ARM64
-                maturin build --release --manylinux 2014
-              else
-                echo "Building for Linux ARM64 using QEMU emulation"
-                # Run in an ARM64 container with QEMU (existing code)
-                docker run --rm --platform linux/arm64 -v "$(pwd)":/io quay.io/pypa/manylinux2014_aarch64 bash -c "
-                  # Install Rust
-                  curl --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-                  source \$HOME/.cargo/env
-          
-                  # Install maturin
-                  /opt/python/cp311-cp311/bin/pip install maturin==0.15.1
-          
-                  # Build the wheel (native ARM64 build)
-                  cd /io
-                  /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
-                "
-              fi
-            fi
-          
-          # Windows build
-          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-              echo "Building for Windows x86_64"
-              maturin build --release --target x86_64-pc-windows-msvc
-            fi
-          fi
+          echo "Building for Linux x86_64"
+          docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin build --release --manylinux 2014
           
           # Debug - list the wheels that were built
-          echo "Wheels built for ${{ matrix.os }}-${{ matrix.arch }}:"
-          find target/wheels -type f -name "*.whl" | sort
+          echo "Wheels built for Linux x86_64:"
+          find target/wheels -name "*.whl" -type f | sort
         shell: bash
 
-      # Setup virtual environment for testing
       - name: Setup test environment
-        if: matrix.arch != 'arm64' && !(matrix.os == 'macos-latest' && matrix.arch == 'x86_64') && !matrix.alpine
         run: |
           pip install virtualenv pytest
           python -m virtualenv venv
-          
-          # Set environment variables (OS-specific)
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            echo "VIRTUAL_ENV=${{ github.workspace }}\venv" >> $GITHUB_ENV
-            echo "${{ github.workspace }}\venv\Scripts" >> $GITHUB_PATH
-          else
-            echo "VIRTUAL_ENV=${{ github.workspace }}/venv" >> $GITHUB_ENV
-            echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
-          fi
+          echo "VIRTUAL_ENV=${{ github.workspace }}/venv" >> $GITHUB_ENV
+          echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
         shell: bash
 
-      # Run tests only on native architecture (not cross-compiled)
       - name: Run tests
-        if: matrix.arch != 'arm64' && !(matrix.os == 'macos-latest' && matrix.arch == 'x86_64') && !matrix.alpine
         run: |
-          # Activate the virtual environment properly
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            . venv/Scripts/activate
-          else
-            . venv/bin/activate
-          fi
-          
-          # Install pytest in the virtual environment
+          . venv/bin/activate
           pip install pytest
-          
-          # Install the wheel
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            pip install $(ls target/wheels/*.whl | head -1)
-          else
-            pip install $(find target/wheels -name "*.whl" | head -1)
-          fi
-          
-          # Verify import works
+          pip install $(find target/wheels -name "*.whl" | head -1)
           python -c "import pam_rustwebrtc; print('Import successful')"
-          
-          # Run tests
           cd tests && python -m pytest test_webrtc.py -v
         shell: bash
 
-      # Alpine Linux build (x86_64 with musl)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pam-rustwebrtc-linux-x86_64
+          path: target/wheels/*.whl
+          retention-days: 14
+
+  # Linux ARM64 build
+  build_linux_arm64:
+    name: Build Linux (ARM64)
+    runs-on: UbuntuArm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python 3.11 using pyenv
+        run: |
+          # Install dependencies for pyenv and Python building
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev zlib1g-dev \
+            libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm \
+            libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev \
+            liblzma-dev libgdbm-dev libnss3-dev libedit-dev git
+          
+          # Install pyenv
+          curl https://pyenv.run | bash
+          
+          # Add pyenv to PATH
+          export PYENV_ROOT="$HOME/.pyenv"
+          export PATH="$PYENV_ROOT/bin:$PATH"
+          eval "$(pyenv init -)"
+          eval "$(pyenv init --path)"
+          
+          # Install Python 3.11
+          pyenv install 3.11.8
+          pyenv global 3.11.8
+          
+          # Verify installation
+          python --version
+          pip --version
+          
+          # Make pyenv settings persist in subsequent steps
+          echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
+          echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
+          echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+          echo 'eval "$(pyenv init --path)"' >> ~/.bashrc
+        shell: bash
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin==0.15.1
+        shell: bash
+
+      - name: Build wheel
+        run: |
+          echo "Building for Linux ARM64 natively on UbuntuArm64"
+          # Build directly without trying to use manylinux
+          maturin build --release
+          
+          # If the basic build fails, try with specific options
+          if [ ! -d "target/wheels" ] || [ -z "$(find target/wheels -name '*.whl' 2>/dev/null)" ]; then
+            echo "Basic build failed, trying with target specified..."
+            mkdir -p target/wheels
+            maturin build --release --target aarch64-unknown-linux-gnu
+          fi
+          
+          # Debug - list the wheels that were built
+          echo "Wheels built for Linux ARM64:"
+          find target -name "*.whl" -type f | sort
+          
+          # Make sure wheels are in target/wheels directory
+          for wheel in $(find target -type f -name "*.whl"); do
+            if [[ "$wheel" != "target/wheels/"* ]]; then
+              mkdir -p target/wheels
+              cp "$wheel" target/wheels/
+              echo "Copied $wheel to target/wheels/"
+            fi
+          done
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pam-rustwebrtc-linux-arm64
+          path: target/wheels/*.whl
+          retention-days: 14
+
+  # macOS builds (x86_64 and arm64)
+  build_macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Install dependencies
+        run: |
+          brew install openssl@3
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin==0.15.1
+        shell: bash
+
+      - name: Build wheels (x86_64 and arm64)
+        run: |
+          export OPENSSL_DIR=$(brew --prefix openssl@3)
+          
+          # Build x86_64 wheel
+          echo "Building for macOS x86_64"
+          maturin build --release --target x86_64-apple-darwin
+          
+          # Build arm64 wheel
+          echo "Building for macOS ARM64"
+          maturin build --release --target aarch64-apple-darwin
+          
+          # Debug - list the wheels that were built
+          echo "Wheels built for macOS:"
+          find target/wheels -name "*.whl" -type f | sort
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pam-rustwebrtc-macos
+          path: target/wheels/*.whl
+          retention-days: 14
+
+  # Windows build
+  build_windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin==0.15.1
+        shell: bash
+
+      - name: Build wheel
+        run: |
+          echo "Building for Windows x86_64"
+          python -m pip show maturin
+          Get-ChildItem target -ErrorAction SilentlyContinue
+          maturin build --release --target x86_64-pc-windows-msvc
+          
+          # Debug - list the wheels that were built
+          echo "Wheels built for Windows x86_64:"
+          Get-ChildItem target/wheels -Filter "*.whl" -ErrorAction SilentlyContinue | Sort-Object Name
+        shell: pwsh
+
+      - name: Setup test environment
+        run: |
+          pip install virtualenv pytest
+          python -m virtualenv venv
+          echo "VIRTUAL_ENV=${{ github.workspace }}\venv" >> $GITHUB_ENV
+          echo "${{ github.workspace }}\venv\Scripts" >> $GITHUB_PATH
+        shell: bash
+
+      - name: Run tests
+        run: |
+          . venv/Scripts/activate
+          pip install pytest
+          pip install (Get-ChildItem -Path "target/wheels/*.whl" | Select-Object -First 1).FullName
+          python -c "import pam_rustwebrtc; print('Import successful')"
+          cd tests && python -m pytest test_webrtc.py -v
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pam-rustwebrtc-windows-x86_64
+          path: target/wheels/*.whl
+          retention-days: 14
+
+  # Alpine Linux build
+  build_alpine:
+    name: Build Alpine Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
       - name: Build Alpine Linux wheel
-        if: matrix.os == 'ubuntu-latest' && matrix.alpine == true
         run: |
           echo "Building wheel for Alpine Linux"
           
+          # Create target directories
+          mkdir -p target/wheels
+          
           # Use a pure Alpine container for building the musllinux wheel
+          # Use root user inside the container but fix permissions after
           docker run --rm -v "$(pwd)":/io alpine:3.16 sh -c "
             # Install build dependencies including patchelf
             apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf
@@ -194,36 +298,44 @@ jobs:
             # Install maturin with patchelf support
             pip3 install 'maturin[patchelf]==0.15.1'
           
-            # Build the wheel directly in Alpine (with correct flags for maturin 0.15.1)
+            # Build the wheel directly in a temporary directory within the container
+            TEMP_DIR=\$(mktemp -d)
             cd /io
-            maturin build --release --strip
           
-            # Create wheels directory if it doesn't exist
+            # Use maturin to build the wheel with explicit output location
             mkdir -p /io/target/wheels
           
-            # Find the built wheel and copy it to target/wheels
-            WHEEL=\$(find /io/target -name '*.whl' | head -1)
-            if [ -n \"\$WHEEL\" ]; then
-              cp \$WHEEL /io/target/wheels/
-              echo \"Copied wheel to /io/target/wheels/\"
-            else
-              echo \"No wheel was built!\"
-              exit 1
-            fi
+            # First try with strip option (faster)
+            echo 'Building wheel with strip option...'
+            maturin build --release --strip --out /io/target/wheels || {
+              echo 'Strip build failed, trying without strip option...'
+              maturin build --release --out /io/target/wheels
+            }
           
-            # List all generated wheels
-            echo 'Wheels built in Alpine environment:'
-            find /io/target -name '*.whl' | sort
+            # Fix permissions on all generated files so host can access them
+            echo 'Fixing permissions on generated files...'
+            find /io/target -type d -exec chmod 777 {} \\;
+            find /io/target -type f -exec chmod 666 {} \\;
           "
           
-          # Create wheels directory if it doesn't exist
-          mkdir -p target/wheels
-          
-          # Check if we have any wheels built
+          # Check if we have any wheels built after Docker
           WHEEL_COUNT=$(find target -type f -name "*.whl" | wc -l)
           if [ $WHEEL_COUNT -eq 0 ]; then
-            echo "ERROR: No wheels were built in Alpine container!"
-            exit 1
+            # Try alternative maturin direct approach
+            echo "No wheels found from Docker approach, trying direct maturin build..."
+          
+            # Install additional dependencies if needed
+            pip install setuptools-rust auditwheel wheel
+          
+            # Try direct build with maturin
+            maturin build --release --interpreter $(which python) --out target/wheels
+          
+            # Check if direct build produced wheels
+            WHEEL_COUNT=$(find target -type f -name "*.whl" | wc -l)
+            if [ $WHEEL_COUNT -eq 0 ]; then
+              echo "ERROR: No wheels were built after trying all approaches!"
+              exit 1
+            fi
           fi
           
           # Make sure wheels are in target/wheels directory
@@ -239,9 +351,7 @@ jobs:
           find target -type f -name "*.whl" | sort
         shell: bash
 
-      # Test Alpine wheel
       - name: Test Alpine wheel
-        if: matrix.alpine == true
         run: |
           echo "Testing wheel in Alpine container"
           
@@ -280,17 +390,16 @@ jobs:
           "
         shell: bash
 
-      # Upload all wheels as artifacts
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.alpine && '-alpine' || '' }}
+          name: pam-rustwebrtc-alpine-x86_64
           path: target/wheels/*.whl
           retention-days: 14
 
   # Create release with all wheels if on main branch
   create_release:
     name: Create Release
-    needs: build_wheels
+    needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:

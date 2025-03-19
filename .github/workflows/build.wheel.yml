@@ -163,10 +163,20 @@ jobs:
             maturin build --release --manylinux 2014
           fi
           
+          # Windows build
+          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+              echo "Building for Windows x86_64"
+              python -m pip show maturin
+              Get-ChildItem target
+              maturin build --release --target x86_64-pc-windows-msvc
+            fi
+          fi
+          
           # Debug - list the wheels that were built
           echo "Wheels built for ${{ matrix.os }}-${{ matrix.arch }}:"
-          find target/wheels -type f -name "*.whl" | sort
-        shell: bash
+          Get-ChildItem target/wheels -Filter "*.whl" | Sort-Object Name
+        shell: pwsh
 
       # Setup virtual environment for testing
       - name: Setup test environment
@@ -201,7 +211,7 @@ jobs:
           
           # Install the wheel
           if [ "${{ runner.os }}" == "Windows" ]; then
-            pip install $(ls target/wheels/*.whl | head -1)
+            pip install $(Get-ChildItem target/wheels/*.whl | Select-Object -First 1).FullName
           else
             pip install $(find target/wheels -name "*.whl" | head -1)
           fi

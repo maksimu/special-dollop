@@ -125,7 +125,7 @@ jobs:
             fi
           
           # Linux builds (x86_64 & ARM64)
-          elif [[ "${{ matrix.os }}" == "ubuntu-latest"* ]]; then
+          elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
             if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
               echo "Building for Linux x86_64"
               docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin build --release --manylinux 2014
@@ -153,13 +153,14 @@ jobs:
                 "
               fi
             fi
-          
-          # Windows build
-          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-              echo "Building for Windows x86_64"
-              maturin build --release --target x86_64-pc-windows-msvc
-            fi
+
+          # Native build for UbuntuArm64
+          elif [[ "${{ matrix.os }}" == "UbuntuArm64" ]]; then
+            echo "Building for Linux ARM64 natively on UbuntuArm64"
+            # Install dependencies for manylinux compatibility
+            pip install manylinux2014-policy auditwheel
+            # Build directly without Docker since we're already on ARM64
+            maturin build --release --manylinux 2014
           fi
           
           # Debug - list the wheels that were built
@@ -218,11 +219,11 @@ jobs:
         run: |
           echo "Building wheel for Alpine Linux"
           
-          # Create target directory with proper permissions
-          mkdir -p target
-          chmod -R 777 target
+          # Create target directories
+          mkdir -p target/wheels
           
           # Use a pure Alpine container for building the musllinux wheel
+          # Use root user inside the container but fix permissions after
           docker run --rm -v "$(pwd)":/io alpine:3.16 sh -c "
             # Install build dependencies including patchelf
             apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf
@@ -231,49 +232,47 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source \$HOME/.cargo/env
           
-            # Create target directory with proper permissions inside container
-            mkdir -p /io/target
-            chmod -R 777 /io/target
-          
             # Install maturin with patchelf support
             pip3 install 'maturin[patchelf]==0.15.1'
           
-            # Build the wheel directly in Alpine (with correct flags for maturin 0.15.1)
+            # Build the wheel directly in a temporary directory within the container
+            TEMP_DIR=\$(mktemp -d)
             cd /io
-            maturin build --release --strip
           
-            # Create wheels directory if it doesn't exist
+            # Use maturin to build the wheel with explicit output location
             mkdir -p /io/target/wheels
-            chmod -R 777 /io/target/wheels
           
-            # Find the built wheel and copy it to target/wheels
-            WHEEL=\$(find /io/target -name '*.whl' | head -1)
-            if [ -n \"\$WHEEL\" ]; then
-              cp \$WHEEL /io/target/wheels/
-              echo \"Copied wheel to /io/target/wheels/\"
-            else
-              echo \"No wheel was built!\"
-              exit 1
-            fi
+            # First try with strip option (faster)
+            echo 'Building wheel with strip option...'
+            maturin build --release --strip --out /io/target/wheels || {
+              echo 'Strip build failed, trying without strip option...'
+              maturin build --release --out /io/target/wheels
+            }
           
-            # List all generated wheels
-            echo 'Wheels built in Alpine environment:'
-            find /io/target -name '*.whl' | sort
+            # Fix permissions on all generated files so host can access them
+            echo 'Fixing permissions on generated files...'
+            find /io/target -type d -exec chmod 777 {} \\;
+            find /io/target -type f -exec chmod 666 {} \\;
           "
           
-          # Create wheels directory if it doesn't exist
-          mkdir -p target/wheels
-          chmod -R 777 target/wheels
-          
-          # Run maturin outside Docker for standard Linux build
-          echo "Running maturin with $(which maturin)"
-          maturin build --release --manylinux 2014 --out target/wheels -v
-          
-          # Check if we have any wheels built
+          # Check if we have any wheels built after Docker
           WHEEL_COUNT=$(find target -type f -name "*.whl" | wc -l)
           if [ $WHEEL_COUNT -eq 0 ]; then
-            echo "ERROR: No wheels were built in Alpine container!"
-            exit 1
+            # Try alternative maturin direct approach
+            echo "No wheels found from Docker approach, trying direct maturin build..."
+          
+            # Install additional dependencies if needed
+            pip install setuptools-rust auditwheel wheel
+          
+            # Try direct build with maturin
+            maturin build --release --interpreter $(which python) --out target/wheels
+          
+            # Check if direct build produced wheels
+            WHEEL_COUNT=$(find target -type f -name "*.whl" | wc -l)
+            if [ $WHEEL_COUNT -eq 0 ]; then
+              echo "ERROR: No wheels were built after trying all approaches!"
+              exit 1
+            fi
           fi
           
           # Make sure wheels are in target/wheels directory

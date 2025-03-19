@@ -253,6 +253,8 @@ jobs:
           "
           
           # Create wheels directory if it doesn't exist
+          echo "Running maturin with $(which maturin)"
+          maturin build --release --manylinux 2014 --out target/wheels -v  
           mkdir -p target/wheels
           
           # Check if we have any wheels built

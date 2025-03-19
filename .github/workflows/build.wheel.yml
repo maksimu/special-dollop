@@ -218,6 +218,10 @@ jobs:
         run: |
           echo "Building wheel for Alpine Linux"
           
+          # Create target directory with proper permissions
+          mkdir -p target
+          chmod -R 777 target
+          
           # Use a pure Alpine container for building the musllinux wheel
           docker run --rm -v "$(pwd)":/io alpine:3.16 sh -c "
             # Install build dependencies including patchelf
@@ -226,6 +230,10 @@ jobs:
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source \$HOME/.cargo/env
+          
+            # Create target directory with proper permissions inside container
+            mkdir -p /io/target
+            chmod -R 777 /io/target
           
             # Install maturin with patchelf support
             pip3 install 'maturin[patchelf]==0.15.1'
@@ -236,6 +244,7 @@ jobs:
           
             # Create wheels directory if it doesn't exist
             mkdir -p /io/target/wheels
+            chmod -R 777 /io/target/wheels
           
             # Find the built wheel and copy it to target/wheels
             WHEEL=\$(find /io/target -name '*.whl' | head -1)
@@ -253,9 +262,12 @@ jobs:
           "
           
           # Create wheels directory if it doesn't exist
-          echo "Running maturin with $(which maturin)"
-          maturin build --release --manylinux 2014 --out target/wheels -v  
           mkdir -p target/wheels
+          chmod -R 777 target/wheels
+          
+          # Run maturin outside Docker for standard Linux build
+          echo "Running maturin with $(which maturin)"
+          maturin build --release --manylinux 2014 --out target/wheels -v
           
           # Check if we have any wheels built
           WHEEL_COUNT=$(find target -type f -name "*.whl" | wc -l)

@@ -1,4 +1,4 @@
-name: Build and Release 🛞Wheels 🛞
+name: Build and Release 🛞Wheels🛞
 
 on:
   push:
@@ -72,77 +72,129 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python 3.11 using pyenv
+      # Check system info before proceeding
+      - name: Check host system info
         run: |
-          # Install dependencies for pyenv and Python building
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev zlib1g-dev \
-            libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm \
-            libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev \
-            liblzma-dev libgdbm-dev libnss3-dev libedit-dev git
-          
-          # Install pyenv
-          curl https://pyenv.run | bash
-          
-          # Add pyenv to PATH
-          export PYENV_ROOT="$HOME/.pyenv"
-          export PATH="$PYENV_ROOT/bin:$PATH"
-          eval "$(pyenv init -)"
-          eval "$(pyenv init --path)"
-          
-          # Install Python 3.11
-          pyenv install 3.11.8
-          pyenv global 3.11.8
-          
-          # Verify installation
-          python --version
-          pip --version
-          
-          # Make pyenv settings persist in subsequent steps
-          echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
-          echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
-          echo 'eval "$(pyenv init -)"' >> ~/.bashrc
-          echo 'eval "$(pyenv init --path)"' >> ~/.bashrc
+          echo "Host system information:"
+          uname -a
+          echo "Host glibc version:"
+          ldd --version | head -n 1
+          echo "Host architecture:"
+          arch
         shell: bash
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Install maturin
+      # Skip Docker installation - use the one that should be pre-installed
+      - name: Check Docker availability
         run: |
-          python -m pip install --upgrade pip
-          pip install maturin==0.15.1
-        shell: bash
-
-      - name: Build wheel
-        run: |
-          echo "Building for Linux ARM64 natively on UbuntuArm64"
-          # Build directly without trying to use manylinux
-          maturin build --release
-          
-          # If the basic build fails, try with specific options
-          if [ ! -d "target/wheels" ] || [ -z "$(find target/wheels -name '*.whl' 2>/dev/null)" ]; then
-            echo "Basic build failed, trying with target specified..."
-            mkdir -p target/wheels
-            maturin build --release --target aarch64-unknown-linux-gnu
+          # Check if Docker is already available
+          if command -v docker &> /dev/null; then
+            echo "Docker is already installed:"
+            docker --version
+          else
+            echo "Docker not found, attempting to configure it..."
+            # Try enabling the service if it exists but isn't running
+            sudo systemctl start docker || true
+            sudo systemctl status docker || true
           fi
+        shell: bash
+
+      # Use the prebuilt manylinux Docker image to build our wheel
+      - name: Build wheel in manylinux container
+        run: |
+          echo "Building for Linux ARM64 with manylinux 2014"
+          
+          # Pull the manylinux2014 image for ARM64
+          docker pull quay.io/pypa/manylinux2014_aarch64
+          
+          # Print container system info to verify glibc version
+          docker run --rm quay.io/pypa/manylinux2014_aarch64 bash -c "
+            echo 'Container system information:'
+            uname -a
+            echo 'Container glibc version:'
+            ldd --version | head -n 1
+            echo 'Container architecture:'
+            arch
+          "
+          
+          # Build the wheel inside the container
+          docker run --rm -v "$(pwd)":/io quay.io/pypa/manylinux2014_aarch64 bash -c "
+            # Install Rust
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+          
+            # Install maturin
+            /opt/python/cp311-cp311/bin/pip install maturin==0.15.1
+          
+            # Build the wheel
+            cd /io
+            /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
+          
+            # Print information about built wheels
+            echo 'Information about built wheels:'
+            for wheel in \$(find /io/target -name \"*.whl\" -type f); do
+              echo \"Wheel: \$wheel\"
+              # Use auditwheel to show glibc requirements
+              /opt/python/cp311-cp311/bin/pip install auditwheel
+              /opt/python/cp311-cp311/bin/auditwheel show \$wheel
+            done
+          
+            # Ensure wheels are in target/wheels
+            mkdir -p /io/target/wheels
+            for wheel in \$(find /io/target -name \"*.whl\" -type f); do
+              if [[ \"\$wheel\" != \"/io/target/wheels/\"* ]]; then
+                cp \"\$wheel\" /io/target/wheels/
+              fi
+            done
+          "
           
           # Debug - list the wheels that were built
           echo "Wheels built for Linux ARM64:"
-          find target -name "*.whl" -type f | sort
-          
-          # Make sure wheels are in target/wheels directory
-          for wheel in $(find target -type f -name "*.whl"); do
-            if [[ "$wheel" != "target/wheels/"* ]]; then
-              mkdir -p target/wheels
-              cp "$wheel" target/wheels/
-              echo "Copied $wheel to target/wheels/"
-            fi
-          done
+          find target/wheels -name "*.whl" -type f | sort
         shell: bash
 
+      # Test the wheel on the host to ensure it works
+      - name: Test the wheel
+        run: |
+          # Test in a virtual environment
+          python -m pip install virtualenv
+          python -m virtualenv venv
+          . venv/bin/activate
+          
+          # Install pytest first
+          pip install pytest
+          
+          # Find and install the wheel
+          WHEEL=$(find target/wheels -name "*.whl" | head -1)
+          if [ -z "$WHEEL" ]; then
+            echo "No wheel found!"
+            exit 1
+          fi
+          
+          pip install $WHEEL
+          python -c "import pam_rustwebrtc; print('Import successful')"
+          cd tests && python -m pytest test_webrtc.py -v
+        shell: bash
+
+      # Verify the wheel compatibility with older glibc
+      - name: Verify wheel compatibility with glibc 2.28
+        run: |
+          # Find the built wheel
+          WHEEL=$(find target/wheels -name "*.whl" | head -1)
+          if [ -z "$WHEEL" ]; then
+            echo "No wheel found for verification!"
+            exit 1
+          fi
+          
+          # Install pip packages for verification
+          pip install auditwheel
+          
+          # Show the dependencies of the wheel to verify glibc version
+          auditwheel show $WHEEL
+          
+          echo "This wheel should be compatible with glibc 2.28 or earlier"
+        shell: bash
+
+      # Upload the artifact
       - uses: actions/upload-artifact@v4
         with:
           name: pam-rustwebrtc-linux-arm64

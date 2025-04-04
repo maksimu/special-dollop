@@ -11,7 +11,9 @@ A high-performance WebRTC implementation for Python, written in Rust for maximum
 - ICE candidate handling
 - Cross-platform compatibility (Linux, macOS, Windows, Alpine)
 
-This package is designed to be used with Keeper Gateway and Keeper Commander.
+This package is designed to be used with Keeper Gateway and Keeper Commander. It serves as a lightweight, focused replacement for [aiortc](https://github.com/aiortc/aiortc), tailored specifically for Keeper Security's internal products and use cases.
+
+> **Note**: This package is intended for internal Keeper Security products and is not being actively advertised for general use.
 
 ## Installation
 
@@ -49,22 +51,6 @@ dc.on_message = on_message
 
 # Close when done
 pc.close()
-```
-
-## Build from Source
-
-### Wheel Files
-
-```shell
-maturin build --release
-pip install keeper-pam-webrtc-rs*
-```
-
-If using a different chip set you can use docker to build it:
-
-```shell
-docker run --rm --platform linux/amd64 -v $(pwd):/io ghcr.io/pyo3/maturin build --release --manylinux 2014
-pip install keeper-pam-webrtc-rs*
 ```
 
 ## Features

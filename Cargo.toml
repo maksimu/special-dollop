@@ -1,10 +1,10 @@
 [package]
-name = "pam_rustwebrtc"
-version = "0.1.0"
+name = "keeper-pam-webrtc-rs"
+version = "0.1.4"
 edition = "2021"
 
 [lib]
-name = "pam_rustwebrtc"
+name = "keeper_pam_webrtc_rs"
 crate-type = ["cdylib"]
 
 [features]
@@ -27,5 +27,5 @@ parking_lot = "0.12.3"
 libc = "0.2.169"
 
 [package.metadata.maturin]
-name = "pam_rustwebrtc"
+name = "keeper_pam_webrtc_rs"
 python-source = "python"

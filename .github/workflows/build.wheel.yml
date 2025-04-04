@@ -1,4 +1,4 @@
-name: Build and Release 🛞Wheels🛞
+name: Build, Release and Publish 🛞Wheels🛞
 
 on:
   push:
@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - 'Cargo.toml'
+    tags:
+      - 'v*'  # Trigger on version tags
   workflow_dispatch:
 
 jobs:
@@ -56,13 +58,13 @@ jobs:
           . venv/bin/activate
           pip install pytest
           pip install $(find target/wheels -name "*.whl" | head -1)
-          python -c "import pam_rustwebrtc; print('Import successful')"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest test_webrtc.py -v
         shell: bash
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-linux-x86_64
+          name: keeper-pam-webrtc-rs-linux-x86_64
           path: target/wheels/*.whl
 
   # Linux ARM64 build
@@ -171,7 +173,7 @@ jobs:
           fi
           
           pip install $WHEEL
-          python -c "import pam_rustwebrtc; print('Import successful')"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest test_webrtc.py -v
         shell: bash
 
@@ -194,10 +196,9 @@ jobs:
           echo "This wheel should be compatible with glibc 2.28 or earlier"
         shell: bash
 
-      # Upload the artifact
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-linux-arm64
+          name: keeper-pam-webrtc-rs-linux-arm64
           path: target/wheels/*.whl
 
   # macOS builds (x86_64 and arm64)
@@ -247,7 +248,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-macos
+          name: keeper-pam-webrtc-rs-macos
           path: target/wheels/*.whl
 
   # Windows build
@@ -299,13 +300,13 @@ jobs:
           . venv/Scripts/activate
           pip install pytest
           pip install (Get-ChildItem -Path "target/wheels/*.whl" | Select-Object -First 1).FullName
-          python -c "import pam_rustwebrtc; print('Import successful')"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest test_webrtc.py -v
         shell: pwsh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-windows-x86_64
+          name: keeper-pam-webrtc-rs-windows-x86_64
           path: target/wheels/*.whl
 
   # Alpine Linux build
@@ -428,7 +429,7 @@ jobs:
             pip install /io/$WHEEL_PATH
           
             # Verify import works
-            python -c 'import pam_rustwebrtc; print(\"Import successful\")'
+            python -c 'import keeper_pam_webrtc_rs; print(\"Import successful\")'
           
             # Install test dependencies
             pip install pytest
@@ -440,15 +441,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pam-rustwebrtc-alpine-x86_64
+          name: keeper-pam-webrtc-rs-alpine-x86_64
           path: target/wheels/*.whl
 
-  # Create release with all wheels if on main branch
+  # Create release with all wheels if on main branch or tag
   create_release:
     name: Create Release
+    environment: prod
     needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 
@@ -463,7 +465,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist/
-          pattern: pam-rustwebrtc-*
+          pattern: keeper-pam-webrtc-rs-*
           merge-multiple: true
 
       - name: Debug wheel files
@@ -475,13 +477,19 @@ jobs:
             echo "Contents of $dir:"
             ls -la "$dir"
           done
+          
+          # Ensure wheels are in the correct location for twine
+          mkdir -p dist/wheels
+          find dist -type f -name "*.whl" -exec cp {} dist/wheels/ \;
+          echo "Files copied to dist/wheels/:"
+          ls -la dist/wheels/
         shell: bash
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*.whl
-          name: pam-rustwebrtc ${{ env.VERSION }}
+          files: dist/wheels/*.whl
+          name: keeper-pam-webrtc-rs ${{ env.VERSION }}
           body: |
             WebRTC Python extension module using Rust
 
@@ -495,3 +503,31 @@ jobs:
           tag_name: v${{ env.VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check PyPI Secrets
+        id: check_secrets
+        run: |
+          if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
+            echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_ENV
+            echo "PyPI secrets are available, will publish to PyPI"
+          else
+            echo "PYPI_SECRETS_AVAILABLE=false" >> $GITHUB_ENV
+            echo "PyPI secrets are NOT available, skipping publishing"
+          fi
+        shell: bash
+
+      - name: Install PyPI tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install twine
+        shell: bash
+
+      - name: Publish to PyPI
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && env.PYPI_SECRETS_AVAILABLE == 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          echo "Publishing wheels to PyPI..."
+          twine upload dist/wheels/*.whl
+        shell: bash

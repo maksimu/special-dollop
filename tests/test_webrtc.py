@@ -10,9 +10,9 @@ import threading
 import unittest
 
 try:
-    import pam_rustwebrtc
+    import keeper_pam_webrtc_rs
 except ImportError as e:
-    logging.error(f"Failed to import pam_rustwebrtc: {e}")
+    logging.error(f"Failed to import keeper_pam_webrtc_rs: {e}")
     logging.error("Make sure the module is built and installed before running tests")
     raise
 
@@ -120,7 +120,7 @@ class TestWebRTC(unittest.TestCase):
     def test_peer_connection_creation(self):
         logging.info("Starting peer connection creation test")
         config = {"iceServers": []}
-        pc = pam_rustwebrtc.PyRTCPeerConnection(
+        pc = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
@@ -141,7 +141,7 @@ class TestWebRTC(unittest.TestCase):
                 }
             ]
         }
-        pc = pam_rustwebrtc.PyRTCPeerConnection(
+        pc = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
@@ -154,7 +154,7 @@ class TestWebRTC(unittest.TestCase):
     def test_data_channel_creation(self):
         logging.info("Starting data channel creation test")
         config = {"iceServers": []}
-        pc = pam_rustwebrtc.PyRTCPeerConnection(
+        pc = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
@@ -172,13 +172,13 @@ class TestWebRTC(unittest.TestCase):
 
         # Create peer connections
         config = {"iceServers": []}
-        peer1 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer1 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
             trickle_ice=True
         )
-        peer2 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate2,
             self.on_data_channel,
@@ -258,13 +258,13 @@ class TestWebRTC(unittest.TestCase):
                 }
             ]
         }
-        peer1 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer1 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             None,  # No ICE candidate callback for non-trickle
             self.on_data_channel,
             trickle_ice=False
         )
-        peer2 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             None,  # No ICE candidate callback for non-trickle
             self.on_data_channel,
@@ -327,13 +327,13 @@ class TestWebRTC(unittest.TestCase):
 
         # Create peer connections
         config = {"iceServers": []}
-        peer1 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer1 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
             trickle_ice=True
         )
-        peer2 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate2,
             self.on_data_channel,
@@ -445,13 +445,13 @@ class TestWebRTC(unittest.TestCase):
 
         # Create peer connections with same configuration as your production code
         config = {"iceServers": []}
-        peer1 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer1 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
             trickle_ice=True
         )
-        peer2 = pam_rustwebrtc.PyRTCPeerConnection(
+        peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate2,
             self.on_data_channel,
@@ -609,13 +609,13 @@ class TestWebRTC(unittest.TestCase):
 
             # Create peer connections
             config = {"iceServers": []}
-            peer1 = pam_rustwebrtc.PyRTCPeerConnection(
+            peer1 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
                 config,
                 self.on_ice_candidate1,
                 self.on_data_channel,
                 trickle_ice=True
             )
-            peer2 = pam_rustwebrtc.PyRTCPeerConnection(
+            peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
                 config,
                 self.on_ice_candidate2,
                 self.on_data_channel,
@@ -674,7 +674,7 @@ if __name__ == '__main__':
 
     # Initialize the Rust logger to use Python's logging system
     try:
-        pam_rustwebrtc.initialize_logger("pam_rustwebrtc", verbose=True, level=logging.DEBUG)
+        keeper_pam_webrtc_rs.initialize_logger("keeper_pam_webrtc_rs", verbose=True, level=logging.DEBUG)
         logging.info("Rust logger initialized successfully")
     except Exception as e:
         logging.error(f"Failed to initialize Rust logger: {e}")

@@ -943,6 +943,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-pam-webrtc-rs"
+version = "0.1.4"
+dependencies = [
+ "bytes",
+ "chrono",
+ "ctor",
+ "libc",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "pyo3",
+ "ring",
+ "tokio",
+ "webrtc",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1145,23 +1162,6 @@ dependencies = [
  "elliptic-curve",
  "primeorder",
  "sha2",
-]
-
-[[package]]
-name = "pam_rustwebrtc"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "chrono",
- "ctor",
- "libc",
- "log",
- "once_cell",
- "parking_lot",
- "pyo3",
- "ring",
- "tokio",
- "webrtc",
 ]
 
 [[package]]

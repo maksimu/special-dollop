@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
@@ -11,12 +11,13 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::RTCPeerConnection;
 
 // Cached API instance for reuse
-static API: once_cell::sync::Lazy<webrtc::api::API> = once_cell::sync::Lazy::new(|| {
-    APIBuilder::new().build()
-});
+static API: once_cell::sync::Lazy<webrtc::api::API> =
+    once_cell::sync::Lazy::new(|| APIBuilder::new().build());
 
 // Utility for formatting ICE candidates as strings with preallocated capacity
-pub fn format_ice_candidate(candidate: &webrtc::ice_transport::ice_candidate::RTCIceCandidate) -> String {
+pub fn format_ice_candidate(
+    candidate: &webrtc::ice_transport::ice_candidate::RTCIceCandidate,
+) -> String {
     // Pre-allocate a reasonably sized string to avoid reallocations
     let mut result = String::with_capacity(128);
 
@@ -46,7 +47,9 @@ pub fn format_ice_candidate(candidate: &webrtc::ice_transport::ice_candidate::RT
 }
 
 // Helper function to create a WebRTC peer connection with cached API
-pub async fn create_peer_connection(config: Option<RTCConfiguration>) -> webrtc::error::Result<RTCPeerConnection> {
+pub async fn create_peer_connection(
+    config: Option<RTCConfiguration>,
+) -> webrtc::error::Result<RTCPeerConnection> {
     // Use cached API instance
     API.new_peer_connection(config.unwrap_or_default()).await
 }
@@ -64,7 +67,9 @@ pub async fn create_data_channel(
         negotiated: None,           // Let WebRTC handle negotiation
     };
 
-    peer_connection.create_data_channel(label, Some(config)).await
+    peer_connection
+        .create_data_channel(label, Some(config))
+        .await
 }
 
 // Async-first wrapper for core WebRTC operations
@@ -77,7 +82,8 @@ pub struct WebRTCPeerConnection {
 impl WebRTCPeerConnection {
     pub async fn new(config: Option<RTCConfiguration>, trickle_ice: bool) -> Result<Self, String> {
         // Create the peer connection
-        let peer_connection = create_peer_connection(config).await
+        let peer_connection = create_peer_connection(config)
+            .await
             .map_err(|e| format!("Failed to create peer connection: {}", e))?;
 
         Ok(Self {
@@ -88,10 +94,7 @@ impl WebRTCPeerConnection {
     }
 
     // Common helper function for offer/answer creation with ICE gathering
-    async fn create_session_description(
-        &self,
-        is_offer: bool,
-    ) -> webrtc::error::Result<String> {
+    async fn create_session_description(&self, is_offer: bool) -> webrtc::error::Result<String> {
         // Create the appropriate description based on type
         let description = if is_offer {
             self.peer_connection.create_offer(None).await?
@@ -100,30 +103,33 @@ impl WebRTCPeerConnection {
         };
 
         // Store the description by setting local description first
-        self.peer_connection.set_local_description(description.clone()).await?;
+        self.peer_connection
+            .set_local_description(description.clone())
+            .await?;
 
         // For non-trickle, wait for gathering to complete
         if !self.trickle_ice {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
-            self.peer_connection.on_ice_gathering_state_change(Box::new(move |s| {
-                let tx = Arc::clone(&tx);
-                Box::pin(async move {
-                    if s == RTCIceGathererState::Complete {
-                        // Take the sender in a minimal lock scope
-                        let sender = {
-                            let mut guard = tx.lock().await;
-                            guard.take()
-                        };
+            self.peer_connection
+                .on_ice_gathering_state_change(Box::new(move |s| {
+                    let tx = Arc::clone(&tx);
+                    Box::pin(async move {
+                        if s == RTCIceGathererState::Complete {
+                            // Take the sender in a minimal lock scope
+                            let sender = {
+                                let mut guard = tx.lock().await;
+                                guard.take()
+                            };
 
-                        // Send outside the lock
-                        if let Some(sender) = sender {
-                            let _ = sender.send(());
+                            // Send outside the lock
+                            if let Some(sender) = sender {
+                                let _ = sender.send(());
+                            }
                         }
-                    }
-                })
-            }));
+                    })
+                }));
 
             // Wait for ICE gathering to complete with a shorter timeout to avoid hanging
             if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(10), rx).await {
@@ -143,7 +149,8 @@ impl WebRTCPeerConnection {
             return Err("Connection is closing".to_string());
         }
 
-        self.create_session_description(true).await
+        self.create_session_description(true)
+            .await
             .map_err(|e| format!("Failed to create offer: {}", e))
     }
 
@@ -153,7 +160,8 @@ impl WebRTCPeerConnection {
             return Err("Connection is closing".to_string());
         }
 
-        self.create_session_description(false).await
+        self.create_session_description(false)
+            .await
             .map_err(|e| format!("Failed to create answer: {}", e))
     }
 
@@ -169,9 +177,11 @@ impl WebRTCPeerConnection {
         } else {
             webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp)
         }
-            .map_err(|e| format!("Failed to create session description: {}", e))?;
+        .map_err(|e| format!("Failed to create session description: {}", e))?;
 
-        self.peer_connection.set_remote_description(desc).await
+        self.peer_connection
+            .set_remote_description(desc)
+            .await
             .map_err(|e| format!("Failed to set remote description: {}", e))
     }
 
@@ -188,7 +198,9 @@ impl WebRTCPeerConnection {
             username_fragment: None,
         };
 
-        self.peer_connection.add_ice_candidate(init).await
+        self.peer_connection
+            .add_ice_candidate(init)
+            .await
             .map_err(|e| format!("Failed to add ICE candidate: {}", e))
     }
 
@@ -204,15 +216,20 @@ impl WebRTCPeerConnection {
     pub async fn close(&self) -> Result<(), String> {
         // Avoid duplicate close operations
         if self.is_closing.swap(true, Ordering::AcqRel) {
-            return Ok(());  // Already closing or closed
+            return Ok(()); // Already closing or closed
         }
 
         // First, clear all callbacks to prevent more mDNS lookups
-        self.peer_connection.on_ice_candidate(Box::new(|_| Box::pin(async {})));
-        self.peer_connection.on_ice_gathering_state_change(Box::new(|_| Box::pin(async {})));
-        self.peer_connection.on_data_channel(Box::new(|_| Box::pin(async {})));
-        self.peer_connection.on_peer_connection_state_change(Box::new(|_| Box::pin(async {})));
-        self.peer_connection.on_signaling_state_change(Box::new(|_| Box::pin(async {})));
+        self.peer_connection
+            .on_ice_candidate(Box::new(|_| Box::pin(async {})));
+        self.peer_connection
+            .on_ice_gathering_state_change(Box::new(|_| Box::pin(async {})));
+        self.peer_connection
+            .on_data_channel(Box::new(|_| Box::pin(async {})));
+        self.peer_connection
+            .on_peer_connection_state_change(Box::new(|_| Box::pin(async {})));
+        self.peer_connection
+            .on_signaling_state_change(Box::new(|_| Box::pin(async {})));
 
         // Then close the connection with a timeout to avoid hanging
         match tokio::time::timeout(Duration::from_secs(5), self.peer_connection.close()).await {
@@ -230,7 +247,6 @@ pub struct WebRTCDataChannel {
     pub data_channel: Arc<RTCDataChannel>,
     is_closing: Arc<AtomicBool>,
 }
-
 
 impl Clone for WebRTCDataChannel {
     fn clone(&self) -> Self {
@@ -308,12 +324,16 @@ impl WebRTCDataChannel {
             }
 
             // Check if already open (most common case first)
-            if self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            if self.data_channel.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            {
                 return Ok(true);
             }
 
             // Check if channel failed (second most common case)
-            if self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed {
+            if self.data_channel.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+            {
                 return Ok(false);
             }
 
@@ -327,7 +347,7 @@ impl WebRTCDataChannel {
     pub async fn close(&self) -> Result<(), String> {
         // Avoid duplicate close operations
         if self.is_closing.swap(true, Ordering::AcqRel) {
-            return Ok(());  // Already closing or closed
+            return Ok(()); // Already closing or closed
         }
 
         // Close with timeout to avoid hanging

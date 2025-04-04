@@ -445,6 +445,7 @@ jobs:
   # Create release with all wheels if on main branch
   create_release:
     name: Create Release
+    environment: prod
     needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'

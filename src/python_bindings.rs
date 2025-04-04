@@ -1,21 +1,23 @@
-use std::clone::Clone;
-use crate::webrtc_core::{WebRTCPeerConnection, WebRTCDataChannel, format_ice_candidate, create_data_channel};
 use crate::get_or_create_runtime_py;
+use crate::webrtc_core::{
+    create_data_channel, format_ice_candidate, WebRTCDataChannel, WebRTCPeerConnection,
+};
+use std::clone::Clone;
 
+use bytes::Bytes;
 use parking_lot::Mutex;
-use pyo3::Bound;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyByteArray, PyDict, PyList, PyModule};
 use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
-use std::sync::Arc;
+use pyo3::prelude::*;
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyModule};
+use pyo3::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use bytes::Bytes;
 use tokio::sync::mpsc;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::data_channel::RTCDataChannel;
 
 #[derive(FromPyObject)]
 struct IceServer {
@@ -42,7 +44,7 @@ async fn try_send_event<T>(tx: &mpsc::Sender<T>, event: T) {
                 if let Err(e) = tx.send(inner_event).await {
                     log::error!("Failed to send event: {}", e);
                 }
-            },
+            }
             mpsc::error::TrySendError::Closed(_) => {
                 log::error!("Channel closed, failed to send event");
             }
@@ -91,10 +93,9 @@ impl PyRTCPeerConnection {
         }
 
         // Create the WebRTC connection asynchronously
-        let conn = runtime.block_on(async {
-            WebRTCPeerConnection::new(Some(rtc_config), trickle_ice).await
-        })
-            .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))?;
+        let conn = runtime
+            .block_on(async { WebRTCPeerConnection::new(Some(rtc_config), trickle_ice).await })
+            .map_err(PyErr::new::<PyRuntimeError, _>)?;
         let conn = Arc::new(conn);
 
         // Create channel for event communication - increased capacity for reduced blocking
@@ -212,9 +213,7 @@ impl PyRTCPeerConnection {
 
         // Use the core implementation to create a data channel
         let dc = runtime
-            .block_on(async {
-                create_data_channel(&self.conn.peer_connection, label).await
-            })
+            .block_on(async { create_data_channel(&self.conn.peer_connection, label).await })
             .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string()))?;
 
         // Set up an initial message handler to buffer messages
@@ -234,7 +233,10 @@ impl PyRTCPeerConnection {
         // Create the Python data channel with the buffer using optimized constructor
         match PyRTCDataChannel::new_from_existing(dc, buffer) {
             Ok(py_dc) => Py::new(py, py_dc),
-            Err(e) => Err(PyErr::new::<PyRuntimeError, _>(format!("Failed to create data channel: {}", e))),
+            Err(e) => Err(PyErr::new::<PyRuntimeError, _>(format!(
+                "Failed to create data channel: {}",
+                e
+            ))),
         }
     }
 
@@ -244,8 +246,9 @@ impl PyRTCPeerConnection {
         let conn = &self.conn;
 
         runtime.block_on(async {
-            conn.create_offer().await
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
+            conn.create_offer()
+                .await
+                .map_err(PyErr::new::<PyRuntimeError, _>)
         })
     }
 
@@ -255,8 +258,9 @@ impl PyRTCPeerConnection {
         let conn = &self.conn;
 
         runtime.block_on(async {
-            conn.create_answer().await
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
+            conn.create_answer()
+                .await
+                .map_err(PyErr::new::<PyRuntimeError, _>)
         })
     }
 
@@ -265,15 +269,16 @@ impl PyRTCPeerConnection {
         // Use reference instead of cloning the Arc
         let conn = &self.conn;
 
-        // Determine if this is an answer based on current state - pre-fetch outside of async block
-        let is_answer = match self.conn.peer_connection.signaling_state() {
-            webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer => true,
-            _ => false,
-        };
+        // Determine if this is an answer based on current state - pre-fetch outside async block
+        let is_answer = matches!(
+            self.conn.peer_connection.signaling_state(),
+            webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer
+        );
 
         runtime.block_on(async {
-            conn.set_remote_description(sdp, is_answer).await
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
+            conn.set_remote_description(sdp, is_answer)
+                .await
+                .map_err(PyErr::new::<PyRuntimeError, _>)
         })
     }
 
@@ -283,8 +288,9 @@ impl PyRTCPeerConnection {
         let conn = &self.conn;
 
         runtime.block_on(async {
-            conn.add_ice_candidate(candidate).await
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
+            conn.add_ice_candidate(candidate)
+                .await
+                .map_err(PyErr::new::<PyRuntimeError, _>)
         })
     }
 
@@ -319,10 +325,7 @@ impl PyRTCPeerConnection {
         let runtime = get_or_create_runtime_py()?;
         let conn = Arc::clone(&self.conn);
 
-        runtime.block_on(async {
-            conn.close().await
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
-        })
+        runtime.block_on(async { conn.close().await.map_err(PyErr::new::<PyRuntimeError, _>) })
     }
 }
 
@@ -366,7 +369,10 @@ pub struct PyRTCDataChannel {
 
 impl PyRTCDataChannel {
     // Optimized constructor from existing data channel and buffer
-    fn new_from_existing(dc: Arc<RTCDataChannel>, initial_buffer: Arc<Mutex<Vec<Vec<u8>>>>) -> Result<Self, String> {
+    fn new_from_existing(
+        dc: Arc<RTCDataChannel>,
+        initial_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
+    ) -> Result<Self, String> {
         // Wrap the data channel
         let dc_wrapper = WebRTCDataChannel::new(dc);
 
@@ -376,7 +382,7 @@ impl PyRTCDataChannel {
         // Create a message buffer with a reasonable initial capacity based on existing data
         let message_buffer = {
             let src = initial_buffer.lock();
-            let capacity = src.len().max(32);  // At least 32 or the current size
+            let capacity = src.len().max(32); // At least 32 or the current size
 
             if src.is_empty() {
                 // If empty, no need to transfer anything
@@ -418,7 +424,7 @@ impl PyRTCDataChannel {
     fn send(&self, py: Python<'_>, data: PyObject, timeout: Option<f64>) -> PyResult<()> {
         let timeout_duration = timeout.map(Duration::from_secs_f64);
         let runtime = get_or_create_runtime_py()?;
-        let dc_wrapper = &self.dc_wrapper;  // Use reference instead of clone
+        let dc_wrapper = &self.dc_wrapper; // Use reference instead of clone
 
         // Efficiently extract the bytes with the most direct method available
         let bytes = if let Ok(bytes) = data.downcast_bound::<PyBytes>(py) {
@@ -437,12 +443,16 @@ impl PyRTCDataChannel {
             // Only wrap in timeout if needed
             if let Some(duration) = timeout_duration {
                 match tokio::time::timeout(duration, dc_wrapper.data_channel.send(&bytes)).await {
-                    Ok(result) => result.map(|_| ())
-                        .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("Failed to send: {}", e))),
-                    Err(_) => Err(PyErr::new::<PyTimeoutError, _>("Send operation timed out"))
+                    Ok(result) => result.map(|_| ()).map_err(|e| {
+                        PyErr::new::<PyRuntimeError, _>(format!("Failed to send: {}", e))
+                    }),
+                    Err(_) => Err(PyErr::new::<PyTimeoutError, _>("Send operation timed out")),
                 }
             } else {
-                dc_wrapper.data_channel.send(&bytes).await
+                dc_wrapper
+                    .data_channel
+                    .send(&bytes)
+                    .await
                     .map(|_| ())
                     .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("Failed to send: {}", e)))
             }
@@ -463,40 +473,42 @@ impl PyRTCDataChannel {
                 let message_buffer = Arc::clone(&self.message_buffer);
                 let is_callback_set = Arc::clone(&self.is_callback_set);
 
-                self.dc_wrapper.data_channel.on_message(Box::new(move |msg| {
-                    // Avoid unnecessary copying when possible
-                    let bytes = msg.data.to_vec(); // We still need to copy here for ownership transfer
-                    let message_callback = Arc::clone(&message_callback);
-                    let message_buffer = Arc::clone(&message_buffer);
-                    let is_callback_set = Arc::clone(&is_callback_set);
+                self.dc_wrapper
+                    .data_channel
+                    .on_message(Box::new(move |msg| {
+                        // Avoid unnecessary copying when possible
+                        let bytes = msg.data.to_vec(); // We still need to copy here for ownership transfer
+                        let message_callback = Arc::clone(&message_callback);
+                        let message_buffer = Arc::clone(&message_buffer);
+                        let is_callback_set = Arc::clone(&is_callback_set);
 
-                    Box::pin(async move {
-                        if is_callback_set.load(Ordering::Acquire) {
-                            // Process outside the Python GIL when possible
-                            let callback_option = Python::with_gil(|py| {
-                                message_callback.lock().as_ref().map(|cb| cb.clone_ref(py))
-                            });
-
-                            // Only enter Python context when we have a callback
-                            if let Some(callback) = callback_option {
-                                Python::with_gil(|py| {
-                                    // Create PyBytes directly from the bytes
-                                    let py_bytes = PyBytes::new(py, &bytes);
-                                    if let Err(e) = callback.call1(py, (py_bytes,)) {
-                                        log::error!("Error in Python callback: {}", e);
-                                    }
+                        Box::pin(async move {
+                            if is_callback_set.load(Ordering::Acquire) {
+                                // Process outside the Python GIL when possible
+                                let callback_option = Python::with_gil(|py| {
+                                    message_callback.lock().as_ref().map(|cb| cb.clone_ref(py))
                                 });
+
+                                // Only enter Python context when we have a callback
+                                if let Some(callback) = callback_option {
+                                    Python::with_gil(|py| {
+                                        // Create PyBytes directly from the bytes
+                                        let py_bytes = PyBytes::new(py, &bytes);
+                                        if let Err(e) = callback.call1(py, (py_bytes,)) {
+                                            log::error!("Error in Python callback: {}", e);
+                                        }
+                                    });
+                                }
+                            } else {
+                                // Buffer the message with minimal lock scope
+                                {
+                                    let mut buffer_guard = message_buffer.lock();
+                                    buffer_guard.push(bytes);
+                                }
+                                log::debug!("Buffered message");
                             }
-                        } else {
-                            // Buffer the message with minimal lock scope
-                            {
-                                let mut buffer_guard = message_buffer.lock();
-                                buffer_guard.push(bytes);
-                            }
-                            log::debug!("Buffered message");
-                        }
-                    })
-                }));
+                        })
+                    }));
 
                 // Process existing buffered messages with minimal locking and memory operations
                 Python::with_gil(|py| {
@@ -527,7 +539,10 @@ impl PyRTCDataChannel {
                         for msg in messages_to_process {
                             let py_bytes = PyBytes::new(py, &msg);
                             if let Err(e) = callback.call1(py, (py_bytes,)) {
-                                log::error!("Error calling Python callback with buffered message: {}", e);
+                                log::error!(
+                                    "Error calling Python callback with buffered message: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -539,7 +554,9 @@ impl PyRTCDataChannel {
                 self.is_callback_set.store(false, Ordering::Release);
 
                 // Use an empty handler to avoid any processing costs
-                self.dc_wrapper.data_channel.on_message(Box::new(move |_| Box::pin(async {})));
+                self.dc_wrapper
+                    .data_channel
+                    .on_message(Box::new(move |_| Box::pin(async {})));
             }
         }
         Ok(())
@@ -577,9 +594,7 @@ impl PyRTCDataChannel {
         // Use reference instead of clone
         let dc_wrapper = &self.dc_wrapper;
 
-        runtime.block_on(async {
-            Ok(dc_wrapper.buffered_amount().await)
-        })
+        runtime.block_on(async { Ok(dc_wrapper.buffered_amount().await) })
     }
 
     #[pyo3(signature = (timeout=None))]
@@ -593,12 +608,14 @@ impl PyRTCDataChannel {
             if let Some(timeout_secs) = timeout {
                 let duration = Duration::from_secs_f64(timeout_secs);
                 match tokio::time::timeout(duration, dc_wrapper.wait_for_channel_open(None)).await {
-                    Ok(result) => result.map_err(|e| PyErr::new::<PyRuntimeError, _>(e)),
-                    Err(_) => Ok(false) // Timeout occurred
+                    Ok(result) => result.map_err(PyErr::new::<PyRuntimeError, _>),
+                    Err(_) => Ok(false), // Timeout occurred
                 }
             } else {
-                dc_wrapper.wait_for_channel_open(None).await
-                    .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
+                dc_wrapper
+                    .wait_for_channel_open(None)
+                    .await
+                    .map_err(PyErr::new::<PyRuntimeError, _>)
             }
         })
     }
@@ -609,8 +626,10 @@ impl PyRTCDataChannel {
         let dc_wrapper = &self.dc_wrapper;
 
         runtime.block_on(async {
-            dc_wrapper.close().await
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e))
+            dc_wrapper
+                .close()
+                .await
+                .map_err(PyErr::new::<PyRuntimeError, _>)
         })
     }
 

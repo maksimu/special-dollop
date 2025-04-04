@@ -1,7 +1,8 @@
 // Tests for WebRTC functionality
+use crate::webrtc_core::format_ice_candidate;
 use crate::{get_or_create_runtime, logger};
-use crate::webrtc_core::{format_ice_candidate};
 
+use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
@@ -12,7 +13,6 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
-use bytes::Bytes;
 
 // Initialize the logger before any test runs, but allow it to be safely called multiple times
 #[ctor::ctor]
@@ -254,10 +254,9 @@ fn test_p2p_connection() {
                 })
             }));
 
-            let received =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), msg_rx.recv())
-                    .await
-                    .unwrap();
+            let received = tokio::time::timeout(tokio::time::Duration::from_secs(5), msg_rx.recv())
+                .await
+                .unwrap();
 
             assert_eq!(received.unwrap(), message);
         }
@@ -412,17 +411,20 @@ fn test_p2p_connection_non_trickle() {
         // Check connection state - be slightly more lenient in this test
         let p1_state = peer1.connection_state();
         let p2_state = peer2.connection_state();
-        println!("Final connection states - peer1: {:?}, peer2: {:?}", p1_state, p2_state);
+        println!(
+            "Final connection states - peer1: {:?}, peer2: {:?}",
+            p1_state, p2_state
+        );
 
         assert!(
-            p1_state == RTCPeerConnectionState::Connected ||
-                p1_state == RTCPeerConnectionState::Connecting,
+            p1_state == RTCPeerConnectionState::Connected
+                || p1_state == RTCPeerConnectionState::Connecting,
             "Peer1 should be connected or connecting"
         );
 
         assert!(
-            p2_state == RTCPeerConnectionState::Connected ||
-                p2_state == RTCPeerConnectionState::Connecting,
+            p2_state == RTCPeerConnectionState::Connected
+                || p2_state == RTCPeerConnectionState::Connecting,
             "Peer2 should be connected or connecting"
         );
     });

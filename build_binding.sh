@@ -18,7 +18,7 @@ WHEEL=$(find target/wheels -name "*.whl" | head -1)
 echo "Installing wheel: $WHEEL"
 
 # Force reinstall to ensure the latest version is used
-pip uninstall -y pam_rustwebrtc || true
+pip uninstall -y keeper_pam_webrtc_rs || true
 pip install $WHEEL --force-reinstall
 
 echo "Running tests..."

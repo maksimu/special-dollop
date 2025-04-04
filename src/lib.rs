@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use once_cell::sync::OnceCell;
-use tokio::runtime::Runtime;
+use std::sync::Arc;
 #[cfg(not(feature = "python"))]
 use std::sync::Mutex;
+use tokio::runtime::Runtime;
 
 // Replace OnceLock with OnceCell for consistency
 static SHARED_RUNTIME: OnceCell<Arc<Runtime>> = OnceCell::new();
@@ -61,8 +61,7 @@ pub fn get_or_create_runtime() -> Result<Arc<Runtime>, String> {
 // For Python bindings, adapt the function to return PyResult with the appropriate error type
 #[cfg(feature = "python")]
 pub fn get_or_create_runtime_py() -> pyo3::PyResult<Arc<Runtime>> {
-    get_or_create_runtime()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    get_or_create_runtime().map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
 // Helper function for Linux thread priority
@@ -71,7 +70,10 @@ fn set_current_thread_priority(priority: i32) -> Result<(), String> {
     unsafe {
         let ret = libc::nice(priority);
         if ret == -1 {
-            Err(format!("Failed to set nice value: {}", std::io::Error::last_os_error()))
+            Err(format!(
+                "Failed to set nice value: {}",
+                std::io::Error::last_os_error()
+            ))
         } else {
             Ok(())
         }

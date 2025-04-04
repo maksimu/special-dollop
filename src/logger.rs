@@ -1,6 +1,6 @@
-use log::{Metadata, Record, LevelFilter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use log::{LevelFilter, Metadata, Record};
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Static flag to track whether logger has been initialized using once_cell instead of lazy_static
 static LOGGER_INITIALIZED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
@@ -9,15 +9,15 @@ static LOGGER_INITIALIZED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false
 #[cfg(feature = "python")]
 mod python_logger {
     use super::*;
-    use pyo3::{pyfunction, PyErr, PyObject, PyResult, Python};
-    use pyo3::exceptions::{PyRuntimeError};
-    use pyo3::prelude::{PyAnyMethods, PyModule};
-    use tokio::sync::mpsc;
-    use tokio::task::JoinHandle;
-    use std::sync::Arc;
     use crate::get_or_create_runtime_py;
     use parking_lot::RwLock;
+    use pyo3::exceptions::PyRuntimeError;
+    use pyo3::prelude::{PyAnyMethods, PyModule};
+    use pyo3::{pyfunction, PyErr, PyObject, PyResult, Python};
     use std::collections::VecDeque;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
 
     // Constant for the queue size to avoid unbound memory growth
     const LOG_BUFFER_SIZE: usize = 1000;
@@ -148,7 +148,7 @@ mod python_logger {
                                         "INFO" => "info",
                                         "DEBUG" => "debug",
                                         "TRACE" => "debug",
-                                        _ => "info"
+                                        _ => "info",
                                     };
 
                                     if let Err(e) = logger.call_method1(py, method, (message,)) {
@@ -161,7 +161,7 @@ mod python_logger {
                             cache.initialized = true;
                         }
                     });
-                },
+                }
                 LoggerMessage::LogMessage(level, message) => {
                     // Check if we have a logger or need to cache
                     let should_cache = {
@@ -189,7 +189,7 @@ mod python_logger {
                                 "INFO" => "info",
                                 "DEBUG" => "debug",
                                 "TRACE" => "debug",
-                                _ => "info"
+                                _ => "info",
                             };
 
                             if let Err(e) = logger.call_method1(py, method, (message,)) {
@@ -218,8 +218,10 @@ mod python_logger {
             let source = metadata.target();
 
             // Filter out noisy TURN/ICE traffic at DEBUG level
-            if level == log::Level::Debug && (source.contains("turn::") || source.contains( "webrtc_sctp::")) {
-                    return false;
+            if level == log::Level::Debug
+                && (source.contains("turn::") || source.contains("webrtc_sctp::"))
+            {
+                return false;
             }
             source.starts_with(&self.module_filter)
         }
@@ -257,10 +259,15 @@ mod python_logger {
 
             // Try to send non-blocking first to improve performance
             // This won't block because we're using an unbounded channel
-            if let Err(e) = self.sender.send(LoggerMessage::LogMessage(level.to_string(), message.clone())) {
+            if let Err(e) = self.sender.send(LoggerMessage::LogMessage(
+                level.to_string(),
+                message.clone(),
+            )) {
                 // If channel closed, just print to stderr as fallback
-                eprintln!("Logger channel closed: {}. Message was: [{}] {}",
-                          e, level, message);
+                eprintln!(
+                    "Logger channel closed: {}. Message was: [{}] {}",
+                    e, level, message
+                );
             }
         }
 
@@ -298,10 +305,8 @@ mod python_logger {
             logger.call_method1("setLevel", (level,))?;
 
             // Create the Rust logger
-            let rust_logger = RustPythonLogger::new(
-                logger_name.to_string(),
-                verbose.unwrap_or(false)
-            )?;
+            let rust_logger =
+                RustPythonLogger::new(logger_name.to_string(), verbose.unwrap_or(false))?;
 
             // Set up the logger
             if let Err(e) = log::set_boxed_logger(Box::new(rust_logger.clone())) {
@@ -312,17 +317,22 @@ mod python_logger {
                     return Ok(());
                 }
 
-                return Err(PyErr::new::<PyRuntimeError, _>(
-                    format!("Failed to initialize logger: {}", e)
-                ));
+                return Err(PyErr::new::<PyRuntimeError, _>(format!(
+                    "Failed to initialize logger: {}",
+                    e
+                )));
             }
 
             // Send the Python logger object through the channel
             let py_logger = logger.into();
-            if let Err(e) = rust_logger.sender.send(LoggerMessage::Initialize(py_logger)) {
-                return Err(PyErr::new::<PyRuntimeError, _>(
-                    format!("Failed to send logger initialization: {}", e)
-                ));
+            if let Err(e) = rust_logger
+                .sender
+                .send(LoggerMessage::Initialize(py_logger))
+            {
+                return Err(PyErr::new::<PyRuntimeError, _>(format!(
+                    "Failed to send logger initialization: {}",
+                    e
+                )));
             }
 
             let rust_level = convert_log_level(level, verbose.unwrap_or(false));
@@ -380,7 +390,7 @@ mod simple_logger {
             let source = metadata.target();
             match &self.module_filter {
                 Some(filter) => source.starts_with(filter),
-                None => true
+                None => true,
             }
         }
 
@@ -398,8 +408,13 @@ mod simple_logger {
             let source = record.module_path().unwrap_or_else(|| record.target());
 
             // Format message only once
-            let message = format!("{} {} [{}] {}",
-                                  timestamp, record.level(), source, record.args());
+            let message = format!(
+                "{} {} [{}] {}",
+                timestamp,
+                record.level(),
+                source,
+                record.args()
+            );
 
             // Write to stderr
             let _ = writeln!(std::io::stderr(), "{}", message);
@@ -412,8 +427,15 @@ mod simple_logger {
 
                 // Only cleanup if at least an hour has passed
                 if now_secs - last_cleanup > 3600 {
-                    if LAST_LOG_CLEANUP.compare_exchange(
-                        last_cleanup, now_secs, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    if LAST_LOG_CLEANUP
+                        .compare_exchange(
+                            last_cleanup,
+                            now_secs,
+                            Ordering::SeqCst,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         // Reset counter to prevent overflow
                         MESSAGE_COUNTER.store(0, Ordering::Relaxed);
                     }
@@ -465,7 +487,11 @@ pub use python_logger::initialize_logger;
 
 // Non-Python logger initialization
 #[cfg(not(feature = "python"))]
-pub fn initialize_logger(logger_name: &str, verbose: Option<bool>, level: i32) -> Result<(), String> {
+pub fn initialize_logger(
+    logger_name: &str,
+    verbose: Option<bool>,
+    level: i32,
+) -> Result<(), String> {
     // Check if logger has already been initialized with relaxed ordering for performance
     if LOGGER_INITIALIZED.load(Ordering::Relaxed) {
         // Already initialized, just return success
@@ -484,7 +510,7 @@ pub fn initialize_logger(logger_name: &str, verbose: Option<bool>, level: i32) -
     let logger = simple_logger::SimpleLogger::new(
         rust_level,
         Some(logger_name.to_string()),
-        verbose.unwrap_or(false)
+        verbose.unwrap_or(false),
     );
 
     if let Err(e) = log::set_boxed_logger(Box::new(logger)) {
@@ -501,7 +527,11 @@ pub fn initialize_logger(logger_name: &str, verbose: Option<bool>, level: i32) -
     log::set_max_level(rust_level);
 
     // Log the initialization
-    log::info!("Initialized simple logger for '{}' with level {}", logger_name, level);
+    log::info!(
+        "Initialized simple logger for '{}' with level {}",
+        logger_name,
+        level
+    );
 
     // Mark logger as initialized with release ordering for visibility
     LOGGER_INITIALIZED.store(true, Ordering::Release);

@@ -58,7 +58,7 @@ jobs:
           . venv/bin/activate
           pip install pytest
           pip install $(find target/wheels -name "*.whl" | head -1)
-          python -c "import pam_rustwebrtc; print('Import successful')"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest test_webrtc.py -v
         shell: bash
 
@@ -173,7 +173,7 @@ jobs:
           fi
           
           pip install $WHEEL
-          python -c "import pam_rustwebrtc; print('Import successful')"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest test_webrtc.py -v
         shell: bash
 
@@ -300,7 +300,7 @@ jobs:
           . venv/Scripts/activate
           pip install pytest
           pip install (Get-ChildItem -Path "target/wheels/*.whl" | Select-Object -First 1).FullName
-          python -c "import pam_rustwebrtc; print('Import successful')"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest test_webrtc.py -v
         shell: pwsh
 
@@ -429,7 +429,7 @@ jobs:
             pip install /io/$WHEEL_PATH
           
             # Verify import works
-            python -c 'import pam_rustwebrtc; print(\"Import successful\")'
+            python -c 'import keeper_pam_webrtc_rs; print(\"Import successful\")'
           
             # Install test dependencies
             pip install pytest

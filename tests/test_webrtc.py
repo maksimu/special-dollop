@@ -10,9 +10,9 @@ import threading
 import unittest
 
 try:
-    import pam_rustwebrtc
+    import keeper_pam_webrtc_rs as pam_rustwebrtc
 except ImportError as e:
-    logging.error(f"Failed to import pam_rustwebrtc: {e}")
+    logging.error(f"Failed to import keeper_pam_webrtc_rs: {e}")
     logging.error("Make sure the module is built and installed before running tests")
     raise
 

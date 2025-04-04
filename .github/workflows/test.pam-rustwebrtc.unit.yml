@@ -73,7 +73,7 @@ jobs:
           fi
           
           # Verify the installation worked
-          python -c "import pam_rustwebrtc; print('Successfully imported pam_rustwebrtc')"
+          python -c "import keeper_pam_webrtc_rs; print('Successfully imported keeper_pam_webrtc_rs')"
         shell: bash
 
       # Run Python tests

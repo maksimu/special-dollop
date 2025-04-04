@@ -501,7 +501,7 @@ jobs:
       - name: Check PyPI Secrets
         id: check_secrets
         run: |
-          if [ -n "${{ secrets.PYPI_USERNAME }}" ] && [ -n "${{ secrets.PYPI_PASSWORD }}" ]; then
+          if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
             echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_ENV
             echo "PyPI secrets are available, will publish to PyPI"
           else

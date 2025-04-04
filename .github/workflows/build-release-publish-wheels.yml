@@ -1,11 +1,19 @@
+# HOW TO PUBLISH A NEW VERSION:
+# 1. Update version in Cargo.toml (e.g., from 0.1.4 to 0.1.5)
+# 2. Commit and push the version change: 
+#    git commit -am "Bump version to x.y.z" && git push origin main
+# 3. Create and push a tag for the new version:
+#    git tag -a vx.y.z -m "Release version x.y.z" && git push origin vx.y.z
+# 4. This workflow will automatically:
+#    - Build wheels for all supported platforms
+#    - Run tests to verify the build
+#    - Create a GitHub release with the tag
+#    - Publish the wheels to PyPI (if PYPI_API_TOKEN is configured)
+
 name: Build, Release and Publish 🛞Wheels🛞
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'Cargo.toml'
     tags:
       - 'v*'  # Trigger on version tags
   workflow_dispatch:
@@ -444,13 +452,13 @@ jobs:
           name: keeper-pam-webrtc-rs-alpine-x86_64
           path: target/wheels/*.whl
 
-  # Create release with all wheels if on main branch or tag
+  # Create release with all wheels if on tag
   create_release:
     name: Create Release
     environment: prod
     needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 
@@ -508,10 +516,10 @@ jobs:
         id: check_secrets
         run: |
           if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
-            echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_ENV
+            echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_OUTPUT
             echo "PyPI secrets are available, will publish to PyPI"
           else
-            echo "PYPI_SECRETS_AVAILABLE=false" >> $GITHUB_ENV
+            echo "PYPI_SECRETS_AVAILABLE=false" >> $GITHUB_OUTPUT
             echo "PyPI secrets are NOT available, skipping publishing"
           fi
         shell: bash
@@ -523,7 +531,7 @@ jobs:
         shell: bash
 
       - name: Publish to PyPI
-        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && env.PYPI_SECRETS_AVAILABLE == 'true'
+        if: startsWith(github.ref, 'refs/tags/v') && steps.check_secrets.outputs.PYPI_SECRETS_AVAILABLE == 'true'
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}

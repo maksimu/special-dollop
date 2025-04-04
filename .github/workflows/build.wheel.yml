@@ -477,12 +477,18 @@ jobs:
             echo "Contents of $dir:"
             ls -la "$dir"
           done
+          
+          # Ensure wheels are in the correct location for twine
+          mkdir -p dist/wheels
+          find dist -type f -name "*.whl" -exec cp {} dist/wheels/ \;
+          echo "Files copied to dist/wheels/:"
+          ls -la dist/wheels/
         shell: bash
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*.whl
+          files: dist/wheels/*.whl
           name: keeper-pam-webrtc-rs ${{ env.VERSION }}
           body: |
             WebRTC Python extension module using Rust
@@ -523,5 +529,5 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           echo "Publishing wheels to PyPI..."
-          twine upload dist/**/*.whl
+          twine upload dist/wheels/*.whl
         shell: bash

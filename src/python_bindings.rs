@@ -626,7 +626,7 @@ impl PyRTCDataChannel {
 }
 
 #[pymodule]
-fn pam_rustwebrtc(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn keeper_pam_webrtc_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRTCPeerConnection>()?;
     m.add_class::<PyRTCDataChannel>()?;
 

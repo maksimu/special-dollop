@@ -94,7 +94,7 @@ impl PyRTCPeerConnection {
                 .collect();
         }
 
-        if turn_only{
+        if turn_only {
             rtc_config.ice_transport_policy = RTCIceTransportPolicy::Relay;
         }
 
@@ -137,7 +137,7 @@ impl PyRTCPeerConnection {
             log::debug!("Data channel detected, setting up initial message buffer");
 
             // Create a pre-sized buffer for early messages
-            let buffer = Arc::new(Mutex::new(Vec::with_capacity(32)));
+            let buffer = Arc::new(Mutex::new(Vec::with_capacity(1400)));
             let buffer_clone = buffer.clone();
 
             // Set up an initial message handler to buffer messages
@@ -214,7 +214,7 @@ impl PyRTCPeerConnection {
         let runtime = get_or_create_runtime_py()?;
 
         // Create a buffer for early messages with optimized capacity
-        let buffer = Arc::new(Mutex::new(Vec::<Vec<u8>>::with_capacity(32)));
+        let buffer = Arc::new(Mutex::new(Vec::<Vec<u8>>::with_capacity(1400)));
         let buffer_clone = Arc::clone(&buffer);
 
         // Use the core implementation to create a data channel
@@ -388,7 +388,7 @@ impl PyRTCDataChannel {
         // Create a message buffer with a reasonable initial capacity based on existing data
         let message_buffer = {
             let src = initial_buffer.lock();
-            let capacity = src.len().max(32); // At least 32 or the current size
+            let capacity = src.len().max(1400);
 
             if src.is_empty() {
                 // If empty, no need to transfer anything

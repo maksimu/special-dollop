@@ -124,7 +124,8 @@ class TestWebRTC(unittest.TestCase):
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
         self.assertEqual(pc.connection_state, "New")
         logging.info("Peer connection creation test passed")
@@ -145,7 +146,8 @@ class TestWebRTC(unittest.TestCase):
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
         self.assertEqual(pc.connection_state, "New")
         logging.info("Peer connection with config test passed")
@@ -158,7 +160,8 @@ class TestWebRTC(unittest.TestCase):
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
         dc = pc.create_data_channel("test")
         self.assertEqual(dc.label, "test")
@@ -176,13 +179,15 @@ class TestWebRTC(unittest.TestCase):
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
         peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate2,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
 
         # Create data channel
@@ -262,13 +267,15 @@ class TestWebRTC(unittest.TestCase):
             config,
             None,  # No ICE candidate callback for non-trickle
             self.on_data_channel,
-            trickle_ice=False
+            trickle_ice=False,
+            turn_only=False
         )
         peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             None,  # No ICE candidate callback for non-trickle
             self.on_data_channel,
-            trickle_ice=False
+            trickle_ice=False,
+            turn_only=False
         )
 
         # Create data channel
@@ -331,13 +338,15 @@ class TestWebRTC(unittest.TestCase):
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
         peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate2,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
 
         # Create data channel
@@ -449,13 +458,15 @@ class TestWebRTC(unittest.TestCase):
             config,
             self.on_ice_candidate1,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
         peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
             config,
             self.on_ice_candidate2,
             self.on_data_channel,
-            trickle_ice=True
+            trickle_ice=True,
+            turn_only=False
         )
 
         # Connect peers and establish data channel
@@ -613,13 +624,15 @@ class TestWebRTC(unittest.TestCase):
                 config,
                 self.on_ice_candidate1,
                 self.on_data_channel,
-                trickle_ice=True
+                trickle_ice=True,
+                turn_only=False
             )
             peer2 = keeper_pam_webrtc_rs.PyRTCPeerConnection(
                 config,
                 self.on_ice_candidate2,
                 self.on_data_channel,
-                trickle_ice=True
+                trickle_ice=True,
+                turn_only=False
             )
 
             # Create data channel

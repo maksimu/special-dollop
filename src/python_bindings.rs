@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 
 #[derive(FromPyObject)]
 struct IceServer {
@@ -68,6 +69,7 @@ impl PyRTCPeerConnection {
         on_ice_candidate: PyObject,
         on_data_channel: PyObject,
         trickle_ice: bool,
+        turn_only: bool,
     ) -> PyResult<Self> {
         // Get shared runtime using the Python-specific accessor
         let runtime = get_or_create_runtime_py()?;
@@ -90,6 +92,10 @@ impl PyRTCPeerConnection {
                         })
                 })
                 .collect();
+        }
+
+        if turn_only{
+            rtc_config.ice_transport_policy = RTCIceTransportPolicy::Relay;
         }
 
         // Create the WebRTC connection asynchronously
@@ -518,9 +524,6 @@ impl PyRTCDataChannel {
                         guard.as_ref().map(|cb| cb.clone_ref(py))
                     };
 
-                    // Mark callback as set before processing
-                    self.is_callback_set.store(true, Ordering::Release);
-
                     // Only process if we have a callback
                     if let Some(callback) = callback_option {
                         // Take ownership of the buffered messages in one operation
@@ -534,6 +537,9 @@ impl PyRTCDataChannel {
                                 buffered
                             }
                         };
+
+                        // Mark callback as set before processing
+                        self.is_callback_set.store(true, Ordering::Release);
 
                         // Process all messages outside of lock
                         for msg in messages_to_process {

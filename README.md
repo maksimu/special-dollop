@@ -32,7 +32,8 @@ pc = keeper_pam_webrtc_rs.PyRTCPeerConnection(
     config, 
     on_ice_candidate=lambda c: print(f"ICE candidate: {c}"), 
     on_data_channel=lambda dc: print(f"Data channel: {dc.label()}"),
-    trickle_ice=True
+    trickle_ice=True,
+    turn_only=False
 )
 
 # Create offer

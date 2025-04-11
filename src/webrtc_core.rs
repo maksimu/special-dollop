@@ -19,7 +19,7 @@ pub fn format_ice_candidate(
     candidate: &webrtc::ice_transport::ice_candidate::RTCIceCandidate,
 ) -> String {
     // Pre-allocate a reasonably sized string to avoid reallocations
-    let mut result = String::with_capacity(128);
+    let mut result = String::with_capacity(256);
 
     result.push_str("candidate:");
     result.push_str(&candidate.foundation);
@@ -272,12 +272,10 @@ impl WebRTCDataChannel {
         }
 
         // Create Bytes from the data slice
-        // Note: We could use Bytes::from_static for static data, but we don't know
-        // if the input slice is actually static, so we have to copy
         let bytes = Bytes::copy_from_slice(data);
 
-        // Send with a reasonable default timeout
-        tokio::time::timeout(Duration::from_secs(5), self.data_channel.send(&bytes))
+        // Increase timeout for large data transfers
+        tokio::time::timeout(Duration::from_secs(15), self.data_channel.send(&bytes))
             .await
             .map_err(|_| "Send operation timed out".to_string())?
             .map(|_| ())
@@ -292,8 +290,6 @@ impl WebRTCDataChannel {
         }
 
         // Create Bytes from the data slice
-        // Note: We could use Bytes::from_static for static data, but we don't know
-        // if the input slice is actually static, so we have to copy
         let bytes = Bytes::copy_from_slice(data);
 
         tokio::time::timeout(timeout, self.data_channel.send(&bytes))

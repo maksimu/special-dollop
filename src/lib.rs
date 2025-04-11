@@ -29,6 +29,12 @@ pub fn get_or_create_runtime() -> Result<Arc<Runtime>, String> {
     builder.enable_all();
     builder.thread_name("webrtc-rt");
 
+    // Increase worker thread count for better concurrency
+    builder.worker_threads(4);
+
+    // Increase thread stack size for handling large packets
+    builder.thread_stack_size(4 * 1024 * 1024); // 4MB stack size
+
     // Set worker threads to use a lower priority on Linux
     #[cfg(target_os = "linux")]
     {

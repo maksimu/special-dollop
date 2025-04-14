@@ -337,8 +337,9 @@ jobs:
           architecture: 'x64'
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
 
       - name: Build Alpine Linux wheel

@@ -14,15 +14,15 @@ python = ["pyo3"]
 [dependencies]
 bytes = "1.10.1"
 chrono = "0.4.40"
-ctor = "0.4.0"  # For test initialization
-log = { version = "0.4.26", features = ["std"] }
-pyo3 = { version = "0.24.0", features = ["extension-module", "abi3-py37"], optional = true }
+ctor = "0.4.1"  # For test initialization
+log = { version = "0.4.27", features = ["std"] }
+pyo3 = { version = "0.24.1", features = ["extension-module", "abi3-py37"], optional = true }
 # Not directly used - included to enforce minimum version for security (CVE fixes in 0.17.12+)
 # Dependency comes through webrtc crate
-ring = "0.17.13"
-tokio = { version = "1.42.0", features = ["full", "rt-multi-thread"] }
+ring = "0.17.14"
+tokio = { version = "1.44.2", features = ["full", "rt-multi-thread"] }
 webrtc = "0.12.0"
-once_cell = "1.20.3"
+once_cell = "1.21.3"
 parking_lot = "0.12.3"
 libc = "0.2.169"
 

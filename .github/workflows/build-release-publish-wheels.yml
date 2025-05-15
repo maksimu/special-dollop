@@ -1,5 +1,5 @@
 # HOW TO PUBLISH A NEW VERSION:
-# 1. Update version in Cargo.toml (e.g., from 0.1.4 to 0.1.5)
+# 1. Update the version in Cargo.toml (e.g., from 0.1.4 to 0.1.5)
 # 2. Commit and push the version change: 
 #    git commit -am "Bump version to x.y.z" && git push origin main
 # 3. Create and push a tag for the new version:
@@ -71,7 +71,7 @@ jobs:
           pip install pytest
           pip install $(find target/wheels -name "*.whl" | head -1)
           python -c "import keeper_pam_webrtc_rs; print('Import successful')"
-          cd tests && python -m pytest test_webrtc.py -v
+          cd tests && python -m pytest -v
         shell: bash
 
       - uses: actions/upload-artifact@v4
@@ -186,7 +186,7 @@ jobs:
           
           pip install $WHEEL
           python -c "import keeper_pam_webrtc_rs; print('Import successful')"
-          cd tests && python -m pytest test_webrtc.py -v
+          cd tests && python -m pytest -v
         shell: bash
 
       # Verify the wheel compatibility with older glibc
@@ -315,7 +315,7 @@ jobs:
           pip install pytest
           pip install (Get-ChildItem -Path "target/wheels/*.whl" | Select-Object -First 1).FullName
           python -c "import keeper_pam_webrtc_rs; print('Import successful')"
-          cd tests && python -m pytest test_webrtc.py -v
+          cd tests && python -m pytest -v
         shell: pwsh
 
       - uses: actions/upload-artifact@v4
@@ -450,7 +450,7 @@ jobs:
             pip install pytest
           
             # Run tests
-            cd /io/tests && python -m pytest test_webrtc.py -v
+            cd /io/tests && python -m pytest -v
           "
         shell: bash
 

@@ -2,14 +2,13 @@ use log::{LevelFilter, Metadata, Record};
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// Static flag to track whether logger has been initialized using once_cell instead of lazy_static
+// Static flag to track whether the logger has been initialized using once_cell instead of lazy_static
 static LOGGER_INITIALIZED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
 // Python-dependent logger
 #[cfg(feature = "python")]
 mod python_logger {
     use super::*;
-    use crate::get_or_create_runtime_py;
     use parking_lot::RwLock;
     use pyo3::exceptions::PyRuntimeError;
     use pyo3::prelude::{PyAnyMethods, PyModule};
@@ -17,7 +16,7 @@ mod python_logger {
     use std::collections::VecDeque;
     use std::sync::Arc;
     use tokio::sync::mpsc;
-    use tokio::task::JoinHandle;
+    use std::thread;
 
     // Constant for the queue size to avoid unbound memory growth
     const LOG_BUFFER_SIZE: usize = 1000;
@@ -71,16 +70,14 @@ mod python_logger {
         sender: Arc<mpsc::UnboundedSender<LoggerMessage>>,
         module_filter: String,
         verbose: bool,
-        _task_handle: Arc<JoinHandle<()>>,
-        // Use a shared cache for logs before Python logger is initialized
+        // Store the thread handle instead of a task handle
+        _thread_handle: Arc<Option<thread::JoinHandle<()>>>,
+        // Use a shared cache for logs before the Python logger is initialized
         log_cache: Arc<RwLock<LogCache>>,
     }
 
     impl RustPythonLogger {
         pub fn new(module_filter: String, verbose: bool) -> Result<Self, PyErr> {
-            // Get the shared runtime
-            let runtime = get_or_create_runtime_py()?;
-
             // Create an unbounded channel to prevent blocking
             let (sender, receiver) = mpsc::unbounded_channel::<LoggerMessage>();
             let sender = Arc::new(sender);
@@ -90,7 +87,7 @@ mod python_logger {
             let log_cache_clone = Arc::clone(&log_cache);
 
             // Spawn a dedicated thread for logging that won't deadlock with other operations
-            let _handle = std::thread::spawn(move || {
+            let thread_handle = thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -102,16 +99,11 @@ mod python_logger {
                 });
             });
 
-            // Create a dummy task handle that will be used for cleanup
-            let task_handle = Arc::new(runtime.spawn(async {
-                // This task doesn't do anything - real work happens in the dedicated thread
-            }));
-
             Ok(RustPythonLogger {
                 sender,
                 module_filter,
                 verbose,
-                _task_handle: task_handle,
+                _thread_handle: Arc::new(Some(thread_handle)),
                 log_cache,
             })
         }
@@ -208,7 +200,7 @@ mod python_logger {
 
     impl log::Log for RustPythonLogger {
         fn enabled(&self, metadata: &Metadata) -> bool {
-            // Fast path for common case
+            // Fast path for a common case
             if self.verbose {
                 return true;
             }
@@ -263,7 +255,7 @@ mod python_logger {
                 level.to_string(),
                 message.clone(),
             )) {
-                // If channel closed, just print to stderr as fallback
+                // If the channel closed, print to stderr as fallback
                 eprintln!(
                     "Logger channel closed: {}. Message was: [{}] {}",
                     e, level, message
@@ -278,28 +270,32 @@ mod python_logger {
         fn drop(&mut self) {
             // Only cleanup if this is the last reference
             if Arc::strong_count(&self.sender) == 1 {
-                // Abort the task when logger is dropped
-                self._task_handle.abort();
+                // Close the channel to signal the thread to exit
+                // When the sender is dropped, the channel will close
+                // The thread will exit once the receiver's recv() returns None
             }
+            
+            // Note: We intentionally don't join the thread here to avoid blocking
+            // The thread will exit gracefully when the channel is closed
         }
     }
 
     #[pyfunction]
     #[pyo3(signature = (logger_name, verbose=None, level=20))]
     pub fn initialize_logger(logger_name: &str, verbose: Option<bool>, level: i32) -> PyResult<()> {
-        // Check if logger has already been initialized with relaxed ordering for better performance
+        // Check if the logger has already been initialized with relaxed ordering for better performance
         if LOGGER_INITIALIZED.load(Ordering::Relaxed) {
-            // Already initialized, just return success
+            // Already initialized, return success
             return Ok(());
         }
 
-        // Double-check with acquire to ensure visibility
+        // Acquire to double-check to ensure visibility
         if LOGGER_INITIALIZED.load(Ordering::Acquire) {
             return Ok(());
         }
 
         Python::with_gil(|py| {
-            // Create Python logger instance
+            // Create a Python logger instance
             let logging = PyModule::import(py, "logging")?;
             let logger = logging.call_method1("getLogger", (logger_name,))?;
             logger.call_method1("setLevel", (level,))?;
@@ -310,9 +306,9 @@ mod python_logger {
 
             // Set up the logger
             if let Err(e) = log::set_boxed_logger(Box::new(rust_logger.clone())) {
-                // Check if the error is because logger is already initialized
+                // Check if the error is because the logger is already initialized
                 if e.to_string().contains("already initialized") {
-                    // Mark as initialized and continue
+                    // Mark as initialized and then continue
                     LOGGER_INITIALIZED.store(true, Ordering::Release);
                     return Ok(());
                 }
@@ -407,7 +403,7 @@ mod simple_logger {
             // Source module path
             let source = record.module_path().unwrap_or_else(|| record.target());
 
-            // Format message only once
+            // Format the message only once
             let message = format!(
                 "{} {} [{}] {}",
                 timestamp,
@@ -492,13 +488,13 @@ pub fn initialize_logger(
     verbose: Option<bool>,
     level: i32,
 ) -> Result<(), String> {
-    // Check if logger has already been initialized with relaxed ordering for performance
+    // Check if the logger has already been initialized with relaxed ordering for performance
     if LOGGER_INITIALIZED.load(Ordering::Relaxed) {
-        // Already initialized, just return success
+        // Already initialized, return success
         return Ok(());
     }
 
-    // Double-check with acquire for proper visibility
+    // Acquire to double-check for proper visibility
     if LOGGER_INITIALIZED.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -514,9 +510,9 @@ pub fn initialize_logger(
     );
 
     if let Err(e) = log::set_boxed_logger(Box::new(logger)) {
-        // Check if the error is because logger is already initialized
+        // Check if the error is because the logger is already initialized
         if e.to_string().contains("already initialized") {
-            // Mark as initialized and continue
+            // Mark as initialized and then continue
             LOGGER_INITIALIZED.store(true, Ordering::Release);
             return Ok(());
         }

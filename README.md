@@ -61,3 +61,53 @@ pc.close()
 - Cross-platform compatibility
 - Built with abi3 for maximum Python version compatibility (Python 3.7+)
 - Comprehensive WebRTC functionality
+
+## WebRTC Configuration
+
+### TURN-only Mode
+
+The WebRTC implementation supports a "TURN-only" mode which forces all WebRTC traffic through TURN servers rather than attempting direct peer-to-peer connections. This can be useful in the following scenarios:
+
+- When you need to guarantee connectivity through restrictive firewalls
+- When you need to ensure consistent network behavior
+- For regulatory compliance requirements that mandate traffic through specific servers
+- When troubleshooting WebRTC connectivity issues
+
+To enable TURN-only mode, set the `turn_only` parameter to `True` when creating a peer connection:
+
+```python
+# Regular mode (uses all ICE candidate types)
+peer = keeper_pam_webrtc_rs.PyRTCPeerConnection(
+    config, on_ice_candidate, on_data_channel,
+    trickle_ice=True, turn_only=False  # Default is False
+)
+
+# TURN-only mode (only uses relay candidates)
+peer = keeper_pam_webrtc_rs.PyRTCPeerConnection(
+    config, on_ice_candidate, on_data_channel,
+    trickle_ice=True, turn_only=True
+)
+```
+
+Note that TURN-only mode requires properly configured TURN servers in your ICE server configuration:
+
+```python
+config = {
+    "iceServers": [
+        {
+            "urls": ["turn:your-turn-server.example.com:3478"],
+            "username": "your-username",
+            "credential": "your-password"
+        }
+    ]
+}
+```
+
+#### Performance Considerations
+
+TURN-only mode forces all media traffic through relay servers, which can introduce:
+- Higher latency compared to direct connections
+- Increased bandwidth costs for TURN server operations
+- Potential bottlenecks if TURN servers are overloaded
+
+Use this mode only when necessary, and ensure your TURN servers are properly scaled for your application's needs.

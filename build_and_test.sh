@@ -23,4 +23,6 @@ pip install $WHEEL --force-reinstall
 
 echo "Running tests..."
 cd tests
-python -m pytest test_webrtc.py -v
+
+# Run all tests
+python -m pytest -v

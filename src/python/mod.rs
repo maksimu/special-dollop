@@ -1,4 +1,3 @@
-mod utils;
 mod tube_registry;
 
 use pyo3::prelude::*;
@@ -6,7 +5,6 @@ use pyo3::wrap_pyfunction;
 use pyo3::Bound;
 use pyo3::types::PyModule;
 pub use tube_registry::{PyTubeRegistry, PyTube};
-pub use utils::DEFAULT_BUFFER_CAPACITY;
 use crate::runtime::get_runtime;
 
 #[pymodule]

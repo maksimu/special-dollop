@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use log::{debug, error};
+use log::debug;
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, Mutex};
@@ -53,8 +53,6 @@ pub struct Channel {
     pub(crate) pending_messages: Arc<Mutex<HashMap<u32, VecDeque<Bytes>>>>,
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
-    pub(crate) ksm_config: String,
-    pub(crate) callback_token: String,
 }
 
 // Implement Clone for Channel
@@ -84,8 +82,6 @@ impl Clone for Channel {
             protocol_connections: HashMap::new(), // We don't clone protocol connections
             pending_messages: Arc::new(Mutex::new(HashMap::<u32, VecDeque<Bytes>>::new())), // New empty pending messages map
             buffer_pool: BufferPool::default(), // Create a new buffer pool
-            ksm_config: self.ksm_config.clone(),
-            callback_token: self.callback_token.clone(),
         }
     }
 }
@@ -97,8 +93,6 @@ impl Channel {
         channel_id: String,
         timeouts: Option<TunnelTimeouts>,
         network_checker: Option<NetworkAccessChecker>,
-        ksm_config: String,
-        callback_token: String,
     ) -> Self {
         // Create a channel for the server to register connections
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32); // Buffer for 32 connections
@@ -119,8 +113,6 @@ impl Channel {
         let webrtc_clone = webrtc.clone();
         let channel_id_clone = channel_id.clone();
         let buffer_pool_clone = buffer_pool.clone();
-        let ksm_config_clone = ksm_config.clone();
-        let callback_token_clone = callback_token.clone();
 
         // Set up the callback for when the buffer drops below the threshold
         webrtc.on_buffered_amount_low(Some(Box::new(move || {
@@ -128,8 +120,6 @@ impl Channel {
             let dc = webrtc_clone.clone();
             let ep_name = channel_id_clone.clone();
             let pool = buffer_pool_clone.clone();
-            let ksm_config_clone = ksm_config_clone.clone();
-            let callback_token_clone = callback_token_clone.clone();
 
             // Spawn a task to process pending messages
             tokio::spawn(async move {
@@ -143,8 +133,6 @@ impl Channel {
                     ep_name.clone(),
                     None, // No timeouts needed for message processing
                     None, // No network checking needed
-                    ksm_config_clone,
-                    callback_token_clone,
                 );
 
                 // Set the pending_messages field to use our shared collection
@@ -180,8 +168,6 @@ impl Channel {
             protocol_connections: HashMap::new(),
             pending_messages,
             buffer_pool,
-            ksm_config,
-            callback_token
         }
     }
 
@@ -314,8 +300,7 @@ impl Channel {
         debug!("Endpoint {}: Processing pending messages for {} connections", 
                    self.channel_id, pending_guard.len());
         
-        // Get the current buffer amount
-        let mut current_buffer = self.webrtc.buffered_amount().await;
+        // Process a batch of messages while staying under the buffer threshold
         let max_to_process = 100; // Maximum total messages to process in one batch
         let mut total_processed = 0;
         
@@ -340,6 +325,9 @@ impl Channel {
         // Get a buffer for potential repackaging operations
         let encode_buffer = self.buffer_pool.acquire();
         
+        // Get buffer threshold one time
+        let buffer_threshold = BUFFER_LOW_THRESHOLD;
+        
         while total_processed < max_to_process && !conn_nos.is_empty() {
             let conn_index = current_index % conn_nos.len();
             let conn_no = conn_nos[conn_index];
@@ -354,19 +342,10 @@ impl Channel {
                     continue;
                 };
                 
-                let message_len = message_to_send.len() as u64;
-
-                // Check buffer before sending
-                if current_buffer >= BUFFER_LOW_THRESHOLD {
-                   debug!("Endpoint {}: Buffer threshold reached during processing, pausing after {} messages", 
-               self.channel_id, total_processed);
-                    break;
-                }
-
-                // Try to send the message
+                // Try to send the message - the WebRTC implementation will handle buffering internally
                 if let Err(e) = self.webrtc.send(message_to_send).await {
                     log::error!("Endpoint {}: Failed to send queued message for connection {}: {}", 
-               self.channel_id, conn_no, e);
+                        self.channel_id, conn_no, e);
                     break;
                 }
 
@@ -374,12 +353,14 @@ impl Channel {
                 queue.pop_front();
                 total_processed += 1;
                 
-                // Update buffer amount estimate (avoid querying WebRTC API too often)
-                current_buffer += message_len;
-                
-                // Every 10 messages, refresh the real buffer amount
+                // Every 10 messages, check if we should continue or wait for buffer to drain
                 if total_processed % 10 == 0 {
-                    current_buffer = self.webrtc.buffered_amount().await;
+                    let current_buffer = self.webrtc.buffered_amount().await;
+                    if current_buffer >= buffer_threshold {
+                        debug!("Endpoint {}: Buffer threshold reached during processing, pausing after {} messages", 
+                            self.channel_id, total_processed);
+                        break;
+                    }
                 }
             }
             
@@ -434,52 +415,66 @@ impl Channel {
 
         Ok(())
     }
-
-
-    // TODO: this
-    // Report connection open state to router
-    pub async fn report_connection_open(&self) -> std::result::Result<(), String> {
-        debug!("Sending connection open callback to router");
-        let token_value = serde_json::Value::String(self.callback_token.clone());
-
-        match crate::router_helpers::post_connection_state(
-            &*self.ksm_config.clone(),
-            "connection_open",
-            &token_value,
-            None
-        ).await {
-            Ok(_) => {
-                debug!("Connection open callback sent successfully");
-                Ok(())
-            },
-            Err(e) => {
-                error!("Error sending connection open callback: {}", e);
-                Err(format!("Failed to send connection open callback: {}", e))
-            }
+    
+    // Method to handle received message bytes from a data channel
+    pub async fn receive_message(&self, bytes: Bytes) -> Result<()> {
+        // Use the buffer pool instead of allocating a new BytesMut
+        let mut buffer = self.buffer_pool.acquire();
+        buffer.clear();
+        buffer.extend_from_slice(&bytes);
+        
+        // Process frames one at a time to avoid holding locks across await points
+        while let Some(frame) = try_parse_frame(&mut buffer) {
+            debug!("Channel({}): Processing frame from message, connection {}, payload size: {}", 
+                    self.channel_id, frame.connection_no, frame.payload.len());
+            
+            // We need a mutable reference for handle_incoming_frame
+            // Using a separate task to avoid cloning the entire channel
+            let frame_clone = frame;
+            let channel_id = self.channel_id.clone();
+            let pending_messages = self.pending_messages.clone();
+            let webrtc = self.webrtc.clone();
+            let protocol_connections = self.protocol_connections.clone();
+            let buffer_pool = self.buffer_pool.clone();
+            
+            // Get these fields individually to avoid cloning the entire channel
+            let is_server_mode = self.server_mode;
+            let timeouts = self.timeouts.clone();
+            let network_checker = self.network_checker.clone();
+            
+            // Spawn a task to handle this frame independently
+            tokio::spawn(async move {
+                // Create a lightweight channel instance just for this frame
+                let (_, rx) = mpsc::unbounded_channel();
+                let mut frame_channel = Channel::new(
+                    webrtc.clone(),
+                    rx,
+                    channel_id.clone(),
+                    Some(timeouts),
+                    network_checker,
+                );
+                
+                // Connect to the shared state
+                frame_channel.pending_messages = pending_messages;
+                frame_channel.buffer_pool = buffer_pool;
+                frame_channel.server_mode = is_server_mode;
+                
+                // Rebuild protocol connections mapping (lightweight copy)
+                for (conn_no, proto_type) in protocol_connections {
+                    frame_channel.protocol_connections.insert(conn_no, proto_type);
+                }
+                
+                // Process the frame
+                if let Err(e) = handle_incoming_frame(&mut frame_channel, frame_clone).await {
+                    log::error!("Channel({}): Error handling frame from message: {}", channel_id, e);
+                }
+            });
         }
-    }
-
-    pub async fn report_connection_close(&self) -> std::result::Result<(), String> {
-        // Report connection close to router if configuration exists
-        debug!("Sending connection close callback to router");
-        let token_value = serde_json::Value::String(self.callback_token.clone());
-
-        // Fall back to direct API call
-        match crate::router_helpers::post_connection_state(
-            &*self.ksm_config.clone(),
-            "connection_close",
-            &token_value,
-            Some(true) // Assuming terminated=true as default for simplicity
-        ).await {
-            Ok(_) => {
-                debug!("Connection close callback sent successfully");
-                Ok(())
-            },
-            Err(e) => {
-                error!("Error sending connection close callback: {}", e);
-                Err(e.to_string())
-            }
-        }
+        
+        // Return the buffer to the pool
+        self.buffer_pool.release(buffer);
+        
+        Ok(())
     }
 
     // Async close_backend implementation

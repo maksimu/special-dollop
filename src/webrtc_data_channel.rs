@@ -49,20 +49,35 @@ impl WebRTCDataChannel {
         // Log the threshold change
         log::debug!("Set buffered amount low threshold to {} bytes", threshold);
 
-        // Start monitoring if we're already above the threshold
+        // Set the native WebRTC bufferedAmountLowThreshold
         if threshold > 0 {
-            let threshold_monitor = self.threshold_monitor.clone();
             let dc = self.clone();
-
-            // Spawn a task to check the current buffer status
+            let threshold_clone = threshold;
+            
+            // Spawn a task to set the threshold and register the callback on the native data channel
             tokio::spawn(async move {
-                // Get the current buffer amount
-                let current = dc.data_channel.buffered_amount().await as u64;
-
-                // If we're already above the threshold, start monitoring
-                if current > threshold && !threshold_monitor.load(Ordering::Acquire) {
-                    dc.start_threshold_monitor(current).await;
-                }
+                // Set the native threshold - convert u64 to usize
+                let threshold_usize = threshold_clone.try_into().unwrap_or(usize::MAX);
+                dc.data_channel.set_buffered_amount_low_threshold(threshold_usize).await;
+                
+                // Make a separate clone for the callback
+                let callback_dc = dc.clone();
+                
+                // Register the onBufferedAmountLow callback
+                dc.data_channel.on_buffered_amount_low(Box::new(move || {
+                    let callback_dc = callback_dc.clone();
+                    let threshold_value = threshold_clone;
+                    
+                    Box::pin(async move {
+                        log::debug!("Native bufferedAmountLow event triggered (buffer below {})", threshold_value);
+                        
+                        // Get and call our callback
+                        let callback_guard = callback_dc.on_buffered_amount_low_callback.lock().unwrap();
+                        if let Some(ref callback) = *callback_guard {
+                            callback();
+                        }
+                    })
+                })).await;
             });
         }
     }
@@ -85,117 +100,11 @@ impl WebRTCDataChannel {
         log::debug!("Set buffered amount low callback: {}", has_callback);
     }
 
-    /// Start monitoring the buffer level in the background with improved efficiency
-    async fn start_threshold_monitor(&self, initial_amount: u64) {
-        // Only start if not already monitoring
-        if self.threshold_monitor.swap(true, Ordering::AcqRel) {
-            return; // Already monitoring
-        }
-
-        // Get the threshold value
-        let threshold = {
-            let guard = self.buffered_amount_low_threshold.lock().unwrap();
-            *guard
-        };
-
-        // If the threshold is 0, or we're already below it, don't start monitoring
-        if threshold == 0 || initial_amount <= threshold {
-            self.threshold_monitor.store(false, Ordering::Release);
-            return;
-        }
-
-        log::debug!("Starting buffer threshold monitor: current={}, threshold={}", 
-                   initial_amount, threshold);
-
-        // Clone what we need for the task
-        let dc = self.clone();
-
-        // Spawn a task to monitor the buffer
-        tokio::spawn(async move {
-            // Start with a short interval and exponentially back off as the buffer drains more slowly
-            let mut check_interval = Duration::from_millis(20);
-            let max_interval = Duration::from_millis(200);
-            let mut last_amount = initial_amount;
-            let mut consecutive_checks_with_no_progress = 0;
-
-            loop {
-                // Exit early if the channel is closing
-                if dc.is_closing.load(Ordering::Acquire) {
-                    break;
-                }
-
-                // Check the current buffer amount
-                let current = dc.data_channel.buffered_amount().await as u64;
-                let threshold = {
-                    let guard = dc.buffered_amount_low_threshold.lock().unwrap();
-                    *guard
-                };
-
-                // Calculate drain rate to adapt polling frequency
-                let drained = if current < last_amount {
-                    last_amount - current
-                } else {
-                    0
-                };
-
-                // If draining is very slow or stalled, increase a check interval
-                if drained < 1024 { // Less than 1KB has been drained since the last check
-                    consecutive_checks_with_no_progress += 1;
-
-                    // Exponentially back off to reduce CPU usage
-                    if consecutive_checks_with_no_progress > 3 {
-                        check_interval = std::cmp::min(check_interval * 2, max_interval);
-                    }
-                } else {
-                    // Reset counter on progress
-                    consecutive_checks_with_no_progress = 0;
-
-                    // Decrease the interval if draining quickly
-                    if drained > 64 * 1024 && check_interval > Duration::from_millis(20) {
-                        check_interval = Duration::from_millis(20);
-                    }
-                }
-
-                last_amount = current;
-
-                // If we've dropped below the threshold, trigger callback
-                if current <= threshold {
-                    log::debug!("Buffer amount is now below threshold: {} <= {}", 
-                               current, threshold);
-
-                    // Get and call the callback if set
-                    let callback_guard = dc.on_buffered_amount_low_callback.lock().unwrap();
-                    if let Some(ref callback) = *callback_guard {
-                        callback();
-                    }
-
-                    // We're done monitoring until the next call to send
-                    break;
-                }
-
-                // Periodically log buffer levels
-                if consecutive_checks_with_no_progress % 10 == 0 && consecutive_checks_with_no_progress > 0 {
-                    log::debug!("Buffer draining slowly: amount={}, threshold={}, check_interval={}ms",
-                              current, threshold, check_interval.as_millis());
-                }
-
-                // Wait before checking again
-                tokio::time::sleep(check_interval).await;
-            }
-
-            // Mark monitoring as done
-            dc.threshold_monitor.store(false, Ordering::Release);
-            log::debug!("Buffer threshold monitor stopped");
-        });
-    }
-
     pub async fn send(&self, data: Bytes) -> Result<(), String> {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
             return Err("Channel is closing".to_string());
         }
-
-        let before_send = self.data_channel.buffered_amount().await as u64;
 
         // Send data with detailed error handling
         let result = self.data_channel
@@ -204,26 +113,8 @@ impl WebRTCDataChannel {
             .map(|_| ())
             .map_err(|e| format!("Failed to send data: {}", e));
 
-        // After sending, check if we need to start monitoring the buffer
-        if result.is_ok() {
-            // Get the current threshold
-            let threshold = {
-                let guard = self.buffered_amount_low_threshold.lock().unwrap();
-                *guard
-            };
-
-            // Only start monitoring if the threshold is non-zero
-            if threshold > 0 {
-                // Get the current buffered amount after sending
-                let after_send = self.data_channel.buffered_amount().await as u64;
-
-                // If we've crossed above the threshold, start monitoring
-                if before_send <= threshold && after_send > threshold {
-                    log::debug!("Buffer crossed threshold after send: {} > {}", after_send, threshold);
-                    self.start_threshold_monitor(after_send).await;
-                }
-            }
-        }
+        // No need to manually monitor buffered amount - we rely on the native WebRTC event
+        // The onBufferedAmountLow event will fire when the buffer drops below the threshold
 
         result
     }
@@ -238,35 +129,75 @@ impl WebRTCDataChannel {
     }
 
     pub async fn wait_for_channel_open(&self, timeout: Option<Duration>) -> Result<bool, String> {
-        let timeout_duration = timeout.unwrap_or(Duration::from_secs(10)); // Reduced from 30 s to 10 s
-        let start = std::time::Instant::now();
-        let check_interval = Duration::from_millis(50); // Reduced from 100 ms to 50 ms
-
-        while start.elapsed() < timeout_duration {
-            // Check for closing early
-            if self.is_closing.load(Ordering::Acquire) {
-                return Err("Data channel is closing".to_string());
-            }
-
-            // Check if already open (the most common case first)
-            if self.data_channel.ready_state()
-                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-            {
-                return Ok(true);
-            }
-
-            // Check if the channel failed (the second most common case)
-            if self.data_channel.ready_state()
-                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
-            {
-                return Ok(false);
-            }
-
-            // Wait before the next check with a shorter interval
-            tokio::time::sleep(check_interval).await;
+        let timeout_duration = timeout.unwrap_or(Duration::from_secs(10));
+        
+        // Use oneshot channel for event-driven notification
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        
+        // Wrap sender in Arc<Mutex<Option<>>> so we can safely consume it from either callback
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        
+        // Create shared flags for state
+        let is_open = Arc::new(AtomicBool::new(false));
+        let is_open_for_close = Arc::clone(&is_open);
+        
+        // We don't need this variable anymore
+        let is_closing = self.is_closing.clone();
+        
+        // Set up onOpen callback if not already open
+        if self.data_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            let sender_clone = Arc::clone(&sender);
+            
+            self.data_channel.on_open(Box::new(move || {
+                // Set the is_open flag
+                is_open.store(true, Ordering::Release);
+                
+                // Send the notification, consuming the sender
+                if let Some(tx) = sender_clone.lock().unwrap().take() {
+                    let _ = tx.send(true);
+                }
+                
+                Box::pin(async {})
+            }));
         }
-
-        Ok(false)
+        
+        // Set up onClose callback
+        let sender_for_close = Arc::clone(&sender);
+        
+        self.data_channel.on_close(Box::new(move || {
+            // If opened and then closed during this wait, send false
+            if is_open_for_close.load(Ordering::Acquire) {
+                // Send false to indicate closed state, consuming the sender
+                if let Some(tx) = sender_for_close.lock().unwrap().take() {
+                    let _ = tx.send(false);
+                }
+            }
+            
+            Box::pin(async {})
+        }));
+        
+        // Check if already closed first (fast path)
+        if is_closing.load(Ordering::Acquire) {
+            return Err("Data channel is closing".to_string());
+        }
+        
+        // Check if already open second (fast path)
+        if self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            return Ok(true);
+        }
+        
+        // Wait for the event or timeout
+        match tokio::time::timeout(timeout_duration, rx).await {
+            Ok(Ok(state)) => Ok(state),
+            Ok(Err(_)) => {
+                // Channel closed without sending a value
+                Ok(false)
+            },
+            Err(_) => {
+                // Timeout occurred
+                Ok(self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open)
+            }
+        }
     }
 
     pub async fn close(&self) -> Result<(), String> {

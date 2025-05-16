@@ -90,7 +90,7 @@ impl GuacdParser {
                 let old_buf = std::mem::replace(&mut self.buffer, new_buf);
                 pool.release(old_buf);
             } else {
-                // Otherwise, just advance the buffer and keep memory
+                // Otherwise, advance the buffer and keep memory
                 self.buffer.advance(self.start_index);
                 self.element_end -= self.start_index as isize;
                 self.start_index = 0;
@@ -276,7 +276,7 @@ impl GuacdParser {
             return bytes;
         }
         
-        // If we used a pool buffer, we need to create a copy before release
+        // If we used a pool buffer, we need to create a copy before release, 
         // This is unfortunate but necessary since we can't know if the caller will hold onto the Bytes
         let result = Bytes::copy_from_slice(&bytes);
         
@@ -365,7 +365,7 @@ impl GuacdParser {
             // End of instruction
         } else {
             return Err(GuacdError::InvalidInstruction(
-                format!("Instruction arg has invalid length")
+                "Instruction arg has invalid length".to_string()
             ));
         }
         

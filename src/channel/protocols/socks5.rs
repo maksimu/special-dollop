@@ -1,8 +1,5 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
 use crate::models::{ProtocolHandler, NetworkAccessChecker};
@@ -17,7 +14,16 @@ const SOCKS5_VERSION: u8 = 5;
 
 // SOCKS5 Command Codes
 const CONNECT: u8 = 1;
+
+// Currently, unused command codes
+// To implement these:
+// - BIND: Would need to handle reverse connections, listening for incoming connections 
+//   and forwarding them to the client. Used for FTP passive mode and similar protocols.
+// - UDP_ASSOCIATE: Would require UDP datagram handling alongside the TCP control connection.
+//   Used for DNS queries, some voice/video protocols, and other UDP-based applications.
+#[allow(dead_code)]
 const BIND: u8 = 2;
+#[allow(dead_code)]
 const UDP_ASSOCIATE: u8 = 3;
 
 // SOCKS5 Address Types
@@ -29,10 +35,21 @@ const IPV6: u8 = 4;
 const SUCCEEDED: u8 = 0;
 const GENERAL_FAILURE: u8 = 1;
 const CONNECTION_NOT_ALLOWED: u8 = 2;
-const NETWORK_UNREACHABLE: u8 = 3;
-const HOST_UNREACHABLE: u8 = 4;
-const CONNECTION_REFUSED: u8 = 5;
-const TTL_EXPIRED: u8 = 6;
+
+// Currently unused error codes
+// To implement these:
+// - Need to catch specific error types when connecting to hosts
+// - Map network exceptions to the appropriate SOCKS5 error codes
+// - Return more precise error information to SOCKS5 clients
+#[allow(dead_code)]
+const NETWORK_UNREACHABLE: u8 = 3;  // Network unreachable (routing impossible)
+#[allow(dead_code)]
+const HOST_UNREACHABLE: u8 = 4;     // Host cannot be reached (no route to host)
+#[allow(dead_code)]
+const CONNECTION_REFUSED: u8 = 5;   // Target server actively refused the connection
+#[allow(dead_code)]
+const TTL_EXPIRED: u8 = 6;          // TTL expired during connection attempt
+
 const COMMAND_NOT_SUPPORTED: u8 = 7;
 const ADDRESS_TYPE_NOT_SUPPORTED: u8 = 8;
 
@@ -51,7 +68,6 @@ enum LocalServerState {
 }
 
 pub struct SOCKS5Handler {
-    active_connections: Arc<Mutex<HashMap<u32, TcpStream>>>,
     network_checker: Option<NetworkAccessChecker>,
     server_state: LocalServerState,
     current_connection: Option<u32>,
@@ -71,7 +87,6 @@ impl SOCKS5Handler {
         let network_checker = tube_and_channel_helpers::parse_network_rules_from_settings(&settings);
             
         Self {
-            active_connections: Arc::new(Mutex::new(HashMap::new())),
             network_checker,
             server_state: LocalServerState::Initial,
             current_connection: None,
@@ -456,7 +471,7 @@ impl ProtocolHandler for SOCKS5Handler {
     fn process_pending_messages(&mut self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             // SOCKS5 handler currently doesn't queue messages, but we could add that
-            // functionality in the future if needed. For now, just return Ok.
+            // functionality in the future if needed. For now, return Ok.
             debug!("SOCKS5 handler: process_pending_messages called (no-op for this handler)");
             Ok(())
         })

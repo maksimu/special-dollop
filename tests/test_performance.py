@@ -63,7 +63,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         # Set the answer on the server
         self.tube_registry.set_remote_description(server_tube.id, answer)
         
-        # Wait for connection establishment
+        # Wait for a connection establishment
         server_id = server_tube.id
         client_id = client_tube.id
         

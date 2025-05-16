@@ -9,7 +9,7 @@ use crate::webrtc_data_channel::WebRTCDataChannel;
 use std::collections::{HashSet, VecDeque};
 use crate::buffer_pool::BufferPool;
 
-/// Structure for pending messages that couldn't be sent due to unavailable WebRTC channel
+/// Structure for pending messages that couldn't be sent due to an unavailable WebRTC channel
 struct PendingMessage {
     conn_no: u32,
     data: Vec<u8>,
@@ -45,7 +45,7 @@ impl PortForwardProtocolHandler {
 
     // Helper function to queue a message when WebRTC channel is unavailable
     fn queue_message(&mut self, conn_no: u32, data: &[u8]) {
-        // Only queue if we haven't reached maximum (to prevent memory leaks)
+        // Only queue if we haven't reached the maximum (to prevent memory leaks)
         if self.pending_messages.len() < self.max_pending_messages {
             debug!("Port forward handler: Queueing message for connection {} ({} bytes)", 
                   conn_no, data.len());
@@ -244,7 +244,7 @@ impl ProtocolHandler for PortForwardProtocolHandler {
                     if pending_count > 0 {
                         info!("Port forward handler: Processing {} pending messages", pending_count);
                         
-                        // Process pending messages until queue is empty or we encounter an error
+                        // Process pending messages until queue is empty, or we encounter an error
                         let mut successful_sends = 0;
                         while let Some(msg) = self.pending_messages.pop_front() {
                             // Create frame and send

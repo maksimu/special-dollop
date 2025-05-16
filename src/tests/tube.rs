@@ -60,7 +60,7 @@ fn test_tube_creation() {
         assert!(retrieved_tube.is_some(), "Tube should still be in the registry after creating peer connection");
 
         // Create a data channel with timeout
-        let data_channel_fut = tube.create_data_channel("test-channel");
+        let data_channel_fut = tube.create_data_channel("test-channel", "TEST_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string());
         let timeout_fut = tokio::time::timeout(tokio::time::Duration::from_secs(3), data_channel_fut);
         let data_channel = match timeout_fut.await {
             Ok(result) => {
@@ -82,7 +82,7 @@ fn test_tube_creation() {
         assert!(retrieved_channel.is_some(), "Data channel should be accessible by label");
 
         // Create the control channel with timeout
-        let control_channel_fut = tube.create_control_channel();
+        let control_channel_fut = tube.create_control_channel("TEST_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string());
         let timeout_fut = tokio::time::timeout(tokio::time::Duration::from_secs(3), control_channel_fut);
         let control_channel = match timeout_fut.await {
             Ok(result) => {
@@ -245,7 +245,7 @@ fn test_tube_p2p_connection() {
         println!("Creating data channels for communication");
         let dc1 = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tube1.create_data_channel("test-channel")
+            tube1.create_data_channel("test-channel", "TEST_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string())
         ).await {
             Ok(result) => result.expect("Failed to create data channel on tube1"),
             Err(_) => {
@@ -327,7 +327,7 @@ fn test_tube_p2p_connection() {
             println!("ICE exchange attempt {}", attempt);
 
             // Run directly instead of spawning to avoid Send issues
-            exchange_tube_ice_candidates(&tube1, &tube2).await;
+            let _ = exchange_tube_ice_candidates(&tube1, &tube2).await;
             println!("ICE candidate exchange completed");
 
             // After exchange, wait with increasing delay
@@ -443,7 +443,7 @@ fn test_tube_p2p_connection() {
             // Try exchanging more ICE candidates periodically
             if i > 0 && i % 30 == 0 {
                 println!("Re-exchanging ICE candidates at attempt {}", i);
-                exchange_tube_ice_candidates(&tube1, &tube2).await;
+                let _ = exchange_tube_ice_candidates(&tube1, &tube2).await;
             }
         }
 
@@ -472,7 +472,7 @@ fn test_tube_p2p_connection() {
                         println!("Message verification successful!");
                     },
                     Ok(None) => println!("Channel closed without receiving message"),
-                    Err(_) => println!("Timeout waiting for message"),
+                    Err(_) => assert!(false, "Timeout waiting for message"),
                 }
             }
         } else {
@@ -613,7 +613,7 @@ fn test_tube_channel_creation() {
         }
 
         // Create a data channel with timeout
-        let data_channel_fut = tube.create_data_channel("test-channel");
+        let data_channel_fut = tube.create_data_channel("test-channel", "TEST_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string());
         let timeout_fut = tokio::time::timeout(std::time::Duration::from_secs(3), data_channel_fut);
         let data_channel = match timeout_fut.await {
             Ok(result) => result.expect("Failed to create data channel"),
@@ -635,8 +635,6 @@ fn test_tube_channel_creation() {
         let _channel = tube.create_channel(
             "test",
             &data_channel,
-            "TEST_KSM_CONFIG".to_string(),
-            "TEST_CALLBACK_TOKEN".to_string(),
             Some(5.0),
         ).expect("Failed to create channel");
 

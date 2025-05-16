@@ -434,7 +434,7 @@ impl PyTubeRegistry {
         // Call the Rust implementation
         let result = runtime.block_on(async move {
             let mut registry = REGISTRY.write();
-            registry.new_connection(tube_id, connection_id, settings_json, server_mode).await
+            registry.new_connection(tube_id, connection_id, settings_json, server_mode, trickle_ice).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create connection: {}", e)))
         })?;
         
@@ -443,7 +443,11 @@ impl PyTubeRegistry {
     }
     
     /// Close a specific connection on a tube
-    fn close_connection(&self, tube_id: &str, channel_id: &str) -> PyResult<()> {
+    #[pyo3(signature = (
+        tube_id,
+        connection_id,
+    ))]
+    fn close_connection(&self, tube_id: &str, connection_id: &str) -> PyResult<()> {
         let runtime = get_runtime();
         
         runtime.block_on(async move {
@@ -455,7 +459,7 @@ impl PyTubeRegistry {
             };
             
             // Close the specific connection
-            tube.close_channel(channel_id)
+            tube.close_channel(connection_id)
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to close connection: {}", e)))
         })
     }
@@ -474,14 +478,14 @@ impl PyTubeRegistry {
     
     /// Create a channel on a tube
     #[pyo3(signature = (
-        channel_id,
+        connection_id,
         tube_id,
         settings,
     ))]
     fn create_channel(
         &self,
         py: Python<'_>,
-        channel_id: &str,
+        connection_id: &str,
         tube_id: &str,
         settings: PyObject,
     ) -> PyResult<PyObject> {
@@ -493,7 +497,7 @@ impl PyTubeRegistry {
         let runtime = get_runtime();
         runtime.block_on(async move {
             // Use register_channel from the Rust implementation
-            registry.register_channel(channel_id, tube_id, &settings_json).await
+            registry.register_channel(connection_id, tube_id, &settings_json).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create channel: {}", e)))?;
                 
             Ok::<(), PyErr>(())
@@ -506,7 +510,7 @@ impl PyTubeRegistry {
     /// Register a protocol handler for a channel
     #[pyo3(signature = (
         tube_id,
-        channel_id,
+        connection_id,
         protocol_type,
         settings = None,
     ))]
@@ -514,7 +518,7 @@ impl PyTubeRegistry {
         &self,
         py: Python<'_>,
         tube_id: &str,
-        channel_id: &str,
+        connection_id: &str,
         protocol_type: &str,
         settings: Option<PyObject>,
     ) -> PyResult<PyObject> {
@@ -530,7 +534,7 @@ impl PyTubeRegistry {
         runtime.block_on(async move {
             // Use the Rust implementation directly
             let registry = REGISTRY.read();
-            registry.register_protocol_handler(tube_id, channel_id, protocol_type, settings_json).await
+            registry.register_protocol_handler(tube_id, connection_id, protocol_type, settings_json).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to register protocol handler: {}", e)))
         })?;
         
@@ -541,7 +545,7 @@ impl PyTubeRegistry {
     /// Send a command to a protocol handler
     #[pyo3(signature = (
         tube_id,
-        channel_id,
+        connection_id,
         protocol_type,
         command,
         params = None,
@@ -550,7 +554,7 @@ impl PyTubeRegistry {
         &self,
         py: Python<'_>,
         tube_id: &str,
-        channel_id: &str,
+        connection_id: &str,
         protocol_type: &str,
         command: &str,
         params: Option<Vec<u8>>,
@@ -564,7 +568,7 @@ impl PyTubeRegistry {
         runtime.block_on(async move {
             // Use the Rust implementation directly
             let registry = REGISTRY.read();
-            registry.send_handler_command(tube_id, channel_id, protocol_type, command, params_bytes).await
+            registry.send_handler_command(tube_id, connection_id, protocol_type, command, params_bytes).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to send command: {}", e)))
         })?;
         
@@ -576,12 +580,12 @@ impl PyTubeRegistry {
     fn get_handler_status(
         &self,
         tube_id: &str,
-        channel_id: &str,
+        connection_id: &str,
         protocol_type: &str,
     ) -> PyResult<String> {
         // Use the Rust implementation directly
         let registry = REGISTRY.read();
-        registry.get_handler_status(tube_id, channel_id, protocol_type)
+        registry.get_handler_status(tube_id, connection_id, protocol_type)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to get handler status: {}", e)))
     }
     
@@ -590,5 +594,27 @@ impl PyTubeRegistry {
         let mut callbacks = PYTHON_CALLBACKS.write();
         callbacks.remove(tube_id);
         Ok(())
+    }
+    
+    /// Get a tube object by conversation ID
+    fn get_tube_by_conversation_id(&self, conversation_id: &str) -> PyResult<PyTube> {
+        let registry = REGISTRY.read();
+        if let Some(tube) = registry.get_by_conversation_id(conversation_id) {
+            // Create a signal receiver for existing tube
+            let signal_receiver = {
+                drop(registry); // Release read lock before writing
+                let mut registry = REGISTRY.write();
+                let receiver = registry.register_signal_channel(&tube.id());
+                Some(Arc::new(Mutex::new(receiver)))
+            };
+            
+            Ok(PyTube { 
+                tube, 
+                sdp: None, // No SDP available for existing tubes
+                signal_receiver,
+            })
+        } else {
+            Err(PyRuntimeError::new_err(format!("No tube found for conversation: {}", conversation_id)))
+        }
     }
 }

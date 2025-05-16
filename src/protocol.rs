@@ -152,55 +152,44 @@ impl Frame {
 /// Try to parse the first complete frame from `buf`.  If successful, remove it
 /// from the buffer and return.  Otherwise, return `None` (need more data).
 pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
-    // Debug message with buffer size
-    log::debug!("try_parse_frame: Buffer size: {}", buf.len());
-    
+    // Early check for minimum size before any processing
     if buf.len() < CONN_NO_LEN + TS_LEN + LEN_LEN {
-        log::debug!("try_parse_frame: Buffer too small for header ({} < {})", 
-                   buf.len(), CONN_NO_LEN + TS_LEN + LEN_LEN);
         return None;
     }
     
+    // Create cursor without consuming the buffer yet
     let mut cursor = &buf[..];
     let conn_no = cursor.get_u32();
     let ts = cursor.get_u64();
     let len = cursor.get_u32() as usize;
     
-    // Debug frame header info
-    log::debug!("try_parse_frame: Header parsed - conn_no: {}, timestamp: {}, payload_len: {}", 
-               conn_no, ts, len);
-    
-    // total frame length including header and terminator
-    let needed = CONN_NO_LEN + TS_LEN + LEN_LEN + len + TERMINATOR.len();
-    if buf.len() < needed {
-        log::debug!("try_parse_frame: Buffer too small for complete frame ({} < {})", 
-                   buf.len(), needed);
+    // Calculate total frame size including terminator
+    let total_size = CONN_NO_LEN + TS_LEN + LEN_LEN + len + TERMINATOR.len();
+    if buf.len() < total_size {
         return None;
     }
     
-    // verify terminator
-    let term_start = needed - TERMINATOR.len();
-    if &buf[term_start..needed] != TERMINATOR {
-        // corrupt stream; drop everything so the higher layer can close
+    // Verify terminator before any allocation
+    let term_start = CONN_NO_LEN + TS_LEN + LEN_LEN + len;
+    if &buf[term_start..term_start + TERMINATOR.len()] != TERMINATOR {
+        // corrupt stream; drop everything
         log::warn!("try_parse_frame: Corrupt stream, terminator mismatch. Expected {:?}, got {:?}", 
-                  TERMINATOR, &buf[term_start..needed]);
+                  TERMINATOR, &buf[term_start..term_start + TERMINATOR.len()]);
         buf.clear();
         return None;
     }
     
-    // Extract payload bytes - we'll use split_to for efficient extraction
-    // This is more efficient than copying in most cases
-    let payload_start = CONN_NO_LEN + TS_LEN + LEN_LEN;
-    let mut frame_bytes = buf.split_to(payload_start + len);
-    frame_bytes.advance(payload_start); // Skip past the header
-    let payload = frame_bytes.freeze(); // Convert to immutable Bytes
+    // Skip the header portion
+    buf.advance(CONN_NO_LEN + TS_LEN + LEN_LEN);
     
-    // Advance buffer past the terminator
+    // Extract payload as a separate chunk (zero-copy)
+    let payload_bytes = buf.split_to(len);
+    let payload = payload_bytes.freeze();
+    
+    // Skip terminator
     buf.advance(TERMINATOR.len());
     
-    log::debug!("try_parse_frame: Successfully parsed frame - conn_no: {}, payload_len: {}", 
-               conn_no, payload.len());
-    
+    // Create frame with extracted values and payload
     Some(Frame {
         connection_no: conn_no,
         timestamp_ms: ts,

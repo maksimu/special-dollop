@@ -5,7 +5,7 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use log;
-
+use log::{debug, error, info, warn};
 use crate::channel::Channel;
 use crate::webrtc_core::{WebRTCPeerConnection, create_data_channel};
 use crate::models::TunnelTimeouts;
@@ -13,6 +13,7 @@ use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::{TubeStatus, setup_channel_for_data_channel};
 use crate::tube_registry::REGISTRY;
 use crate::webrtc_data_channel::WebRTCDataChannel;
+use bytes;
 
 // A single tube holding a WebRTC peer connection and channels
 #[derive(Clone)]
@@ -42,8 +43,8 @@ impl Tube {
         // Print debug info about the current registry state
         {
             let registry = REGISTRY.read();
-            log::debug!("Before adding new tube - registry has {} tubes", registry.all_tube_ids().len());
-            log::debug!("Registry tubes: {:?}", registry.all_tube_ids());
+            debug!("Before adding new tube - registry has {} tubes", registry.all_tube_ids().len());
+            debug!("Registry tubes: {:?}", registry.all_tube_ids());
         }
 
         let tube = Arc::new(Self {
@@ -58,7 +59,7 @@ impl Tube {
 
         // Register in the global registry with explicit lock scope
         {
-            log::info!("Adding tube with ID: {} to registry", id);
+            info!("Adding tube with ID: {} to registry", id);
             let mut registry = REGISTRY.write();
             registry.add_tube(Arc::clone(&tube));
         }
@@ -67,9 +68,9 @@ impl Tube {
         {
             let registry = REGISTRY.read();
             let tube_ids = registry.all_tube_ids();
-            log::debug!("After adding tube - registry contains: {:?}", tube_ids);
+            debug!("After adding tube - registry contains: {:?}", tube_ids);
             if !tube_ids.contains(&id) {
-                log::error!("ERROR: Added tube not found in registry!");
+                error!("ERROR: Added tube not found in registry!");
             }
         }
 
@@ -101,7 +102,6 @@ impl Tube {
         
         // Set up connection state monitoring
         let status = self.status.clone();
-        let ksm_config_clone = ksm_config.clone();
         let callback_token_clone = callback_token.clone();
         let tube_id = self.id.clone();
         
@@ -114,18 +114,18 @@ impl Tube {
                 match state {
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected => {
                         *status_clone.write() = TubeStatus::Connected;
-                        log::info!("Tube connection state changed to Connected");
+                        info!("Tube connection state changed to Connected");
                     },
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
                         *status_clone.write() = TubeStatus::Failed;
-                        log::info!("Tube connection state changed to Failed");
+                        info!("Tube connection state changed to Failed");
                     },
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed => {
                         *status_clone.write() = TubeStatus::Closed;
-                        log::info!("Tube connection state changed to Closed");
+                        info!("Tube connection state changed to Closed");
                     },
                     _ => {
-                        log::debug!("Connection state changed to: {:?}", state);
+                        debug!("Connection state changed to: {:?}", state);
                     }
                 }
             })
@@ -133,35 +133,31 @@ impl Tube {
         
         // Set up handler for incoming data channels
         let tube_clone = self.clone();
-        let ksm_config_for_handler = ksm_config_clone.clone();
-        let callback_token_for_handler = callback_token_clone.clone();
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
             let tube = tube_clone.clone();
-            let ksm_config_inner = ksm_config_for_handler.clone();
-            let callback_token_inner = callback_token_for_handler.clone();
             
             Box::pin(async move {
                 let label = rtc_data_channel.label().to_string();
-                log::info!("Received data channel from remote peer with label: {}", label);
+                info!("Received data channel from remote peer with label: {}", label);
 
                 // Create our WebRTCDataChannel wrapper
                 let data_channel = WebRTCDataChannel::new(rtc_data_channel);
 
                 // Add it to our data channels map
                 if let Err(e) = tube.add_data_channel(data_channel.clone()) {
-                    log::error!("Failed to add data channel to tube: {}", e);
+                    error!("Failed to add data channel to tube: {}", e);
                     return;
                 }
 
                 // If this is the control channel, store it specially
                 if label == "control" {
                     *tube.control_channel.write() = Some(data_channel.clone());
-                    log::info!("Set control channel");
+                    info!("Set control channel");
                     return;
                 }
 
                 // Set up the data channel and create a Channel object
-                let channel = setup_channel_for_data_channel(&data_channel, label.clone(), ksm_config_inner, callback_token_inner, None);
+                let channel = setup_channel_for_data_channel(&data_channel, label.clone(), None);
 
                 // Store in the channel map
                 tube.channels.write().insert(label.clone(), Arc::clone(&channel));
@@ -175,7 +171,7 @@ impl Tube {
                     let channel = match channel_clone.lock() {
                         Ok(guard) => (*guard).clone(),
                         Err(e) => {
-                            log::error!("Failed to lock channel '{}': {}", label_clone, e);
+                            error!("Failed to lock channel '{}': {}", label_clone, e);
                             return;
                         }
                     };
@@ -189,16 +185,16 @@ impl Tube {
 
                     if is_server_mode {
                         if let Err(e) = channel.run().await {
-                            log::error!("Channel '{}' encountered an error: {}", label_clone, e);
+                            error!("Channel '{}' encountered an error: {}", label_clone, e);
                         }
                     } else {
                         if let Err(e) = channel.wait_for_events().await {
-                            log::error!("Channel '{}' encountered an error in wait_for_events: {}", label_clone, e);
+                            error!("Channel '{}' encountered an error in wait_for_events: {}", label_clone, e);
                         }
                     }
                 });
                 
-                log::info!("Successfully set up channel for incoming data channel: {}", label);
+                info!("Successfully set up channel for incoming data channel: {}", label);
             })
         }));
 
@@ -210,7 +206,7 @@ impl Tube {
         *self.status.write() = TubeStatus::Connecting;
 
         // Print debug status
-        log::debug!("Updated tube status to: {:?}", self.status());
+        debug!("Updated tube status to: {:?}", self.status());
 
         // Add a small delay to ensure any pending operations complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -219,9 +215,9 @@ impl Tube {
         {
             let registry = REGISTRY.read();
             let tube_ids = registry.all_tube_ids();
-            log::debug!("After creating peer connection - registry contains: {:?}", tube_ids);
+            debug!("After creating peer connection - registry contains: {:?}", tube_ids);
             if !tube_ids.contains(&self.id) {
-                log::warn!("WARNING: Tube not found in registry after creating peer connection!");
+                warn!("WARNING: Tube not found in registry after creating peer connection!");
 
                 // Re-add it to the registry as a safeguard using get_tube
                 drop(registry); // Release the read lock
@@ -229,7 +225,7 @@ impl Tube {
                 // Cannot re-add directly since we don't have an Arc<Tube> to self
                 // Instead, we'll create a flag to indicate that this tube needs to be re-registered
                 *self.status.write() = TubeStatus::Connecting;
-                log::info!("Marked tube for re-registration");
+                info!("Marked tube for re-registration");
             }
         }
 
@@ -281,12 +277,15 @@ impl Tube {
     }
     
     // Create a new data channel and add it to the tube
-    pub async fn create_data_channel(&self, label: &str) -> Result<WebRTCDataChannel> {
+    pub async fn create_data_channel(&self, label: &str, ksm_config: String, callback_token: String) -> Result<WebRTCDataChannel> {
         let pc_guard = self.peer_connection.lock().await;
         
         if let Some(pc) = &*pc_guard {
             let rtc_data_channel = create_data_channel(&pc.peer_connection, label).await?;
             let data_channel = WebRTCDataChannel::new(rtc_data_channel);
+            
+            // Set up message handler with zero-copy using buffer pool
+            self.setup_data_channel_handlers(&data_channel, label.to_string(), ksm_config, callback_token);
             
             // Clone for release outside the lock
             let data_channel_clone = data_channel.clone();
@@ -303,13 +302,175 @@ impl Tube {
         }
     }
     
+    // Setup event handlers for a data channel
+    fn setup_data_channel_handlers(&self, data_channel: &WebRTCDataChannel, label: String, ksm_config: String, callback_token: String) {
+        // Store references directly where possible
+        let dc_ref = &data_channel.data_channel;
+        let tube_id_ref = self.id.clone();
+        let channel_map_ref = Arc::clone(&self.channels);
+        
+        // Create a single buffer pool at the tube level rather than per-message
+        let buffer_pool = Arc::new(crate::buffer_pool::BufferPool::default());
+        
+        // Clone the label for message handler
+        let label_for_message = label.clone();
+        
+        // Set up the message handler
+        dc_ref.on_message(Box::new(move |msg| {
+            // Clone references for the async block
+            let tube_id = tube_id_ref.clone();
+            let label_clone = label_for_message.clone();
+            let channel_map = Arc::clone(&channel_map_ref);
+            let buffer_pool_clone = Arc::clone(&buffer_pool);
+            
+            Box::pin(async move {
+                // Convert WebRTC message data to Bytes with minimal copying
+                let message_bytes = if msg.is_string {
+                    // For text, we have a less efficient path that requires allocation
+                    warn!("Tube {}: String data path hit - less efficient allocation needed ({} bytes)", 
+                         tube_id, msg.data.len());
+                    
+                    // If the string data is small enough, we could still use buffer pool
+                    if msg.data.len() <= 1024 {
+                        // For small strings, use the buffer pool
+                        buffer_pool_clone.create_bytes(&msg.data)
+                    } else {
+                        // For larger strings, fall back to normal allocation
+                        bytes::Bytes::from(msg.data.to_vec())
+                    }
+                } else {
+                    // For binary, use the buffer pool to avoid allocation - optimal path
+                    buffer_pool_clone.create_bytes(&msg.data)
+                };
+                let message_len = message_bytes.len();
+                
+                debug!("Tube {}: Received {} bytes on data channel '{}'", 
+                           tube_id, message_len, label_clone);
+                
+                // Find the channel outside any lock scope
+                let channel_option = {
+                    // Acquire read lock in a limited scope
+                    channel_map.read().get(&label_clone).cloned()
+                };
+                
+                // Process the message if we found a channel (avoids nested scopes)
+                if let Some(channel) = channel_option {
+                    // Try to get a reference to the channel without excessive cloning
+                    let channel_object = match channel.try_lock() {
+                        Ok(guard) => {
+                            // Clone the channel content, not the guard
+                            let channel_clone = (*guard).clone();
+                            // Explicitly drop the guard before any await points
+                            drop(guard);
+                            channel_clone
+                        },
+                        Err(_) => {
+                            error!("Failed to lock channel '{}': already locked", label_clone);
+                            return;
+                        }
+                    };
+                    
+                    // Now we can safely process the message with no guard held
+                    if let Err(e) = channel_object.receive_message(message_bytes).await {
+                        error!("Failed to forward message to channel '{}': {}", 
+                             label_clone, e);
+                    }
+                } else {
+                    // No registered channel handler, log the message
+                    debug!("No channel handler for data channel '{}' with {} bytes", 
+                              label_clone, message_len);
+                }
+            })
+        }));
+        
+        // Set up state change handler - use string literals to avoid clones
+        let label_for_open = label.clone();
+        let ksm_config_for_open = ksm_config.clone();
+        let callback_token_for_open = callback_token.clone();
+        let self_clone_for_open = self.clone();
+        
+        dc_ref.on_open(Box::new(move || {
+            let label_clone = label_for_open.clone();
+            let ksm_config_clone = ksm_config_for_open.clone();
+            let callback_token_clone = callback_token_for_open.clone();
+            let self_clone = self_clone_for_open.clone();
+            
+            Box::pin(async move {
+                info!("Data channel '{}' opened", label_clone);
+                if let Err(e) = self_clone.report_connection_open(ksm_config_clone, callback_token_clone).await {
+                    error!("Failed to report connection open: {}", e);
+                }
+            })
+        }));
+        
+        let self_clone_for_close = self.clone();
+        
+        dc_ref.on_close(Box::new(move || {
+            let label_clone = label.clone();
+            let ksm_config_clone = ksm_config.clone();
+            let callback_token_clone = callback_token.clone();
+            let self_clone = self_clone_for_close.clone();
+            
+            Box::pin(async move {
+                info!("Data channel '{}' closed", label_clone);
+                if let Err(e) = self_clone.report_connection_close(ksm_config_clone, callback_token_clone).await {
+                    error!("Failed to report connection close: {}", e);
+                }
+            })
+        }));
+    }
+    
+    // Report connection open state to router
+    pub async fn report_connection_open(&self, ksm_config: String, callback_token: String) -> std::result::Result<(), String> {
+        debug!("Sending connection open callback to router");
+        let token_value = serde_json::Value::String(callback_token);
+
+        match crate::router_helpers::post_connection_state(
+            &*ksm_config,
+            "connection_open",
+            &token_value,
+            None
+        ).await {
+            Ok(_) => {
+                debug!("Connection open callback sent successfully");
+                Ok(())
+            },
+            Err(e) => {
+                error!("Error sending connection open callback: {}", e);
+                Err(format!("Failed to send connection open callback: {}", e))
+            }
+        }
+    }
+
+    pub async fn report_connection_close(&self, ksm_config: String, callback_token: String) -> std::result::Result<(), String> {
+        // Report connection close to router if configuration exists
+        debug!("Sending connection close callback to router");
+        let token_value = serde_json::Value::String(callback_token);
+
+        // Fall back to direct API call
+        match crate::router_helpers::post_connection_state(
+            &*ksm_config,
+            "connection_close",
+            &token_value,
+            Some(true) // Assuming terminated=true as default for simplicity
+        ).await {
+            Ok(_) => {
+                debug!("Connection close callback sent successfully");
+                Ok(())
+            },
+            Err(e) => {
+                error!("Error sending connection close callback: {}", e);
+                Err(e.to_string())
+            }
+        }
+    }
+
+
     // Create a channel with the given name, using an existing data channel
     pub fn create_channel(
         &self,
         name: &str,
         data_channel: &WebRTCDataChannel,
-        ksm_config: String,
-        callback_token: String,
         timeout_seconds: Option<f64>,
     ) -> Result<Arc<Mutex<Channel>>> {
         // Create timeouts
@@ -325,7 +486,7 @@ impl Tube {
         };
 
         // Set up the data channel and create a Channel object
-        let channel = setup_channel_for_data_channel(data_channel, name.to_string(), ksm_config, callback_token, timeouts);
+        let channel = setup_channel_for_data_channel(data_channel, name.to_string(), timeouts);
 
         // Store in the channel map
         self.channels.write().insert(name.to_string(), Arc::clone(&channel));
@@ -337,13 +498,13 @@ impl Tube {
             let channel = match channel_clone.lock() {
                 Ok(guard) => (*guard).clone(),
                 Err(e) => {
-                    log::error!("Failed to lock channel '{}': {}", name_clone, e);
+                    error!("Failed to lock channel '{}': {}", name_clone, e);
                     return;
                 }
             };
 
             if let Err(e) = channel.run().await {
-                log::error!("Channel '{}' encountered an error: {}", name_clone, e);
+                error!("Channel '{}' encountered an error: {}", name_clone, e);
             }
         });
 
@@ -351,8 +512,8 @@ impl Tube {
     }
     
     // Create the default control channel
-    pub async fn create_control_channel(&self) -> Result<WebRTCDataChannel> {
-        let control_channel = self.create_data_channel("control").await?;
+    pub async fn create_control_channel(&self, ksm_config: String, callback_token: String) -> Result<WebRTCDataChannel> {
+        let control_channel = self.create_data_channel("control", ksm_config, callback_token).await?;
         *self.control_channel.write() = Some(control_channel.clone());
         Ok(control_channel)
     }
@@ -448,11 +609,11 @@ impl Tube {
     
     // Close the entire tube
     pub async fn close(&self) -> Result<()> {
-        log::info!("Closing tube with ID: {}", self.id);
+        info!("Closing tube with ID: {}", self.id);
 
         // Set the status to Closed first to prevent Drop from trying to remove
         *self.status.write() = TubeStatus::Closed;
-        log::info!("Set tube status to Closed");
+        info!("Set tube status to Closed");
 
         // Close all channels
         self.channels.write().clear();
@@ -470,18 +631,18 @@ impl Tube {
 
         // Remove from the global registry with explicit error handling
         {
-            log::info!("Removing tube {} from registry via close()", self.id);
+            info!("Removing tube {} from registry via close()", self.id);
             let mut registry = REGISTRY.write();
             registry.remove_tube(&self.id);
 
             // Verify removal
             if registry.all_tube_ids().contains(&self.id) {
-                log::warn!("WARNING: Failed to remove tube from registry!");
+                warn!("WARNING: Failed to remove tube from registry!");
                 // Force removal in case it wasn't properly removed
                 registry.tubes_by_id.remove(&self.id);
                 registry.conversation_mappings.retain(|_, tid| tid != &self.id);
             } else {
-                log::info!("Successfully removed tube from registry");
+                info!("Successfully removed tube from registry");
             }
         }
 
@@ -504,37 +665,37 @@ impl Tube {
 
 impl Drop for Tube {
     fn drop(&mut self) {
-        log::debug!("Drop called for tube with ID: {}", self.id);
+        debug!("Drop called for tube with ID: {}", self.id);
 
         // Only attempt to remove if not already in Closed state
         // This prevents redundant removal attempts
         if *self.status.read() != TubeStatus::Closed {
-            log::debug!("Drop: removing tube {} from registry", self.id);
+            debug!("Drop: removing tube {} from registry", self.id);
             
             // Attempt to acquire the lock - if we can't, log an error
             match REGISTRY.try_write() {
                 Some(mut registry) => {
                     registry.remove_tube(&self.id);
-                    log::debug!("Drop: tube removed from registry");
+                    debug!("Drop: tube removed from registry");
                     
                     // Force additional cleanup in case references remain
                     registry.tubes_by_id.remove(&self.id);
                     registry.conversation_mappings.retain(|_, tid| tid != &self.id);
                 }
                 None => {
-                    log::error!("Drop: couldn't acquire registry lock for tube {}", self.id);
+                    error!("Drop: couldn't acquire registry lock for tube {}", self.id);
                     // Spawn a cleanup task on the runtime
                     let id = self.id.clone();
                     if let Ok(runtime) = std::panic::catch_unwind(|| get_runtime()) {
                         runtime.spawn(async move {
-                            log::info!("Async cleanup for tube {}", id);
+                            info!("Async cleanup for tube {}", id);
                             // Use a loop with retry logic
                             for attempt in 1..=3 {
                                 if let Some(mut registry) = REGISTRY.try_write() {
                                     registry.remove_tube(&id);
                                     registry.tubes_by_id.remove(&id);
                                     registry.conversation_mappings.retain(|_, tid| tid != &id);
-                                    log::info!("Async cleanup successful for tube {} on attempt {}", id, attempt);
+                                    info!("Async cleanup successful for tube {} on attempt {}", id, attempt);
                                     break;
                                 }
                                 tokio::time::sleep(tokio::time::Duration::from_millis(10 * attempt)).await;
@@ -544,7 +705,7 @@ impl Drop for Tube {
                 }
             }
         } else {
-            log::debug!("Drop: tube {} already in Closed state, skipping registry cleanup", self.id);
+            debug!("Drop: tube {} already in Closed state, skipping registry cleanup", self.id);
         }
     }
 }

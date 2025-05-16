@@ -82,20 +82,6 @@ impl GuacdHandler {
         }
     }
 
-    fn initialize(&mut self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async {
-            debug!("GuacdHandler: Initializing handler with client_id: {}", self.client_id);
-            // Print the settings we have
-            debug!("GuacdHandler: Connection settings:");
-            for (key, value) in &self.connection_settings {
-                debug!("  - {}: {}", key, value);
-            }
-            
-            // Connect to guacd server during initialization
-            self.connect_to_guacd().await
-        })
-    }
-
     async fn connect_to_guacd(&mut self) -> Result<()> {
         let host = self.connection_settings.get("host")
             .and_then(|v| v.as_str())

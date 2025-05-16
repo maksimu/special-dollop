@@ -1,7 +1,7 @@
 // Protocol handlers for channel communication
 mod socks5;
 pub mod guacd;
-mod port_forward;
+pub(crate) mod port_forward;
 pub mod guacd_parser;
 
 pub use socks5::SOCKS5Handler;

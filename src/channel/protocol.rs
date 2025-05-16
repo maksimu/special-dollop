@@ -81,63 +81,113 @@ impl Channel {
         // Only collect protocol type names, not trying to clone the actual handlers
         let protocol_types: Vec<String> = self.protocol_handlers.keys().cloned().collect();
         
-        // Set up data channel state change monitoring
-        let runtime = get_runtime();
-        
         // We only set this up once per channel
         static STATE_MONITORING_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if STATE_MONITORING_SET.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return; // Already set up
         }
         
-        // Create a closure to track WebRTC state
-        let mut last_state = webrtc.ready_state();
+        // Create a reference to share with the closure
         let server_mode_clone = self.server_mode.clone();
         
-        // Spawn a background task to monitor WebRTC state changes
-        runtime.spawn(async move {
-            // Check the state periodically
-            let mut check_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        // Set up the state change handler directly on the WebRTC data channel
+        let last_state = webrtc.ready_state();
+        
+        // Create a shared channel for state change notifications
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(8);
+        
+        // Set up the WebRTC data channel state change callback
+        let data_channel = webrtc.data_channel.clone();
+        let state_tx_clone = state_tx.clone();
+        
+        // Register callback for data channel state changes - properly access the state change functionality
+        data_channel.on_open(Box::new(move || {
+            let tx = state_tx_clone.clone();
             
-            loop {
-                check_interval.tick().await;
-                
-                // Get current state
-                let current_state = webrtc.ready_state();
-                
-                // If the state changed, notify protocol handlers
-                if current_state != last_state {
+            // Spawn task to send state change notification for open
+            tokio::spawn(async move {
+                if let Err(e) = tx.send("Open".to_string()).await {
+                    log::error!("Failed to send open state notification: {}", e);
+                }
+            });
+            
+            Box::pin(async {})
+        }));
+        
+        let state_tx_clone2 = state_tx.clone();
+        data_channel.on_close(Box::new(move || {
+            let tx = state_tx_clone2.clone();
+            
+            // Spawn task to send state change notification for close
+            tokio::spawn(async move {
+                if let Err(e) = tx.send("Closed".to_string()).await {
+                    log::error!("Failed to send close state notification: {}", e);
+                }
+            });
+            
+            Box::pin(async {})
+        }));
+        
+        let state_tx_clone3 = state_tx.clone();
+        data_channel.on_error(Box::new(move |err| {
+            let tx = state_tx_clone3.clone();
+            let err_str = format!("Error: {}", err);
+            
+            // Spawn task to send state change notification for error
+            tokio::spawn(async move {
+                if let Err(e) = tx.send(err_str).await {
+                    log::error!("Failed to send error state notification: {}", e);
+                }
+            });
+            
+            Box::pin(async {})
+        }));
+        
+        // We need to clone these for the task that processes the events
+        let webrtc_clone = webrtc.clone();
+        let channel_id_clone = channel_id.clone();
+        let protocol_types_clone = protocol_types.clone();
+        
+        // Spawn a task to handle the state change events
+        let runtime = get_runtime();
+        runtime.spawn(async move {
+            let mut last_state_in_task = last_state;
+            
+            // Process state change events
+            while let Some(current_state) = state_rx.recv().await {
+                // Only process if the state actually changed
+                if current_state != last_state_in_task {
                     log::info!("Endpoint {}: WebRTC state changed: {} -> {}", 
-                             channel_id, last_state, current_state);
+                             channel_id_clone, last_state_in_task, current_state);
                     
                     // Process each protocol type
-                    for protocol_type in &protocol_types {
+                    for protocol_type in &protocol_types_clone {
                         // Create a new handler instance for each type
-                        // This avoids the need to clone the existing handlers
                         match create_protocol_handler(server_mode_clone, HashMap::new()) {
                             Ok(mut handler) => {
                                 // Set the WebRTC channel
-                                handler.set_webrtc_channel(webrtc.clone());
+                                handler.set_webrtc_channel(webrtc_clone.clone());
                                 
                                 // Notify about state change
                                 if let Err(e) = handler.on_webrtc_channel_state_change(&current_state).await {
                                     log::error!("Endpoint {}: Error notifying {} handler of state change: {}", 
-                                             channel_id, protocol_type, e);
+                                             channel_id_clone, protocol_type, e);
                                 }
                             },
                             Err(e) => {
                                 log::error!("Endpoint {}: Failed to create handler for {}: {}", 
-                                         channel_id, protocol_type, e);
+                                         channel_id_clone, protocol_type, e);
                             }
                         }
                     }
                     
-                    last_state = current_state.clone();
+                    // Update last state
+                    last_state_in_task = current_state.clone();
                 }
                 
-                // If the channel is closed/closing, and we're monitoring, exit the loop
+                // If closed/closing, break the loop
                 if current_state.to_lowercase() == "closed" || current_state.to_lowercase() == "closing" {
-                   debug!("Endpoint {}: WebRTC channel closed, stopping state monitoring", channel_id);
+                    debug!("Endpoint {}: WebRTC channel closed, stopping state monitoring", channel_id_clone);
                     
                     // Reset the monitoring flag so it can be set up again if needed
                     STATE_MONITORING_SET.store(false, std::sync::atomic::Ordering::Release);

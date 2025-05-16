@@ -50,6 +50,7 @@ impl TubeRegistry {
     }
 
     // Register a signal channel for a tube
+    #[allow(dead_code)]
     pub(crate) fn register_signal_channel(&mut self, tube_id: &str) -> Receiver<SignalMessage> {
         let (sender, receiver) = channel::<SignalMessage>();
         self.signal_channels.insert(tube_id.to_string(), sender);
@@ -67,6 +68,7 @@ impl TubeRegistry {
     }
 
     // Send a message to the signal channel for a tube
+    #[allow(dead_code)]
     pub(crate) fn send_signal(&self, message: SignalMessage) -> Result<()> {
         if let Some(sender) = self.signal_channels.get(&message.tube_id) {
             sender.send(message).map_err(|e| anyhow!("Failed to send signal: {}", e))?;
@@ -89,6 +91,7 @@ impl TubeRegistry {
     }
 
     // Set server mode
+    #[allow(dead_code)]
     pub(crate) fn set_server_mode(&mut self, server_mode: bool) {
         self.server_mode = server_mode;
     }
@@ -123,6 +126,7 @@ impl TubeRegistry {
     }
 
     // Get a tube by a conversation ID
+    #[allow(dead_code)]
     pub(crate) fn get_by_conversation_id(&self, conversation_id: &str) -> Option<Arc<Tube>> {
         if let Some(tube_id) = self.conversation_mappings.get(conversation_id) {
             self.tubes_by_id.get(tube_id).cloned()
@@ -132,6 +136,7 @@ impl TubeRegistry {
     }
 
     // Associate a conversation ID with a tube
+    #[allow(dead_code)]
     pub(crate) fn associate_conversation(&mut self, tube_id: &str, conversation_id: &str) -> Result<()> {
         if !self.tubes_by_id.contains_key(tube_id) {
             return Err(anyhow!("Tube not found: {}", tube_id));
@@ -147,6 +152,7 @@ impl TubeRegistry {
     }
 
     // Find tubes by partial match of tube ID or conversation ID
+    #[allow(dead_code)]
     pub(crate) fn find_tubes(&self, search_term: &str) -> Vec<Arc<Tube>> {
         let mut results = Vec::new();
 
@@ -173,11 +179,13 @@ impl TubeRegistry {
     }
     
     /// get all conversations from a tube id
+    #[allow(dead_code)]
     pub(crate) fn tube_id_from_conversation_id(&self, conversation_id: &str) -> Option<&String> {
         self.conversation_mappings.get(conversation_id)
     }
     
     /// get all conversation ids by tube id 
+    #[allow(dead_code)]
     pub(crate) fn conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<&String> {
         let mut results = Vec::new();
         // Search in conversation IDs
@@ -193,6 +201,7 @@ impl TubeRegistry {
     }
 
     /// Create a tube with WebRTC connection and ICE configuration
+    #[allow(dead_code)]
     pub(crate) async fn create_tube(
         &mut self,
         conversation_id: &str,
@@ -295,20 +304,18 @@ impl TubeRegistry {
         ).await?;
         
         // Create the control channel
-        match tube.create_control_channel().await {
+        match tube.create_control_channel(ksm_config.to_string(), callback_token.to_string()).await {
             Ok(_) => log::debug!("Control channel created for tube {}", tube.id()),
             Err(e) => log::warn!("Failed to create control channel: {}", e),
         }
         
         // Create a data channel for the conversation
-        let data_channel = tube.create_data_channel(conversation_id).await?;
+        let data_channel = tube.create_data_channel(conversation_id,ksm_config.to_string(), callback_token.to_string()).await?;
         
         // Create the channel
         let channel = tube.create_channel(
             conversation_id,
             &data_channel,
-            ksm_config.to_string(),
-            callback_token.to_string(),
             None,  // timeout_seconds
         )?;
         
@@ -339,6 +346,7 @@ impl TubeRegistry {
     }
     
     /// Set remote description and create answer if needed
+    #[allow(dead_code)]
     pub(crate) async fn set_remote_description(
         &self,
         tube_id: &str,
@@ -364,6 +372,7 @@ impl TubeRegistry {
     }
     
     /// Add an ICE candidate
+    #[allow(dead_code)]
     pub(crate) async fn add_ice_candidate(
         &self,
         tube_id: &str,
@@ -379,6 +388,7 @@ impl TubeRegistry {
     }
     
     /// Get connection state
+    #[allow(dead_code)]
     pub(crate) async fn get_connection_state(&self, tube_id: &str) -> Result<String> {
         let tube = self.get_by_tube_id(tube_id)
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
@@ -387,6 +397,7 @@ impl TubeRegistry {
     }
     
     /// Close a tube
+    #[allow(dead_code)]
     pub(crate) async fn close_tube(&mut self, tube_id: &str) -> Result<()> {
         let tube = self.get_by_tube_id(tube_id)
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
@@ -401,12 +412,14 @@ impl TubeRegistry {
     }
     
     /// Register a channel and set up a data channel
+    #[allow(dead_code)]
     pub(crate) async fn register_channel(
         &mut self,
         channel_id: &str,
         tube_id: &str,
         settings: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
+        // TODO if we are using an existing tube then webrtc is already set up... just need a new data channel and channel
 
         // Associate conversation with tube
         self.associate_conversation(&tube_id, channel_id)?;
@@ -437,13 +450,13 @@ impl TubeRegistry {
         tube.create_peer_connection(None, trickle_ice, turn_only, ksm_config.to_string(), callback_token.to_string()).await?;
         
         // Create a data channel for this channel
-        let data_channel = tube.create_data_channel(channel_id).await?;
+        let data_channel = tube.create_data_channel(channel_id, ksm_config.to_string(), callback_token.to_string()).await?;
         
         // Create the channel
-        tube.create_channel(channel_id, &data_channel, ksm_config.to_string(), callback_token.to_string(), None)?;
+        tube.create_channel(channel_id, &data_channel, None)?;
         
         // Create the control channel
-        if let Err(e) = tube.create_control_channel().await {
+        if let Err(e) = tube.create_control_channel(ksm_config.to_string(), callback_token.to_string()).await {
             log::warn!("Failed to create control channel: {}", e);
         }
         
@@ -451,6 +464,7 @@ impl TubeRegistry {
         let channels = tube.channels.read();
         if let Some(channel) = channels.get(channel_id) {
             // Use the provided protocol type if available, otherwise determine from settings
+            // TODO this is wrong... should be using the value in settings
             let protocol_type =
                 // Determine protocol type from settings
                 if settings.contains_key("destination") {
@@ -489,6 +503,7 @@ impl TubeRegistry {
     }
 
     /// Register a protocol handler for a channel
+    #[allow(dead_code)]
     pub(crate) async fn register_protocol_handler(
         &self,
         tube_id: &str,
@@ -515,6 +530,7 @@ impl TubeRegistry {
     }
 
     /// Send a command to a protocol handler
+    #[allow(dead_code)]
     pub(crate) async fn send_handler_command(
         &self,
         tube_id: &str,
@@ -542,6 +558,7 @@ impl TubeRegistry {
     }
 
     /// Get the status of a protocol handler
+    #[allow(dead_code)]
     pub(crate) fn get_handler_status(
         &self,
         tube_id: &str,
@@ -567,12 +584,14 @@ impl TubeRegistry {
     }
 
     /// Create a new connection, either using an existing tube or creating a new one
+    #[allow(dead_code)]
     pub(crate) async fn new_connection(
         &mut self,
         tube_id: Option<&str>,
         channel_id: &str,
         settings: HashMap<String, serde_json::Value>,
         server_mode: bool,
+        trickle_ice: bool,
     ) -> Result<String> {
         // Handle tube_id logic
         let the_tube_id = match tube_id {
@@ -606,6 +625,7 @@ impl TubeRegistry {
     }
 
     /// Add an ICE candidate received from the external source
+    #[allow(dead_code)]
     pub(crate) async fn add_external_ice_candidate(&self, tube_id: &str, candidate: &str) -> Result<()> {
         let tube = self.get_by_tube_id(tube_id)
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;

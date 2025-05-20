@@ -1,21 +1,24 @@
 // Connection management functionality for Channel
 
 use anyhow::Result;
-use log::debug;
+use log::{debug, error, warn};
 use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use crate::models::{Conn, ConnectionStats, StreamHalf};
-use crate::protocol::Frame;
+use crate::tube_protocol::Frame;
+use crate::channel::types::ActiveProtocol;
+use crate::channel::guacd_parser::GuacdParser;
+use bytes::Bytes;
 
 use super::core::Channel;
 
 // Open a backend connection to a given address
-pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr) -> Result<()> {
-    debug!("Endpoint {}: Opening connection {} to {}", channel.channel_id, conn_no, addr);
+pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr, active_protocol: ActiveProtocol) -> Result<()> {
+    debug!("Endpoint {}: Opening connection {} to {} for protocol {:?}", channel.channel_id, conn_no, addr, active_protocol);
 
     // Check if the connection already exists
-    if channel.conns.contains_key(&conn_no) {
+    if channel.conns.lock().await.contains_key(&conn_no) {
         log::warn!("Endpoint {}: Connection {} already exists", channel.channel_id, conn_no);
         return Ok(());
     }
@@ -24,15 +27,15 @@ pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr)
     let stream = TcpStream::connect(addr).await?;
     
     // Set up the outbound task for this connection
-    setup_outbound_task(channel, conn_no, stream).await?;
+    setup_outbound_task(channel, conn_no, stream, active_protocol).await?;
 
     Ok(())
 }
 
 // Set up a task to read from the backend and send to WebRTC
-pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: TcpStream) -> Result<()> {
+pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: TcpStream, active_protocol: ActiveProtocol) -> Result<()> {
     // Split the stream into a reader and writer
-    let (reader, writer) = stream.into_split();
+    let (backend_reader, backend_writer) = stream.into_split();
 
     // Create an entry in the pending messages map for this connection
     {
@@ -48,8 +51,14 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
     let buffer_pool = channel.buffer_pool.clone(); // Share the buffer pool with the task
     let buffer_low_threshold = super::core::BUFFER_LOW_THRESHOLD;
 
+    let mut task_guacd_parser = if active_protocol == ActiveProtocol::Guacd {
+        Some(GuacdParser::new())
+    } else {
+        None
+    };
+
     let outbound_handle = tokio::spawn(async move {
-        let mut reader = reader;
+        let mut reader = backend_reader;
         let mut eof_sent = false;
         
         // Get a single reusable buffer from the pool
@@ -77,7 +86,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     if !eof_sent {
                         // Create EOF control message
                         let eof_frame = Frame::new_control_with_pool(
-                            crate::protocol::ControlMessage::SendEOF,
+                            crate::tube_protocol::ControlMessage::SendEOF,
                             &conn_no.to_be_bytes(),
                             &buffer_pool
                         );
@@ -97,45 +106,86 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     // Data handling - got data in read_buffer
                     eof_sent = false;
 
-                    // Create a data frame with the read portion of the buffer
                     // We use a view of just the filled part
-                    let frame = Frame::new_data_with_pool(conn_no, &read_buffer[0..n], &buffer_pool);
+                    let current_payload_bytes_slice = &read_buffer[0..n];
                     
-                    // Encode the frame reusing our encode buffer
-                    let bytes_written = frame.encode_into(&mut encode_buffer);
-                    let encoded = encode_buffer.split_to(bytes_written).freeze();
+                    let mut frames_to_send_payloads: Vec<Bytes> = Vec::new();
 
-                    // Get the current buffer amount
-                    let buffered_amount = dc.buffered_amount().await;
-                    
-                    // Check if the buffer is high - if so, queue the message instead of sending directly
-                    if buffered_amount >= buffer_low_threshold {
-                       debug!(
-                            "Endpoint {}: Buffer amount high ({} bytes), queueing message for connection {}",
-                            channel_id, buffered_amount, conn_no
-                        );
-                        
-                        // Add to pending messages queue
-                        let mut pending_guard = pending_messages.lock().await;
-                        if let Some(queue) = pending_guard.get_mut(&conn_no) {
-                            queue.push_back(encoded);
-                            
-                            // Log queue size periodically
-                            if queue.len() % 100 == 0 {
-                               debug!(
-                                    "Endpoint {}: Pending queue for connection {} has {} messages",
-                                    channel_id, conn_no, queue.len()
-                                );
+                    if active_protocol == ActiveProtocol::Guacd {
+                        if let Some(parser) = &mut task_guacd_parser {
+                            if let Err(e) = parser.receive(conn_no, current_payload_bytes_slice) {
+                                error!("Channel({}): GuacdParser receive error conn_no {}: {}", channel_id, conn_no, e);
+                                // On parser error, might be good to break and initiate close
+                                break; 
+                            } else {
+                                let mut close_conn_and_break = false;
+                                while let Some(instruction) = parser.get_instruction() {
+                                    debug!("Channel({}): Parsed Guacd instruction from backend for conn_no {}: {:?}", channel_id, conn_no, instruction.opcode);
+                                    if instruction.opcode == "disconnect" || instruction.opcode == "error" {
+                                        warn!(
+                                            "Channel({}): Guacd instruction '{}' received from backend for conn_no {}. Args: {:?}. Closing connection.",
+                                            channel_id, instruction.opcode, conn_no, instruction.args
+                                        );
+                                        let close_payload = conn_no.to_be_bytes();
+                                        let close_frame = Frame::new_control_with_pool(crate::tube_protocol::ControlMessage::CloseConnection, &close_payload, &buffer_pool);
+                                        if let Err(e) = dc.send(close_frame.encode_with_pool(&buffer_pool)).await {
+                                            error!("Channel({}): Failed to send CloseConnection for Guacd error on conn_no {}: {}", channel_id, conn_no, e);
+                                        }
+                                        close_conn_and_break = true;
+                                        break; // Stop processing further instructions from this batch for this conn_no
+                                    }
+                                    frames_to_send_payloads.push(GuacdParser::guacd_encode_instruction(&instruction));
+                                }
+                                if close_conn_and_break {
+                                    break; // Break from the outer read loop for this connection
+                                }
                             }
+                        } else {
+                            error!("Channel({}): GuacdParser missing for conn_no {} but protocol is Guacd.", channel_id, conn_no);
+                            frames_to_send_payloads.push(Bytes::copy_from_slice(current_payload_bytes_slice)); // Fallback: send raw
                         }
                     } else {
-                        // Send it directly
-                        if let Err(e) = dc.send(encoded).await {
-                            log::error!(
-                                "Endpoint {}: Failed to send data for connection {}: {}",
-                                channel_id, conn_no, e
+                        // For PortForward, SOCKS5 data phase - forward raw data
+                        frames_to_send_payloads.push(Bytes::copy_from_slice(current_payload_bytes_slice));
+                    }
+
+                    for payload_bytes_to_send in frames_to_send_payloads {
+                        if payload_bytes_to_send.is_empty() { continue; }
+
+                        let frame = Frame::new_data_with_pool(conn_no, &payload_bytes_to_send, &buffer_pool);
+                        encode_buffer.clear();
+                        let bytes_written = frame.encode_into(&mut encode_buffer);
+                        let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+
+                        let buffered_amount = dc.buffered_amount().await;
+                        if buffered_amount >= buffer_low_threshold {
+                            debug!(
+                                "Endpoint {}: Buffer amount high ({} bytes), queueing message for connection {}",
+                                channel_id, buffered_amount, conn_no
                             );
-                            break;
+                            
+                            // Add to pending messages queue
+                            let mut pending_guard = pending_messages.lock().await;
+                            if let Some(queue) = pending_guard.get_mut(&conn_no) {
+                                queue.push_back(encoded_frame_bytes);
+                                
+                                // Log queue size periodically
+                                if queue.len() % 100 == 0 {
+                                    debug!(
+                                        "Endpoint {}: Pending queue for connection {} has {} messages",
+                                        channel_id, conn_no, queue.len()
+                                    );
+                                }
+                            }
+                        } else {
+                            // Send it directly
+                            if let Err(e) = dc.send(encoded_frame_bytes).await {
+                                log::error!(
+                                    "Endpoint {}: Failed to send data for connection {}: {}",
+                                    channel_id, conn_no, e
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -167,19 +217,14 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
     // Store the writer part of the stream for us to write to
     let stream_half = StreamHalf {
         reader: None,
-        writer,
+        writer: backend_writer,
     };
     
-    // We need to store this connection somewhere to write back to it
-    // Create a new Conn instance for this connection
-    let conn = Conn {
+    channel.conns.lock().await.insert(conn_no, Conn {
         backend: Box::new(stream_half),
         to_webrtc: outbound_handle,
         stats: ConnectionStats::default(),
-    };
-    
-    // Store the connection in our registry
-    channel.conns.insert(conn_no, conn);
+    });
     
     debug!("Endpoint {}: Connection {} added to registry", channel_id_for_log, conn_no);
 

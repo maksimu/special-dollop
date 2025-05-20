@@ -23,10 +23,10 @@ const TERMINATOR: &[u8] = b";";
 pub enum ControlMessage {
     Ping = 1,
     Pong = 2,
-    OpenConnection = 3,
-    CloseConnection = 4,
-    SendEOF = 5,
-    ConnectionOpened = 6,
+    OpenConnection = 101,
+    CloseConnection = 102,
+    SendEOF = 104,
+    ConnectionOpened = 103,
 }
 impl std::fmt::Display for ControlMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,6 +41,22 @@ impl std::fmt::Display for ControlMessage {
     }
 }
 
+impl TryFrom<u16> for ControlMessage {
+    type Error = anyhow::Error;
+    fn try_from(raw: u16) -> anyhow::Result<Self, Self::Error> {
+        use ControlMessage::*;
+        match raw {
+            1 => Ok(Ping),
+            2 => Ok(Pong),
+            101 => Ok(OpenConnection),
+            102 => Ok(CloseConnection),
+            104 => Ok(SendEOF),
+            103 => Ok(ConnectionOpened),
+            _ => Err(anyhow::anyhow!("Unknown control message: {}", raw)),
+        }
+    }
+}
+
 #[repr(u16)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CloseConnectionReason {
@@ -49,20 +65,28 @@ pub enum CloseConnectionReason {
     ConnectionLost = 2,
     Timeout = 3,
     AIClosed = 4,
+    AddressResolutionFailed = 5,
+    DecryptionFailed = 6,
+    ConfigurationError = 7,
+    ProtocolError = 8,
+    Unknown = 0xFFFF,
 }
 
-impl TryFrom<u16> for ControlMessage {
-    type Error = anyhow::Error;
-    fn try_from(raw: u16) -> anyhow::Result<Self, Self::Error> {
-        use ControlMessage::*;
-        match raw {
-            1 => Ok(Ping),
-            2 => Ok(Pong),
-            3 => Ok(OpenConnection),
-            4 => Ok(CloseConnection),
-            5 => Ok(SendEOF),
-            6 => Ok(ConnectionOpened),
-            _ => Err(anyhow::anyhow!("Unknown control message: {}", raw)),
+// Helper for CloseConnectionReason (assuming it might be defined elsewhere, adding a basic version)
+// This should ideally be part of the CloseConnectionReason enum itself.
+impl CloseConnectionReason {
+    pub fn from_code(code: u16) -> Self {
+        match code {
+            0 => CloseConnectionReason::Normal,
+            1 => CloseConnectionReason::ConnectionFailed,
+            2 => CloseConnectionReason::ConnectionLost,
+            3 => CloseConnectionReason::Timeout,
+            4 => CloseConnectionReason::AIClosed,
+            5 => CloseConnectionReason::AddressResolutionFailed,
+            6 => CloseConnectionReason::DecryptionFailed,
+            7 => CloseConnectionReason::ConfigurationError,
+            8 => CloseConnectionReason::ProtocolError,
+            _ => CloseConnectionReason::Unknown,
         }
     }
 }
@@ -157,7 +181,7 @@ pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
         return None;
     }
     
-    // Create cursor without consuming the buffer yet
+    // Create a cursor without consuming the buffer yet
     let mut cursor = &buf[..];
     let conn_no = cursor.get_u32();
     let ts = cursor.get_u64();
@@ -169,7 +193,7 @@ pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
         return None;
     }
     
-    // Verify terminator before any allocation
+    // Verify the terminator before any allocation
     let term_start = CONN_NO_LEN + TS_LEN + LEN_LEN + len;
     if &buf[term_start..term_start + TERMINATOR.len()] != TERMINATOR {
         // corrupt stream; drop everything
@@ -189,7 +213,7 @@ pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
     // Skip terminator
     buf.advance(TERMINATOR.len());
     
-    // Create frame with extracted values and payload
+    // Create a frame with extracted values and payload
     Some(Frame {
         connection_no: conn_no,
         timestamp_ms: ts,

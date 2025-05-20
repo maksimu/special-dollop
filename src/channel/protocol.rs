@@ -1,222 +1,770 @@
-// Protocol handler functionality for Channel
-
-use anyhow::{anyhow, Result};
-use log::debug;
-use std::collections::HashMap;
 use crate::runtime::get_runtime;
+use anyhow::{anyhow, Result};
+use bytes::Buf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::ToSocketAddrs;
+use log::{debug, error, info, warn};
+use tokio::io::AsyncWriteExt;
 
 use super::core::Channel;
-use super::protocols::create_protocol_handler;
-use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
+use crate::tube_protocol::{ControlMessage, CloseConnectionReason, CONN_NO_LEN};
+
+// Import from the new connect_as module
+use super::connect_as::decrypt_connect_as_payload;
+
+// Constants for protocol message structure
+pub(crate) const BUFFER_SIZE: usize = 8192;
+pub(crate) const TIME_STAMP_LEN: usize = 8;
+pub(crate) const DATA_LEN: usize = 4;
+pub(crate) const TERMINATOR: &[u8] = b";";
+
+// Placeholder constants - ensure these are defined correctly in your project scope
+// or move them to a more appropriate central location (e.g., types.rs or a consts.rs)
+pub(crate) const PUBLIC_KEY_LENGTH: usize = 65; 
+pub(crate) const NONCE_LENGTH: usize = 12;
+
+/// Get the current time in milliseconds since epoch
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 impl Channel {
-    // Register a protocol handler for a specific protocol type
-    pub async fn register_protocol_handler(
-        &mut self,
-        protocol_type: &str,
-        settings: HashMap<String, serde_json::Value>,
-    ) -> Result<()> {
-
-        // Create a network checker if needed
-        self.network_checker = parse_network_rules_from_settings(&settings);
-        
-        debug!("Channel({}): Creating protocol handler for '{}'", self.channel_id, protocol_type);
-        
-        let mut handler = create_protocol_handler(
-            self.server_mode,
-            settings,
-        )?;
-        
-        // Set the WebRTC data channel for the handler to use for sending data
-        debug!("Channel({}): Setting WebRTC channel for protocol handler '{}'", 
-               self.channel_id, protocol_type);
-        handler.set_webrtc_channel(self.webrtc.clone());
-        
-        // Initialize the protocol handler
-        debug!("Channel({}): Initializing protocol handler '{}'", self.channel_id, protocol_type);
-        handler.initialize().await?;
-        
-        // Notify handler of current WebRTC state
-        let current_state = self.webrtc.ready_state();
-        debug!("Channel({}): Notifying handler '{}' of WebRTC state: {}", 
-               self.channel_id, protocol_type, current_state);
-        handler.on_webrtc_channel_state_change(&current_state).await?;
-        
-        // Store the protocol handler
-        debug!("Channel({}): Storing protocol handler '{}'", self.channel_id, protocol_type);
-        self.protocol_handlers.insert(protocol_type.to_string(), handler);
-        
-        // Set up WebRTC state monitoring if not already done
-        debug!("Channel({}): Setting up WebRTC state monitoring", self.channel_id);
-        self.setup_webrtc_state_monitoring();
-        
-        // Verify the handler was registered successfully
-        if !self.protocol_handlers.contains_key(protocol_type) {
-            log::error!("Channel({}): Failed to verify protocol handler registration for '{}'", 
-                        self.channel_id, protocol_type);
-            return Err(anyhow!("Failed to register protocol handler for {}", protocol_type));
-        }
-
-        debug!("Channel({}): Testing protocol handler status for '{}'", self.channel_id, protocol_type);
-        if let Some(handler) = self.protocol_handlers.get(protocol_type) {
-            let status = handler.status();
-            debug!("Channel({}): Protocol handler '{}' status: {}", 
-                   self.channel_id, protocol_type, status);
-        } else {
-            log::error!("Channel({}): Protocol handler '{}' not found after registration", 
-                       self.channel_id, protocol_type);
-            return Err(anyhow!("Protocol handler not found after registration: {}", protocol_type));
-        }
-        
-        log::info!("Endpoint {}: Registered protocol handler for {}", self.channel_id, protocol_type);
-        Ok(())
-    }
-    
-    // Setup WebRTC state change monitoring to notify protocol handlers
-    fn setup_webrtc_state_monitoring(&mut self) {
-        // Clone what we need for the handler callbacks
+    pub(crate) fn setup_webrtc_state_monitoring(&mut self) {
         let webrtc = self.webrtc.clone();
         let channel_id = self.channel_id.clone();
         
-        // Only collect protocol type names, not trying to clone the actual handlers
-        let protocol_types: Vec<String> = self.protocol_handlers.keys().cloned().collect();
-        
-        // We only set this up once per channel
-        static STATE_MONITORING_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if STATE_MONITORING_SET.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return; // Already set up
-        }
-        
-        // Create a reference to share with the closure
-        let server_mode_clone = self.server_mode.clone();
-        
-        // Set up the state change handler directly on the WebRTC data channel
         let last_state = webrtc.ready_state();
-        
-        // Create a shared channel for state change notifications
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(8);
         
-        // Set up the WebRTC data channel state change callback
-        let data_channel = webrtc.data_channel.clone();
-        let state_tx_clone = state_tx.clone();
+        let data_channel = webrtc.data_channel.clone(); // Arc<DataChannel>
         
-        // Register callback for data channel state changes - properly access the state change functionality
+        let state_tx_open = state_tx.clone();
         data_channel.on_open(Box::new(move || {
-            let tx = state_tx_clone.clone();
-            
-            // Spawn task to send state change notification for open
+            let tx = state_tx_open.clone();
             tokio::spawn(async move {
                 if let Err(e) = tx.send("Open".to_string()).await {
                     log::error!("Failed to send open state notification: {}", e);
                 }
             });
-            
             Box::pin(async {})
         }));
         
-        let state_tx_clone2 = state_tx.clone();
+        let state_tx_close = state_tx.clone();
         data_channel.on_close(Box::new(move || {
-            let tx = state_tx_clone2.clone();
-            
-            // Spawn task to send state change notification for close
+            let tx = state_tx_close.clone();
             tokio::spawn(async move {
                 if let Err(e) = tx.send("Closed".to_string()).await {
                     log::error!("Failed to send close state notification: {}", e);
                 }
             });
-            
             Box::pin(async {})
         }));
         
-        let state_tx_clone3 = state_tx.clone();
+        let state_tx_error = state_tx.clone();
         data_channel.on_error(Box::new(move |err| {
-            let tx = state_tx_clone3.clone();
+            let tx = state_tx_error.clone();
             let err_str = format!("Error: {}", err);
-            
-            // Spawn task to send state change notification for error
             tokio::spawn(async move {
                 if let Err(e) = tx.send(err_str).await {
                     log::error!("Failed to send error state notification: {}", e);
                 }
             });
-            
             Box::pin(async {})
         }));
         
-        // We need to clone these for the task that processes the events
-        let webrtc_clone = webrtc.clone();
-        let channel_id_clone = channel_id.clone();
-        let protocol_types_clone = protocol_types.clone();
-        
-        // Spawn a task to handle the state change events
         let runtime = get_runtime();
         runtime.spawn(async move {
             let mut last_state_in_task = last_state;
-            
-            // Process state change events
             while let Some(current_state) = state_rx.recv().await {
-                // Only process if the state actually changed
                 if current_state != last_state_in_task {
-                    log::info!("Endpoint {}: WebRTC state changed: {} -> {}", 
-                             channel_id_clone, last_state_in_task, current_state);
-                    
-                    // Process each protocol type
-                    for protocol_type in &protocol_types_clone {
-                        // Create a new handler instance for each type
-                        match create_protocol_handler(server_mode_clone, HashMap::new()) {
-                            Ok(mut handler) => {
-                                // Set the WebRTC channel
-                                handler.set_webrtc_channel(webrtc_clone.clone());
-                                
-                                // Notify about state change
-                                if let Err(e) = handler.on_webrtc_channel_state_change(&current_state).await {
-                                    log::error!("Endpoint {}: Error notifying {} handler of state change: {}", 
-                                             channel_id_clone, protocol_type, e);
-                                }
-                            },
-                            Err(e) => {
-                                log::error!("Endpoint {}: Failed to create handler for {}: {}", 
-                                         channel_id_clone, protocol_type, e);
-                            }
-                        }
-                    }
-                    
-                    // Update last state
+                    info!("Endpoint {}: WebRTC state changed: {} -> {}", channel_id, last_state_in_task, current_state);
                     last_state_in_task = current_state.clone();
                 }
                 
-                // If closed/closing, break the loop
-                if current_state.to_lowercase() == "closed" || current_state.to_lowercase() == "closing" {
-                    debug!("Endpoint {}: WebRTC channel closed, stopping state monitoring", channel_id_clone);
-                    
-                    // Reset the monitoring flag so it can be set up again if needed
-                    STATE_MONITORING_SET.store(false, std::sync::atomic::Ordering::Release);
+                let lower_current_state = current_state.to_lowercase();
+                if lower_current_state == "closed" || lower_current_state.starts_with("error") {
+                    info!("Endpoint {}: WebRTC state is '{}', stopping state monitoring task.", channel_id, current_state);
+                    // The actual channel teardown is primarily handled by the rx_from_dc stream ending in the Channel::run loop.
                     break;
                 }
             }
         });
+        info!("Channel({}): WebRTC state change monitoring set up.", self.channel_id);
     }
-    
-    // Send a command to a protocol handler
-    pub async fn send_handler_command(
-        &mut self,
-        protocol_type: &str,
-        command: &str,
-        params: &[u8],
+
+    /// Process a control message received from the data channel
+    pub(crate) async fn process_control_message(
+        &mut self, 
+        message_type: ControlMessage, 
+        data: &[u8]
     ) -> Result<()> {
-        if let Some(handler) = self.protocol_handlers.get_mut(protocol_type) {
-            handler.handle_command(command, params).await
+        debug!("Endpoint {}: Processing control message: {:?}", self.channel_id, message_type);
+
+        match message_type {
+            ControlMessage::CloseConnection => {
+                self.handle_close_connection(data).await?;
+            },
+            ControlMessage::OpenConnection => {
+                self.handle_open_connection(data).await?;
+            },
+            ControlMessage::Ping => {
+                self.handle_ping(data).await?;
+            },
+            ControlMessage::Pong => {
+                self.handle_pong(data).await?;
+            },
+            ControlMessage::SendEOF => {
+                self.handle_send_eof(data).await?;
+            },
+            ControlMessage::ConnectionOpened => {
+                // In server mode, this completes protocol handshakes like SOCKS5
+                // In client mode, we just log and continue
+                self.handle_connection_opened(data).await?;
+            },
+        }
+
+        Ok(())
+    }
+
+    /// Handle a CloseConnection control message
+    async fn handle_close_connection(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < CONN_NO_LEN {
+            return Err(anyhow!("CloseConnection message too short"));
+        }
+
+        let target_connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        
+        // Extract reason if available
+        let reason = if data.len() > CONN_NO_LEN {
+            let reason_code = u16::from_be_bytes([data[CONN_NO_LEN], data[CONN_NO_LEN + 1]]);
+            CloseConnectionReason::from_code(reason_code)
         } else {
-            Err(anyhow::anyhow!("Protocol handler not found for {}", protocol_type))
+            CloseConnectionReason::Normal
+        };
+
+        debug!("Endpoint {}: Closing connection {} (reason: {:?})", 
+               self.channel_id, target_connection_no, reason);
+
+        // Special case for connection 0 (control connection)
+        if target_connection_no == 0 {
+            self.should_exit.store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+
+        // Close the connection
+        self.close_backend(target_connection_no, reason).await
+    }
+
+    /// Handle an OpenConnection control message
+    async fn handle_open_connection(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < CONN_NO_LEN {
+            return Err(anyhow!("OpenConnection message too short, expected at least {} bytes for conn_no", CONN_NO_LEN));
+        }
+
+        let mut cursor = std::io::Cursor::new(data);
+        let target_connection_no = cursor.get_u32();
+
+        debug!(
+            "Endpoint {}: Received OpenConnection request for connection {} with payload size {}. Server mode: {}, Active Protocol: {:?}",
+            self.channel_id, target_connection_no, cursor.remaining(), self.server_mode, self.active_protocol
+        );
+
+        // If this channel is a server-mode PortForwarder, it originates connections locally.
+        // An incoming OpenConnection for a specific conn_no is an ack/part of handshake from the client-side of the tunnel.
+        // The server should already have (or be in the process of setting up) this conn_no from a local TCP accept.
+        // It should not try to establish a new outbound connection based on this message.
+        if self.server_mode && self.active_protocol == super::types::ActiveProtocol::PortForward {
+            debug!(
+                "Endpoint {}: Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened.",
+                self.channel_id, target_connection_no
+            );
+            // The connection should be in self.conns or will be shortly via the local TCP accept path.
+            // Sending ConnectionOpened confirms to the client that this conn_no is active on the server side.
+            self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
+            return Ok(());
+        }
+
+        // Existing check: if connection already processed and in conns map (e.g. client mode, or SOCKS5 server after target resolution)
+        if self.conns.lock().await.contains_key(&target_connection_no) {
+            debug!(
+                "Endpoint {}: Connection {} already exists or is being processed. Sending ConnectionOpened.",
+                self.channel_id, target_connection_no
+            );
+            self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
+            return Ok(());
+        }
+
+        let mut host_to_connect: String;
+        let mut port_to_connect: u16;
+
+        // Scenario 1: SOCKS5 - Python SOCKS5Server sends conn_no, host_len, host, port
+        // Scenario 2: Guacd with connect_as - Python TunnelEntrance (acting on behalf of GuacdExit's request)
+        //             might send conn_no, then an encrypted blob. The other Python end (GuacdExit) decrypts this.
+        //             The Rust channel's role here is primarily to establish the TCP link to the guacd server.
+        //             The *final* guacd host/port might be fixed, come from channel config, or be derivable
+        //             if the Rust channel itself were to decrypt a part of the connect_as blob (less likely).
+        // Scenario 3: Simple Port Forward / Guacd (no connect_as in payload) - Python TunnelEntrance sends just conn_no.
+        //             Rust channel uses its pre-configured target.
+
+        if cursor.has_remaining() { 
+            if self.network_checker.is_some() && cursor.remaining() >= 4 { // 4 for host_len u32
+                let pos_before_socks_parse = cursor.position();
+                let host_len = cursor.get_u32() as usize;
+                if cursor.remaining() >= host_len + 2 { 
+                    let mut host_bytes = vec![0u8; host_len];
+                    cursor.copy_to_slice(&mut host_bytes);
+                    let parsed_host = String::from_utf8(host_bytes)
+                        .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?;
+                    let parsed_port = cursor.get_u16();
+
+                    if let Some(ref checker) = self.network_checker {
+                        if !checker.is_host_allowed(&parsed_host) {
+                            error!("Endpoint {}: SOCKS5 target host {} not allowed.", self.channel_id, parsed_host);
+                            return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 host not allowed").await;
+                        }
+                        if !checker.is_port_allowed(parsed_port) {
+                            error!("Endpoint {}: SOCKS5 target port {} not allowed.", self.channel_id, parsed_port);
+                            return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 port not allowed").await;
+                        }
+                    }
+                    host_to_connect = parsed_host;
+                    port_to_connect = parsed_port;
+                    debug!("Endpoint {}: Parsed SOCKS5 target from OpenConnection: {}:{} for conn_no {}", self.channel_id, host_to_connect, port_to_connect, target_connection_no);
+                    return self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await;
+                } else {
+                    // Not enough data for SOCKS5 host/port, rewind cursor for other parsing logic.
+                    cursor.set_position(pos_before_socks_parse);
+                    warn!("Endpoint {}: OpenConnection payload looked like SOCKS5 but was too short. Rewinding for other parsing.", self.channel_id);
+                }
+            }
+
+            // If not SOCKS5 or SOCKS5 parsing failed to consume, the payload might be for other protocols (e.g., connect_as for Guacd)
+            // For Guacd with 'connect_as'; the other side sends the OpenConnection with this payload.
+            // The Rust channel's job is to connect to the guacd server.
+            // The Rust channel here might need to know the Guacd server's host/port from its own config, especially if 'connect_as' doesn't change it.
+            if self.active_protocol == super::types::ActiveProtocol::Guacd {
+                let remaining_at_connect_as_check = cursor.remaining();
+
+                // Using self.connect_as_settings directly
+                return if (self.connect_as_settings.allow_supply_user || self.connect_as_settings.allow_supply_host) &&
+                    remaining_at_connect_as_check >= (4 /*len field*/ + PUBLIC_KEY_LENGTH + NONCE_LENGTH) {
+                    let connect_as_declared_len = cursor.get_u32() as usize;
+
+                    if cursor.remaining() >= (PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len) {
+                        let mut client_public_key = vec![0u8; PUBLIC_KEY_LENGTH];
+                        cursor.copy_to_slice(&mut client_public_key);
+
+                        let mut client_nonce = vec![0u8; NONCE_LENGTH];
+                        cursor.copy_to_slice(&mut client_nonce);
+
+                        let mut encrypted_connect_as_data = vec![0u8; connect_as_declared_len];
+                        cursor.copy_to_slice(&mut encrypted_connect_as_data);
+
+                        debug!(
+                            "Endpoint {}: Extracted Guacd 'connect_as' fields for conn_no {}. Encrypted payload length: {}.",
+                            self.channel_id, target_connection_no, connect_as_declared_len
+                        );
+                        // Using self.connect_as_settings directly
+                        if let Some(private_key_hex) = &self.connect_as_settings.gateway_private_key {
+                            match decrypt_connect_as_payload(
+                                private_key_hex,
+                                &client_public_key,
+                                &client_nonce,
+                                &encrypted_connect_as_data,
+                            ) {
+                                Ok(decrypted_payload) => {
+                                    info!("Endpoint {}: Successfully decrypted 'connect_as' payload for conn_no {}: {:?}", self.channel_id, target_connection_no, decrypted_payload);
+
+                                    // Use self.guacd_host and self.guacd_port as defaults
+                                    host_to_connect = self.guacd_host.clone().unwrap_or_else(|| "localhost".to_string());
+                                    port_to_connect = self.guacd_port.unwrap_or(4822);
+
+                                    if self.connect_as_settings.allow_supply_host {
+                                        if let Some(supplied_host) = decrypted_payload.host {
+                                            host_to_connect = supplied_host;
+                                            info!("Endpoint {}: Using host '{}' from 'connect_as' payload for conn_no {}.", self.channel_id, host_to_connect, target_connection_no);
+                                        }
+                                        if let Some(supplied_port) = decrypted_payload.port {
+                                            port_to_connect = supplied_port;
+                                            info!("Endpoint {}: Using port {} from 'connect_as' payload for conn_no {}.", self.channel_id, port_to_connect, target_connection_no);
+                                        }
+                                    }
+
+                                    if self.connect_as_settings.allow_supply_user {
+                                        if let Some(user_info) = decrypted_payload.user {
+                                            debug!("Endpoint {}: User details from 'connect_as' for conn_no {}: {:?}", self.channel_id, target_connection_no, user_info);
+
+                                            let mut params_guard = self.guacd_params.lock().await;
+                                            // Clear specific connect_as params before adding new ones for this connection? Or augment?
+                                            // For now, augmenting. If params are strictly per-connection and not additive to base, clearing might be needed.
+                                            if let Some(username) = user_info.username {
+                                                params_guard.insert("username".to_string(), username);
+                                            }
+                                            if let Some(password) = user_info.password {
+                                                params_guard.insert("password".to_string(), password);
+                                            }
+                                            if let Some(domain) = user_info.domain {
+                                                params_guard.insert("domain".to_string(), domain);
+                                            }
+                                            if let Some(private_key) = user_info.private_key {
+                                                params_guard.insert("private-key".to_string(), private_key);
+                                            }
+                                            if let Some(pk_pass) = user_info.private_key_passphrase {
+                                                params_guard.insert("private_key_passphrase".to_string(), pk_pass);
+                                            }
+                                            if let Some(connect_db) = user_info.connect_database {
+                                                params_guard.insert("connect_database".to_string(), connect_db);
+                                            }
+                                            if let Some(d_name) = user_info.distinguished_name {
+                                                params_guard.insert("distinguished_name".to_string(), d_name);
+                                            }
+                                            drop(params_guard);
+                                            warn!("Endpoint {}: Updated self.guacd_params with connect_as user details for conn_no {}. TODO: Ensure these params are correctly passed to Guacd connection logic.", self.channel_id, target_connection_no);
+                                        }
+                                    }
+                                    self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await
+                                },
+                                Err(e) => {
+                                    error!("Endpoint {}: Failed to decrypt/process 'connect_as' payload for conn_no {}: {}. Check key configuration and payload structure.", self.channel_id, target_connection_no, e);
+                                    self.close_backend_and_notify(target_connection_no, CloseConnectionReason::DecryptionFailed, "Connect As decryption/processing failed").await
+                                }
+                            }
+                        } else {
+                            error!("Endpoint {}: Gateway private key for 'connect_as' not configured (self.connect_as_settings). Cannot decrypt payload for conn_no {}.", self.channel_id, target_connection_no);
+                            self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConfigurationError, "Connect As private key missing").await
+                        }
+                    } else {
+                        error!("Endpoint {}: Invalid Guacd 'connect_as' data for conn_no {}: not enough bytes for key, nonce, and declared payload length {}. Declared: {}, cursor remaining: {}, key+nonce needed: {}.",
+                            self.channel_id, target_connection_no, connect_as_declared_len, connect_as_declared_len, cursor.remaining(), PUBLIC_KEY_LENGTH + NONCE_LENGTH);
+                        self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ProtocolError, "Invalid Connect As data structure (length mismatch)").await
+                    }
+                } else {
+                    error!(
+                        "Endpoint {}: OpenConnection for Guacd conn_no {} does not match 'connect_as' structure (min length for header+key+nonce: {}, remaining: {}) or 'connect_as' is not allowed/configured (self.connect_as_settings). Using configured Guacd target.",
+                        self.channel_id, target_connection_no, 4 + PUBLIC_KEY_LENGTH + NONCE_LENGTH, remaining_at_connect_as_check
+                    );
+                    self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ProtocolError, "Invalid Connect As data structure (length mismatch)").await
+                }
+            }
+        }
+ 
+        debug!("Endpoint {}: OpenConnection for conn_no {} has no (or unparsed) specific target payload. Using pre-configured target.", self.channel_id, target_connection_no);
+        match self.active_protocol {
+            super::types::ActiveProtocol::PortForward => {
+                if let super::core::ProtocolLogicState::PortForward(ref pf_state) = self.protocol_state {
+                    host_to_connect = pf_state.target_host.clone().ok_or_else(|| anyhow!("PortForward target host not set for conn_no {}", target_connection_no))?;
+                    port_to_connect = pf_state.target_port.ok_or_else(|| anyhow!("PortForward target port not set for conn_no {}", target_connection_no))?;
+                } else {
+                    return Err(anyhow!("Invalid state for PortForward OpenConnection for conn_no {}", target_connection_no));
+                }
+            }
+            super::types::ActiveProtocol::Guacd => {
+                // Use self.guacd_host and self.guacd_port
+                host_to_connect = self.guacd_host.clone().unwrap_or_else(|| "localhost".to_string());
+                port_to_connect = self.guacd_port.unwrap_or(4822);
+                debug!("Endpoint {}: Guacd OpenConnection (no specific payload) for conn_no {}. Connecting to configured Guacd server {}:{}.", self.channel_id, target_connection_no, host_to_connect, port_to_connect);
+            }
+            super::types::ActiveProtocol::Socks5 => {
+                error!("Endpoint {}: SOCKS5 mode, but OpenConnection for conn_no {} did not contain a valid SOCKS5 target payload.", self.channel_id, target_connection_no);
+                return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 target missing in OpenConnection").await;
+            }
+        }
+        self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await
+    }
+
+    /// Helper to close the backend and potentially send a CloseConnection control message.
+    async fn close_backend_and_notify(&mut self, conn_no: u32, reason: CloseConnectionReason, log_message: &str) -> Result<()> {
+        error!("Endpoint {}: {} for conn_no {}. Closing backend.", self.channel_id, log_message, conn_no);
+        // The close_backend method should handle removing the connection from self.conns
+        // and cleaning up its resources. It might also send a CloseConnection control message.
+        // If close_backend doesn't always send a notification, we might need to send one here.
+        self.close_backend(conn_no, reason).await
+        // Optionally, ensure a CloseConnection is sent if not handled by close_backend:
+        // let mut payload = Vec::new();
+        // payload.extend_from_slice(&conn_no.to_be_bytes());
+        // payload.extend_from_slice(&(reason as u16).to_be_bytes());
+        // self.send_control_message(ControlMessage::CloseConnection, &payload).await?;
+        // Ok(()) returning Ok because the OpenConnection *message itself* was processed, even if the outcome was failure.
+    }
+
+    /// Helper function to establish backend connection and send ConnectionOpened
+    async fn establish_backend_connection(&mut self, conn_no: u32, host: &str, port: u16) -> Result<()> {
+        let target_str = format!("{}:{}", host, port);
+        debug!("Endpoint {}: Attempting to open backend connection {} to {}", self.channel_id, conn_no, target_str);
+
+        // Check network access rules if configured (primarily for client-side initiated from OpenConnection)
+        if let Some(ref checker) = self.network_checker {
+            if !checker.is_host_allowed(host) {
+                error!("Endpoint {}: Target host {} not allowed by network rules for conn_no {}.", self.channel_id, host, conn_no);
+                self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
+                // We might want to send a CloseConnection control message back to origin if not already handled by close_backend.
+                return Ok(()); // Return Ok to signify a message handled, even if the connection failed rules.
+            }
+            if !checker.is_port_allowed(port) {
+                error!("Endpoint {}: Target port {} not allowed by network rules for conn_no {}.", self.channel_id, port, conn_no);
+                self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
+                return Ok(());
+            }
+        }
+
+        let addrs = match target_str.to_socket_addrs() {
+            Ok(iter) => iter.collect::<Vec<_>>(),
+            Err(e) => {
+                error!("Endpoint {}: Failed to resolve address {}: {} for conn_no {}.", self.channel_id, target_str, e, conn_no);
+                self.close_backend(conn_no, CloseConnectionReason::AddressResolutionFailed).await?;
+                return Ok(());
+            }
+        };
+
+        if addrs.is_empty() {
+            error!("Endpoint {}: Could not resolve address: {} for conn_no {}.", self.channel_id, target_str, conn_no);
+            self.close_backend(conn_no, CloseConnectionReason::AddressResolutionFailed).await?;
+            return Ok(());
+        }
+
+        match tokio::time::timeout(
+            self.timeouts.open_connection,
+            super::connections::open_backend(self, conn_no, addrs[0], self.active_protocol)
+        ).await {
+            Ok(Ok(_)) => {
+                self.send_control_message(ControlMessage::ConnectionOpened, &conn_no.to_be_bytes()).await?;
+                info!(
+                    "Endpoint {}: Successfully opened backend connection {} to {}:{}. Sent ConnectionOpened.",
+                    self.channel_id, conn_no, host, port
+                );
+            }
+            Ok(Err(e)) => {
+                error!(
+                    "Endpoint {}: Failed to open backend connection {} to {}:{}: {}",
+                    self.channel_id, conn_no, host, port, e
+                );
+                self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
+            }
+            Err(_) => {
+                error!(
+                    "Endpoint {}: Backend connection {} to {}:{} timed out.",
+                    self.channel_id, conn_no, host, port
+                );
+                self.close_backend(conn_no, CloseConnectionReason::Timeout).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a Ping control message
+    async fn handle_ping(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < CONN_NO_LEN {
+            // Basic ping without connection info
+            debug!("Endpoint {}: Received basic Ping request", self.channel_id);
+            self.send_control_message(
+                ControlMessage::Pong,
+                &[0, 0, 0, 0] // connection 0
+            ).await?;
+            return Ok(());
+        }
+
+        // Extract connection number
+        let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        
+        // Check if the connection exists
+        if !self.conns.lock().await.contains_key(&conn_no) {
+            error!("Endpoint {}: Connection {} not found for Ping", 
+                   self.channel_id, conn_no);
+            return Ok(());
+        }
+        
+        // Build response - include connection number
+        let mut response = Vec::with_capacity(4);
+        response.extend_from_slice(&conn_no.to_be_bytes());
+        
+        // Handle timing information if present
+        if data.len() > CONN_NO_LEN {
+            // TODO: transfer_latency tracking implement here. 
+            response.extend_from_slice(&data[CONN_NO_LEN..]);
+            debug!("Endpoint {}: Received ACK request with timing data for {}", 
+                   self.channel_id, conn_no);
+        } else {
+            debug!("Endpoint {}: Received ACK request for {}", 
+                   self.channel_id, conn_no);
+        }
+        
+        // Send response
+        self.send_control_message(ControlMessage::Pong, &response).await?;
+        
+        Ok(())
+    }
+
+    /// Handle a Pong control message
+    async fn handle_pong(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < CONN_NO_LEN {
+            debug!("Endpoint {}: Received basic pong", self.channel_id);
+            self.ping_attempt = 0;
+            return Ok(());
+        }
+
+        // Extract connection number
+        let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        
+        // Update connection state
+        let mut conns_guard = self.conns.lock().await;
+        if let Some(conn) = conns_guard.get_mut(&conn_no) {
+            // Reset message counter
+            conn.stats.message_counter = 0;
+            
+            if conn_no == 0 {
+                debug!("Endpoint {}: Received pong", self.channel_id);
+            } else {
+                debug!("Endpoint {}: Received ACK response for {}", 
+                       self.channel_id, conn_no);
+            }
+            
+            // Handle round-trip latency calculation if ping time was set
+            if let Some(ping_time) = conn.stats.ping_time {
+                let latency = now_ms().saturating_sub(ping_time);
+                
+                // Add to a round-trip latency collection
+                {
+                    let mut rtl_guard = self.round_trip_latency.lock().await;
+                    rtl_guard.push(latency);
+                    // Keep the collection size bounded
+                    if rtl_guard.len() > 20 {
+                        rtl_guard.remove(0);
+                    }
+                }
+                
+                debug!("Endpoint {}: Round trip latency: {} ms", 
+                       self.channel_id, latency);
+                
+                // Reset ping time
+                conn.stats.ping_time = None;
+                
+                // Handle transfer latency calculation
+                // In Python, there's additional transfer latency tracking that we'd implement here
+            }
+        } else {
+            debug!("Endpoint {}: Received pong for unknown connection {}", 
+                   self.channel_id, conn_no);
+        }
+        
+        // Reset ping attempt counter
+        self.ping_attempt = 0;
+        
+        Ok(())
+    }
+
+    /// Handle a SendEOF control message
+    async fn handle_send_eof(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < CONN_NO_LEN {
+            return Err(anyhow!("SendEOF message too short"));
+        }
+
+        // Extract connection number
+        let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        
+        // Check if the connection exists and send EOF
+        let mut conns_guard = self.conns.lock().await;
+        if let Some(conn) = conns_guard.get_mut(&conn_no) {
+            debug!("Endpoint {}: Sending EOF to backend for connection {}", 
+                   self.channel_id, conn_no);
+            
+            let backend = conn.backend.as_mut(); // Get a mutable reference to the Box<dyn BackendConnection>
+            
+            match backend.shutdown().await { // Call shutdown on the trait object
+                Ok(_) => {
+                    debug!("Endpoint {}: Successfully sent shutdown to backend for EOF on conn {}", 
+                           self.channel_id, conn_no);
+                }
+                Err(e) => {
+                    error!("Endpoint {}: Error shutting down backend for EOF on conn {}: {}", self.channel_id, conn_no, e);
+                    // Decide if we need to hard close or if shutdown failure is non-fatal for the EOF intent.
+                }
+            }
+        } else {
+            error!("Endpoint {}: Connection for EOF {} not found", 
+                   self.channel_id, conn_no);
+        }
+        
+        Ok(())
+    }
+
+    /// Handle a ConnectionOpened control message
+    async fn handle_connection_opened(&mut self, data: &[u8]) -> Result<()> {
+        // This is called when we receive a ConnectionOpened control message from WebRTC
+        // In server_mode, this completes the connection setup
+        if !self.server_mode {
+            debug!("Endpoint {}: Received ConnectionOpened in client mode (ignoring)", 
+                   self.channel_id);
+            return Ok(());
+        }
+
+        if data.len() < CONN_NO_LEN {
+            return Err(anyhow!("ConnectionOpened message too short"));
+        }
+
+        let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        debug!("Endpoint {}: Starting reader for connection {}", 
+               self.channel_id, connection_no);
+        
+        // Get the connection
+        let mut conns_guard = self.conns.lock().await;
+        let connection = match conns_guard.get_mut(&connection_no) {
+            Some(c) => c,
+            None => {
+                error!("Endpoint {}: Connection {} not found for ConnectionOpened", 
+                       self.channel_id, connection_no);
+                return Ok(());
+            }
+        };
+        
+        // If it's a SOCKS5 connection, send a success response to the client
+        if self.active_protocol == super::types::ActiveProtocol::Socks5 {
+            debug!("Endpoint {}: SOCKS5 Connection {} opened", 
+                   self.channel_id, connection_no);
+            
+            let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            
+            let backend = connection.backend.as_mut();
+            debug!("Endpoint {}: Sending SOCKS5 success response to connection {}", 
+                    self.channel_id, connection_no);
+            
+            match backend.write_all(&response).await {
+                Ok(_) => {
+                    debug!("Endpoint {}: SOCKS5 success response sent for connection {}", 
+                            self.channel_id, connection_no);
+                    if let Err(e) = backend.flush().await {
+                        error!("Endpoint {}: Failed to flush SOCKS5 writer: {}", 
+                                self.channel_id, e);
+                    }
+                },
+                Err(e) => {
+                    error!("Endpoint {}: Failed to send SOCKS5 success response: {}", 
+                            self.channel_id, e);
+                }
+            }
+        }
+        
+        // The conn.to_webrtc task is already set up by open_backend (via establish_backend_connection)
+        // to handle reading from the backend and sending to WebRTC. No need to spawn another one here.
+        if connection.to_webrtc.is_finished() {
+            warn!("Endpoint {}: In ConnectionOpened, to_webrtc task for conn_no {} was already finished. This is unexpected.", self.channel_id, connection_no);
+        }
+        
+        info!("Endpoint {}: Connection {} fully opened and ready.", 
+              self.channel_id, connection_no);
+        
+        drop(conns_guard);
+        Ok(())
+    }
+
+    /// Send data to a target connection
+    async fn send_data_to_target(&mut self, connection_no: u32, data: &[u8]) -> Result<()> {
+        // Get the connection
+        let mut conns_guard = self.conns.lock().await;
+        let conn = match conns_guard.get_mut(&connection_no) {
+            Some(c) => c,
+            None => {
+                drop(conns_guard);
+                return Err(anyhow!("Connection {} not found for send_data_to_target", connection_no));
+            }
+        };
+        
+        let backend = conn.backend.as_mut();
+        
+        // Write to backend
+        match backend.write_all(data).await {
+            Ok(_) => {
+                // Also flush the writer to ensure data is sent
+                match backend.flush().await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        drop(conns_guard);
+                        Err(anyhow!("Failed to flush backend for send_data_to_target: {}", e))
+                    }
+                }
+            },
+            Err(e) => {
+                drop(conns_guard);
+                Err(anyhow!("Failed to write to backend for send_data_to_target: {}", e))
+            }
         }
     }
-    
-    // Get protocol handler status
-    pub fn get_handler_status(&self, protocol_type: &str) -> Result<String> {
-        if let Some(handler) = self.protocol_handlers.get(protocol_type) {
-            Ok(handler.status())
-        } else {
-            Err(anyhow::anyhow!("Protocol handler not found for {}", protocol_type))
+
+    /// Parse target host and port from the data in an OpenConnection message
+    async fn parse_target_info(&mut self, data: &[u8], connection_no: u32) -> Result<(String, u16)> {
+        if data.len() < 4 {
+            return Err(anyhow!("Target info data too short"));
+        }
+        
+        let mut cursor = std::io::Cursor::new(data);
+        
+        // Read host length (4 bytes)
+        let mut host_len_bytes = [0u8; 4];
+        std::io::Read::read_exact(&mut cursor, &mut host_len_bytes)
+            .map_err(|e| anyhow!("Failed to read host length: {}", e))?;
+        let host_len = u32::from_be_bytes(host_len_bytes) as usize;
+        
+        if host_len > 256 {
+            return Err(anyhow!("Host length too large: {}", host_len));
+        }
+        
+        // Read host
+        let mut host_bytes = vec![0u8; host_len];
+        std::io::Read::read_exact(&mut cursor, &mut host_bytes)
+            .map_err(|e| anyhow!("Failed to read host: {}", e))?;
+        let host = String::from_utf8(host_bytes)
+            .map_err(|e| anyhow!("Invalid UTF-8 in host: {}", e))?;
+        
+        // Read port (2 bytes)
+        let mut port_bytes = [0u8; 2];
+        std::io::Read::read_exact(&mut cursor, &mut port_bytes)
+            .map_err(|e| anyhow!("Failed to read port: {}", e))?;
+        let port = u16::from_be_bytes(port_bytes);
+        
+        debug!("Endpoint {}: Parsed target for connection {}: {}:{}", 
+               self.channel_id, connection_no, host, port);
+        
+        Ok((host, port))
+    }
+
+    /// Update connection statistics based on received data
+    async fn update_stats(&mut self, connection_no: u32, bytes: usize, timestamp: u64) {
+        // Get current time
+        let now = now_ms();
+        
+        // Calculate receive latency (how long it took for the message to arrive)
+        let receive_latency = now.saturating_sub(timestamp);
+        
+        // Update connection stats
+        let mut conns_guard = self.conns.lock().await;
+        if let Some(conn) = conns_guard.get_mut(&connection_no) {
+            // Update bytes received
+            conn.stats.receive_size += bytes;
+            
+            // Update message counter (used for ACK tracking)
+            conn.stats.message_counter += 1;
+            
+            // Update receive latency
+            conn.stats.receive_latency_sum += receive_latency;
+            conn.stats.receive_latency_count += 1;
+            
+            // Log stats periodically (every 1000 messages)
+            if conn.stats.message_counter % 1000 == 0 {
+                let avg_latency = if conn.stats.receive_latency_count > 0 {
+                    conn.stats.receive_latency_sum / conn.stats.receive_latency_count
+                } else {
+                    0
+                };
+                
+                debug!("Endpoint {}: Stats for connection {}: {} bytes received, avg latency {} ms", 
+                       self.channel_id, connection_no, conn.stats.receive_size, avg_latency);
+            }
+        } else if connection_no != 0 {
+            // Only log for non-control connections
+            debug!("Endpoint {}: No connection found for stats update: {}", 
+                   self.channel_id, connection_no);
         }
     }
 }

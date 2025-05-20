@@ -3,14 +3,14 @@
 // Internal modules
 mod core;
 mod server;
-mod protocol;
 mod connections;
-mod frame_handling;
+pub(crate) mod frame_handling; // Logic to be merged into core.rs
 mod utils;
-pub mod protocols;
+pub mod types; // Added new types module
+mod connect_as; // Added a new connect_as module
 
-// Re-export main Channel struct to maintain API compatibility
+// Re-export the main Channel struct to maintain API compatibility
 pub use core::Channel;
 
-// Re-export protocol factory to maintain API compatibility
-pub use protocols::create_protocol_handler;
+pub(crate) mod protocol;
+pub(crate) mod guacd_parser;

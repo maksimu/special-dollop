@@ -34,6 +34,10 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 lazy_static = "1.5.0"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
+hex = "0.4.3"
+sha2 = "0.10.8"
+hkdf = "0.12.4"
+aes-gcm = "0.10.3"
 
 [package.metadata.maturin]
 name = "keeper_pam_webrtc_rs"

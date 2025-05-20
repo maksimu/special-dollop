@@ -1,7 +1,7 @@
 // runtime.rs
 use once_cell::sync::Lazy;
 use std::sync::Arc;
-use tokio::runtime::{Builder, Runtime};
+pub(crate) use tokio::runtime::{Builder, Runtime};
 
 /// A single multithread Tokio runtime for the whole process,
 /// wrapped in Arc so callers can clone cheaply.

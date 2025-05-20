@@ -2,15 +2,20 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use bytes::Bytes;
+#[cfg(test)]
+use futures::future::BoxFuture;
 use webrtc::data_channel::RTCDataChannel;
 
 // Async-first wrapper for data channel functionality
 pub struct WebRTCDataChannel {
     pub data_channel: Arc<RTCDataChannel>,
-    is_closing: Arc<AtomicBool>,
-    buffered_amount_low_threshold: Arc<Mutex<u64>>,
-    on_buffered_amount_low_callback: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>,
-    threshold_monitor: Arc<AtomicBool>,
+    pub(crate) is_closing: Arc<AtomicBool>,
+    pub(crate) buffered_amount_low_threshold: Arc<Mutex<u64>>,
+    pub(crate) on_buffered_amount_low_callback: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>,
+    pub(crate) threshold_monitor: Arc<AtomicBool>,
+
+    #[cfg(test)]
+    pub(crate) test_send_hook: Arc<Mutex<Option<Box<dyn Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static>>>>,
 }
 
 impl Clone for WebRTCDataChannel {
@@ -21,6 +26,9 @@ impl Clone for WebRTCDataChannel {
             buffered_amount_low_threshold: Arc::clone(&self.buffered_amount_low_threshold),
             on_buffered_amount_low_callback: Arc::clone(&self.on_buffered_amount_low_callback),
             threshold_monitor: Arc::clone(&self.threshold_monitor),
+
+            #[cfg(test)]
+            test_send_hook: Arc::clone(&self.test_send_hook),
         }
     }
 }
@@ -33,12 +41,10 @@ impl WebRTCDataChannel {
             buffered_amount_low_threshold: Arc::new(Mutex::new(0)),
             on_buffered_amount_low_callback: Arc::new(Mutex::new(None)),
             threshold_monitor: Arc::new(AtomicBool::new(false)),
+            
+            #[cfg(test)]
+            test_send_hook: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// Create a fake data channel for testing or initialization
-    pub fn dummy() -> Self {
-        panic!("WebRTCDataChannel::dummy should only be used for testing or initialization and should not be called directly")
     }
 
     /// Set the buffered amount low threshold
@@ -100,12 +106,38 @@ impl WebRTCDataChannel {
         log::debug!("Set buffered amount low callback: {}", has_callback);
     }
 
+    // Add a test method to set the sending hook for testing
+    #[cfg(test)]
+    pub fn set_test_send_hook<F>(&self, hook: F)
+    where
+        F: Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        let mut guard = self.test_send_hook.lock().unwrap();
+        *guard = Some(Box::new(hook));
+    }
+
     pub async fn send(&self, data: Bytes) -> Result<(), String> {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
             return Err("Channel is closing".to_string());
         }
+        
+        // For testing: call the test hook if set
+        #[cfg(test)]
+        {
+            let hook_guard = self.test_send_hook.lock().unwrap();
+            if let Some(ref hook) = *hook_guard {
+                // Clone the data for the hook
+                let data_clone = data.clone();
 
+                // Call the hook with a clone of the data
+                let hook_future = hook(data_clone);
+
+                // Spawn the hook execution to avoid blocking
+                tokio::spawn(hook_future);
+            }
+        }
+        
         // Send data with detailed error handling
         let result = self.data_channel
             .send(&data)
@@ -165,9 +197,9 @@ impl WebRTCDataChannel {
         let sender_for_close = Arc::clone(&sender);
         
         self.data_channel.on_close(Box::new(move || {
-            // If opened and then closed during this wait, send false
+            // If opened and then closed during this wait, send it false
             if is_open_for_close.load(Ordering::Acquire) {
-                // Send false to indicate closed state, consuming the sender
+                // Send false to indicate a closed state, consuming the sender
                 if let Some(tx) = sender_for_close.lock().unwrap().take() {
                     let _ = tx.send(false);
                 }
@@ -181,7 +213,7 @@ impl WebRTCDataChannel {
             return Err("Data channel is closing".to_string());
         }
         
-        // Check if already open second (fast path)
+        // Check if already open the second (fast path)
         if self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
             return Ok(true);
         }

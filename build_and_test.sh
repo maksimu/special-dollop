@@ -21,8 +21,17 @@ echo "Installing wheel: $WHEEL"
 pip uninstall -y keeper_pam_webrtc_rs || true
 pip install $WHEEL --force-reinstall
 
+echo "Running Rust tests..."
+# Ensure Rust tests link against the correct Python interpreter
+export PYO3_PYTHON_ORIGINAL_PATH="$PATH"
+export PATH="$PWD/.venv/bin:$PATH"
+export PYO3_PYTHON=$(which python3)
+export PATH="$PYO3_PYTHON_ORIGINAL_PATH"
+echo "Using PYO3_PYTHON=$PYO3_PYTHON for Rust tests"
+cargo test --release
+
 echo "Running tests..."
 cd tests
 
 # Run all tests
-python -m pytest -v
+python3 -m pytest -v

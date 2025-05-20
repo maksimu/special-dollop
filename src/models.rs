@@ -4,56 +4,12 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use bytes::Bytes;
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use anyhow::Result;
-
-// Static empty bytes for when empty responses are needed
-pub(crate) static EMPTY_BYTES: once_cell::sync::Lazy<Bytes> = once_cell::sync::Lazy::new(|| Bytes::new());
-
-// Protocol handler trait for supporting different protocols
-pub trait ProtocolHandler {
-    /// Initialize the protocol handler
-    fn initialize(&mut self) -> BoxFuture<'_, Result<()>>;
-
-    /// Process incoming data from the client and determine where to send it
-    fn process_client_data<'a>(&'a mut self, conn_no: u32, data: &'a [u8]) -> BoxFuture<'a, Result<Bytes>>;
-
-    /// Process incoming data from the server and determine where to send it
-    fn process_server_data<'a>(&'a mut self, conn_no: u32, data: &'a [u8]) -> BoxFuture<'a, Result<Bytes>>;
-
-    /// Handle protocol-specific commands or state changes
-    fn handle_command<'a>(&'a mut self, command: &'a str, params: &'a [u8]) -> BoxFuture<'a, Result<()>>;
-
-    /// Handle a new connection
-    fn handle_new_connection(&mut self, conn_no: u32) -> BoxFuture<'_, Result<()>>;
-
-    /// Handle EOF on a connection
-    fn handle_eof(&mut self, conn_no: u32) -> BoxFuture<'_, Result<()>>;
-
-    /// Handle a connection close message
-    fn handle_close(&mut self, conn_no: u32) -> BoxFuture<'_, Result<()>>;
-
-    /// Set the WebRTC channel for sending data
-    fn set_webrtc_channel(&mut self, channel: crate::webrtc_data_channel::WebRTCDataChannel);
-
-    /// Notifies the handler when WebRTC channel state changes
-    /// This allows handlers to reconnect and send pending messages when the channel becomes available
-    fn on_webrtc_channel_state_change(&mut self, state: &str) -> BoxFuture<'_, Result<()>>;
-
-    /// Process any pending messages if the WebRTC channel is available
-    fn process_pending_messages(&mut self) -> BoxFuture<'_, Result<()>>;
-
-    /// Shutdown protocol handler
-    fn shutdown(&mut self) -> BoxFuture<'_, Result<()>>;
-
-    /// Get handler status
-    fn status(&self) -> String;
-}
 
 // Connection statistics
 #[derive(Debug, Default, Clone)]
@@ -66,6 +22,8 @@ pub(crate) struct ConnectionStats {
     pub(crate) transfer_latency_count: u64,
     pub(crate) ping_time: Option<u64>,
     pub(crate) message_counter: u32,
+    pub(crate) received_eof: bool,
+    pub(crate) remote_connected: bool,
 }
 
 impl ConnectionStats {
@@ -162,7 +120,7 @@ impl AsyncReadWrite for TcpStream {
 
 /// Per‑connection state.
 pub(crate) struct Conn {
-    pub(crate) backend: Box<dyn AsyncReadWrite>,
+    pub(crate) backend: Box<dyn AsyncReadWrite + Send + Sync + Unpin>,
     pub(crate) to_webrtc: JoinHandle<()>,
     pub(crate) stats: ConnectionStats,
 }
@@ -217,16 +175,6 @@ impl NetworkAccessChecker {
             return true;
         }
         self.allowed_ports.contains(&port)
-    }
-    
-    // Getter for allowed hosts
-    pub fn allowed_hosts(&self) -> &Vec<String> {
-        &self.allowed_hosts
-    }
-    
-    // Getter for allowed ports
-    pub fn allowed_ports(&self) -> &Vec<u16> {
-        &self.allowed_ports
     }
 }
 

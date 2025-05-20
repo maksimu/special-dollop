@@ -10,7 +10,7 @@ mod buffer_pool;
 mod runtime;
 mod channel;
 mod models;
-mod protocol;
+mod tube_protocol;
 mod error;
 mod tube;
 mod router_helpers;
@@ -19,8 +19,6 @@ mod tube_and_channel_helpers;
 mod tube_registry;
 
 pub use webrtc_core::*;
-pub use channel::protocols::*;
-pub use channel::create_protocol_handler;
 pub use tube::*;
 
 #[cfg(feature = "python")]

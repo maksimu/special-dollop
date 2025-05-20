@@ -1,6 +1,6 @@
 //! Protocol frame and message tests
 use crate::models::ConnectionStats;
-use crate::protocol::{ControlMessage, Frame, now_ms, try_parse_frame};
+use crate::tube_protocol::{ControlMessage, Frame, now_ms, try_parse_frame};
 use crate::runtime::get_runtime;
 use crate::buffer_pool::BufferPool;
 

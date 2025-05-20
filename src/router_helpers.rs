@@ -282,7 +282,7 @@ fn is_base64(s: &str) -> bool {
     // Standard base64 uses A-Z, a-z, 0-9, +, /, and = for padding
     // URL-safe base64 uses A-Z, a-z, 0-9, -, _, and = for padding
     
-    // Only check if length is valid for base64 (multiple of 4 if padding is used)
+    // Only check if the length is valid for base64 (multiple of 4 if padding is used)
     if s.len() % 4 != 0 && !s.ends_with('=') {
         return false;
     }

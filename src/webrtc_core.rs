@@ -12,7 +12,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 use crate::tube_registry::SignalMessage;
 
 // Cached API instance for reuse
@@ -80,104 +80,6 @@ pub async fn create_data_channel(
         .await
 }
 
-// Helper function to set up STUN/TURN servers
-pub async fn setup_ice_servers(
-    ksm_config: &str,
-    relay_server: &str,
-    turn_only: bool,
-    show_pwd: bool,
-) -> Result<RTCConfiguration, String> {
-    use crate::router_helpers::get_relay_access_creds;
-    
-    let response_dict = get_relay_access_creds(ksm_config, None)
-        .await
-        .map_err(|e| format!("STUN/TURN Allocation Failed: {}", e))?;
-    
-    if response_dict.is_null() || response_dict.is_object() && response_dict.as_object().unwrap().is_empty() {
-        return Err("Could not get TURN credentials".to_string());
-    }
-    
-    // Extract username and password
-    let username = match response_dict.get("username") {
-        Some(u) => u.as_str().unwrap_or("").to_string(),
-        None => "".to_string(),
-    };
-    
-    let password = match response_dict.get("password") {
-        Some(p) => p.as_str().unwrap_or("").to_string(),
-        None => "".to_string(),
-    };
-    
-    // TODO: this may have a timestamp needed to pare the clocks in it that is need to return as well
-    let time_offset = match response_dict.get("time") {
-        Some(t) => t.as_u64().unwrap_or(0),
-        None => 0,
-    };
-    debug!("Got time: {}", time_offset);
-    
-    
-    if show_pwd {
-        debug!("Got TURN credentials: username={}, password={}", username, password);
-    } else {
-        debug!("Got TURN credentials: username={}, password=***", username);
-    }
-    
-    // Configure ice servers
-    let mut ice_servers = Vec::new();
-    
-    // Add STUN servers if not turn_only
-    if !turn_only {
-        let stun_server = webrtc::ice_transport::ice_server::RTCIceServer {
-            urls: vec![format!("stun:{}:3478", relay_server)],
-            username: "".to_string(),
-            credential: "".to_string(),
-        };
-        ice_servers.push(stun_server);
-        
-        // Add STUN server with TCP transport
-        let stun_tcp_server = webrtc::ice_transport::ice_server::RTCIceServer {
-            urls: vec![format!("stun:{}:3478?transport=tcp", relay_server)],
-            username: "".to_string(),
-            credential: "".to_string(),
-        };
-        ice_servers.push(stun_tcp_server);
-    }
-    
-    // Add TURN servers if credentials are available
-    if !username.is_empty() && !password.is_empty() {
-        let turn_server = webrtc::ice_transport::ice_server::RTCIceServer {
-            urls: vec![format!("turn:{}:3478", relay_server)],
-            username: username.clone(),
-            credential: password.clone(),
-        };
-        ice_servers.push(turn_server);
-        
-        // Add the TURN server with TCP transport
-        let turn_tcp_server = webrtc::ice_transport::ice_server::RTCIceServer {
-            urls: vec![format!("turn:{}:3478?transport=tcp", relay_server)],
-            username,
-            credential: password,
-        };
-        ice_servers.push(turn_tcp_server);
-    }
-    
-    // Create configuration
-    let mut config = RTCConfiguration::default();
-    config.ice_servers = ice_servers;
-    
-    Ok(config)
-}
-
-// ICE candidate helper
-pub fn parse_candidate(
-    candidate_str: &str,
-) -> webrtc::error::Result<RTCIceCandidateInit> {
-    Ok(RTCIceCandidateInit {
-        candidate: candidate_str.to_string(),
-        ..Default::default()
-    })
-}
-
 // Async-first wrapper for core WebRTC operations
 pub struct WebRTCPeerConnection {
     pub peer_connection: Arc<RTCPeerConnection>,
@@ -186,7 +88,7 @@ pub struct WebRTCPeerConnection {
     ksm_config: String,
     answer_sent: Arc<AtomicBool>,
     pending_ice_candidates: Arc<Mutex<Vec<String>>>,
-    signal_sender: Option<Sender<SignalMessage>>,
+    signal_sender: Option<UnboundedSender<SignalMessage>>,
 }
 
 impl WebRTCPeerConnection {
@@ -195,7 +97,7 @@ impl WebRTCPeerConnection {
         trickle_ice: bool, 
         turn_only: bool,
         ksm_config: String,
-        signal_sender: Option<Sender<SignalMessage>>,
+        signal_sender: Option<UnboundedSender<SignalMessage>>,
     ) -> Result<Self, String> {
         // Use the provided configuration or default
         let mut actual_config = config.unwrap_or_default();
@@ -221,7 +123,7 @@ impl WebRTCPeerConnection {
         let pc_arc = Arc::new(peer_connection);
         let is_closing_clone = Arc::clone(&is_closing);
         
-        // Set up connection state change handler
+        // Set up a connection state change handler
         pc_arc.on_peer_connection_state_change(Box::new(move |state| {
             let is_closing = Arc::clone(&is_closing_clone);
             Box::pin(async move {
@@ -253,55 +155,74 @@ impl WebRTCPeerConnection {
     pub fn setup_ice_candidate_handler(
         &self,
         tube_id: String,
-        endpoint_name: String,
+        conversation_id: String,
     ) {
         // Handle ICE candidates only when using trickle ICE
         if !self.trickle_ice {
-            debug!("Not setting up ICE candidate handler - trickle ICE is disabled");
+            debug!("Not setting up ICE candidate handler - trickle ICE is disabled for tube {} conv {}", tube_id, conversation_id);
             return;
         }
+        info!("[ICE_HANDLER_SETUP] Setting up ICE candidate handler for tube {} conv {} (trickle_ice: {})", tube_id, conversation_id, self.trickle_ice);
         
         // Create a clone of self-reference for sending candidates
         let self_ref = self.clone();
         let tube_id_clone = tube_id.clone();
-        let endpoint_name_clone = endpoint_name.clone();
+        let conversation_id_clone = conversation_id.clone();
         
         // Remove any existing handlers first to avoid duplicates
         self.peer_connection.on_ice_candidate(Box::new(|_| Box::pin(async {})));
         
         // Set up handler for ICE candidates
-        self.peer_connection.on_ice_candidate(Box::new(move |candidate| {
+        self.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+            // CLONE FOR LOGGING - ensure tube_id_clone and conversation_id_clone are fresh for this scope if needed
+            let tube_id_for_log = tube_id_clone.clone(); 
+            log::info!("[ICE_CALLBACK_DEBUG] on_ice_candidate triggered for tube_id: {}. Candidate is: {:?}", tube_id_for_log, candidate);
+
             let self_clone = self_ref.clone();
-            let tube_id = tube_id_clone.clone();
-            let endpoint_name = endpoint_name_clone.clone();
+            let tube_id_clone2 = tube_id_clone.clone(); 
+            let conversation_id_clone2 = conversation_id_clone.clone();
             
             Box::pin(async move {
                 if let Some(c) = candidate {
                     // Convert the ICE candidate to a string representation
                     let candidate_str = format_ice_candidate(&c);
-                    debug!("New ICE candidate: {}", candidate_str);
+                    debug!("New ICE candidate for tube {}: {}", tube_id_clone2, candidate_str);
                     
                     // Store the candidate for later use if an answer hasn't been sent
                     if !self_clone.answer_sent.load(Ordering::Acquire) {
                         let mut candidates_lock = self_clone.pending_ice_candidates.lock().unwrap();
                         candidates_lock.push(candidate_str.clone());
+                        debug!("Stored ICE candidate for tube {} (answer not sent yet)", tube_id_clone2);
                     }
                     
-                    // Send it to the signal channel if an answer has been sent, or we're using trickle ICE
-                    if self_clone.answer_sent.load(Ordering::Acquire) {
-                        self_clone.send_ice_candidate(
-                            &candidate_str,
-                            &tube_id,
-                            &endpoint_name,
-                        );
-                    }
+                    // Send it to the signal channel if an answer has been sent, or (always if trickle ICE is on for this handler)
+                    // The original logic was: if self_clone.answer_sent.load(Ordering::Acquire)
+                    // For trickle ICE, we generally send candidates as they arrive after offer/answer exchange has begun.
+                    // The `answer_sent` flag is more about flushing pending candidates when an answer is *sent by this peer*.
+                    // If we are the offerer, we send candidates once set_remote_description(answer) is done.
+                    // If we are the answerer, we send candidates once set_local_description(answer) is done (which sets answer_sent).
+                    // Let's assume for now if trickle_ice is on for the PC, we always try to send.
+                    // The `answer_sent` logic for flushing *pending* candidates remains in `send_answer`.
+                    self_clone.send_ice_candidate(
+                        &candidate_str,
+                        &tube_id_clone2,
+                        &conversation_id_clone2,
+                    );
+                } else {
+                    // Candidate is None, which means ICE gathering is complete for this transport
+                    debug!("All ICE candidates gathered for tube {} (received None). Sending empty candidate signal.", tube_id_clone2);
+                    self_clone.send_ice_candidate(
+                        "", // Empty string to signify end of candidates
+                        &tube_id_clone2,
+                        &conversation_id_clone2,
+                    );
                 }
             })
         }));
     }
 
     // Set or update the signal channel
-    pub fn set_signal_channel(&mut self, signal_sender: Sender<SignalMessage>) {
+    pub fn set_signal_channel(&mut self, signal_sender: UnboundedSender<SignalMessage>) {
         self.signal_sender = Some(signal_sender);
     }
 
@@ -309,23 +230,23 @@ impl WebRTCPeerConnection {
     pub fn send_ice_candidate(&self, 
                              candidate: &str, 
                              tube_id: &str,
-                             endpoint_name: &str) {
+                             conversation_id: &str) {
         // Only proceed if we have a signal channel
         if let Some(sender) = &self.signal_sender {
             // Create the ICE candidate message - use one-time allocation with format!
-            let prep_message = format!("{{\"candidate\":\"{}\", \"tube_id\":\"{}\"}}", candidate, tube_id);
+            // The data field of SignalMessage is just a String. We'll send the candidate string directly.
             
             // Prepare the signaling message
             let message = SignalMessage {
                 tube_id: tube_id.to_string(),
                 kind: "icecandidate".to_string(),
-                data: prep_message,
-                conversation_id: endpoint_name.to_string(),
+                data: candidate.to_string(), // Send the candidate string directly
+                conversation_id: conversation_id.to_string(),
             };
             
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!("Failed to send ICE candidate: {}", e);
+                warn!("Failed to send ICE candidate through signal channel: {}", e);
             }
         } else {
             debug!("No signal channel available to send ICE candidate");
@@ -334,8 +255,8 @@ impl WebRTCPeerConnection {
     
     // Method to send answer to router and flush-buffered candidates
     pub fn send_answer(&self,
-                       answer: &str,
-                       endpoint_name: &str,
+                       answer_sdp: &str,
+                       conversation_id: &str,
                        tube_id: &str) {
         // Only send it if we have a signal channel
         if let Some(sender) = &self.signal_sender {
@@ -343,13 +264,13 @@ impl WebRTCPeerConnection {
             let message = SignalMessage {
                 tube_id: tube_id.to_string(),
                 kind: "answer".to_string(),
-                data: format!("{{\"answer\":\"{}\"}}", answer),
-                conversation_id: endpoint_name.to_string(),
+                data: answer_sdp.to_string(), // Send the answer SDP string directly
+                conversation_id: conversation_id.to_string(),
             };
             
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!("Failed to send answer: {}", e);
+                warn!("Failed to send answer through signal channel: {}", e);
                 return; // Don't process candidates if we can't send the answer
             }
         } else {
@@ -370,7 +291,7 @@ impl WebRTCPeerConnection {
         if !pending_candidates.is_empty() {
             debug!("Sending {} buffered ICE candidates", pending_candidates.len());
             for candidate in pending_candidates {
-                self.send_ice_candidate(&candidate, tube_id, endpoint_name);
+                self.send_ice_candidate(&candidate, tube_id, conversation_id);
             }
         }
     }

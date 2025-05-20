@@ -1065,12 +1065,15 @@ dependencies = [
 name = "keeper-pam-webrtc-rs"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64",
  "bytes",
  "chrono",
  "ctor",
  "futures",
+ "hex",
+ "hkdf",
  "lazy_static",
  "log",
  "once_cell",
@@ -1081,6 +1084,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.12",
  "tokio",
  "uuid",

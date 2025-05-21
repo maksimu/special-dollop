@@ -1,10 +1,10 @@
-mod tube_registry;
+mod tube_registry_binding;
 
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use pyo3::Bound;
 use pyo3::types::PyModule;
-pub use tube_registry::{PyTubeRegistry};
+pub use tube_registry_binding::{PyTubeRegistry};
 use crate::runtime::get_runtime;
 
 #[pymodule]

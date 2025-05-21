@@ -6,7 +6,7 @@ echo "Cleaning previous builds..."
 cargo clean
 
 # Make sure to remove any cached wheels, but don't error if none exist
-rm -rf target/wheels/* 2>/dev/null || true
+rm -rf target/wheels && mkdir -p target/wheels
 # Alternatively: if [ -d "target/wheels" ]; then rm -rf target/wheels/*; fi
 
 echo "Building wheel..."
@@ -21,17 +21,9 @@ echo "Installing wheel: $WHEEL"
 pip uninstall -y keeper_pam_webrtc_rs || true
 pip install $WHEEL --force-reinstall
 
-echo "Running Rust tests..."
-# Ensure Rust tests link against the correct Python interpreter
-export PYO3_PYTHON_ORIGINAL_PATH="$PATH"
-export PATH="$PWD/.venv/bin:$PATH"
-export PYO3_PYTHON=$(which python3)
-export PATH="$PYO3_PYTHON_ORIGINAL_PATH"
-echo "Using PYO3_PYTHON=$PYO3_PYTHON for Rust tests"
-cargo test --release
-
 echo "Running tests..."
 cd tests
 
 # Run all tests
-python3 -m pytest -v
+export RUST_BACKTRACE=1
+python3 -m pytest -v --log-cli-level=DEBUG

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut, BufMut};
-use log::{debug, error};
+use tracing::{debug, error};
 use std::collections::VecDeque;
 use std::str;
 
@@ -30,9 +30,6 @@ impl GuacdInstruction {
 pub(crate) enum GuacdError {
     #[error("Invalid instruction: {0}")]
     InvalidInstruction(String),
-
-    #[error("Parse error: {0}")]
-    ParseError(String),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -164,11 +161,13 @@ impl GuacdParser {
     }
 
     /// Get all pending instructions (for batch processing)
+    #[allow(dead_code)]
     pub fn get_all_instructions(&mut self) -> Vec<GuacdInstruction> {
         self.instructions.drain(..).collect()
     }
 
     /// Encode an instruction into Guacamole protocol format with minimal allocations
+    #[allow(dead_code)]
     pub fn guacd_encode(opcode: &str, args: &[&str]) -> Vec<u8> {
         // Estimate buffer size to avoid reallocations
         let estimated_size = opcode.len() +
@@ -223,6 +222,7 @@ impl GuacdParser {
     }
 
     /// Decode a Guacamole protocol message
+    #[allow(dead_code)]
     pub fn guacd_decode(data: &[u8]) -> Result<GuacdInstruction> {
         if data.is_empty() {
             return Err(anyhow!("Empty data to decode"));

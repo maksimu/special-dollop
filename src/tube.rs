@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
-use anyhow::Result;
-use parking_lot::RwLock;
+use anyhow::{anyhow, Result};
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use log;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use crate::webrtc_core::{WebRTCPeerConnection, create_data_channel};
 use crate::models::TunnelTimeouts;
 use crate::runtime::get_runtime;
@@ -13,9 +11,11 @@ use crate::tube_and_channel_helpers::{TubeStatus, setup_channel_for_data_channel
 use crate::tube_registry::REGISTRY;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use crate::tube_registry::SignalMessage;
 use std::sync::atomic::AtomicBool;
+use crate::router_helpers::post_connection_state;
 
 // A single tube holding a WebRTC peer connection and channels
 #[derive(Clone)]
@@ -25,15 +25,15 @@ pub struct Tube {
     // WebRTC peer connection
     pub(crate) peer_connection: Arc<TokioMutex<Option<Arc<WebRTCPeerConnection>>>>,
     // Data channels mapped by label
-    pub(crate) data_channels: Arc<RwLock<HashMap<String, WebRTCDataChannel>>>,
+    pub(crate) data_channels: Arc<TokioRwLock<HashMap<String, WebRTCDataChannel>>>,
     // Control channel (special default channel)
-    pub(crate) control_channel: Arc<RwLock<Option<WebRTCDataChannel>>>,
+    pub(crate) control_channel: Arc<TokioRwLock<Option<WebRTCDataChannel>>>,
     // Map of channel names to their shutdown signals
-    pub channel_shutdown_signals: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    pub channel_shutdown_signals: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
     // Indicates if this tube was created in a server or client context by its registry
     pub(crate) is_server_mode_context: bool,
     // Current status
-    pub(crate) status: Arc<RwLock<TubeStatus>>,
+    pub(crate) status: Arc<TokioRwLock<TubeStatus>>,
     // Runtime
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
 }
@@ -47,11 +47,11 @@ impl Tube {
         let tube = Arc::new(Self {
             id: id.clone(), // Clone ID to use below
             peer_connection: Arc::new(TokioMutex::new(None)),
-            data_channels: Arc::new(RwLock::new(HashMap::new())),
-            control_channel: Arc::new(RwLock::new(None)),
-            channel_shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
+            data_channels: Arc::new(TokioRwLock::new(HashMap::new())),
+            control_channel: Arc::new(TokioRwLock::new(None)),
+            channel_shutdown_signals: Arc::new(TokioRwLock::new(HashMap::new())),
             is_server_mode_context,
-            status: Arc::new(RwLock::new(TubeStatus::New)),
+            status: Arc::new(TokioRwLock::new(TubeStatus::New)),
             runtime,
         });
 
@@ -70,31 +70,37 @@ impl Tube {
     ) -> Result<()> {
         info!("[TUBE_DEBUG] Tube {}: create_peer_connection called. trickle_ice: {}, turn_only: {}", self.id, trickle_ice, turn_only);
 
-        let connection = WebRTCPeerConnection::new(config, trickle_ice, turn_only, ksm_config.clone(), Some(signal_sender)).await 
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let connection = WebRTCPeerConnection::new(
+            config, 
+            trickle_ice, 
+            turn_only, 
+            ksm_config.clone(), 
+            Some(signal_sender),
+            self.id.clone(), // Pass tube_id
+        ).await 
+            .map_err(|e| anyhow!("{}", e))?;
 
         let connection_arc = Arc::new(connection);
         
         let status = self.status.clone();
-        let tube_id_for_state_handler = self.id.clone(); // Used by state change handler
         
-        info!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id): {}", self.id, callback_token);
-        connection_arc.setup_ice_candidate_handler(tube_id_for_state_handler.clone(), callback_token.clone());
+        info!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
+        connection_arc.setup_ice_candidate_handler();
         
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
             Box::pin(async move {
                 match state {
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected => {
-                        *status_clone.write() = TubeStatus::Connected;
+                        *status_clone.write().await = TubeStatus::Connected;
                         info!("Tube connection state changed to Connected");
                     },
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                        *status_clone.write() = TubeStatus::Failed;
+                        *status_clone.write().await = TubeStatus::Failed;
                         info!("Tube connection state changed to Failed");
                     },
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed => {
-                        *status_clone.write() = TubeStatus::Closed;
+                        *status_clone.write().await = TubeStatus::Closed;
                         info!("Tube connection state changed to Closed");
                     },
                     _ => {
@@ -118,14 +124,14 @@ impl Tube {
                 let data_channel = WebRTCDataChannel::new(rtc_data_channel);
 
                 // Add it to our data channels map
-                if let Err(e) = tube.add_data_channel(data_channel.clone()) {
+                if let Err(e) = tube.add_data_channel(data_channel.clone()).await {
                     error!("Failed to add data channel to tube: {}", e);
                     return;
                 }
 
                 // If this is the control channel, store it specially
                 if label == "control" {
-                    *tube.control_channel.write() = Some(data_channel.clone());
+                    *tube.control_channel.write().await = Some(data_channel.clone());
                     info!("Set control channel");
                     return;
                 }
@@ -151,7 +157,7 @@ impl Tube {
 
                 // Store the shutdown signal for this newly created channel
                 let shutdown_signal = Arc::clone(&owned_channel.should_exit);
-                tube.channel_shutdown_signals.write().insert(label.clone(), shutdown_signal);
+                tube.channel_shutdown_signals.write().await.insert(label.clone(), shutdown_signal);
 
                 if owned_channel.server_mode {
                     if let Some(listen_addr_str) = owned_channel.local_listen_addr.clone() {
@@ -167,8 +173,8 @@ impl Tube {
                                 Err(e) => {
                                     error!("Tube({}): Channel (from on_data_channel) '{}' failed to start server on {}: {}. Channel will not run effectively.", tube.id, label, listen_addr_str, e);
                                     // Remove signal if server start failed and we won't run the channel
-                                    tube.channel_shutdown_signals.write().remove(&label);
-                                    return; // Don't spawn run if server setup failed critically
+                                    tube.channel_shutdown_signals.write().await.remove(&label);
+                                    return; // Don't spawn run because server setup failed critically
                                 }
                             }
                         }
@@ -183,7 +189,7 @@ impl Tube {
                     if let Err(e) = owned_channel.run().await {
                         error!("Tube {}: Endpoint (from on_data_channel) {}: Error running channel: {}", tube_id_for_log, label_clone_for_run, e);
                     }
-                    // Optionally, after run finishes, remove its shutdown signal from the map.
+                    // Optionally, after the run finishes, remove its shutdown signal from the map.
                     // Requires cloning tube.channel_shutdown_signals Arc into the task.
                 });
                 
@@ -196,10 +202,10 @@ impl Tube {
         *pc = Some(connection_arc);
 
         // Update status
-        *self.status.write() = TubeStatus::Connecting;
+        *self.status.write().await = TubeStatus::Connecting;
 
         // Print debug status
-        debug!("Updated tube status to: {:?}", self.status());
+        debug!("Updated tube status to: {:?}", self.status().await);
 
         // Add a small delay to ensure any pending operations complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -220,27 +226,23 @@ impl Tube {
     }
     
     // Add a data channel
-    pub(crate) fn add_data_channel(&self, data_channel: WebRTCDataChannel) -> Result<()> {
+    pub(crate) async fn add_data_channel(&self, data_channel: WebRTCDataChannel) -> Result<()> {
         let label = data_channel.label();
         
         // If this is the control channel, set it specially
         if label == "control" {
-            *self.control_channel.write() = Some(data_channel.clone());
+            *self.control_channel.write().await = Some(data_channel.clone());
         }
         
         // Add to the channel map
-        self.data_channels.write().insert(label, data_channel);
+        self.data_channels.write().await.insert(label, data_channel);
         Ok(())
     }
     
     // Get data channel by label
-    pub(crate) fn get_data_channel(&self, label: &str) -> Option<WebRTCDataChannel> {
-        self.data_channels.read().get(label).cloned()
-    }
-    
-    // Get all data channels
-    pub(crate) fn get_all_data_channels(&self) -> Vec<WebRTCDataChannel> {
-        self.data_channels.read().values().cloned().collect()
+    #[cfg(test)]
+    pub(crate) async fn get_data_channel(&self, label: &str) -> Option<WebRTCDataChannel> {
+        self.data_channels.read().await.get(label).cloned()
     }
     
     // Create a new data channel and add it to the tube
@@ -261,11 +263,11 @@ impl Tube {
             drop(pc_guard);
             
             // Add to our mapping
-            self.add_data_channel(data_channel)?;
+            self.add_data_channel(data_channel.clone()).await?;
             
             Ok(data_channel_clone)
         } else {
-            Err(anyhow::anyhow!("No peer connection available").into())
+            Err(anyhow!("No peer connection available").into())
         }
     }
     
@@ -320,7 +322,7 @@ impl Tube {
         debug!("Sending connection open callback to router");
         let token_value = serde_json::Value::String(callback_token);
 
-        match crate::router_helpers::post_connection_state(
+        match post_connection_state(
             &*ksm_config,
             "connection_open",
             &token_value,
@@ -347,7 +349,7 @@ impl Tube {
         let token_value = serde_json::Value::String(callback_token);
 
         // Fall back to direct API call
-        match crate::router_helpers::post_connection_state(
+        match post_connection_state(
             &*ksm_config,
             "connection_close",
             &token_value,
@@ -394,7 +396,7 @@ impl Tube {
 
         // Store the shutdown signal for this channel
         let shutdown_signal = Arc::clone(&owned_channel.should_exit);
-        self.channel_shutdown_signals.write().insert(name.to_string(), shutdown_signal);
+        self.channel_shutdown_signals.write().await.insert(name.to_string(), shutdown_signal);
 
         let mut actual_listening_port: Option<u16> = None;
 
@@ -413,8 +415,8 @@ impl Tube {
                         Err(e) => {
                             error!("Tube({}): Channel '{}' failed to start server on {}: {}. Channel will not listen.", self.id, name, listen_addr_str, e);
                             // Remove signal if server start failed and we won't run the channel
-                            self.channel_shutdown_signals.write().remove(name);
-                            return Err(anyhow::anyhow!("Failed to start server for channel {}: {}", name, e));
+                            self.channel_shutdown_signals.write().await.remove(name);
+                            return Err(anyhow!("Failed to start server for channel {}: {}", name, e));
                         }
                     }
                 }
@@ -438,20 +440,20 @@ impl Tube {
     // Create the default control channel
     pub(crate) async fn create_control_channel(&self, ksm_config: String, callback_token: String) -> Result<WebRTCDataChannel> {
         let control_channel = self.create_data_channel("control", ksm_config, callback_token).await?;
-        *self.control_channel.write() = Some(control_channel.clone());
+        *self.control_channel.write().await = Some(control_channel.clone());
         Ok(control_channel)
     }
     
     // Close a specific channel by signaling its run loop to exit
-    pub(crate) fn close_channel(&self, name: &str) -> Result<()> {
-        let mut signals = self.channel_shutdown_signals.write();
-        if let Some(signal_arc) = signals.remove(name) { // Remove from map once signaled
+    pub(crate) async fn close_channel(&self, name: &str) -> Result<()> {
+        let mut signals = self.channel_shutdown_signals.write().await;
+        if let Some(signal_arc) = signals.remove(name) { // Remove from the map once signaled
             info!("Tube {}: Signaling channel '{}' to close.", self.id, name);
             signal_arc.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         } else {
             warn!("Tube {}: No shutdown signal found for channel '{}' during close_channel. It might have already been closed or never run.", self.id, name);
-            Err(anyhow::anyhow!("No shutdown signal for channel not found: {}", name))
+            Err(anyhow!("No shutdown signal for channel not found: {}", name))
         }
     }
     
@@ -538,14 +540,14 @@ impl Tube {
         info!("Closing tube with ID: {}", self.id);
 
         // Set the status to Closed first to prevent Drop from trying to remove
-        *self.status.write() = TubeStatus::Closed;
+        *self.status.write().await = TubeStatus::Closed;
         info!("Set tube status to Closed");
 
         // Clear all channel shutdown signals
-        self.channel_shutdown_signals.write().clear();
+        self.channel_shutdown_signals.write().await.clear();
 
         // Close all data channels
-        for (_, dc) in self.data_channels.write().drain() {
+        for (_, dc) in self.data_channels.write().await.drain() {
             let _ = dc.close().await;
         }
 
@@ -558,11 +560,11 @@ impl Tube {
         // Remove from the global registry with explicit error handling
         {
             info!("Removing tube {} from registry via close()", self.id);
-            let mut registry = REGISTRY.write();
-            registry.remove_tube(&self.id);
+            let mut registry = REGISTRY.write().await;
+            registry.remove_tube(&self.id).await;
 
             // Verify removal
-            if registry.all_tube_ids().contains(&self.id) {
+            if registry.all_tube_ids().await.contains(&self.id) {
                 warn!("WARNING: Failed to remove tube from registry!");
                 // Force removal in case it wasn't properly removed
                 registry.tubes_by_id.remove(&self.id);
@@ -579,13 +581,8 @@ impl Tube {
     }
     
     // Get status
-    pub fn status(&self) -> TubeStatus {
-        self.status.read().clone()
-    }
-    
-    // Set status
-    pub(crate) fn set_status(&self, status: TubeStatus) {
-        *self.status.write() = status;
+    pub async fn status(&self) -> TubeStatus {
+        self.status.read().await.clone()
     }
 }
 

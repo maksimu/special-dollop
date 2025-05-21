@@ -346,7 +346,14 @@ async fn test_turn_only_mode() {
     let ksm_config_1 = "TEST_MODE_KSM_CONFIG_1".to_string();
 
     // Create the connection
-    let conn = crate::WebRTCPeerConnection::new(config.clone(), trickle_ice, turn_only, ksm_config_1, None).await.unwrap();
+    let conn = crate::WebRTCPeerConnection::new(
+        config.clone(), 
+        trickle_ice, 
+        turn_only, 
+        ksm_config_1, 
+        None,
+        "test_tube_id".to_string(),
+    ).await.unwrap();
 
     // Use reflection to check that the ICE transport policy was set to Relay
     let ice_transport_policy = conn.peer_connection.get_configuration().await.ice_transport_policy;
@@ -359,7 +366,14 @@ async fn test_turn_only_mode() {
     // Create another connection with turn_only set to false
     let turn_only = false;
     let ksm_config_2 = "TEST_MODE_KSM_CONFIG_2".to_string();
-    let conn_regular = crate::WebRTCPeerConnection::new(config, trickle_ice, turn_only, ksm_config_2, None).await.unwrap();
+    let conn_regular = crate::WebRTCPeerConnection::new(
+        config, 
+        trickle_ice, 
+        turn_only, 
+        ksm_config_2, 
+        None,
+        "test_tube_id_regular".to_string(),
+    ).await.unwrap();
 
     // Check that ICE transport policy is set to All for regular mode
     let ice_transport_policy = conn_regular.peer_connection.get_configuration().await.ice_transport_policy;

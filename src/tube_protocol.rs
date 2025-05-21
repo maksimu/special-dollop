@@ -9,6 +9,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::{Buf, BufMut, BytesMut, Bytes};
 use crate::buffer_pool::BufferPool;
+use tracing::warn;
 
 pub(crate) const CONN_NO_LEN: usize = 4;
 pub(crate) const CTRL_NO_LEN: usize = 2;
@@ -196,10 +197,14 @@ pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
     // Verify the terminator before any allocation
     let term_start = CONN_NO_LEN + TS_LEN + LEN_LEN + len;
     if &buf[term_start..term_start + TERMINATOR.len()] != TERMINATOR {
-        // corrupt stream; drop everything
-        log::warn!("try_parse_frame: Corrupt stream, terminator mismatch. Expected {:?}, got {:?}", 
-                  TERMINATOR, &buf[term_start..term_start + TERMINATOR.len()]);
-        buf.clear();
+        warn!(
+                target: "protocol_parse",
+                expected_terminator = ?TERMINATOR,
+                actual_bytes = ?&buf[term_start..std::cmp::min(buf.len(), term_start+2+5)], // Log a few bytes for context
+                "try_parse_frame: Corrupt stream, terminator mismatch."
+            );
+        // Consume the entire buffer to prevent reprocessing the bad data
+        buf.advance(buf.len());
         return None;
     }
     

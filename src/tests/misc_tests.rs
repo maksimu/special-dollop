@@ -1,36 +1,53 @@
 //! Miscellaneous tests
 use crate::logger;
+use tracing::{info, debug, warn, error, trace};
+use crate::logger::{InitializeLoggerError};
 
 #[test]
 fn test_logger_enhancements() {
     // Initialize the logger in test mode with debug level and a small cache size
     let test_module_name = "test_logger";
     let init_result = logger::initialize_logger(test_module_name, Some(true), 10);
-    assert!(init_result.is_ok(), "Logger initialization should succeed");
+    assert!(init_result.is_ok(), "Logger initialization should succeed: {:?}", init_result.err());
 
     // Test that logs are being processed at different levels
-    log::info!("Test info message");
-    log::debug!("Test debug message");
-    log::warn!("Test warning message");
-    log::error!("Test error message");
+    info!("Test info message");
+    debug!("Test debug message");
+    warn!("Test warning message");
+    error!("Test error message");
 
     // Test that we can call initialize multiple times without error
     let reinit_result = logger::initialize_logger(test_module_name, Some(true), 10);
-    assert!(reinit_result.is_ok(), "Logger re-initialization should succeed");
+    assert!(reinit_result.is_err(), "Logger re-initialization should fail");
+    if let Err(InitializeLoggerError::SetGlobalDefaultError(_)) = reinit_result {
+        // This is the expected error
+    } else {
+        panic!("Logger re-initialization failed with unexpected error: {:?}", reinit_result);
+    }
 
-    // Test with a different module name
+    // Test with a different module name - this should also fail as a logger is already set
     let other_module = "other_module";
     let other_init = logger::initialize_logger(other_module, Some(true), 10);
-    assert!(other_init.is_ok(), "Logger initialization with different module should succeed");
+    assert!(other_init.is_err(), "Logger initialization with different module should fail");
+    if let Err(InitializeLoggerError::SetGlobalDefaultError(_)) = other_init {
+        // This is the expected error
+    } else {
+        panic!("Logger initialization with different module failed with unexpected error: {:?}", other_init);
+    }
 
-    // Test with a different log level
-    let init_trace = logger::initialize_logger(test_module_name, Some(true), 10);
-    assert!(init_trace.is_ok(), "Logger initialization with trace level should succeed");
+    // Test with a different log level - this should also fail
+    let init_trace = logger::initialize_logger(test_module_name, Some(true), 10); // Log level here doesn't matter as it will fail before using it
+    assert!(init_trace.is_err(), "Logger initialization with trace level should fail");
+    if let Err(InitializeLoggerError::SetGlobalDefaultError(_)) = init_trace {
+        // This is the expected error
+    } else {
+        panic!("Logger initialization with trace level failed with unexpected error: {:?}", init_trace);
+    }
 
     // Create and log some messages
-    log::trace!("This is a trace message that may not be shown");
-    log::debug!("This is a debug message");
-    log::info!("This is an info message");
-    log::warn!("This is a warning message");
-    log::error!("This is an error message");
+    trace!("This is a trace message that may not be shown");
+    debug!("This is a debug message");
+    info!("This is an info message");
+    warn!("This is a warning message");
+    error!("This is an error message");
 }

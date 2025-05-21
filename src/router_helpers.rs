@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::error::Error;
 use std::time::Duration;
 use anyhow::anyhow;
+use tracing::debug;
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -56,10 +57,11 @@ const KEY_CLIENT_ID: &str = "clientId";
 mod challenge_response {
     use super::*;
     use lazy_static::lazy_static;
-    use log::{debug, error};
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use p256::pkcs8::DecodePrivateKey;
+    use anyhow::Result;
+    use tracing::{debug, error};
 
     const CHALLENGE_RESPONSE_TIMEOUT_SEC: u64 = 300; // 5 minutes
     const WEBSOCKET_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,8 +98,11 @@ mod challenge_response {
                 if latest_challenge_seconds < CHALLENGE_RESPONSE_TIMEOUT_SEC as f64
                     && !data.challenge.is_empty()
                     && !data.signature.is_empty() {
-                    debug!("Using Keeper API challenge already received {} seconds ago.",
-                          latest_challenge_seconds as u64);
+                    debug!(
+                        target: "challenge_response",
+                        age_seconds = latest_challenge_seconds as u64,
+                        "Using Keeper API challenge already received."
+                    );
                     return Ok((data.challenge.clone(), data.signature.clone()));
                 }
             }
@@ -116,8 +121,9 @@ mod challenge_response {
                     if !resp.status().is_success() {
                         let status = resp.status();
                         error!(
-                            "HTTP error response code ({}) received fetching challenge string from Keeper",
-                            status
+                            target: "challenge_response",
+                            status_code = %status,
+                            "HTTP error response code received fetching challenge string from Keeper"
                         );
                         return Err(Box::new(KRouterError(format!(
                             "HTTP error response code ({})",
@@ -127,7 +133,11 @@ mod challenge_response {
                     resp
                 }
                 Err(e) => {
-                    error!("HTTP error received fetching challenge string from Keeper: {}", e);
+                    error!(
+                        target: "challenge_response",
+                        error = %e,
+                        "HTTP error received fetching challenge string from Keeper"
+                    );
                     return Err(Box::new(e));
                 }
             };
@@ -135,7 +145,7 @@ mod challenge_response {
             let challenge = response.text().await?;
             let signature = sign_client_id(ksm_config, &challenge)?;
 
-            debug!("Fetched new Keeper API challenge and generated response.");
+            debug!(target: "challenge_response", "Fetched new Keeper API challenge and generated response.");
 
             // Update the cache
             {
@@ -163,12 +173,12 @@ mod challenge_response {
             None => return Err(Box::new(KRouterError("Client ID not found in config".into()))),
         };
 
-        debug!("Decoding client_id and private key");
+        debug!(target: "challenge_response", "Decoding client_id and private key");
         
         let private_key_der_bytes = match url_safe_str_to_bytes(private_key_der_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("Failed to decode private key: {}", e);
+                error!(target: "challenge_response", error = %e, "Failed to decode private key");
                 return Err(e);
             }
         };
@@ -176,17 +186,17 @@ mod challenge_response {
         let mut client_id_bytes = match url_safe_str_to_bytes(client_id_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("Failed to decode client_id: {}", e);
+                error!(target: "challenge_response", error = %e, "Failed to decode client_id");
                 return Err(e);
             }
         };
 
-        debug!("Adding challenge to the signature before connecting to the router");
+        debug!(target: "challenge_response", "Adding challenge to the signature before connecting to the router");
         
         let challenge_bytes = match url_safe_str_to_bytes(challenge) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("Failed to decode challenge: {}", e);
+                error!(target: "challenge_response", error = %e, "Failed to decode challenge");
                 return Err(e);
             }
         };
@@ -325,7 +335,13 @@ async fn router_request(
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
-    log::debug!("Router request: {} {}, ksm_config={:?}", http_method, url_path, ksm_config);
+    debug!(
+        target: "router_communication", 
+        method = %http_method, 
+        path = %url_path, 
+        ?ksm_config,
+        "Router request"
+    );
     
     let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
     let ksm_config_parsed: KsmConfig = serde_json::from_str(ksm_config)?;
@@ -429,7 +445,11 @@ pub async fn post_connection_state(
     // Special handling for test mode
     if ksm_config == "TEST_MODE_KSM_CONFIG" {
         // Just return OK for tests without making an actual request
-        log::debug!("TEST MODE: Skipping post_connection_state for {}", connection_state);
+        debug!(
+            target: "router_communication", 
+            connection_state = %connection_state, 
+            "TEST MODE: Skipping post_connection_state"
+        );
         return Ok(());
     }
 
@@ -469,6 +489,16 @@ pub async fn post_connection_state(
             ))));
         }
     };
+
+    // For test environments, allow skipping actual HTTP post
+    if std::env::var("TEST_MODE_SKIP_POST_CONNECTION_STATE").is_ok() {
+        debug!(
+            target: "router_communication",
+            connection_state = %body.connection_type,
+            "TEST MODE: Skipping post_connection_state"
+        );
+        return Ok(());
+    }
 
     router_request(
         ksm_config,

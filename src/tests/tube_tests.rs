@@ -13,13 +13,13 @@ use tokio::sync::{mpsc, oneshot};
 use std::time::Duration;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use chrono::Utc;
-use log::{error, info};
+use tracing::{error, info};
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
 // Get a tube by ID from the registry
-pub fn get_tube(tube_id: &str) -> Option<Arc<Tube>> {
-    REGISTRY.read().get_by_tube_id(tube_id)
+pub async fn get_tube(tube_id: &str) -> Option<Arc<Tube>> {
+    REGISTRY.read().await.get_by_tube_id(tube_id).await
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn test_tube_creation() {
         assert_eq!(data_channel.label(), "test-channel");
 
         // Get data channel by label
-        let retrieved_channel = tube.get_data_channel("test-channel");
+        let retrieved_channel = tube.get_data_channel("test-channel").await;
         assert!(retrieved_channel.is_some(), "Data channel should be accessible by label");
 
         // Create the control channel with timeout
@@ -103,10 +103,10 @@ fn test_tube_creation() {
             .expect("Failed to close tube");
 
         // Verify status changed to Closed
-        assert_eq!(tube.status(), TubeStatus::Closed);
+        assert_eq!(tube.status().await, TubeStatus::Closed);
 
         // Verify tube is removed from the registry
-        let retrieved_tube = get_tube(&tube_id);
+        let retrieved_tube = get_tube(&tube_id).await;
         assert!(retrieved_tube.is_none(), "Tube should be removed from the registry");
     });
 }
@@ -150,25 +150,25 @@ fn test_tube_channel_creation() {
         ).await.expect("Call to create_channel itself failed");
 
         // Verify channel shutdown signal exists
-        assert!(tube.channel_shutdown_signals.read().contains_key("test"), "Channel shutdown signal should exist after creation");
+        assert!(tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should exist after creation");
 
         // Close the channel and verify the signal is acted upon (signal removed from map)
-        let close_result = tube.close_channel("test");
+        let close_result = tube.close_channel("test").await;
         assert!(close_result.is_ok(), "close_channel should return Ok. Actual: {:?}", close_result);
-        assert!(!tube.channel_shutdown_signals.read().contains_key("test"), "Channel shutdown signal should be removed after closing");
+        assert!(!tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should be removed after closing");
 
         // Try to close a non-existent channel
-        assert!(tube.close_channel("nonexistent").is_err(), "Non-existent channel should return an error on close");
+        assert!(tube.close_channel("nonexistent").await.is_err(), "Non-existent channel should return an error on close");
 
         tube.close().await.expect("Failed to close tube");
 
         for _ in 0..3 {
-            if get_tube(&tube_id).is_none() {
+            if get_tube(&tube_id).await.is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if get_tube(&tube_id).is_some() {
+        if get_tube(&tube_id).await.is_some() {
             println!("Warning: Tube was not removed from registry after closing in test_tube_channel_creation");
         }
     });
@@ -249,7 +249,7 @@ async fn test_tube_create_channel() {
     ).await.expect("Failed to create channel instance");
 
     // Assert that the channel shutdown signal exists in the tube's map
-    assert!(tube.channel_shutdown_signals.read().contains_key("test"), "Channel shutdown signal should be present after creation.");
+    assert!(tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should be present after creation.");
 }
 
 // New helper for offer/answer and ICE exchange
@@ -496,7 +496,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     let mut dc2_in_opt: Option<WebRTCDataChannel> = None; // This will be our wrapper
 
     for i in 0..200 { // Poll for up to 20 seconds
-        if let Some(found_dc_wrapper) = tube2.get_data_channel(&dc_label) {
+        if let Some(found_dc_wrapper) = tube2.get_data_channel(&dc_label).await {
             info!("[E2E_TEST] Tube2: Found '{}' via get_data_channel. Setting handlers.", dc_label);
             
             let (dc2_open_tx_test, dc2_open_rx_test) = oneshot::channel();

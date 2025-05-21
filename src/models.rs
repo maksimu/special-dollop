@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use anyhow::Result;
 
 // Connection statistics
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub(crate) struct ConnectionStats {
     pub(crate) receive_size: usize,
     pub(crate) transfer_size: usize,

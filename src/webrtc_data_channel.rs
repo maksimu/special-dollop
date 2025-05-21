@@ -5,6 +5,7 @@ use bytes::Bytes;
 #[cfg(test)]
 use futures::future::BoxFuture;
 use webrtc::data_channel::RTCDataChannel;
+use tracing::{debug, warn};
 
 // Async-first wrapper for data channel functionality
 pub struct WebRTCDataChannel {
@@ -53,7 +54,7 @@ impl WebRTCDataChannel {
         *guard = threshold;
 
         // Log the threshold change
-        log::debug!("Set buffered amount low threshold to {} bytes", threshold);
+        debug!("Set buffered amount low threshold to {} bytes", threshold);
 
         // Set the native WebRTC bufferedAmountLowThreshold
         if threshold > 0 {
@@ -75,7 +76,7 @@ impl WebRTCDataChannel {
                     let threshold_value = threshold_clone;
                     
                     Box::pin(async move {
-                        log::debug!("Native bufferedAmountLow event triggered (buffer below {})", threshold_value);
+                        debug!("Native bufferedAmountLow event triggered (buffer below {})", threshold_value);
                         
                         // Get and call our callback
                         let callback_guard = callback_dc.on_buffered_amount_low_callback.lock().unwrap();
@@ -88,12 +89,6 @@ impl WebRTCDataChannel {
         }
     }
 
-    /// Get the current buffered amount low threshold
-    pub fn get_buffered_amount_low_threshold(&self) -> u64 {
-        let guard = self.buffered_amount_low_threshold.lock().unwrap();
-        *guard
-    }
-
     /// Set the callback to be called when the buffered amount drops below the threshold
     pub fn on_buffered_amount_low(&self, callback: Option<Box<dyn Fn() + Send + Sync + 'static>>) {
         // Check is_some() before moving the callback
@@ -103,7 +98,7 @@ impl WebRTCDataChannel {
         let mut guard = self.on_buffered_amount_low_callback.lock().unwrap();
         *guard = callback;
 
-        log::debug!("Set buffered amount low callback: {}", has_callback);
+        debug!("Set buffered amount low callback: {}", has_callback);
     }
 
     // Add a test method to set the sending hook for testing
@@ -160,6 +155,7 @@ impl WebRTCDataChannel {
         self.data_channel.buffered_amount().await as u64
     }
 
+    #[cfg(test)]
     pub async fn wait_for_channel_open(&self, timeout: Option<Duration>) -> Result<bool, String> {
         let timeout_duration = timeout.unwrap_or(Duration::from_secs(10));
         
@@ -242,7 +238,7 @@ impl WebRTCDataChannel {
         match tokio::time::timeout(Duration::from_secs(3), self.data_channel.close()).await {
             Ok(result) => result.map_err(|e| format!("Failed to close data channel: {}", e)),
             Err(_) => {
-                log::warn!("Data channel close operation timed out, forcing abandonment");
+                warn!("Data channel close operation timed out, forcing abandonment");
                 Ok(()) // Force success even though it timed out
             }
         }

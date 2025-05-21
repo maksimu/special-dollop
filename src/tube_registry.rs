@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 use crate::Tube;
-use log;
+use tracing::{debug, info, warn};
 use anyhow::{Result, anyhow};
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use crate::router_helpers::{get_relay_access_creds, router_url_from_ksm_config};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
+use tokio::sync::mpsc::UnboundedSender;
+#[cfg(test)]
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 // Define a message structure for signaling
 #[derive(Debug, Clone)]
@@ -22,7 +24,7 @@ pub struct SignalMessage {
 
 // Global registry for all tubes - using Lazy with explicit thread safety
 pub(crate) static REGISTRY: Lazy<RwLock<TubeRegistry>> = Lazy::new(|| {
-    log::info!("Initializing global tube registry");
+    info!("Initializing global tube registry");
     RwLock::new(TubeRegistry::new())
 });
 
@@ -40,6 +42,7 @@ pub(crate) struct TubeRegistry {
 
 impl TubeRegistry {
     pub(crate) fn new() -> Self {
+        debug!("TubeRegistry::new() called");
         Self {
             tubes_by_id: HashMap::new(),
             conversation_mappings: HashMap::new(),
@@ -49,26 +52,27 @@ impl TubeRegistry {
     }
 
     // Register a signal channel for a tube
-    #[allow(dead_code)]
-    pub(crate) fn register_signal_channel(&mut self, tube_id: &str) -> UnboundedReceiver<SignalMessage> {
+    #[cfg(test)]
+    pub(crate) async fn register_signal_channel(&mut self, tube_id: &str) -> UnboundedReceiver<SignalMessage> {
         let (sender, receiver) = unbounded_channel::<SignalMessage>();
         self.signal_channels.insert(tube_id.to_string(), sender);
         receiver
     }
 
     // Remove a signal channel
-    pub(crate) fn remove_signal_channel(&mut self, tube_id: &str) {
+    pub(crate) async fn remove_signal_channel(&mut self, tube_id: &str) {
         self.signal_channels.remove(tube_id);
     }
 
     // Get a signal channel sender
-    pub(crate) fn get_signal_channel(&self, tube_id: &str) -> Option<UnboundedSender<SignalMessage>> {
+    #[cfg(test)]
+    pub(crate) async fn get_signal_channel(&self, tube_id: &str) -> Option<UnboundedSender<SignalMessage>> {
         self.signal_channels.get(tube_id).cloned()
     }
 
     // Send a message to the signal channel for a tube
-    #[allow(dead_code)]
-    pub(crate) fn send_signal(&self, message: SignalMessage) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) async fn send_signal(&self, message: SignalMessage) -> Result<()> {
         if let Some(sender) = self.signal_channels.get(&message.tube_id) {
             sender.send(message).map_err(|e| anyhow!("Failed to send signal, message was: {:?}", e.0))?;
             Ok(())
@@ -78,55 +82,54 @@ impl TubeRegistry {
     }
 
     // Add a tube to the registry
-    pub(crate) fn add_tube(&mut self, tube: Arc<Tube>) {
+    pub(crate) async fn add_tube(&mut self, tube: Arc<Tube>) {
         let id = tube.id();
-        log::debug!("TubeRegistry::add_tube - Adding tube with ID: {}", id);
-        self.tubes_by_id.insert(id, Arc::clone(&tube));
+        debug!(target: "registry", tube_id = %id, "TubeRegistry::add_tube - Adding tube");
+        self.tubes_by_id.insert(id.clone(), Arc::clone(&tube));
 
         // Verify it was added
         if !self.tubes_by_id.contains_key(&tube.id()) {
-            log::error!("ERROR: Failed to add tube to registry!");
+            warn!(target: "registry", tube_id = %id, "Tube with ID already exists in registry. Overwriting.");
         }
     }
 
     // Set server mode
-    #[allow(dead_code)]
-    pub(crate) fn set_server_mode(&mut self, server_mode: bool) {
+    pub(crate) async fn set_server_mode(&mut self, server_mode: bool) {
         self.server_mode = server_mode;
     }
 
     // Get server mode
-    pub(crate) fn is_server_mode(&self) -> bool {
+    pub(crate) async fn is_server_mode(&self) -> bool {
         self.server_mode
     }
 
     // Remove a tube from the registry
-    pub(crate) fn remove_tube(&mut self, tube_id: &str) {
+    pub(crate) async fn remove_tube(&mut self, tube_id: &str) {
         self.tubes_by_id.remove(tube_id);
         
         // Remove the signal channel
-        self.remove_signal_channel(tube_id);
+        self.remove_signal_channel(tube_id).await;
 
         // Also remove any conversation mappings pointing to this tube
         self.conversation_mappings.retain(|_, tid| tid != tube_id);
     }
 
-    pub(crate) fn get_by_tube_id(&self, tube_id: &str) -> Option<Arc<Tube>> {
-        log::debug!("TubeRegistry::get_by_tube_id - Looking for tube: {}", tube_id);
-        log::debug!("Available tubes: {:?}", self.tubes_by_id.keys().collect::<Vec<_>>());
-
-        if let Some(tube) = self.tubes_by_id.get(tube_id) {
-            log::debug!("Found tube with ID: {}", tube_id);
-            Some(Arc::clone(tube))
-        } else {
-            log::debug!("Tube with ID {} not found in registry", tube_id);
-            None
+    pub(crate) async fn get_by_tube_id(&self, tube_id: &str) -> Option<Arc<Tube>> {
+        debug!("TubeRegistry::get_by_tube_id - Looking for tube: {}", tube_id);
+        match self.tubes_by_id.get(tube_id) {
+            Some(tube) => {
+                debug!("Found tube with ID: {}", tube_id);
+                Some(tube.clone())
+            }
+            None => {
+                debug!("Tube with ID {} not found in registry", tube_id);
+                None
+            }
         }
     }
 
     // Get a tube by a conversation ID
-    #[allow(dead_code)]
-    pub(crate) fn get_by_conversation_id(&self, conversation_id: &str) -> Option<Arc<Tube>> {
+    pub(crate) async fn get_by_conversation_id(&self, conversation_id: &str) -> Option<Arc<Tube>> {
         if let Some(tube_id) = self.conversation_mappings.get(conversation_id) {
             self.tubes_by_id.get(tube_id).cloned()
         } else {
@@ -135,8 +138,7 @@ impl TubeRegistry {
     }
 
     // Associate a conversation ID with a tube
-    #[allow(dead_code)]
-    pub(crate) fn associate_conversation(&mut self, tube_id: &str, conversation_id: &str) -> Result<()> {
+    pub(crate) async fn associate_conversation(&mut self, tube_id: &str, conversation_id: &str) -> Result<()> {
         if !self.tubes_by_id.contains_key(tube_id) {
             return Err(anyhow!("Tube not found: {}", tube_id));
         }
@@ -146,13 +148,12 @@ impl TubeRegistry {
     }
 
     // Get all tube IDs
-    pub(crate) fn all_tube_ids(&self) -> Vec<String> {
+    pub(crate) async fn all_tube_ids(&self) -> Vec<String> {
         self.tubes_by_id.keys().cloned().collect()
     }
 
     // Find tubes by partial match of tube ID or conversation ID
-    #[allow(dead_code)]
-    pub(crate) fn find_tubes(&self, search_term: &str) -> Vec<String> {
+    pub(crate) async fn find_tubes(&self, search_term: &str) -> Vec<String> {
         let mut results = Vec::new();
 
         // Search in tube IDs
@@ -178,14 +179,12 @@ impl TubeRegistry {
     }
     
     /// get all conversations from a tube id
-    #[allow(dead_code)]
-    pub(crate) fn tube_id_from_conversation_id(&self, conversation_id: &str) -> Option<&String> {
+    pub(crate) async fn tube_id_from_conversation_id(&self, conversation_id: &str) -> Option<&String> {
         self.conversation_mappings.get(conversation_id)
     }
     
     /// get all conversation ids by tube id 
-    #[allow(dead_code)]
-    pub(crate) fn conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<&String> {
+    pub(crate) async fn conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<&String> {
         let mut results = Vec::new();
         // Search in conversation IDs
         for (conv_id, con_tube_id) in &self.conversation_mappings {
@@ -200,7 +199,6 @@ impl TubeRegistry {
     }
 
     /// Create a tube with WebRTC connection and ICE configuration
-    #[allow(dead_code)]
     pub(crate) async fn create_tube(
         &mut self,
         conversation_id: &str,
@@ -216,16 +214,16 @@ impl TubeRegistry {
         let tube_arc = Tube::new(is_server_mode)?;
         let tube_id = tube_arc.id();
 
-        self.add_tube(Arc::clone(&tube_arc));
-        self.associate_conversation(&tube_id, conversation_id)?;
-        self.set_server_mode(is_server_mode);
+        self.add_tube(Arc::clone(&tube_arc)).await;
+        self.associate_conversation(&tube_id, conversation_id).await?;
+        self.set_server_mode(is_server_mode).await;
         self.signal_channels.insert(tube_id.clone(), signal_sender.clone());
 
         let mut ice_servers = Vec::new();
         let mut turn_only_for_config = settings.get("turn_only").map_or(false, |v| v.as_bool().unwrap_or(false));
 
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
-            log::info!("TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration.");
+            info!("TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration.");
             turn_only_for_config = false;
             ice_servers.push(RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302?transport=udp&family=ipv4".to_string()],
@@ -269,10 +267,10 @@ impl TubeRegistry {
                                 credential,
                             });
                         } else {
-                            log::warn!("TURN credentials are empty, not adding TURN servers for {}.", relay_server);
+                            warn!("TURN credentials are empty, not adding TURN servers for {}.", relay_server);
                         }
                     },
-                    Err(e) => log::warn!("Failed to get relay access credentials for TURN, not adding TURN servers: {}", e),
+                    Err(e) => warn!("Failed to get relay access credentials for TURN, not adding TURN servers: {}", e),
                 }
             }
         }
@@ -301,7 +299,7 @@ impl TubeRegistry {
         ).await?;
 
         if let Err(e) = tube_arc.create_control_channel(ksm_config.to_string(), callback_token.to_string()).await {
-            log::warn!("Failed to create control channel for tube {}: {}", tube_id, e);
+            warn!("Failed to create control channel for tube {}: {}", tube_id, e);
         }
 
         let data_channel_arc = tube_arc.create_data_channel(conversation_id, ksm_config.to_string(), callback_token.to_string()).await?;
@@ -324,21 +322,27 @@ impl TubeRegistry {
             result_map.insert("answer".to_string(), answer_sdp);
         }
 
-        log::info!("[TubeRegistry::create_tube] Tube {} (conv: {}) processing complete. Mode: {}, Result keys: {:?}, Settings: {:?}", 
-            tube_id, conversation_id, if is_server_mode {"Server"} else {"Client"}, result_map.keys(), settings.keys());
+        info!(
+            target: "tube_lifecycle", 
+            tube_id = %tube_id, 
+            conversation_id = %conversation_id, 
+            mode = if is_server_mode {"Server"} else {"Client"}, 
+            result_keys = ?result_map.keys(), 
+            settings_keys = ?settings.keys(),
+            "Tube processing complete."
+        );
 
         Ok(result_map)
     }
     
     /// Set remote description and create answer if needed
-    #[allow(dead_code)]
     pub(crate) async fn set_remote_description(
         &self,
         tube_id: &str,
         sdp: &str,
         is_answer: bool,
     ) -> Result<Option<String>> {
-        let tube = self.get_by_tube_id(tube_id)
+        let tube = self.get_by_tube_id(tube_id).await
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
         
         // Set the remote description
@@ -363,7 +367,7 @@ impl TubeRegistry {
         tube_id: &str,
         candidate: &str,
     ) -> Result<()> {
-        let tube = self.get_by_tube_id(tube_id)
+        let tube = self.get_by_tube_id(tube_id).await
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
         
         tube.add_ice_candidate(candidate.to_string()).await
@@ -373,41 +377,38 @@ impl TubeRegistry {
     }
     
     /// Get connection state
-    #[allow(dead_code)]
     pub(crate) async fn get_connection_state(&self, tube_id: &str) -> Result<String> {
-        let tube = self.get_by_tube_id(tube_id)
+        let tube = self.get_by_tube_id(tube_id).await
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
         
         Ok(tube.connection_state().await)
     }
     
     /// Close a tube
-    #[allow(dead_code)]
     pub(crate) async fn close_tube(&mut self, tube_id: &str) -> Result<()> {
-        let tube = self.get_by_tube_id(tube_id)
+        let tube = self.get_by_tube_id(tube_id).await
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
         
         // Close the tube
         tube.close().await?;
         
         // Remove from the registry
-        self.remove_tube(tube_id);
+        self.remove_tube(tube_id).await;
         
         Ok(())
     }
     
     /// Register a channel and set up a data channel on an EXISTING tube.
     /// This function assumes the tube and its peer connection are already established.
-    #[allow(dead_code)]
     pub(crate) async fn register_channel(
-        &mut self, // Changed to &self as it only reads, doesn't need to modify self.signal_channels here
+        &mut self,
         channel_id: &str,
         tube_id: &str,
         settings: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
-        self.associate_conversation(tube_id, channel_id)?;
+        self.associate_conversation(tube_id, channel_id).await?;
 
-        let tube = match self.get_by_tube_id(tube_id) {
+        let tube = match self.get_by_tube_id(tube_id).await {
             Some(existing_tube) => existing_tube,
             None => return Err(anyhow::anyhow!("Tube not found: {}", tube_id)),
         };
@@ -426,7 +427,6 @@ impl TubeRegistry {
     }
 
     /// Create a new connection, either using an existing tube or creating a new one
-    #[allow(dead_code)]
     pub(crate) async fn new_connection(
         &mut self,
         tube_id: Option<&str>,
@@ -460,7 +460,7 @@ impl TubeRegistry {
                 let callback_token_for_new_tube = settings.get("callback_token").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("callback_token missing in settings for new_connection/new_tube"))?.to_string();
 
                 let response_map = self.create_tube(
-                    channel_id, // First channel_id can be the conversation_id for the new tube
+                    channel_id,
                     settings.clone(),
                     initial_offer_sdp,
                     trickle_ice_value, 
@@ -477,26 +477,32 @@ impl TubeRegistry {
         // If a new tube was created, create_tube already made a data channel and logical channel for channel_id.
         // So, only call register_channel if we are adding a channel to an *existing* tube.
         if !new_tube_created {
-            self.register_channel(channel_id, &the_tube_id_str, &settings).await?; 
+            self.register_channel(channel_id, &the_tube_id_str, &settings).await?;
         } else {
             // If a new tube was created, create_tube already handled the initial channel creation for channel_id.
             // We might still need to associate the conversation_id (channel_id) with the tube if create_tube
             // used a different primary identifier for the tube's initial data channel.
             // However, create_tube already does: self.associate_conversation(&tube.id(), conversation_id)?;
             // where conversation_id is the channel_id passed to new_connection. So this should be covered.
-            log::info!("New tube {} created by new_connection, initial channel {} set up by create_tube.", the_tube_id_str, channel_id);
+            info!(
+                target: "tube_lifecycle", 
+                tube_id = %the_tube_id_str, 
+                channel_id = %channel_id, 
+                "New tube created by new_connection, initial channel set up by create_tube."
+            );
         }
         
         Ok(the_tube_id_str)
     }
 
     /// Add an ICE candidate received from the external source
-    #[allow(dead_code)]
     pub(crate) async fn add_external_ice_candidate(&self, tube_id: &str, candidate: &str) -> Result<()> {
-        let tube = self.get_by_tube_id(tube_id)
+        let tube = self.get_by_tube_id(tube_id).await
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
         
         tube.add_ice_candidate(candidate.to_string()).await
-            .map_err(|e| anyhow!("Failed to add ICE candidate: {}", e))
+            .map_err(|e| anyhow!("Failed to add ICE candidate: {}", e))?;
+        
+        Ok(())
     }
 }

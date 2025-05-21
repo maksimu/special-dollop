@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
@@ -89,6 +89,7 @@ pub struct WebRTCPeerConnection {
     answer_sent: Arc<AtomicBool>,
     pending_ice_candidates: Arc<Mutex<Vec<String>>>,
     signal_sender: Option<UnboundedSender<SignalMessage>>,
+    pub tube_id: String,
 }
 
 impl WebRTCPeerConnection {
@@ -98,6 +99,7 @@ impl WebRTCPeerConnection {
         turn_only: bool,
         ksm_config: String,
         signal_sender: Option<UnboundedSender<SignalMessage>>,
+        tube_id: String,
     ) -> Result<Self, String> {
         // Use the provided configuration or default
         let mut actual_config = config.unwrap_or_default();
@@ -127,7 +129,7 @@ impl WebRTCPeerConnection {
         pc_arc.on_peer_connection_state_change(Box::new(move |state| {
             let is_closing = Arc::clone(&is_closing_clone);
             Box::pin(async move {
-                debug!("Peer connection state changed to {}", state);
+                debug!(target: "webrtc_state", state = ?state, "Peer connection state changed");
                 
                 // Update the closing flag if needed
                 if state == RTCPeerConnectionState::Closed || state == RTCPeerConnectionState::Failed {
@@ -148,73 +150,54 @@ impl WebRTCPeerConnection {
             answer_sent: Arc::new(AtomicBool::new(false)),
             pending_ice_candidates,
             signal_sender,
+            tube_id,
         })
     }
 
     // Method to set up ICE candidate handler with channel-based signaling
     pub fn setup_ice_candidate_handler(
         &self,
-        tube_id: String,
-        conversation_id: String,
     ) {
         // Handle ICE candidates only when using trickle ICE
         if !self.trickle_ice {
-            debug!("Not setting up ICE candidate handler - trickle ICE is disabled for tube {} conv {}", tube_id, conversation_id);
+            debug!(target: "webrtc_ice", tube_id = %self.tube_id, "Not setting up ICE candidate handler - trickle ICE is disabled");
             return;
         }
-        info!("[ICE_HANDLER_SETUP] Setting up ICE candidate handler for tube {} conv {} (trickle_ice: {})", tube_id, conversation_id, self.trickle_ice);
+        info!(target: "webrtc_ice", tube_id = %self.tube_id, "Setting up ICE candidate handler");
         
         // Create a clone of self-reference for sending candidates
         let self_ref = self.clone();
-        let tube_id_clone = tube_id.clone();
-        let conversation_id_clone = conversation_id.clone();
         
         // Remove any existing handlers first to avoid duplicates
         self.peer_connection.on_ice_candidate(Box::new(|_| Box::pin(async {})));
         
         // Set up handler for ICE candidates
         self.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            // CLONE FOR LOGGING - ensure tube_id_clone and conversation_id_clone are fresh for this scope if needed
-            let tube_id_for_log = tube_id_clone.clone(); 
-            log::info!("[ICE_CALLBACK_DEBUG] on_ice_candidate triggered for tube_id: {}. Candidate is: {:?}", tube_id_for_log, candidate);
+            info!(target: "webrtc_ice_internal", tube_id = %self_ref.tube_id, ?candidate, "on_ice_candidate triggered");
 
             let self_clone = self_ref.clone();
-            let tube_id_clone2 = tube_id_clone.clone(); 
-            let conversation_id_clone2 = conversation_id_clone.clone();
             
             Box::pin(async move {
                 if let Some(c) = candidate {
                     // Convert the ICE candidate to a string representation
                     let candidate_str = format_ice_candidate(&c);
-                    debug!("New ICE candidate for tube {}: {}", tube_id_clone2, candidate_str);
+                    info!(target: "webrtc_ice", tube_id = %self_clone.tube_id, candidate = %candidate_str, "ICE candidate gathered");
+                    debug!(target: "webrtc_ice_verbose", tube_id = %self_clone.tube_id, candidate = %candidate_str, "New ICE candidate details");
                     
                     // Store the candidate for later use if an answer hasn't been sent
                     if !self_clone.answer_sent.load(Ordering::Acquire) {
                         let mut candidates_lock = self_clone.pending_ice_candidates.lock().unwrap();
                         candidates_lock.push(candidate_str.clone());
-                        debug!("Stored ICE candidate for tube {} (answer not sent yet)", tube_id_clone2);
+                        debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "Stored ICE candidate (trickle_ice: {}, answer_sent: {})", self_clone.trickle_ice, self_clone.answer_sent.load(Ordering::Acquire));
                     }
                     
-                    // Send it to the signal channel if an answer has been sent, or (always if trickle ICE is on for this handler)
-                    // The original logic was: if self_clone.answer_sent.load(Ordering::Acquire)
-                    // For trickle ICE, we generally send candidates as they arrive after offer/answer exchange has begun.
-                    // The `answer_sent` flag is more about flushing pending candidates when an answer is *sent by this peer*.
-                    // If we are the offerer, we send candidates once set_remote_description(answer) is done.
-                    // If we are the answerer, we send candidates once set_local_description(answer) is done (which sets answer_sent).
-                    // Let's assume for now if trickle_ice is on for the PC, we always try to send.
-                    // The `answer_sent` logic for flushing *pending* candidates remains in `send_answer`.
                     self_clone.send_ice_candidate(
                         &candidate_str,
-                        &tube_id_clone2,
-                        &conversation_id_clone2,
                     );
                 } else {
-                    // Candidate is None, which means ICE gathering is complete for this transport
-                    debug!("All ICE candidates gathered for tube {} (received None). Sending empty candidate signal.", tube_id_clone2);
+                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "All ICE candidates gathered (received None). Sending empty candidate signal.");
                     self_clone.send_ice_candidate(
-                        "", // Empty string to signify end of candidates
-                        &tube_id_clone2,
-                        &conversation_id_clone2,
+                        "", 
                     );
                 }
             })
@@ -229,8 +212,7 @@ impl WebRTCPeerConnection {
     // Method to send an ICE candidate using the signal channel
     pub fn send_ice_candidate(&self, 
                              candidate: &str, 
-                             tube_id: &str,
-                             conversation_id: &str) {
+                            ) {
         // Only proceed if we have a signal channel
         if let Some(sender) = &self.signal_sender {
             // Create the ICE candidate message - use one-time allocation with format!
@@ -238,43 +220,42 @@ impl WebRTCPeerConnection {
             
             // Prepare the signaling message
             let message = SignalMessage {
-                tube_id: tube_id.to_string(),
+                tube_id: self.tube_id.clone(),
                 kind: "icecandidate".to_string(),
                 data: candidate.to_string(), // Send the candidate string directly
-                conversation_id: conversation_id.to_string(),
+                conversation_id: self.tube_id.clone(), // Using tube_id as conversation_id for SignalMessage
             };
             
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!("Failed to send ICE candidate through signal channel: {}", e);
+                warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send ICE candidate signal");
             }
         } else {
-            debug!("No signal channel available to send ICE candidate");
+            warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for ICE candidate");
         }
     }
     
     // Method to send answer to router and flush-buffered candidates
     pub fn send_answer(&self,
                        answer_sdp: &str,
-                       conversation_id: &str,
-                       tube_id: &str) {
+                      ) {
         // Only send it if we have a signal channel
         if let Some(sender) = &self.signal_sender {
             // Create and serialize the answer in one step
             let message = SignalMessage {
-                tube_id: tube_id.to_string(),
+                tube_id: self.tube_id.clone(),
                 kind: "answer".to_string(),
                 data: answer_sdp.to_string(), // Send the answer SDP string directly
-                conversation_id: conversation_id.to_string(),
+                conversation_id: self.tube_id.clone(), // Using tube_id as conversation_id for SignalMessage
             };
             
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!("Failed to send answer through signal channel: {}", e);
+                warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send answer signal");
                 return; // Don't process candidates if we can't send the answer
             }
         } else {
-            debug!("No signal channel available to send answer");
+            warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for answer");
             return; // Don't process candidates if we have no signal channel
         }
         
@@ -289,9 +270,9 @@ impl WebRTCPeerConnection {
         
         // Send any buffered candidates
         if !pending_candidates.is_empty() {
-            debug!("Sending {} buffered ICE candidates", pending_candidates.len());
+            debug!(target: "webrtc_ice", count = pending_candidates.len(), "Sending buffered ICE candidates");
             for candidate in pending_candidates {
-                self.send_ice_candidate(&candidate, tube_id, conversation_id);
+                self.send_ice_candidate(&candidate);
             }
         }
     }
@@ -306,6 +287,7 @@ impl WebRTCPeerConnection {
             answer_sent: Arc::clone(&self.answer_sent),
             pending_ice_candidates: Arc::clone(&self.pending_ice_candidates),
             signal_sender: self.signal_sender.clone(),
+            tube_id: self.tube_id.clone(),
         }
     }
 
@@ -318,7 +300,7 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state
         let current_state = self.peer_connection.signaling_state();
-        debug!("Current signaling state before create_offer: {:?}", current_state);
+        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before create_offer");
         
         // Validate that we can create an offer in the current state
         match current_state {
@@ -349,7 +331,7 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state
         let current_state = self.peer_connection.signaling_state();
-        debug!("Current signaling state before create_answer: {:?}", current_state);
+        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before create_answer");
         
         // Validate that we can create an answer in the current state
         match current_state {
@@ -390,7 +372,7 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state before setting the remote description
         let current_state = self.peer_connection.signaling_state();
-        debug!("Current signaling state before set_remote_description: {:?}", current_state);
+        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before set_remote_description");
         
         // Validate that the signaling state transition is valid
         let valid_transition = match (current_state, is_answer) {
@@ -463,8 +445,8 @@ impl WebRTCPeerConnection {
         match tokio::time::timeout(Duration::from_secs(5), self.peer_connection.close()).await {
             Ok(result) => result.map_err(|e| format!("Failed to close peer connection: {}", e)),
             Err(_) => {
-                warn!("Close operation timed out, forcing abandonment");
-                Ok(()) // Force success even though it timed out
+                warn!(target: "webrtc_lifecycle", "Close operation timed out, forcing abandonment");
+                Ok(())
             }
         }
     }
@@ -472,21 +454,22 @@ impl WebRTCPeerConnection {
     // Method to set up a simple connection state monitor for open/close events only
     pub fn setup_connection_state_monitor(&self) {
         // Set up the connection state change handler
+        let tube_id_clone = self.tube_id.clone();
+
         self.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            
+            let tube_id_for_log = tube_id_clone.clone();
             Box::pin(async move {
                 let state_str = format!("{:?}", state);
-                debug!("Connection state changed: {}", state_str);
-                
-                // Only handle Connected and Closed states for router reporting
+                debug!(target: "webrtc_state", tube_id = %tube_id_for_log, state = %state_str, "Connection state changed");
+
                 match state {
                     RTCPeerConnectionState::Connected => {
-                        // Report connection open to router if available
-                        debug!("Sending connection open callback to router");
+                        debug!(target: "webrtc_state_report", tube_id = %tube_id_for_log, "Sending connection open callback to router");
                     },
-                    RTCPeerConnectionState::Closed => {
-                        info!("Connection is closed");
-                        // No need to report a closed state here as it's handled by the close() method
+                    RTCPeerConnectionState::Closed |
+                    RTCPeerConnectionState::Failed |
+                    RTCPeerConnectionState::Disconnected => {
+                        info!(target: "webrtc_lifecycle", tube_id = %tube_id_for_log, state = %state_str, "Connection ended");
                     },
                     _ => {}
                 }
@@ -511,7 +494,7 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state before setting the local description
         let current_state = self.peer_connection.signaling_state();
-        debug!("Current signaling state before set_local_description: {:?}", current_state);
+        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before set_local_description");
         
         // Validate that the signaling state transition is valid
         let valid_transition = match (current_state, is_answer) {

@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use crate::channel::Channel;
 use crate::models::{NetworkAccessChecker, TunnelTimeouts};
 use crate::webrtc_data_channel::WebRTCDataChannel;
+use tracing::{debug, error};
 
 // Tube Status
 #[derive(Debug, Clone, PartialEq)]
@@ -64,12 +65,19 @@ pub(crate) async fn setup_channel_for_data_channel(
             let message_bytes = buffer_pool_clone.create_bytes(data);
             let message_len = message_bytes.len();
             
-            log::debug!("Channel({}): Received {} bytes from WebRTC data channel", 
-                     label_clone, message_len);
+            debug!(
+                target: "channel_flow", 
+                channel_id = %label_clone, 
+                bytes_count = message_len, 
+                "Channel: Received bytes from WebRTC data channel"
+            );
             
-            if let Err(e) = tx_clone.send(message_bytes) {
-                log::error!("Channel({}): Failed to send message to MPSC channel for {}: {}", 
-                        label_clone, label_clone, e);
+            if let Err(_e) = tx_clone.send(message_bytes) {
+                error!(
+                    target: "channel_flow", 
+                    channel_id = %label_clone, 
+                    "Channel: Failed to send message to MPSC channel for processing"
+                );
             }
         })
     }));

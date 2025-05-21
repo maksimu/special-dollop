@@ -91,7 +91,7 @@ impl BufferPool {
         buf.extend_from_slice(data);
         buf.freeze() // Convert to Bytes
     }
-    
+
     /// Get the number of buffers currently in the pool
     pub fn count(&self) -> usize {
         let inner = self.inner.lock().unwrap();

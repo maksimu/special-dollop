@@ -1,10 +1,12 @@
 import unittest
 import logging
 import time
+import socket
+import threading
 
 import keeper_pam_webrtc_rs
 
-from test_utils import with_runtime, BaseWebRTCTest
+from test_utils import with_runtime, BaseWebRTCTest, run_ack_server_in_thread
 
 # Special test mode values that might be recognized by the Rust code
 TEST_KSM_CONFIG = "TEST_MODE_KSM_CONFIG"
@@ -16,57 +18,86 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        self.tube_states = {}  # Stores current state of each tube_id
+        self.tube_connection_events = {} # tube_id -> threading.Event for connected state
+        self._lock = threading.Lock() # To protect access to shared tube_states and events
+
+    def _signal_handler(self, signal_dict):
+        """Handles signals from the Rust layer."""
+        # This handler can be called from a Rust thread, so protect shared data
+        with self._lock:
+            tube_id = signal_dict.get('tube_id')
+            kind = signal_dict.get('kind')
+            data = signal_dict.get('data')
+            # conv_id = signal_dict.get('conversation_id') # Available if needed
+
+            if not tube_id or not kind:
+                logging.warning(f"Received incomplete signal: {signal_dict}")
+                return
+
+            # logging.debug(f"Signal handler received: tube_id={tube_id}, kind={kind}, data={data}, conv_id={conv_id}")
+
+            if kind == "connection_state_changed":
+                logging.info(f"Tube {tube_id} connection state changed to: {data}")
+                self.tube_states[tube_id] = data.lower() # Store lowercase state
+                
+                # If this tube_id doesn't have an event yet, create one
+                if tube_id not in self.tube_connection_events:
+                    self.tube_connection_events[tube_id] = threading.Event()
+
+                if data.lower() == "connected":
+                    self.tube_connection_events[tube_id].set() # Signal that this tube is connected
+                elif data.lower() in ["failed", "closed", "disconnected"]:
+                    # If it was connected and now it's not, clear the event
+                    # Or, if tests need to react to failures, set a different event.
+                    if tube_id in self.tube_connection_events:
+                         self.tube_connection_events[tube_id].clear() # Or handle failure explicitly
+            # else: 
+                # Potentially handle other signal kinds like 'icecandidate', 'answer' if needed by tests directly
+                # logging.debug(f"Received other signal for {tube_id}: {kind}")
     
     @with_runtime
     def test_data_channel_load(self):
         """Test basic tube creation and connection performance"""
         logging.info("Starting tube creation and connection test")
 
-        # Create tubes for testing
-        settings = {}
+        settings = {"conversationType": "tunnel"}
         
-        # Create server tube
-        server_tube = self.tube_registry.create_tube(
+        # Create a server tube
+        server_tube_info = self.tube_registry.create_tube(
             conversation_id="performance-test-server",
-            relay_server="test-relay.example.com",
             ksm_config=TEST_KSM_CONFIG,
-            protocol_type="port_forward",
             settings=settings,
             trickle_ice=True,
-            turn_only=False,
             callback_token=TEST_CALLBACK_TOKEN,
-            use_turn=False
+            signal_callback=self._signal_handler
         )
         
-        # Get the offer from server
-        offer = server_tube.sdp
+        # Get the offer from a server
+        offer = server_tube_info['offer']
+        server_id = server_tube_info['tube_id']
         self.assertIsNotNone(offer, "Server should generate an offer")
         
-        # Create client tube with the offer
-        client_tube = self.tube_registry.create_tube(
+        # Create a client tube with the offer
+        client_tube_info = self.tube_registry.create_tube(
             conversation_id="performance-test-client",
-            relay_server="test-relay.example.com",
             ksm_config=TEST_KSM_CONFIG,
-            protocol_type="port_forward",
             settings=settings,
             trickle_ice=True,
-            turn_only=False,
             callback_token=TEST_CALLBACK_TOKEN,
             offer=offer,
-            use_turn=False
+            signal_callback=self._signal_handler
         )
         
-        # Get the answer from client
-        answer = client_tube.sdp
+        # Get the answer from a client
+        answer = client_tube_info['answer']
+        client_id = client_tube_info['tube_id']
         self.assertIsNotNone(answer, "Client should generate an answer")
         
         # Set the answer on the server
-        self.tube_registry.set_remote_description(server_tube.id, answer)
+        self.tube_registry.set_remote_description(server_id, answer, is_answer=True)
         
         # Wait for a connection establishment
-        server_id = server_tube.id
-        client_id = client_tube.id
-        
         start_time = time.time()
         connected = self.wait_for_tube_connection(server_id, client_id, 10)
         connection_time = time.time() - start_time
@@ -74,14 +105,12 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         self.assertTrue(connected, "Failed to establish connection")
         logging.info(f"Connection established in {connection_time:.2f} seconds")
         
-        # Create a channel for data exchange
         channel_name = "performance-test-channel"
-        channel_settings = {}
+        channel_settings = {"conversationType": "tunnel"} 
         
         self.tube_registry.create_channel(
             server_id,
             channel_name,
-            "port_forward",
             channel_settings
         )
         
@@ -94,17 +123,194 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
     
     def wait_for_tube_connection(self, tube_id1, tube_id2, timeout=10):
         """Wait for both tubes to establish a connection"""
-        logging.info(f"Waiting for tube connection establishment (timeout: {timeout}s)")
+        logging.info(f"Waiting for tube connection: {tube_id1} and {tube_id2} (timeout: {timeout}s)")
         start_time = time.time()
+        state1 = "unknown" # Initialize states
+        state2 = "unknown" # Initialize states
         while time.time() - start_time < timeout:
             state1 = self.tube_registry.get_connection_state(tube_id1)
             state2 = self.tube_registry.get_connection_state(tube_id2)
+            logging.debug(f"Poll: {tube_id1} state: {state1}, {tube_id2} state: {state2}")
             if state1.lower() == "connected" and state2.lower() == "connected":
-                logging.info("Connection established")
+                logging.info(f"Connection established between {tube_id1} and {tube_id2}")
                 return True
             time.sleep(0.1)
-        logging.warning("Connection establishment timed out")
+        logging.warning(f"Connection establishment timed out for {tube_id1} and {tube_id2}. Final states: {tube_id1}={state1}, {tube_id2}={state2}")
         return False
+
+    @with_runtime
+    def test_e2e_echo_flow(self):
+        logging.info("Starting E2E echo flow test")
+        ack_server = None
+        external_client_socket = None
+        server_tube_id = None
+        client_tube_id = None
+
+        try:
+            # 1. Start the AckServer
+            ack_server = run_ack_server_in_thread()
+            self.assertIsNotNone(ack_server.actual_port, "AckServer did not start or report port")
+            logging.info(f"[E2E_Test] AckServer running on 127.0.0.1:{ack_server.actual_port}")
+
+            # 2. Server Tube Setup
+            server_conv_id = "e2e-server-conv"
+            server_settings = {
+                "conversationType": "tunnel", # As per Rust test
+                "local_listen_addr": "127.0.0.1:0" # Server tube listens here, dynamic port
+            }
+            
+            # The create_tube in Python seems to be a bit different from Rust's.
+            # It might not directly expose on_ice_candidate per-tube object in the same way.
+            # We are using the BaseWebRTCTest's on_ice_candidate1/2, which is generic.
+            # We need to ensure these are somehow linked or the library handles it.
+            # For now, let's assume the library's PyTubeRegistry might have a way to globally set these 
+            # or that `create_tube` itself registers some internal callbacks.
+            # The existing tests use self.tube_registry.get_connection_state, implying ICE is handled.
+
+            logging.info(f"[E2E_Test] Creating server tube with settings: {server_settings}")
+            server_tube_info = self.tube_registry.create_tube(
+                conversation_id=server_conv_id,
+                ksm_config=TEST_KSM_CONFIG, 
+                settings=server_settings,
+                trickle_ice=True,
+                callback_token=TEST_CALLBACK_TOKEN,
+                signal_callback=self._signal_handler
+            )
+            self.assertIsNotNone(server_tube_info, "Server tube creation failed")
+            server_offer_sdp = server_tube_info['offer']
+            server_tube_id = server_tube_info['tube_id']
+            server_actual_listen_addr_str = server_tube_info.get('actual_local_listen_addr') # Use .get for safety
+            
+            self.assertIsNotNone(server_offer_sdp, "Server should generate an offer")
+            self.assertIsNotNone(server_tube_id, "Server tube should have an ID")
+            self.assertIsNotNone(server_actual_listen_addr_str, "Server tube should have actual_local_listen_addr")
+            logging.info(f"[E2E_Test] Server tube {server_tube_id} created. Offer generated. Listening on {server_actual_listen_addr_str}")
+
+            # 3. Client Tube Setup
+            client_conv_id = "e2e-client-conv"
+            client_settings = {
+                "conversationType": "tunnel",
+                "target_host": "127.0.0.1",
+                "target_port": str(ack_server.actual_port) # Connect to AckServer
+            }
+            logging.info(f"[E2E_Test] Creating client tube with offer and settings: {client_settings}")
+            client_tube_info = self.tube_registry.create_tube(
+                conversation_id=client_conv_id,
+                ksm_config=TEST_KSM_CONFIG,
+                settings=client_settings,
+                trickle_ice=True,
+                callback_token=TEST_CALLBACK_TOKEN,
+                offer=server_offer_sdp,
+                signal_callback=self._signal_handler
+            )
+            self.assertIsNotNone(client_tube_info, "Client tube creation failed")
+            client_answer_sdp = client_tube_info['answer']
+            client_tube_id = client_tube_info['tube_id']
+
+            self.assertIsNotNone(client_answer_sdp, "Client should generate an answer")
+            self.assertIsNotNone(client_tube_id, "Client tube should have an ID")
+            logging.info(f"[E2E_Test] Client tube {client_tube_id} created. Answer generated.")
+
+            # 4. Signaling: Set remote description
+            # The Rust test has a more elaborate ICE exchange via signal channels.
+            # Python tests rely on `wait_for_tube_connection` which implies internal ICE handling after SDP exchange.
+            logging.info(f"[E2E_Test] Server tube {server_tube_id} setting remote description (client's answer)")
+            self.tube_registry.set_remote_description(server_tube_id, client_answer_sdp, is_answer=True)
+            
+            # The client tube in Rust's `create_tube` (when offer is provided) also calls `set_remote_description` internally for the offer.
+            # And then `create_answer`. The Python `create_tube` with an offer likely does this too.
+            # We might not need an explicit `set_remote_description` on the client side if `create_tube` handles the initial offer.
+
+            # 5. Wait for connection
+            logging.info(f"[E2E_Test] Waiting for WebRTC connection between {server_tube_id} and {client_tube_id}...")
+            connected = self.wait_for_tube_connection(server_tube_id, client_tube_id, timeout=20) # Increased timeout for E2E
+            self.assertTrue(connected, f"WebRTC connection failed between {server_tube_id} and {client_tube_id}")
+            logging.info(f"[E2E_Test] WebRTC connection established.")
+
+            # At this point, data channels should be ready if the library follows WebRTC standards.
+            # The Rust test waits for data channels to open. Here, we assume the connection implies data channel readiness for simplicity,
+            # unless specific API calls for data channel status are available and necessary.
+
+            # 6. Simulate External Client connecting to Server Tube's local TCP endpoint
+            self.assertIsNotNone(server_actual_listen_addr_str, "Server actual_local_listen_addr is None") # Check from .get()
+            parts = server_actual_listen_addr_str.split(':')
+            self.assertEqual(len(parts), 2, "server_actual_listen_addr_str is not in host:port format")
+            server_listen_host = parts[0]
+            server_listen_port = int(parts[1])
+            
+            logging.info(f"[E2E_Test] External client connecting to ServerTube's local TCP endpoint: {server_listen_host}:{server_listen_port}")
+            external_client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            external_client_socket.settimeout(10) # Set timeout for socket operations
+            external_client_socket.connect((server_listen_host, server_listen_port))
+            logging.info("[E2E_Test] External client connected.")
+
+            # 7. Send a message from External Client
+            message_content = "Hello Proxied World via Python!"
+            message_bytes = message_content.encode('utf-8')
+            external_client_socket.sendall(message_bytes)
+            logging.info(f"[E2E_Test] External client sent: '{message_content}'")
+
+            # 8. Receive acked message by External Client
+            # Expected flow: External Client -> ServerTube(TCP) -> ServerTube(WebRTC) -> ClientTube(WebRTC) 
+            # -> ClientTube(TCP) -> AckServer -> ClientTube(TCP) -> ClientTube(WebRTC) 
+            # -> ServerTube(WebRTC) -> ServerTube(TCP) -> External Client
+            
+            received_buffer = bytearray()
+            expected_response = (message_content + " ack").encode('utf-8')
+            time_limit = time.time() + 15 # 15-second timeout for receiving response
+            
+            while time.time() < time_limit:
+                try:
+                    chunk = external_client_socket.recv(4096)
+                    if not chunk:
+                        logging.warning("[E2E_Test] External client socket closed by server while receiving.")
+                        break
+                    received_buffer.extend(chunk)
+                    if received_buffer == expected_response:
+                        break 
+                except socket.timeout:
+                    logging.debug("[E2E_Test] Socket recv timeout, retrying...")
+                    continue
+                except Exception as e:
+                    logging.error(f"[E2E_Test] Error receiving from external client socket: {e}")
+                    self.fail(f"Error receiving from external client socket: {e}")
+            
+            received_message = received_buffer.decode('utf-8')
+            logging.info(f"[E2E_Test] External client received: '{received_message}'")
+            self.assertEqual(received_message, expected_response.decode('utf-8'), 
+                             "Final acked message mismatch on external client socket")
+            logging.info("[E2E_Test] SUCCESS! External client received expected acked message.")
+
+        except Exception as e:
+            logging.error(f"[E2E_Test] Exception: {e}", exc_info=True)
+            self.fail(f"E2E echo flow test failed with exception: {e}")
+        finally:
+            logging.info("[E2E_Test] Cleaning up...")
+            if external_client_socket:
+                try:
+                    external_client_socket.close()
+                    logging.info("[E2E_Test] External client socket closed.")
+                except Exception as e:
+                    logging.error(f"[E2E_Test] Error closing external client socket: {e}")
+            
+            if self.tube_registry and server_tube_id:
+                try:
+                    self.tube_registry.close_tube(server_tube_id)
+                    logging.info(f"[E2E_Test] Server tube {server_tube_id} closed.")
+                except Exception as e:
+                    logging.error(f"[E2E_Test] Error closing server tube {server_tube_id}: {e}")
+            
+            if self.tube_registry and client_tube_id:
+                try:
+                    self.tube_registry.close_tube(client_tube_id)
+                    logging.info(f"[E2E_Test] Client tube {client_tube_id} closed.")
+                except Exception as e:
+                    logging.error(f"[E2E_Test] Error closing client tube {client_tube_id}: {e}")
+            
+            if ack_server:
+                ack_server.stop()
+                logging.info("[E2E_Test] AckServer stopped.")
+            logging.info("[E2E_Test] Cleanup finished.")
 
 class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
     """Tests for tube connection with different settings"""
@@ -118,50 +324,43 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         """Test basic tube connection with non-trickle ICE to evaluate connection reliability"""
         logging.info("Starting tube connection reliability test")
 
-        # Create tubes with non-trickle ICE
-        settings = {}
+        settings = {"conversationType": "tunnel"}
         
         # Create a server tube with non-trickle ICE
-        server_tube = self.tube_registry.create_tube(
+        server_tube_info = self.tube_registry.create_tube(
             conversation_id="fragmentation-test-server",
-            relay_server="test-relay.example.com",
             ksm_config=TEST_KSM_CONFIG,
-            protocol_type="port_forward",
             settings=settings,
             trickle_ice=False,  # Use non-trickle ICE
-            turn_only=False,
             callback_token=TEST_CALLBACK_TOKEN,
-            use_turn=False
         )
         
-        # Get the offer from server
-        offer = server_tube.sdp
+        # Get the offer from a server
+        offer = server_tube_info['offer']
+        server_id = server_tube_info['tube_id']
         self.assertIsNotNone(offer, "Server should generate an offer")
         
-        # Create client tube with the offer
-        client_tube = self.tube_registry.create_tube(
+        # Create a client tube with the offer
+        client_settings = {"conversationType": "tunnel"} # Ensure client also has its own settings if needed
+        client_tube_info = self.tube_registry.create_tube(
             conversation_id="fragmentation-test-client",
-            relay_server="test-relay.example.com",
             ksm_config=TEST_KSM_CONFIG,
-            protocol_type="port_forward",
-            settings=settings,
+            settings=client_settings, # Pass original settings, not modified ones
             trickle_ice=False,  # Use non-trickle ICE
-            turn_only=False,
             callback_token=TEST_CALLBACK_TOKEN,
-            offer=offer,
-            use_turn=False
+            offer=offer, 
         )
         
-        # Get the answer from client
-        answer = client_tube.sdp
+        # Get the answer from a client
+        answer = client_tube_info['answer']
+        client_id = client_tube_info['tube_id']
         self.assertIsNotNone(answer, "Client should generate an answer")
         
         # Set the answer on the server
-        self.tube_registry.set_remote_description(server_tube.id, answer)
+        self.tube_registry.set_remote_description(server_id, answer, is_answer=True)
         
         # Wait for a connection establishment
-        server_id = server_tube.id
-        client_id = client_tube.id
+        # server_id and client_id are already assigned
         
         # Measure connection establishment time
         start_time = time.time()
@@ -181,14 +380,17 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         """Wait for both tubes to establish a connection"""
         logging.info(f"Waiting for tube connection establishment (timeout: {timeout}s)")
         start_time = time.time()
+        state1 = "unknown" # Initialize states
+        state2 = "unknown" # Initialize states
         while time.time() - start_time < timeout:
             state1 = self.tube_registry.get_connection_state(tube_id1)
             state2 = self.tube_registry.get_connection_state(tube_id2)
+            logging.debug(f"Poll: {tube_id1} state: {state1}, {tube_id2} state: {state2}")
             if state1.lower() == "connected" and state2.lower() == "connected":
                 logging.info("Connection established")
                 return True
             time.sleep(0.1)
-        logging.warning("Connection establishment timed out")
+        logging.warning(f"Connection establishment timed out. Final states: {tube_id1}={state1}, {tube_id2}={state2}")
         return False
 
 if __name__ == '__main__':

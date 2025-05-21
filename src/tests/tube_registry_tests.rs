@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use log::{info, error, warn};
+use tracing::{info, error, warn};
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use crate::tube_registry::{SignalMessage, TubeRegistry};
 
@@ -22,11 +22,11 @@ fn new_test_tube_without_registry_add() -> Result<Arc<Tube>> {
     Ok(Arc::new(Tube {
         id,
         peer_connection: Arc::new(tokio::sync::Mutex::new(None)),
-        data_channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        control_channel: Arc::new(parking_lot::RwLock::new(None)),
-        channel_shutdown_signals: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        data_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        control_channel: Arc::new(tokio::sync::RwLock::new(None)),
+        channel_shutdown_signals: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         is_server_mode_context: false, // Default to client context for this helper
-        status: Arc::new(parking_lot::RwLock::new(crate::tube_and_channel_helpers::TubeStatus::New)),
+        status: Arc::new(tokio::sync::RwLock::new(crate::tube_and_channel_helpers::TubeStatus::New)),
         runtime,
     }))
 }
@@ -43,9 +43,9 @@ async fn test_add_and_get_tube() {
     let tube = new_test_tube_without_registry_add().expect("Failed to create test tube");
     let tube_id = tube.id();
 
-    registry.add_tube(Arc::clone(&tube));
+    registry.add_tube(Arc::clone(&tube)).await;
 
-    let retrieved_tube = registry.get_by_tube_id(&tube_id);
+    let retrieved_tube = registry.get_by_tube_id(&tube_id).await;
     assert!(retrieved_tube.is_some(), "Tube should be found by ID");
     assert_eq!(retrieved_tube.unwrap().id(), tube_id, "Retrieved tube ID should match original");
 }
@@ -56,12 +56,12 @@ async fn test_remove_tube() {
     let tube = new_test_tube_without_registry_add().expect("Failed to create test tube");
     let tube_id = tube.id();
 
-    registry.add_tube(Arc::clone(&tube));
-    assert!(registry.get_by_tube_id(&tube_id).is_some(), "Tube should be present before removal");
+    registry.add_tube(Arc::clone(&tube)).await;
+    assert!(registry.get_by_tube_id(&tube_id).await.is_some(), "Tube should be present before removal");
 
-    registry.remove_tube(&tube_id);
-    assert!(registry.get_by_tube_id(&tube_id).is_none(), "Tube should be gone after removal");
-    assert!(registry.get_signal_channel(&tube_id).is_none(), "Signal channel should be removed");
+    registry.remove_tube(&tube_id).await;
+    assert!(registry.get_by_tube_id(&tube_id).await.is_none(), "Tube should be gone after removal");
+    assert!(registry.get_signal_channel(&tube_id).await.is_none(), "Signal channel should be removed");
 }
 
 #[tokio::test]
@@ -71,15 +71,15 @@ async fn test_associate_and_get_by_conversation_id() -> Result<()> {
     let tube_id = tube.id();
     let conversation_id = "conv_123";
 
-    registry.add_tube(Arc::clone(&tube));
-    registry.associate_conversation(&tube_id, conversation_id)?;
+    registry.add_tube(Arc::clone(&tube)).await;
+    registry.associate_conversation(&tube_id, conversation_id).await?;
 
-    let retrieved_tube = registry.get_by_conversation_id(conversation_id);
+    let retrieved_tube = registry.get_by_conversation_id(conversation_id).await;
     assert!(retrieved_tube.is_some(), "Tube should be found by conversation ID");
     assert_eq!(retrieved_tube.unwrap().id(), tube_id, "Retrieved tube ID should match");
 
-    registry.remove_tube(&tube_id);
-    assert!(registry.get_by_conversation_id(conversation_id).is_none(), "Conversation mapping should be gone after tube removal");
+    registry.remove_tube(&tube_id).await;
+    assert!(registry.get_by_conversation_id(conversation_id).await.is_none(), "Conversation mapping should be gone after tube removal");
 
     Ok(())
 }
@@ -92,10 +92,10 @@ async fn test_all_tube_ids() -> Result<()> {
     let tube1_id = tube1.id();
     let tube2_id = tube2.id();
 
-    registry.add_tube(Arc::clone(&tube1));
-    registry.add_tube(Arc::clone(&tube2));
+    registry.add_tube(Arc::clone(&tube1)).await;
+    registry.add_tube(Arc::clone(&tube2)).await;
 
-    let ids = registry.all_tube_ids();
+    let ids = registry.all_tube_ids().await;
     assert_eq!(ids.len(), 2, "Should have two tube IDs");
     assert!(ids.contains(&tube1_id), "List should contain tube1's ID");
     assert!(ids.contains(&tube2_id), "List should contain tube2's ID");
@@ -112,26 +112,26 @@ async fn test_find_tubes() -> Result<()> {
     let tube1_id_str = tube1.id();
     let conv_id_for_tube3 = format!("conv_for_{}", tube3.id());
 
-    registry.add_tube(Arc::clone(&tube1));
-    registry.add_tube(Arc::clone(&tube2));
-    registry.add_tube(Arc::clone(&tube3));
-    registry.associate_conversation(&tube3.id(), &conv_id_for_tube3)?;
+    registry.add_tube(Arc::clone(&tube1)).await;
+    registry.add_tube(Arc::clone(&tube2)).await;
+    registry.add_tube(Arc::clone(&tube3)).await;
+    registry.associate_conversation(&tube3.id(), &conv_id_for_tube3).await?;
 
     if tube1_id_str.len() >= 5 {
         let partial_id1 = &tube1_id_str[0..5];
-        let found_tubes1 = registry.find_tubes(partial_id1);
+        let found_tubes1 = registry.find_tubes(partial_id1).await;
         assert_eq!(found_tubes1.len(), 1, "Should find tube1 by partial ID: {}", partial_id1);
         assert_eq!(found_tubes1[0], tube1_id_str);
     }
 
     if conv_id_for_tube3.len() >= 10 {
         let partial_conv_id3 = &conv_id_for_tube3[0..10];
-        let found_tubes2 = registry.find_tubes(partial_conv_id3);
+        let found_tubes2 = registry.find_tubes(partial_conv_id3).await;
         assert_eq!(found_tubes2.len(), 1, "Should find tube3 by partial conversation ID: {}", partial_conv_id3);
         assert_eq!(found_tubes2[0], tube3.id());
     }
     
-    let found_tubes_none = registry.find_tubes("nonexistent_term");
+    let found_tubes_none = registry.find_tubes("nonexistent_term").await;
     assert!(found_tubes_none.is_empty(), "Should find no tubes for a nonexistent term");
 
     Ok(())
@@ -143,7 +143,7 @@ async fn test_signal_channels() -> Result<()> {
     let tube = new_test_tube_without_registry_add()?;
     let tube_id = tube.id();
 
-    let mut receiver = registry.register_signal_channel(&tube_id);
+    let mut receiver = registry.register_signal_channel(&tube_id).await;
 
     let test_signal = SignalMessage {
         tube_id: tube_id.clone(),
@@ -152,7 +152,7 @@ async fn test_signal_channels() -> Result<()> {
         conversation_id: "conv_signal_123".to_string(),
     };
 
-    registry.send_signal(test_signal.clone())?;
+    registry.send_signal(test_signal.clone()).await?;
 
     match tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await {
         Ok(Some(received_signal)) => {
@@ -161,12 +161,12 @@ async fn test_signal_channels() -> Result<()> {
             assert_eq!(received_signal.data, test_signal.data);
             assert_eq!(received_signal.conversation_id, test_signal.conversation_id);
         }
-        Ok(None) => panic!("Signal channel closed prematurely"),
-        Err(_) => panic!("Timeout waiting for signal message"),
+        Ok(None) => panic!("Signal channel closed prematurely (received None from recv() within timeout)"),
+        Err(_elapsed_error) => panic!("Timeout waiting for signal message"),
     }
 
-    registry.remove_signal_channel(&tube_id);
-    assert!(registry.get_signal_channel(&tube_id).is_none(), "Signal channel should be removed");
+    registry.remove_signal_channel(&tube_id).await;
+    assert!(registry.get_signal_channel(&tube_id).await.is_none(), "Signal channel should be removed");
 
     Ok(())
 }
@@ -174,14 +174,12 @@ async fn test_signal_channels() -> Result<()> {
 #[tokio::test]
 async fn test_set_and_get_server_mode() {
     let mut registry = TubeRegistry::new();
-    assert!(!registry.is_server_mode(), "Should default to not server mode");
-    registry.set_server_mode(true);
-    assert!(registry.is_server_mode(), "Should be in server mode after setting true");
-    registry.set_server_mode(false);
-    assert!(!registry.is_server_mode(), "Should be in client mode after setting false");
+    assert!(!registry.is_server_mode().await, "Should default to not server mode");
+    registry.set_server_mode(true).await;
+    assert!(registry.is_server_mode().await, "Should be in server mode after setting true");
+    registry.set_server_mode(false).await;
+    assert!(!registry.is_server_mode().await, "Should be in client mode after setting false");
 }
-
-const ECHO_SERVER_ADDR: &str = "127.0.0.1:0";
 
 // Use the special test mode KSM config string
 const TEST_MODE_KSM_CONFIG: &str = "TEST_MODE_KSM_CONFIG";
@@ -249,9 +247,9 @@ async fn perform_tube_signaling(
     signal_rx2: &mut UnboundedReceiver<SignalMessage>,
     client_answer_sdp: String,
 ) -> Result<(), String> {
-    let server_tube = server_registry.get_by_tube_id(server_tube_id)
+    let server_tube = server_registry.get_by_tube_id(server_tube_id).await
         .ok_or_else(|| format!("Server tube {} not found in registry", server_tube_id))?;
-    let client_tube = client_registry.get_by_tube_id(client_tube_id)
+    let client_tube = client_registry.get_by_tube_id(client_tube_id).await
         .ok_or_else(|| format!("Client tube {} not found in registry", client_tube_id))?;
 
     server_tube.set_remote_description(client_answer_sdp.clone(), true).await
@@ -418,10 +416,10 @@ async fn test_registry_e2e_server_client_echo() -> Result<(), Box<dyn std::error
     info!("[E2E_Test] WebRTC signaling complete.");
 
     // Wait for data channels to open (optional, good practice)
-    let server_tube_from_reg = server_registry.get_by_tube_id(&server_tube_id).ok_or_else(|| anyhow!("Failed to get server tube from registry"))?;
-    let client_tube_from_reg = client_registry.get_by_tube_id(&client_tube_id).ok_or_else(|| anyhow!("Failed to get client tube from registry"))?;
-    let server_dc = server_tube_from_reg.get_data_channel(server_conversation_id).ok_or_else(|| anyhow!("Server DC not found"))?;
-    let client_dc = client_tube_from_reg.get_data_channel(client_conversation_id).ok_or_else(|| anyhow!("Client DC not found"))?;
+    let server_tube_from_reg = server_registry.get_by_tube_id(&server_tube_id).await.ok_or_else(|| anyhow!("Failed to get server tube from registry"))?;
+    let client_tube_from_reg = client_registry.get_by_tube_id(&client_tube_id).await.ok_or_else(|| anyhow!("Failed to get client tube from registry"))?;
+    let server_dc = server_tube_from_reg.get_data_channel(server_conversation_id).await.ok_or_else(|| anyhow!("Server DC not found"))?;
+    let client_dc = client_tube_from_reg.get_data_channel(client_conversation_id).await.ok_or_else(|| anyhow!("Client DC not found"))?;
     
     tokio::time::timeout(Duration::from_secs(10), server_dc.wait_for_channel_open(None)).await??;
     info!("[E2E_Test] Server DC '{}' is open.", server_dc.label());
@@ -464,7 +462,7 @@ async fn test_registry_e2e_server_client_echo() -> Result<(), Box<dyn std::error
 
     info!("[E2E_Test] Shutting down Ack server...");
     let _ = ack_server_actual_kill_tx_for_test.send(()); 
-    tokio::time::sleep(Duration::from_millis(200)).await; // Give time for server to shutdown
+    tokio::time::sleep(Duration::from_millis(200)).await; // Give time for the server to shut down
     
     server_registry.close_tube(&server_tube_id).await?;
     client_registry.close_tube(&client_tube_id).await?;

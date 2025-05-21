@@ -12,7 +12,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::RTCPeerConnection;
 use tokio::sync::oneshot;
-use log::debug;
+use tracing::debug;
 
 // Helper function to create a test WebRTC data channel
 pub async fn create_test_webrtc_data_channel() -> WebRTCDataChannel {

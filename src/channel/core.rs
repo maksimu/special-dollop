@@ -5,7 +5,6 @@ use bytes::BytesMut;
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use log::{debug, info};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, Mutex};
@@ -18,6 +17,7 @@ use crate::webrtc_data_channel::WebRTCDataChannel;
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
 use super::types::ActiveProtocol;
+use tracing::{debug, error, info, warn};
 
 // Import from sibling modules
 use super::frame_handling::handle_incoming_frame;
@@ -27,7 +27,7 @@ use super::utils::handle_ping_timeout;
 pub(crate) const BUFFER_LOW_THRESHOLD: u64 = 14 * 1024 * 1024; // 14MB for responsive UI
 
 // --- Protocol-specific state definitions ---
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub(crate) struct ChannelSocks5State {
     pub handshake_complete: bool,
     pub target_addr: Option<String>, 
@@ -47,7 +47,7 @@ pub(crate) struct ChannelPortForwardState {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum ProtocolLogicState {
     None, // Should not typically be used once initialized unless as a default before settings apply
     Socks5(ChannelSocks5State),
@@ -176,7 +176,7 @@ impl Channel {
         protocol_settings: HashMap<String, serde_json::Value>, // This is the main settings object
         server_mode: bool,
     ) -> Result<Self> {
-        info!("Channel::new called for id: '{}', with server_mode param: {}", channel_id, server_mode);
+        info!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
 
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
         let (f_input_tx, f_input_rx) = mpsc::unbounded_channel::<Frame>();
@@ -196,8 +196,8 @@ impl Channel {
         let network_checker = parse_network_rules_from_settings(&protocol_settings);
 
         // --- Determine Active Protocol and State ---
-        let mut determined_protocol = ActiveProtocol::PortForward; // Default
-        let mut initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState::default()); // Default state
+        let determined_protocol;
+        let initial_protocol_state;
 
         // --- Parse Guacd specific settings ---
         let mut guacd_host_setting: Option<String> = None;
@@ -213,7 +213,7 @@ impl Channel {
                 match protocol_name_str.parse::<ConversationType>() {
                     Ok(parsed_conversation_type) => {
                         if is_guacd_session(&parsed_conversation_type) {
-                            debug!("Channel({}): Configuring for GuacD protocol based on type: {}", channel_id, protocol_name_str);
+                            debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for GuacD protocol");
                             determined_protocol = ActiveProtocol::Guacd;
                             // Guacd host/port from specific guacd settings take precedence
                             // If not found, it will remain None, and protocol_tests will use defaults or error
@@ -239,11 +239,11 @@ impl Channel {
                             match parsed_conversation_type {
                                 ConversationType::Tunnel => {
                                     if network_checker.is_some() && server_mode {
-                                        debug!("Channel({}): Configuring for SOCKS5 protocol (conversationType: tunnel, network rules present)", channel_id);
+                                        debug!(target:"channel_setup", channel_id = %channel_id, "Configuring for SOCKS5 protocol (Tunnel type with network rules)");
                                         determined_protocol = ActiveProtocol::Socks5;
                                         initial_protocol_state = ProtocolLogicState::Socks5(ChannelSocks5State::default());
                                     } else {
-                                        debug!("Channel({}): Configuring for PortForward protocol (conversationType: tunnel). Server_mode param: {}", channel_id, server_mode);
+                                        debug!(target:"channel_setup", channel_id = %channel_id, server_mode, "Configuring for PortForward protocol (Tunnel type)");
                                         determined_protocol = ActiveProtocol::PortForward;
                                         if server_mode {
                                             initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState::default());
@@ -251,7 +251,7 @@ impl Channel {
                                             let dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
                                             let dest_port = protocol_settings.get("target_port")
                                                 .and_then(|v| {
-                                                    // First, try to get it as a u64 directly
+                                                    // First, try to get it as an u64 directly
                                                     if let Some(num) = v.as_u64() {
                                                         Some(num as u16)
                                                     }
@@ -276,11 +276,11 @@ impl Channel {
                                 }
                                 _ => { // Other non-Guacd types
                                     if network_checker.is_some() {
-                                        debug!("Channel({}): Configuring for SOCKS5 protocol (conversationType: {}, network rules present)", channel_id, protocol_name_str);
+                                        debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for SOCKS5 protocol (network rules present)");
                                         determined_protocol = ActiveProtocol::Socks5;
                                         initial_protocol_state = ProtocolLogicState::Socks5(ChannelSocks5State::default());
                                     } else {
-                                        debug!("Channel({}): Configuring for PortForward protocol (conversationType: {}, defaulting due to no specific rules)", channel_id, protocol_name_str);
+                                        debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for PortForward protocol (defaulting)");
                                         determined_protocol = ActiveProtocol::PortForward;
                                         let dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
                                         let dest_port = protocol_settings.get("target_port").and_then(|v| v.as_u64()).map(|p| p as u16);
@@ -294,16 +294,16 @@ impl Channel {
                         }
                     }
                     Err(_) => {
-                         debug!("Channel({}): Invalid conversationType string '{}'. Erroring out.", channel_id, protocol_name_str);
+                         error!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Invalid conversationType string. Erroring out.");
                          return Err(anyhow::anyhow!("Invalid conversationType string: {}", protocol_name_str));
                     }
                 }
             } else { // protocol_name_val is not a string
-                debug!("Channel({}): conversationType is not a string. Erroring out.", channel_id);
+                error!(target:"channel_setup", channel_id = %channel_id, "conversationType is not a string. Erroring out.");
                 return Err(anyhow::anyhow!("conversationType is not a string"));
             }
         } else { // "conversationType" not found
-            debug!("Channel({}): No specific protocol defined (conversationType missing). Erroring out.", channel_id);
+            error!(target:"channel_setup", channel_id = %channel_id, "No specific protocol defined (conversationType missing). Erroring out.");
             return Err(anyhow::anyhow!("No specific protocol defined (conversationType missing)"));
         }
         // --- End Protocol Determination ---
@@ -327,9 +327,9 @@ impl Channel {
             let ep_name_cb = channel_id_clone.clone();
             let trigger_tx = process_pending_trigger_tx_clone.clone();
             tokio::spawn(async move {
-               debug!("Endpoint {}: Buffer amount is now below threshold, signaling to process pending messages", ep_name_cb);
+               debug!(target: "channel_flow", channel_id = %ep_name_cb, "Buffer amount is now below threshold, signaling to process pending messages");
                if let Err(e) = trigger_tx.send(()) {
-                    log::error!("Endpoint {}: Failed to send pending process trigger: {}", ep_name_cb, e);
+                    error!(target: "channel_flow", channel_id = %ep_name_cb, error = %e, "Failed to send pending process trigger");
                }
             });
         })));
@@ -372,7 +372,7 @@ impl Channel {
             connection_tx: None,
         };
         
-        info!("Channel '{}' initialized with self.server_mode: {}", new_channel.channel_id, new_channel.server_mode);
+        info!(target: "channel_lifecycle", channel_id = %new_channel.channel_id, server_mode = new_channel.server_mode, "Channel initialized");
         
         Ok(new_channel)
     }
@@ -389,11 +389,10 @@ impl Channel {
         while !self.should_exit.load(std::sync::atomic::Ordering::Relaxed) {
             // Process any complete frames in the buffer
             while let Some(frame) = try_parse_frame(&mut buf) {
-                debug!("Channel({}): Received frame from WebRTC, connection {}, payload size: {}", 
-                        self.channel_id, frame.connection_no, frame.payload.len());
+                debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Received frame from WebRTC");
                 
                 if let Err(e) = handle_incoming_frame(&mut self, frame).await {
-                    log::error!("Channel({}): Error handling frame: {}", self.channel_id, e);
+                    error!(target: "channel_flow", channel_id = %self.channel_id, error = %e, "Error handling frame");
                 }
             }
 
@@ -403,8 +402,7 @@ impl Channel {
                 biased;
                 maybe_conn = async { server_conn_rx.as_mut()?.recv().await }, if server_conn_rx.is_some() => {
                     if let Some((conn_no, writer, task)) = maybe_conn {
-                        debug!("Endpoint {}: Registering connection {} from server", 
-                                self.channel_id, conn_no);
+                        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Registering connection from server");
                             
                         // Create a stream half
                         let stream_half = StreamHalf {
@@ -431,24 +429,21 @@ impl Channel {
                 maybe_chunk = self.rx_from_dc.recv() => {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
-                            debug!("Channel({}): Received {} bytes from WebRTC", 
-                                    self.channel_id, chunk.len());
+                            debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
                             
                             if chunk.len() > 0 {
-                                debug!("Channel({}): First few bytes: {:?}", 
-                                        self.channel_id, &chunk[..std::cmp::min(20, chunk.len())]);
+                                debug!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
                             }
                             
                             buf.extend_from_slice(&chunk);
-                            debug!("Channel({}): Buffer size after adding chunk: {} bytes", 
-                                    self.channel_id, buf.len());
+                            debug!(target: "channel_flow", channel_id = %self.channel_id, buffer_size = buf.len(), "Buffer size after adding chunk");
                             
                             // Process pending messages might be triggered by buffer low, 
                             // but also good to try after receiving new data if not recently triggered.
                             self.process_pending_messages().await?;
                         }
                         Ok(None) => {
-                            log::info!("Channel({}): WebRTC data channel closed or sender dropped.", self.channel_id);
+                            info!(target: "channel_lifecycle", channel_id = %self.channel_id, "WebRTC data channel closed or sender dropped.");
                             break; 
                         }
                         Err(_) => { // Timeout on rx_from_dc.recv()
@@ -463,11 +458,11 @@ impl Channel {
                     guard.recv().await
                 } => {
                     if trigger.is_some() {
-                        debug!("Channel({}): Trigger received to process pending messages.", self.channel_id);
+                        debug!(target: "channel_flow", channel_id = %self.channel_id, "Trigger received to process pending messages.");
                         self.process_pending_messages().await?;
                     } else {
                         // Trigger channel closed, maybe log or break.
-                        log::info!("Channel({}): Process pending trigger channel closed.", self.channel_id);
+                        info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Process pending trigger channel closed.");
                         // Depending on desired behavior, you might want to break the loop.
                     }
                 }
@@ -484,12 +479,12 @@ impl Channel {
         if pending_guard.iter().all(|(_, queue)| queue.is_empty()) {
             return Ok(());
         }
-        debug!("Endpoint {}: Processing pending messages for {} connections", self.channel_id, pending_guard.len());
+        debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "Processing pending messages");
         let max_to_process = 100;
         let mut total_processed = 0;
         let total_messages: usize = pending_guard.values().map(|q| q.len()).sum();
         if total_messages > 0 {
-           debug!("Endpoint {}: Total of {} pending messages across all connections", self.channel_id, total_messages);
+           debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "Total pending messages across all connections");
         }
         let conn_nos: Vec<u32> = pending_guard.keys().filter(|&conn_no| !pending_guard[conn_no].is_empty()).copied().collect();
         let mut current_index = 0;
@@ -514,7 +509,7 @@ impl Channel {
                 };
                 
                 if let Err(e) = self.webrtc.send(message_to_send).await {
-                    log::error!("Endpoint {}: Failed to send queued message for connection {}: {}", self.channel_id, conn_no, e);
+                    error!(target: "channel_flow", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send queued message for connection");
                     break;
                 }
 
@@ -524,21 +519,21 @@ impl Channel {
                 if total_processed % 10 == 0 {
                     let current_buffer = self.webrtc.buffered_amount().await;
                     if current_buffer >= buffer_threshold {
-                        debug!("Endpoint {}: Buffer threshold reached during processing, pausing after {} messages", self.channel_id, total_processed);
+                        debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, "Buffer threshold reached during processing, pausing");
                         break;
                     }
 
                 }
             } else {
                  // This case should ideally not happen if conn_nos is derived from pending_guard keys
-                 log::warn!("Channel {}: Connection {} not found in pending_messages during processing.", self.channel_id, conn_no);
+                 warn!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "Connection not found in pending_messages during processing.");
             }
             current_index += 1;
         }
         
         self.buffer_pool.release(encode_buffer);
         if total_processed > 0 {
-           debug!("Endpoint {}: Processed {} pending messages in this batch", self.channel_id, total_processed);
+           debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "Processed pending messages in this batch");
         }
         Ok(())
     }
@@ -558,32 +553,32 @@ impl Channel {
         let encoded = frame.encode_with_pool(&self.buffer_pool);
         let buffered_amount = self.webrtc.buffered_amount().await;
         if buffered_amount >= BUFFER_LOW_THRESHOLD {
-           debug!("Endpoint {}: Control message buffer full ({} bytes), but sending control message for {}", self.channel_id, buffered_amount, message);
+           debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");
         }
         self.webrtc.send(encoded).await.map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
-    
-    // Method to handle received message bytes from a data channel
-    pub async fn receive_message(&mut self, bytes: Bytes) -> Result<()> {
-        let mut buffer = self.buffer_pool.acquire();
-        buffer.clear();
-        buffer.extend_from_slice(&bytes);
-        
-        while let Some(frame) = try_parse_frame(&mut buffer) {
-            debug!("Channel({}): Processing frame from message, connection {}, payload size: {}", self.channel_id, frame.connection_no, frame.payload.len());
-            
-            if let Err(e) = handle_incoming_frame(self, frame).await {
-                log::error!("Channel({}): Error handling frame from message processing: {}", self.channel_id, e);
-            }
-        }
-        
-        self.buffer_pool.release(buffer);
-        Ok(())
-    }
+    // 
+    // // Method to handle received message bytes from a data channel
+    // pub async fn receive_message(&mut self, bytes: Bytes) -> Result<()> {
+    //     let mut buffer = self.buffer_pool.acquire();
+    //     buffer.clear();
+    //     buffer.extend_from_slice(&bytes);
+    //     
+    //     while let Some(frame) = try_parse_frame(&mut buffer) {
+    //         debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Processing frame from message");
+    //         
+    //         if let Err(e) = handle_incoming_frame(self, frame).await {
+    //             error!(target: "channel_flow", channel_id = %self.channel_id, error = %e, "Error handling frame from message processing");
+    //         }
+    //     }
+    //     
+    //     self.buffer_pool.release(buffer);
+    //     Ok(())
+    // }
 
     pub(crate) async fn close_backend(&mut self, conn_no: u32, reason: CloseConnectionReason) -> Result<()> {
-        log::info!("Endpoint {}: Closing connection {} (reason: {:?})", self.channel_id, conn_no, reason);
+        info!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, ?reason, "Closing connection");
 
         let mut buffer = self.buffer_pool.acquire();
         buffer.clear();
@@ -600,8 +595,8 @@ impl Channel {
             let _ = crate::models::AsyncReadWrite::shutdown(&mut conn.backend).await;
             conn.to_webrtc.abort();
             match tokio::time::timeout(self.timeouts.close_connection, conn.to_webrtc).await {
-                Ok(_) => debug!("Endpoint {}: Successfully closed backend task for connection {}", self.channel_id, conn_no),
-                Err(_) => log::warn!("Endpoint {}: Timeout waiting for backend task to close for connection {}", self.channel_id, conn_no),
+                Ok(_) => debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed backend task for connection"),
+                Err(_) => warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Timeout waiting for backend task to close for connection"),
             }
         }
 
@@ -618,7 +613,7 @@ impl Channel {
     }
 
     pub(crate) async fn internal_handle_connection_close(&mut self, conn_no: u32, reason: CloseConnectionReason) -> Result<()> {
-        debug!("Channel({}): internal_handle_connection_close for conn_no {}, reason: {:?}", self.channel_id, conn_no, reason);
+        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, ?reason, "internal_handle_connection_close");
         match self.active_protocol {
             ActiveProtocol::Socks5 => {
                 // TODO: SOCKS5 specific close logic
@@ -661,11 +656,11 @@ impl Drop for Channel {
                 let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut close_buffer);
                 let encoded = close_frame.encode_with_pool(&buffer_pool_clone);
                 if let Err(e) = webrtc.send(encoded).await {
-                    log::warn!("Channel({}): Error sending close frame in drop for conn {}: {}", channel_id, conn_no, e);
+                    warn!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error sending close frame in drop for connection");
                 }
                 buffer_pool_clone.release(close_buffer);
             }
-            log::info!("Endpoint {}: Basic resource cleanup initiated in drop for Channel", channel_id);
+            info!(target: "channel_lifecycle", channel_id = %channel_id, "Basic resource cleanup initiated in drop for Channel");
         });
     }
 }

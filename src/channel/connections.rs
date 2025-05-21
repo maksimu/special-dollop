@@ -1,7 +1,6 @@
 // Connection management functionality for Channel
 
 use anyhow::Result;
-use log::{debug, error, warn};
 use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -10,6 +9,7 @@ use crate::tube_protocol::Frame;
 use crate::channel::types::ActiveProtocol;
 use crate::channel::guacd_parser::GuacdParser;
 use bytes::Bytes;
+use tracing::{debug, error, warn};
 
 use super::core::Channel;
 
@@ -19,7 +19,7 @@ pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr,
 
     // Check if the connection already exists
     if channel.conns.lock().await.contains_key(&conn_no) {
-        log::warn!("Endpoint {}: Connection {} already exists", channel.channel_id, conn_no);
+        warn!("Endpoint {}: Connection {} already exists", channel.channel_id, conn_no);
         return Ok(());
     }
 
@@ -180,7 +180,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                         } else {
                             // Send it directly
                             if let Err(e) = dc.send(encoded_frame_bytes).await {
-                                log::error!(
+                                error!(
                                     "Endpoint {}: Failed to send data for connection {}: {}",
                                     channel_id, conn_no, e
                                 );
@@ -194,7 +194,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     continue;
                 }
                 Err(e) => {
-                    log::error!(
+                    error!(
                     "Endpoint {}: Read error on connection {}: {}",
                     channel_id, conn_no, e
                 );

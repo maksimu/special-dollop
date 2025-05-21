@@ -3,11 +3,11 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::net::SocketAddr;
-use log::{debug, info, error, warn};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason};
+use tracing::{debug, info, error, warn};
 
 use super::core::Channel;
 use super::types::ActiveProtocol;
@@ -15,16 +15,15 @@ use crate::webrtc_data_channel::WebRTCDataChannel;
 
 // Constants for SOCKS5 protocol
 const SOCKS5_VERSION: u8 = 0x05;
-const SOCKS5_NO_AUTH: u8 = 0x00;
+const SOCKS5_AUTH_METHOD_NONE: u8 = 0x00;
 // const SOCKS5_AUTH_USER_PW: u8 = 0x02;
 const SOCKS5_AUTH_FAILED: u8 = 0xFF;
 const SOCKS5_CMD_CONNECT: u8 = 0x01;
 // const SOCKS5_CMD_BIND: u8 = 0x02;
 // const SOCKS5_CMD_UDP: u8 = 0x03;
-const SOCKS5_ATYP_IPV4: u8 = 0x01;
+const SOCKS5_ADDR_TYPE_IPV4: u8 = 0x01;
 const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
-const SOCKS5_SUCCESS: u8 = 0x00;
 const SOCKS5_FAIL: u8 = 0x01;
 
 impl Channel {
@@ -214,8 +213,8 @@ async fn handle_socks5_connection(
     reader.read_exact(&mut methods).await?;
     
     // Check if no authentication is supported
-    let selected_method = if methods.contains(&SOCKS5_NO_AUTH) {
-        SOCKS5_NO_AUTH
+    let selected_method = if methods.contains(&SOCKS5_AUTH_METHOD_NONE) {
+        SOCKS5_AUTH_METHOD_NONE
     } else {
         // No supported authentication method
         SOCKS5_AUTH_FAILED
@@ -251,7 +250,7 @@ async fn handle_socks5_connection(
     
     // Parse the destination address
     let dest_host = match addr_type {
-        SOCKS5_ATYP_IPV4 => {
+        SOCKS5_ADDR_TYPE_IPV4 => {
             let mut addr = [0u8; 4];
             reader.read_exact(&mut addr).await?;
             format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3])
@@ -410,7 +409,7 @@ async fn send_socks5_response(
     response.push(SOCKS5_VERSION);
     response.push(rep);
     response.push(0x00); // Reserved
-    response.push(SOCKS5_ATYP_IPV4); // Address type
+    response.push(SOCKS5_ADDR_TYPE_IPV4); // Address type
     response.extend_from_slice(addr);
     response.extend_from_slice(&port.to_be_bytes());
     

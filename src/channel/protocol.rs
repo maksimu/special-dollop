@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use bytes::Buf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::ToSocketAddrs;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use tokio::io::AsyncWriteExt;
 
 use super::core::Channel;
@@ -11,12 +11,6 @@ use crate::tube_protocol::{ControlMessage, CloseConnectionReason, CONN_NO_LEN};
 
 // Import from the new connect_as module
 use super::connect_as::decrypt_connect_as_payload;
-
-// Constants for protocol message structure
-pub(crate) const BUFFER_SIZE: usize = 8192;
-pub(crate) const TIME_STAMP_LEN: usize = 8;
-pub(crate) const DATA_LEN: usize = 4;
-pub(crate) const TERMINATOR: &[u8] = b";";
 
 // Placeholder constants - ensure these are defined correctly in your project scope
 // or move them to a more appropriate central location (e.g., types.rs or a consts.rs)
@@ -34,65 +28,72 @@ pub fn now_ms() -> u64 {
 impl Channel {
     pub(crate) fn setup_webrtc_state_monitoring(&mut self) {
         let webrtc = self.webrtc.clone();
-        let channel_id = self.channel_id.clone();
+        let channel_id_base = self.channel_id.clone(); // Base clone for the function scope
         
         let last_state = webrtc.ready_state();
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel(8);
         
-        let data_channel = webrtc.data_channel.clone(); // Arc<DataChannel>
+        let data_channel = webrtc.data_channel.clone(); 
         
         let state_tx_open = state_tx.clone();
+        let channel_id_for_open = channel_id_base.clone(); // Clone for on_open
         data_channel.on_open(Box::new(move || {
             let tx = state_tx_open.clone();
+            let channel_id_log = channel_id_for_open.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send("Open".to_string()).await {
-                    log::error!("Failed to send open state notification: {}", e);
+                    warn!(target: "protocol_event", channel_id=%channel_id_log, error=%e, "Failed to send open state notification");
                 }
             });
             Box::pin(async {})
         }));
         
         let state_tx_close = state_tx.clone();
+        let channel_id_for_close = channel_id_base.clone(); // Clone for on_close
         data_channel.on_close(Box::new(move || {
             let tx = state_tx_close.clone();
+            let channel_id_log = channel_id_for_close.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send("Closed".to_string()).await {
-                    log::error!("Failed to send close state notification: {}", e);
+                    warn!(target: "protocol_event", channel_id=%channel_id_log, error=%e, "Failed to send close state notification");
                 }
             });
             Box::pin(async {})
         }));
         
         let state_tx_error = state_tx.clone();
+        let channel_id_for_error = channel_id_base.clone(); // Clone for on_error
         data_channel.on_error(Box::new(move |err| {
             let tx = state_tx_error.clone();
             let err_str = format!("Error: {}", err);
+            let channel_id_log = channel_id_for_error.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send(err_str).await {
-                    log::error!("Failed to send error state notification: {}", e);
+                    warn!(target: "protocol_event", channel_id=%channel_id_log, error=%e, "Failed to send error state notification");
                 }
             });
             Box::pin(async {})
         }));
         
         let runtime = get_runtime();
+        let channel_id_for_runtime_spawn = channel_id_base.clone(); // Clone for runtime spawn
         runtime.spawn(async move {
             let mut last_state_in_task = last_state;
+            let channel_id_log = channel_id_for_runtime_spawn.clone(); // Clone for use in loop
             while let Some(current_state) = state_rx.recv().await {
                 if current_state != last_state_in_task {
-                    info!("Endpoint {}: WebRTC state changed: {} -> {}", channel_id, last_state_in_task, current_state);
+                    info!(target: "protocol_event", channel_id=%channel_id_log, "Endpoint WebRTC state changed: {} -> {}", last_state_in_task, current_state);
                     last_state_in_task = current_state.clone();
                 }
                 
                 let lower_current_state = current_state.to_lowercase();
                 if lower_current_state == "closed" || lower_current_state.starts_with("error") {
-                    info!("Endpoint {}: WebRTC state is '{}', stopping state monitoring task.", channel_id, current_state);
-                    // The actual channel teardown is primarily handled by the rx_from_dc stream ending in the Channel::run loop.
+                    info!(target: "protocol_event", channel_id=%channel_id_log, state = %current_state, "Endpoint WebRTC state, stopping state monitoring task.");
                     break;
                 }
             }
         });
-        info!("Channel({}): WebRTC state change monitoring set up.", self.channel_id);
+        info!(target: "protocol_event", channel_id=%channel_id_base, "Channel WebRTC state change monitoring set up.");
     }
 
     /// Process a control message received from the data channel
@@ -101,7 +102,7 @@ impl Channel {
         message_type: ControlMessage, 
         data: &[u8]
     ) -> Result<()> {
-        debug!("Endpoint {}: Processing control message: {:?}", self.channel_id, message_type);
+        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Processing control message: {:?}", message_type);
 
         match message_type {
             ControlMessage::CloseConnection => {
@@ -145,8 +146,7 @@ impl Channel {
             CloseConnectionReason::Normal
         };
 
-        debug!("Endpoint {}: Closing connection {} (reason: {:?})", 
-               self.channel_id, target_connection_no, reason);
+        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Closing connection {} (reason: {:?})", target_connection_no, reason);
 
         // Special case for connection 0 (control connection)
         if target_connection_no == 0 {
@@ -167,20 +167,14 @@ impl Channel {
         let mut cursor = std::io::Cursor::new(data);
         let target_connection_no = cursor.get_u32();
 
-        debug!(
-            "Endpoint {}: Received OpenConnection request for connection {} with payload size {}. Server mode: {}, Active Protocol: {:?}",
-            self.channel_id, target_connection_no, cursor.remaining(), self.server_mode, self.active_protocol
-        );
+        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received OpenConnection request for connection {} with payload size {}. Server mode: {}, Active Protocol: {:?}", target_connection_no, cursor.remaining(), self.server_mode, self.active_protocol);
 
         // If this channel is a server-mode PortForwarder, it originates connections locally.
         // An incoming OpenConnection for a specific conn_no is an ack/part of handshake from the client-side of the tunnel.
         // The server should already have (or be in the process of setting up) this conn_no from a local TCP accept.
         // It should not try to establish a new outbound connection based on this message.
         if self.server_mode && self.active_protocol == super::types::ActiveProtocol::PortForward {
-            debug!(
-                "Endpoint {}: Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened.",
-                self.channel_id, target_connection_no
-            );
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened.", target_connection_no);
             // The connection should be in self.conns or will be shortly via the local TCP accept path.
             // Sending ConnectionOpened confirms to the client that this conn_no is active on the server side.
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
@@ -189,10 +183,7 @@ impl Channel {
 
         // Existing check: if connection already processed and in conns map (e.g. client mode, or SOCKS5 server after target resolution)
         if self.conns.lock().await.contains_key(&target_connection_no) {
-            debug!(
-                "Endpoint {}: Connection {} already exists or is being processed. Sending ConnectionOpened.",
-                self.channel_id, target_connection_no
-            );
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened.", target_connection_no);
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
             return Ok(());
         }
@@ -222,22 +213,22 @@ impl Channel {
 
                     if let Some(ref checker) = self.network_checker {
                         if !checker.is_host_allowed(&parsed_host) {
-                            error!("Endpoint {}: SOCKS5 target host {} not allowed.", self.channel_id, parsed_host);
+                            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target host {} not allowed.", parsed_host);
                             return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 host not allowed").await;
                         }
                         if !checker.is_port_allowed(parsed_port) {
-                            error!("Endpoint {}: SOCKS5 target port {} not allowed.", self.channel_id, parsed_port);
+                            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target port {} not allowed.", parsed_port);
                             return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 port not allowed").await;
                         }
                     }
                     host_to_connect = parsed_host;
                     port_to_connect = parsed_port;
-                    debug!("Endpoint {}: Parsed SOCKS5 target from OpenConnection: {}:{} for conn_no {}", self.channel_id, host_to_connect, port_to_connect, target_connection_no);
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Parsed SOCKS5 target from OpenConnection: {}:{} for conn_no {}", host_to_connect, port_to_connect, target_connection_no);
                     return self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await;
                 } else {
                     // Not enough data for SOCKS5 host/port, rewind cursor for other parsing logic.
                     cursor.set_position(pos_before_socks_parse);
-                    warn!("Endpoint {}: OpenConnection payload looked like SOCKS5 but was too short. Rewinding for other parsing.", self.channel_id);
+                    warn!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint OpenConnection payload looked like SOCKS5 but was too short. Rewinding for other parsing.");
                 }
             }
 
@@ -263,10 +254,7 @@ impl Channel {
                         let mut encrypted_connect_as_data = vec![0u8; connect_as_declared_len];
                         cursor.copy_to_slice(&mut encrypted_connect_as_data);
 
-                        debug!(
-                            "Endpoint {}: Extracted Guacd 'connect_as' fields for conn_no {}. Encrypted payload length: {}.",
-                            self.channel_id, target_connection_no, connect_as_declared_len
-                        );
+                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Extracted Guacd 'connect_as' fields for conn_no {}. Encrypted payload length: {}.", target_connection_no, connect_as_declared_len);
                         // Using self.connect_as_settings directly
                         if let Some(private_key_hex) = &self.connect_as_settings.gateway_private_key {
                             match decrypt_connect_as_payload(
@@ -276,7 +264,7 @@ impl Channel {
                                 &encrypted_connect_as_data,
                             ) {
                                 Ok(decrypted_payload) => {
-                                    info!("Endpoint {}: Successfully decrypted 'connect_as' payload for conn_no {}: {:?}", self.channel_id, target_connection_no, decrypted_payload);
+                                    info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully decrypted 'connect_as' payload for conn_no {}: {:?}", target_connection_no, decrypted_payload);
 
                                     // Use self.guacd_host and self.guacd_port as defaults
                                     host_to_connect = self.guacd_host.clone().unwrap_or_else(|| "localhost".to_string());
@@ -285,17 +273,17 @@ impl Channel {
                                     if self.connect_as_settings.allow_supply_host {
                                         if let Some(supplied_host) = decrypted_payload.host {
                                             host_to_connect = supplied_host;
-                                            info!("Endpoint {}: Using host '{}' from 'connect_as' payload for conn_no {}.", self.channel_id, host_to_connect, target_connection_no);
+                                            info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Using host '{}' from 'connect_as' payload for conn_no {}.", host_to_connect, target_connection_no);
                                         }
                                         if let Some(supplied_port) = decrypted_payload.port {
                                             port_to_connect = supplied_port;
-                                            info!("Endpoint {}: Using port {} from 'connect_as' payload for conn_no {}.", self.channel_id, port_to_connect, target_connection_no);
+                                            info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Using port {} from 'connect_as' payload for conn_no {}.", port_to_connect, target_connection_no);
                                         }
                                     }
 
                                     if self.connect_as_settings.allow_supply_user {
                                         if let Some(user_info) = decrypted_payload.user {
-                                            debug!("Endpoint {}: User details from 'connect_as' for conn_no {}: {:?}", self.channel_id, target_connection_no, user_info);
+                                            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint User details from 'connect_as' for conn_no {}: {:?}", target_connection_no, user_info);
 
                                             let mut params_guard = self.guacd_params.lock().await;
                                             // Clear specific connect_as params before adding new ones for this connection? Or augment?
@@ -322,36 +310,32 @@ impl Channel {
                                                 params_guard.insert("distinguished_name".to_string(), d_name);
                                             }
                                             drop(params_guard);
-                                            warn!("Endpoint {}: Updated self.guacd_params with connect_as user details for conn_no {}. TODO: Ensure these params are correctly passed to Guacd connection logic.", self.channel_id, target_connection_no);
+                                            warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %target_connection_no, "Updated self.guacd_params with connect_as user details. TODO: Ensure params are correctly passed to Guacd connection logic.");
                                         }
                                     }
                                     self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await
                                 },
                                 Err(e) => {
-                                    error!("Endpoint {}: Failed to decrypt/process 'connect_as' payload for conn_no {}: {}. Check key configuration and payload structure.", self.channel_id, target_connection_no, e);
+                                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to decrypt/process 'connect_as' payload for conn_no {}: {}. Check key configuration and payload structure.", target_connection_no, e);
                                     self.close_backend_and_notify(target_connection_no, CloseConnectionReason::DecryptionFailed, "Connect As decryption/processing failed").await
                                 }
                             }
                         } else {
-                            error!("Endpoint {}: Gateway private key for 'connect_as' not configured (self.connect_as_settings). Cannot decrypt payload for conn_no {}.", self.channel_id, target_connection_no);
+                            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Gateway private key for 'connect_as' not configured (self.connect_as_settings). Cannot decrypt payload for conn_no {}.", target_connection_no);
                             self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConfigurationError, "Connect As private key missing").await
                         }
                     } else {
-                        error!("Endpoint {}: Invalid Guacd 'connect_as' data for conn_no {}: not enough bytes for key, nonce, and declared payload length {}. Declared: {}, cursor remaining: {}, key+nonce needed: {}.",
-                            self.channel_id, target_connection_no, connect_as_declared_len, connect_as_declared_len, cursor.remaining(), PUBLIC_KEY_LENGTH + NONCE_LENGTH);
+                        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Invalid Guacd 'connect_as' data for conn_no {}: not enough bytes for key, nonce, and declared payload length {}. Declared: {}, cursor remaining: {}, key+nonce needed: {}.", target_connection_no, connect_as_declared_len, connect_as_declared_len, cursor.remaining(), PUBLIC_KEY_LENGTH + NONCE_LENGTH);
                         self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ProtocolError, "Invalid Connect As data structure (length mismatch)").await
                     }
                 } else {
-                    error!(
-                        "Endpoint {}: OpenConnection for Guacd conn_no {} does not match 'connect_as' structure (min length for header+key+nonce: {}, remaining: {}) or 'connect_as' is not allowed/configured (self.connect_as_settings). Using configured Guacd target.",
-                        self.channel_id, target_connection_no, 4 + PUBLIC_KEY_LENGTH + NONCE_LENGTH, remaining_at_connect_as_check
-                    );
+                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint OpenConnection for Guacd conn_no {} does not match 'connect_as' structure (min length for header+key+nonce: {}, remaining: {}) or 'connect_as' is not allowed/configured (self.connect_as_settings). Using configured Guacd target.", target_connection_no, 4 + PUBLIC_KEY_LENGTH + NONCE_LENGTH, remaining_at_connect_as_check);
                     self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ProtocolError, "Invalid Connect As data structure (length mismatch)").await
                 }
             }
         }
  
-        debug!("Endpoint {}: OpenConnection for conn_no {} has no (or unparsed) specific target payload. Using pre-configured target.", self.channel_id, target_connection_no);
+        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint OpenConnection for conn_no {} has no (or unparsed) specific target payload. Using pre-configured target.", target_connection_no);
         match self.active_protocol {
             super::types::ActiveProtocol::PortForward => {
                 if let super::core::ProtocolLogicState::PortForward(ref pf_state) = self.protocol_state {
@@ -365,10 +349,10 @@ impl Channel {
                 // Use self.guacd_host and self.guacd_port
                 host_to_connect = self.guacd_host.clone().unwrap_or_else(|| "localhost".to_string());
                 port_to_connect = self.guacd_port.unwrap_or(4822);
-                debug!("Endpoint {}: Guacd OpenConnection (no specific payload) for conn_no {}. Connecting to configured Guacd server {}:{}.", self.channel_id, target_connection_no, host_to_connect, port_to_connect);
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Guacd OpenConnection (no specific payload) for conn_no {}. Connecting to configured Guacd server {}:{}.", target_connection_no, host_to_connect, port_to_connect);
             }
             super::types::ActiveProtocol::Socks5 => {
-                error!("Endpoint {}: SOCKS5 mode, but OpenConnection for conn_no {} did not contain a valid SOCKS5 target payload.", self.channel_id, target_connection_no);
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 mode, but OpenConnection for conn_no {} did not contain a valid SOCKS5 target payload.", target_connection_no);
                 return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 target missing in OpenConnection").await;
             }
         }
@@ -377,7 +361,7 @@ impl Channel {
 
     /// Helper to close the backend and potentially send a CloseConnection control message.
     async fn close_backend_and_notify(&mut self, conn_no: u32, reason: CloseConnectionReason, log_message: &str) -> Result<()> {
-        error!("Endpoint {}: {} for conn_no {}. Closing backend.", self.channel_id, log_message, conn_no);
+        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint {} for conn_no {}. Closing backend.", log_message, conn_no);
         // The close_backend method should handle removing the connection from self.conns
         // and cleaning up its resources. It might also send a CloseConnection control message.
         // If close_backend doesn't always send a notification, we might need to send one here.
@@ -393,18 +377,18 @@ impl Channel {
     /// Helper function to establish backend connection and send ConnectionOpened
     async fn establish_backend_connection(&mut self, conn_no: u32, host: &str, port: u16) -> Result<()> {
         let target_str = format!("{}:{}", host, port);
-        debug!("Endpoint {}: Attempting to open backend connection {} to {}", self.channel_id, conn_no, target_str);
+        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Attempting to open backend connection {} to {}", conn_no, target_str);
 
         // Check network access rules if configured (primarily for client-side initiated from OpenConnection)
         if let Some(ref checker) = self.network_checker {
             if !checker.is_host_allowed(host) {
-                error!("Endpoint {}: Target host {} not allowed by network rules for conn_no {}.", self.channel_id, host, conn_no);
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Target host {} not allowed by network rules for conn_no {}.", host, conn_no);
                 self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
                 // We might want to send a CloseConnection control message back to origin if not already handled by close_backend.
                 return Ok(()); // Return Ok to signify a message handled, even if the connection failed rules.
             }
             if !checker.is_port_allowed(port) {
-                error!("Endpoint {}: Target port {} not allowed by network rules for conn_no {}.", self.channel_id, port, conn_no);
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Target port {} not allowed by network rules for conn_no {}.", port, conn_no);
                 self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
                 return Ok(());
             }
@@ -413,14 +397,14 @@ impl Channel {
         let addrs = match target_str.to_socket_addrs() {
             Ok(iter) => iter.collect::<Vec<_>>(),
             Err(e) => {
-                error!("Endpoint {}: Failed to resolve address {}: {} for conn_no {}.", self.channel_id, target_str, e, conn_no);
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to resolve address {}: {} for conn_no {}.", target_str, e, conn_no);
                 self.close_backend(conn_no, CloseConnectionReason::AddressResolutionFailed).await?;
                 return Ok(());
             }
         };
 
         if addrs.is_empty() {
-            error!("Endpoint {}: Could not resolve address: {} for conn_no {}.", self.channel_id, target_str, conn_no);
+            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Could not resolve address: {} for conn_no {}.", target_str, conn_no);
             self.close_backend(conn_no, CloseConnectionReason::AddressResolutionFailed).await?;
             return Ok(());
         }
@@ -431,23 +415,14 @@ impl Channel {
         ).await {
             Ok(Ok(_)) => {
                 self.send_control_message(ControlMessage::ConnectionOpened, &conn_no.to_be_bytes()).await?;
-                info!(
-                    "Endpoint {}: Successfully opened backend connection {} to {}:{}. Sent ConnectionOpened.",
-                    self.channel_id, conn_no, host, port
-                );
+                info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully opened backend connection {} to {}:{}. Sent ConnectionOpened.", conn_no, host, port);
             }
             Ok(Err(e)) => {
-                error!(
-                    "Endpoint {}: Failed to open backend connection {} to {}:{}: {}",
-                    self.channel_id, conn_no, host, port, e
-                );
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to open backend connection {} to {}:{}: {}", conn_no, host, port, e);
                 self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
             }
             Err(_) => {
-                error!(
-                    "Endpoint {}: Backend connection {} to {}:{} timed out.",
-                    self.channel_id, conn_no, host, port
-                );
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Backend connection {} to {}:{} timed out.", conn_no, host, port);
                 self.close_backend(conn_no, CloseConnectionReason::Timeout).await?;
             }
         }
@@ -458,7 +433,7 @@ impl Channel {
     async fn handle_ping(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
             // Basic ping without connection info
-            debug!("Endpoint {}: Received basic Ping request", self.channel_id);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic Ping request");
             self.send_control_message(
                 ControlMessage::Pong,
                 &[0, 0, 0, 0] // connection 0
@@ -471,8 +446,7 @@ impl Channel {
         
         // Check if the connection exists
         if !self.conns.lock().await.contains_key(&conn_no) {
-            error!("Endpoint {}: Connection {} not found for Ping", 
-                   self.channel_id, conn_no);
+            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for Ping", conn_no);
             return Ok(());
         }
         
@@ -484,11 +458,9 @@ impl Channel {
         if data.len() > CONN_NO_LEN {
             // TODO: transfer_latency tracking implement here. 
             response.extend_from_slice(&data[CONN_NO_LEN..]);
-            debug!("Endpoint {}: Received ACK request with timing data for {}", 
-                   self.channel_id, conn_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request with timing data for {}", conn_no);
         } else {
-            debug!("Endpoint {}: Received ACK request for {}", 
-                   self.channel_id, conn_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request for {}", conn_no);
         }
         
         // Send response
@@ -500,7 +472,7 @@ impl Channel {
     /// Handle a Pong control message
     async fn handle_pong(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
-            debug!("Endpoint {}: Received basic pong", self.channel_id);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic pong");
             self.ping_attempt = 0;
             return Ok(());
         }
@@ -515,10 +487,9 @@ impl Channel {
             conn.stats.message_counter = 0;
             
             if conn_no == 0 {
-                debug!("Endpoint {}: Received pong", self.channel_id);
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong");
             } else {
-                debug!("Endpoint {}: Received ACK response for {}", 
-                       self.channel_id, conn_no);
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
             }
             
             // Handle round-trip latency calculation if ping time was set
@@ -535,8 +506,7 @@ impl Channel {
                     }
                 }
                 
-                debug!("Endpoint {}: Round trip latency: {} ms", 
-                       self.channel_id, latency);
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Round trip latency: {} ms", latency);
                 
                 // Reset ping time
                 conn.stats.ping_time = None;
@@ -545,8 +515,7 @@ impl Channel {
                 // In Python, there's additional transfer latency tracking that we'd implement here
             }
         } else {
-            debug!("Endpoint {}: Received pong for unknown connection {}", 
-                   self.channel_id, conn_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong for unknown connection {}", conn_no);
         }
         
         // Reset ping attempt counter
@@ -567,24 +536,21 @@ impl Channel {
         // Check if the connection exists and send EOF
         let mut conns_guard = self.conns.lock().await;
         if let Some(conn) = conns_guard.get_mut(&conn_no) {
-            debug!("Endpoint {}: Sending EOF to backend for connection {}", 
-                   self.channel_id, conn_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending EOF to backend for connection {}", conn_no);
             
             let backend = conn.backend.as_mut(); // Get a mutable reference to the Box<dyn BackendConnection>
             
             match backend.shutdown().await { // Call shutdown on the trait object
                 Ok(_) => {
-                    debug!("Endpoint {}: Successfully sent shutdown to backend for EOF on conn {}", 
-                           self.channel_id, conn_no);
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully sent shutdown to backend for EOF on conn {}", conn_no);
                 }
                 Err(e) => {
-                    error!("Endpoint {}: Error shutting down backend for EOF on conn {}: {}", self.channel_id, conn_no, e);
+                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Error shutting down backend for EOF on conn {}: {}", conn_no, e);
                     // Decide if we need to hard close or if shutdown failure is non-fatal for the EOF intent.
                 }
             }
         } else {
-            error!("Endpoint {}: Connection for EOF {} not found", 
-                   self.channel_id, conn_no);
+            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection for EOF {} not found", conn_no);
         }
         
         Ok(())
@@ -595,8 +561,7 @@ impl Channel {
         // This is called when we receive a ConnectionOpened control message from WebRTC
         // In server_mode, this completes the connection setup
         if !self.server_mode {
-            debug!("Endpoint {}: Received ConnectionOpened in client mode (ignoring)", 
-                   self.channel_id);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ConnectionOpened in client mode (ignoring)");
             return Ok(());
         }
 
@@ -605,43 +570,36 @@ impl Channel {
         }
 
         let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        debug!("Endpoint {}: Starting reader for connection {}", 
-               self.channel_id, connection_no);
+        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Starting reader for connection {}", connection_no);
         
         // Get the connection
         let mut conns_guard = self.conns.lock().await;
         let connection = match conns_guard.get_mut(&connection_no) {
             Some(c) => c,
             None => {
-                error!("Endpoint {}: Connection {} not found for ConnectionOpened", 
-                       self.channel_id, connection_no);
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for ConnectionOpened", connection_no);
                 return Ok(());
             }
         };
         
         // If it's a SOCKS5 connection, send a success response to the client
         if self.active_protocol == super::types::ActiveProtocol::Socks5 {
-            debug!("Endpoint {}: SOCKS5 Connection {} opened", 
-                   self.channel_id, connection_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
             
             let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             
             let backend = connection.backend.as_mut();
-            debug!("Endpoint {}: Sending SOCKS5 success response to connection {}", 
-                    self.channel_id, connection_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
             
             match backend.write_all(&response).await {
                 Ok(_) => {
-                    debug!("Endpoint {}: SOCKS5 success response sent for connection {}", 
-                            self.channel_id, connection_no);
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response sent for connection {}", connection_no);
                     if let Err(e) = backend.flush().await {
-                        error!("Endpoint {}: Failed to flush SOCKS5 writer: {}", 
-                                self.channel_id, e);
+                        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to flush SOCKS5 writer: {}", e);
                     }
                 },
                 Err(e) => {
-                    error!("Endpoint {}: Failed to send SOCKS5 success response: {}", 
-                            self.channel_id, e);
+                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to send SOCKS5 success response: {}", e);
                 }
             }
         }
@@ -649,85 +607,83 @@ impl Channel {
         // The conn.to_webrtc task is already set up by open_backend (via establish_backend_connection)
         // to handle reading from the backend and sending to WebRTC. No need to spawn another one here.
         if connection.to_webrtc.is_finished() {
-            warn!("Endpoint {}: In ConnectionOpened, to_webrtc task for conn_no {} was already finished. This is unexpected.", self.channel_id, connection_no);
+            warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "In ConnectionOpened, to_webrtc task was already finished. This is unexpected.");
         }
         
-        info!("Endpoint {}: Connection {} fully opened and ready.", 
-              self.channel_id, connection_no);
+        info!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "Connection fully opened and ready.");
         
         drop(conns_guard);
         Ok(())
     }
+    // 
+    // /// Send data to a target connection
+    // async fn send_data_to_target(&mut self, connection_no: u32, data: &[u8]) -> Result<()> {
+    //     // Get the connection
+    //     let mut conns_guard = self.conns.lock().await;
+    //     let conn = match conns_guard.get_mut(&connection_no) {
+    //         Some(c) => c,
+    //         None => {
+    //             drop(conns_guard);
+    //             return Err(anyhow!("Connection {} not found for send_data_to_target", connection_no));
+    //         }
+    //     };
+    //     
+    //     let backend = conn.backend.as_mut();
+    //     
+    //     // Write to backend
+    //     match backend.write_all(data).await {
+    //         Ok(_) => {
+    //             // Also flush the writer to ensure data is sent
+    //             match backend.flush().await {
+    //                 Ok(_) => Ok(()),
+    //                 Err(e) => {
+    //                     drop(conns_guard);
+    //                     Err(anyhow!("Failed to flush backend for send_data_to_target: {}", e))
+    //                 }
+    //             }
+    //         },
+    //         Err(e) => {
+    //             drop(conns_guard);
+    //             Err(anyhow!("Failed to write to backend for send_data_to_target: {}", e))
+    //         }
+    //     }
+    // }
 
-    /// Send data to a target connection
-    async fn send_data_to_target(&mut self, connection_no: u32, data: &[u8]) -> Result<()> {
-        // Get the connection
-        let mut conns_guard = self.conns.lock().await;
-        let conn = match conns_guard.get_mut(&connection_no) {
-            Some(c) => c,
-            None => {
-                drop(conns_guard);
-                return Err(anyhow!("Connection {} not found for send_data_to_target", connection_no));
-            }
-        };
-        
-        let backend = conn.backend.as_mut();
-        
-        // Write to backend
-        match backend.write_all(data).await {
-            Ok(_) => {
-                // Also flush the writer to ensure data is sent
-                match backend.flush().await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        drop(conns_guard);
-                        Err(anyhow!("Failed to flush backend for send_data_to_target: {}", e))
-                    }
-                }
-            },
-            Err(e) => {
-                drop(conns_guard);
-                Err(anyhow!("Failed to write to backend for send_data_to_target: {}", e))
-            }
-        }
-    }
-
-    /// Parse target host and port from the data in an OpenConnection message
-    async fn parse_target_info(&mut self, data: &[u8], connection_no: u32) -> Result<(String, u16)> {
-        if data.len() < 4 {
-            return Err(anyhow!("Target info data too short"));
-        }
-        
-        let mut cursor = std::io::Cursor::new(data);
-        
-        // Read host length (4 bytes)
-        let mut host_len_bytes = [0u8; 4];
-        std::io::Read::read_exact(&mut cursor, &mut host_len_bytes)
-            .map_err(|e| anyhow!("Failed to read host length: {}", e))?;
-        let host_len = u32::from_be_bytes(host_len_bytes) as usize;
-        
-        if host_len > 256 {
-            return Err(anyhow!("Host length too large: {}", host_len));
-        }
-        
-        // Read host
-        let mut host_bytes = vec![0u8; host_len];
-        std::io::Read::read_exact(&mut cursor, &mut host_bytes)
-            .map_err(|e| anyhow!("Failed to read host: {}", e))?;
-        let host = String::from_utf8(host_bytes)
-            .map_err(|e| anyhow!("Invalid UTF-8 in host: {}", e))?;
-        
-        // Read port (2 bytes)
-        let mut port_bytes = [0u8; 2];
-        std::io::Read::read_exact(&mut cursor, &mut port_bytes)
-            .map_err(|e| anyhow!("Failed to read port: {}", e))?;
-        let port = u16::from_be_bytes(port_bytes);
-        
-        debug!("Endpoint {}: Parsed target for connection {}: {}:{}", 
-               self.channel_id, connection_no, host, port);
-        
-        Ok((host, port))
-    }
+    // /// Parse target host and port from the data in an OpenConnection message
+    // async fn parse_target_info(&mut self, data: &[u8], connection_no: u32) -> Result<(String, u16)> {
+    //     if data.len() < 4 {
+    //         return Err(anyhow!("Target info data too short"));
+    //     }
+    //     
+    //     let mut cursor = std::io::Cursor::new(data);
+    //     
+    //     // Read host length (4 bytes)
+    //     let mut host_len_bytes = [0u8; 4];
+    //     std::io::Read::read_exact(&mut cursor, &mut host_len_bytes)
+    //         .map_err(|e| anyhow!("Failed to read host length: {}", e))?;
+    //     let host_len = u32::from_be_bytes(host_len_bytes) as usize;
+    //     
+    //     if host_len > 256 {
+    //         return Err(anyhow!("Host length too large: {}", host_len));
+    //     }
+    //     
+    //     // Read host
+    //     let mut host_bytes = vec![0u8; host_len];
+    //     std::io::Read::read_exact(&mut cursor, &mut host_bytes)
+    //         .map_err(|e| anyhow!("Failed to read host: {}", e))?;
+    //     let host = String::from_utf8(host_bytes)
+    //         .map_err(|e| anyhow!("Invalid UTF-8 in host: {}", e))?;
+    //     
+    //     // Read port (2 bytes)
+    //     let mut port_bytes = [0u8; 2];
+    //     std::io::Read::read_exact(&mut cursor, &mut port_bytes)
+    //         .map_err(|e| anyhow!("Failed to read port: {}", e))?;
+    //     let port = u16::from_be_bytes(port_bytes);
+    //     
+    //     debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Parsed target for connection {}: {}:{}", connection_no, host, port);
+    //     
+    //     Ok((host, port))
+    // }
 
     /// Update connection statistics based on received data
     async fn update_stats(&mut self, connection_no: u32, bytes: usize, timestamp: u64) {
@@ -758,13 +714,11 @@ impl Channel {
                     0
                 };
                 
-                debug!("Endpoint {}: Stats for connection {}: {} bytes received, avg latency {} ms", 
-                       self.channel_id, connection_no, conn.stats.receive_size, avg_latency);
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Stats for connection {}: {} bytes received, avg latency {} ms", connection_no, conn.stats.receive_size, avg_latency);
             }
         } else if connection_no != 0 {
             // Only log for non-control connections
-            debug!("Endpoint {}: No connection found for stats update: {}", 
-                   self.channel_id, connection_no);
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint No connection found for stats update: {}", connection_no);
         }
     }
 }

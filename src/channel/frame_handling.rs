@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason, CTRL_NO_LEN};
-use log::{debug, error, warn};
+use tracing::{debug, error, warn};
 use super::core::Channel;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;

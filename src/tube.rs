@@ -8,7 +8,6 @@ use crate::webrtc_core::{WebRTCPeerConnection, create_data_channel};
 use crate::models::TunnelTimeouts;
 use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::{TubeStatus, setup_channel_for_data_channel};
-use crate::tube_registry::REGISTRY;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock as TokioRwLock;
@@ -174,7 +173,7 @@ impl Tube {
                                     error!("Tube({}): Channel (from on_data_channel) '{}' failed to start server on {}: {}. Channel will not run effectively.", tube.id, label, listen_addr_str, e);
                                     // Remove signal if server start failed and we won't run the channel
                                     tube.channel_shutdown_signals.write().await.remove(&label);
-                                    return; // Don't spawn run because server setup failed critically
+                                    return; // Don't spawn run; because server setup failed critically
                                 }
                             }
                         }
@@ -461,19 +460,20 @@ impl Tube {
     async fn create_session_description(&self, is_offer: bool) -> Result<String, String> {
         let pc_guard = self.peer_connection.lock().await;
         
-        if let Some(pc) = &*pc_guard {
-            // First, create the offer/answer
-            let sdp = if is_offer {
-                pc.create_offer().await?
+        if let Some(pc_arc) = &*pc_guard { 
+            // Call the unified (now pub(crate)) method in WebRTCPeerConnection
+            let sdp = pc_arc.create_description_with_checks(is_offer).await?;
+            
+            // If using trickle ICE, we still need to set the local description here with the initial SDP.
+            // For non-trickle ICE, create_description_with_checks (via generate_sdp_and_maybe_gather_ice)
+            // already handled setting the local description.
+            if pc_arc.trickle_ice { // trickle_ice was made pub(crate) by the user
+                debug!(target: "webrtc_sdp", tube_id = %pc_arc.tube_id, "Trickle ICE: Setting local description in Tube::create_session_description");
+                pc_arc.set_local_description(sdp.clone(), !is_offer).await?;
             } else {
-                pc.create_answer().await?
-            };
+                debug!(target: "webrtc_sdp", tube_id = %pc_arc.tube_id, "Non-trickle ICE: Local description already set and finalized. Skipping redundant set_local_description in Tube.");
+            }
             
-            // Now set it as the local description properly
-            // Pass is_answer as true when we created an answer (is_offer is false)
-            pc.set_local_description(sdp.clone(), !is_offer).await?;
-            
-            // Return the SDP
             Ok(sdp)
         } else {
             Err("No peer connection available".to_string())
@@ -536,7 +536,7 @@ impl Tube {
     }
     
     // Close the entire tube
-    pub(crate) async fn close(&self) -> Result<()> {
+    pub(crate) async fn close(&self, registry: &mut crate::tube_registry::TubeRegistry) -> Result<()> {
         info!("Closing tube with ID: {}", self.id);
 
         // Set the status to Closed first to prevent Drop from trying to remove
@@ -553,25 +553,22 @@ impl Tube {
 
         // Close peer connection if exists
         let mut pc = self.peer_connection.lock().await;
-        if let Some(pc) = pc.take() {
-            let _ = pc.close().await;
+        if let Some(pc_inner) = pc.take() {
+            let _ = pc_inner.close().await;
         }
 
-        // Remove from the global registry with explicit error handling
-        {
-            info!("Removing tube {} from registry via close()", self.id);
-            let mut registry = REGISTRY.write().await;
-            registry.remove_tube(&self.id).await;
+        // Remove from the global registry using the passed-in mutable reference
+        info!("Removing tube {} from registry via Tube::close()", self.id);
+        registry.remove_tube(&self.id);
 
-            // Verify removal
-            if registry.all_tube_ids().await.contains(&self.id) {
-                warn!("WARNING: Failed to remove tube from registry!");
-                // Force removal in case it wasn't properly removed
-                registry.tubes_by_id.remove(&self.id);
-                registry.conversation_mappings.retain(|_, tid| tid != &self.id);
-            } else {
-                info!("Successfully removed tube from registry");
-            }
+        // Verify removal
+        if registry.all_tube_ids_sync().contains(&self.id) {
+            warn!("WARNING: Failed to remove tube from registry!");
+            // Force removal in case it wasn't properly removed
+            registry.tubes_by_id.remove(&self.id);
+            registry.conversation_mappings.retain(|_, tid| tid != &self.id);
+        } else {
+            info!("Successfully removed tube from registry");
         }
 
         // Add a delay to ensure registry updates propagate

@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use tokio::sync::{RwLock, mpsc::unbounded_channel};
-use once_cell::sync::Lazy;
+use tokio::sync::{mpsc::unbounded_channel};
 use pyo3::exceptions::PyRuntimeError;
-use tracing::warn;
-use uuid::Uuid;
+use tracing::{debug, info, warn};
 use crate::runtime::get_runtime;
 use crate::tube_registry::REGISTRY;
 
@@ -44,11 +42,6 @@ use crate::tube_registry::REGISTRY;
 ///     signal_callback=on_signal
 /// )
 /// ```
-
-// Map of tube IDs to Python callbacks
-pub(crate) static PYTHON_CALLBACKS: Lazy<RwLock<HashMap<String, PyObject>>> = Lazy::new(|| {
-    RwLock::new(HashMap::new())
-});
 
 /// Convert a Python dictionary to HashMap<String, serde_json::Value>
 fn pyobj_to_json_hashmap(py: Python<'_>, dict_obj: &PyObject) -> PyResult<HashMap<String, serde_json::Value>> {
@@ -90,93 +83,111 @@ impl PyTubeRegistry {
     }
     
     /// Set server mode in the registry
-    fn set_server_mode(&self, server_mode: bool) -> PyResult<()> {
+    fn set_server_mode(&self, py: Python<'_>, server_mode: bool) -> PyResult<()> {
         let master_runtime = get_runtime();
-        master_runtime.clone().block_on(async move {
-            let mut registry = REGISTRY.write().await;
-            registry.set_server_mode(server_mode).await;
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let mut registry = REGISTRY.write().await;
+                registry.set_server_mode(server_mode);
+            });
         });
         Ok(())
     }
     
     /// Check if the registry is in server mode
-    fn is_server_mode(&self) -> bool {
+    fn is_server_mode(&self, py: Python<'_>) -> bool {
         let master_runtime = get_runtime();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.is_server_mode().await
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.is_server_mode()
+            })
         })
     }
     
     /// Associate a conversation ID with a tube
-    fn associate_conversation(&self, tube_id: &str, connection_id: &str) -> PyResult<()> {
+    fn associate_conversation(&self, py: Python<'_>, tube_id: &str, connection_id: &str) -> PyResult<()> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
         let connection_id_owned = connection_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let mut registry = REGISTRY.write().await;
-            registry.associate_conversation(&tube_id_owned, &connection_id_owned).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to associate conversation: {}", e)))
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let mut registry = REGISTRY.write().await;
+                registry.associate_conversation(&tube_id_owned, &connection_id_owned)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to associate conversation: {}", e)))
+            })
         })
     }
     
     /// find if a tube already exists
-    fn tube_found(&self, tube_id:&str) -> bool {
+    fn tube_found(&self, py: Python<'_>, tube_id:&str) -> bool {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.get_by_tube_id(&tube_id_owned).await.is_some()
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.get_by_tube_id(&tube_id_owned).is_some()
+            })
         })
     }
     
     /// Get all tube IDs
-    fn all_tube_ids(&self) -> Vec<String> {
+    fn all_tube_ids(&self, py: Python<'_>) -> Vec<String> {
         let master_runtime = get_runtime();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.all_tube_ids().await
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.all_tube_ids_sync()
+            })
         })
     }
     
     /// Get all Connection IDs for a tube
-    fn all_connection_ids(&self, tube_id: &str) -> Vec<String> {
+    fn all_connection_ids(&self, py: Python<'_>, tube_id: &str) -> Vec<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.conversation_ids_by_tube_id(&tube_id_owned).await.into_iter().cloned().collect()
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.conversation_ids_by_tube_id(&tube_id_owned).into_iter().cloned().collect()
+            })
         })
     }
     
     /// Get all Conversation IDs by Tube ID
-    fn get_conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<String> {
+    fn get_conversation_ids_by_tube_id(&self, py: Python<'_>, tube_id: &str) -> Vec<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.conversation_ids_by_tube_id(&tube_id_owned).await.into_iter().cloned().collect()
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.conversation_ids_by_tube_id(&tube_id_owned).into_iter().cloned().collect()
+            })
         })
     }
     
     /// find tube by connection ID
-    fn tube_id_from_connection_id(&self, connection_id: &str) -> Option<String> {
+    fn tube_id_from_connection_id(&self, py: Python<'_>, connection_id: &str) -> Option<String> {
         let master_runtime = get_runtime();
         let connection_id_owned = connection_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.tube_id_from_conversation_id(&connection_id_owned).await.cloned()
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.tube_id_from_conversation_id(&connection_id_owned).cloned()
+            })
         })
     }
     
     /// Find tubes by partial match of tube ID or conversation ID
-    fn find_tubes(&self, search_term: &str) -> PyResult<Vec<String>> {
+    fn find_tubes(&self, py: Python<'_>, search_term: &str) -> PyResult<Vec<String>> {
         let master_runtime = get_runtime();
         let search_term_owned = search_term.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            let tubes = registry.find_tubes(&search_term_owned).await;
-            Ok(tubes)
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                let tubes = registry.find_tubes(&search_term_owned);
+                Ok(tubes)
+            })
         })
     }
     
@@ -207,56 +218,37 @@ impl PyTubeRegistry {
         
         let (signal_sender, signal_receiver) = unbounded_channel();
         
-        let temp_callback_id_for_storage = if let Some(callback_py_obj) = signal_callback.as_ref() {
-            let temp_id = format!("temp_callback_store_{}", Uuid::new_v4());
-            let callback_clone_for_map = callback_py_obj.clone_ref(py);
-            master_runtime.clone().block_on(async { 
-                let mut callbacks = PYTHON_CALLBACKS.write().await;
-                callbacks.insert(temp_id.clone(), callback_clone_for_map);
-            });
-            Some(temp_id)
-        } else {
-            None
-        };
-        
         let offer_string = offer.map(String::from);
         let conversation_id_owned = conversation_id.to_string();
         let callback_token_owned = callback_token.to_string();
         let ksm_config_owned = ksm_config.to_string();
 
-        let creation_outcome = master_runtime.clone().block_on(async move {
-            let mut registry = REGISTRY.write().await;
-            
-            let result_map = registry.create_tube(
-                &conversation_id_owned,
-                settings_json.clone(), 
-                offer_string,
-                trickle_ice,
-                &callback_token_owned,
-                &ksm_config_owned,
-                signal_sender, 
-            ).await.map_err(|e| PyRuntimeError::new_err(format!("Failed to create tube: {}", e)))?;
-            
-            let tube_id = result_map.get("tube_id")
-                .ok_or_else(|| PyRuntimeError::new_err("No tube_id in result from registry.create_tube"))?
-                .clone();
+        let creation_outcome = py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let mut registry = REGISTRY.write().await;
                 
-            if let Some(tid) = temp_callback_id_for_storage {
-                let mut callbacks = PYTHON_CALLBACKS.write().await;
-                if let Some(callback_obj) = callbacks.remove(&tid) {
-                    callbacks.insert(tube_id.clone(), callback_obj);
-                } else {
-                    warn!("Callback for temp_id {} not found when creating tube {}", tid, tube_id);
-                }
-            }
-            
-            Ok::< (HashMap<String, String>, String), PyErr>((result_map, tube_id))
+                let result_map = registry.create_tube(
+                    &conversation_id_owned,
+                    settings_json.clone(), 
+                    offer_string,
+                    trickle_ice,
+                    &callback_token_owned,
+                    &ksm_config_owned,
+                    signal_sender,
+                ).await.map_err(|e| PyRuntimeError::new_err(format!("Failed to create tube: {}", e)))?;
+                
+                let tube_id = result_map.get("tube_id")
+                    .ok_or_else(|| PyRuntimeError::new_err("No tube_id in result from registry.create_tube"))?
+                    .clone();
+                    
+                Ok::< (HashMap<String, String>, String), PyErr>((result_map, tube_id))
+            })
         })?;
 
         let (result_map, final_tube_id) = creation_outcome;
 
-        if signal_callback.is_some() {
-            setup_signal_handler(final_tube_id.clone(), signal_receiver, master_runtime.clone());
+        if let Some(cb) = signal_callback { 
+            setup_signal_handler(final_tube_id.clone(), signal_receiver, master_runtime.clone(), cb);
         }
         
         let py_dict = PyDict::new(py);
@@ -268,32 +260,36 @@ impl PyTubeRegistry {
     }
     
     /// Create an offer for a tube
-    fn create_offer(&self, tube_id: &str) -> PyResult<String> {
+    fn create_offer(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            if let Some(tube) = registry.get_by_tube_id(&tube_id_owned).await {
-                tube.create_offer().await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create offer: {}", e)))
-            } else {
-                Err(PyRuntimeError::new_err(format!("Tube not found: {}", tube_id)))
-            }
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                    tube.create_offer().await
+                        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create offer: {}", e)))
+                } else {
+                    Err(PyRuntimeError::new_err(format!("Tube not found: {}", tube_id_owned)))
+                }
+            })
         })
     }
     
     /// Create an answer for a tube
-    fn create_answer(&self, tube_id: &str) -> PyResult<String> {
+    fn create_answer(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            if let Some(tube) = registry.get_by_tube_id(&tube_id_owned).await {
-                tube.create_answer().await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create answer: {}", e)))
-            } else {
-                Err(PyRuntimeError::new_err(format!("Tube not found: {}", tube_id)))
-            }
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                    tube.create_answer().await
+                        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create answer: {}", e)))
+                } else {
+                    Err(PyRuntimeError::new_err(format!("Tube not found: {}", tube_id_owned)))
+                }
+            })
         })
     }
     
@@ -305,37 +301,47 @@ impl PyTubeRegistry {
     ))]
     fn set_remote_description(
         &self,
+        py: Python<'_>,
         tube_id: &str,
         sdp: String,
         is_answer: bool,
     ) -> PyResult<Option<String>> {
         let master_runtime = get_runtime();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.set_remote_description(tube_id, &sdp, is_answer).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to set remote description: {}", e)))
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.set_remote_description(tube_id, &sdp, is_answer).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to set remote description: {}", e)))
+            })
         })
     }
     
     /// Add an ICE candidate to a tube
-    fn add_ice_candidate(&self, tube_id: &str, candidate: String) -> PyResult<()> {
+    fn add_ice_candidate(&self, _py: Python<'_>, tube_id: &str, candidate: String) -> PyResult<()> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string(); 
-        master_runtime.clone().block_on(async move {
+        let candidate_owned = candidate;
+
+        // Spawn the async work onto the runtime, don't block current (potentially Tokio worker) thread
+        master_runtime.spawn(async move {
             let registry = REGISTRY.read().await;
-            registry.add_external_ice_candidate(&tube_id_owned, &candidate).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to add ICE candidate: {}", e)))
-        })
+            if let Err(e) = registry.add_external_ice_candidate(&tube_id_owned, &candidate_owned).await {
+                warn!(target: "python_bindings", "Error in spawned add_ice_candidate for tube {}: {}", tube_id_owned, e);
+            }
+        });
+        Ok(())
     }
     
     /// Get connection state of a tube
-    fn get_connection_state(&self, tube_id: &str) -> PyResult<String> {
+    fn get_connection_state(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move {
-            let registry = REGISTRY.read().await;
-            registry.get_connection_state(&tube_id_owned).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to get connection state: {}", e)))
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                registry.get_connection_state(&tube_id_owned).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to get connection state: {}", e)))
+            })
         })
     }
     
@@ -362,61 +368,43 @@ impl PyTubeRegistry {
         
         let settings_json = pyobj_to_json_hashmap(py, &settings)?;
         
-        let (opt_signal_sender, opt_signal_receiver) = 
-            if tube_id.is_none() && signal_callback.is_some() {
+        // Conditionally prepare for signal handling if a new tube is created with a callback
+        let mut opt_signal_sender_for_rust: Option<tokio::sync::mpsc::UnboundedSender<crate::tube_registry::SignalMessage>> = None;
+        let mut opt_signal_receiver_for_handler: Option<tokio::sync::mpsc::UnboundedReceiver<crate::tube_registry::SignalMessage>> = None;
+        let mut cb_obj_for_handler: Option<PyObject> = None;
+
+        if tube_id.is_none() { // If creating a new tube
+            if let Some(cb_provided) = signal_callback {
                 let (tx, rx) = unbounded_channel();
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
-        
-        let temp_id_for_new_tube_callback = if tube_id.is_none() && signal_callback.is_some() {
-            let temp_id = format!("temp_new_conn_callback_{}", Uuid::new_v4().to_string());
-            if let Some(sc) = signal_callback.as_ref() {
-                 let callback_clone = sc.clone_ref(py);
-                 master_runtime.clone().block_on(async { 
-                    let mut callbacks = PYTHON_CALLBACKS.write().await;
-                    callbacks.insert(temp_id.clone(), callback_clone);
-                });
+                opt_signal_sender_for_rust = Some(tx);
+                opt_signal_receiver_for_handler = Some(rx);
+                cb_obj_for_handler = Some(cb_provided.clone_ref(py)); // Clone for the handler task
             }
-            Some(temp_id)
-        } else {
-            None
-        };
+        }
         
         let offer_string = offer.map(String::from);
         let connection_id_owned = connection_id.to_string();
-        let tube_id_owned = tube_id.map(String::from);
+        let tube_id_for_rust = tube_id.map(String::from);
 
-        let result_new_tube_id = master_runtime.clone().block_on(async move { 
-            let mut registry = REGISTRY.write().await;
-            let new_tube_id_str = registry.new_connection(
-                tube_id_owned.as_deref(), 
-                &connection_id_owned, 
-                settings_json, 
-                offer_string,
-                Some(trickle_ice), 
-                opt_signal_sender 
-            ).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create connection: {}", e)))?;
-            
-            if tube_id_owned.is_none() { 
-                if let Some(tid) = temp_id_for_new_tube_callback {
-                    let mut callbacks = PYTHON_CALLBACKS.write().await;
-                    if let Some(callback_obj) = callbacks.remove(&tid) {
-                        callbacks.insert(new_tube_id_str.clone(), callback_obj);
-                    } else {
-                         warn!("Callback for temp_id {} not found during new_connection for new tube {}", tid, new_tube_id_str);
-                    }
-                }
-            }
-            
-            Ok::<String, PyErr>(new_tube_id_str)
+        let result_new_tube_id = py.allow_threads(|| {
+            master_runtime.clone().block_on(async move { 
+                let mut registry = REGISTRY.write().await;
+                registry.new_connection(
+                    tube_id_for_rust.as_deref(), 
+                    &connection_id_owned, 
+                    settings_json, 
+                    offer_string,
+                    Some(trickle_ice), 
+                    opt_signal_sender_for_rust // Pass the sender if created
+                ).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create connection: {}", e)))
+            })
         })?;
         
-        if tube_id.is_none() && signal_callback.is_some() { 
-            if let Some(receiver) = opt_signal_receiver {
-                setup_signal_handler(result_new_tube_id.clone(), receiver, master_runtime.clone()); 
+        // If a new tube was created and we have a receiver and callback, set up the handler
+        if tube_id.is_none() {
+            if let (Some(receiver), Some(cb)) = (opt_signal_receiver_for_handler, cb_obj_for_handler) {
+                setup_signal_handler(result_new_tube_id.clone(), receiver, master_runtime.clone(), cb);
             }
         }
         
@@ -428,32 +416,43 @@ impl PyTubeRegistry {
         tube_id,
         connection_id,
     ))]
-    fn close_connection(&self, tube_id: &str, connection_id: &str) -> PyResult<()> {
+    fn close_connection(&self, py: Python<'_>, tube_id: &str, connection_id: &str) -> PyResult<()> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
         let connection_id_owned = connection_id.to_string();
         
-        master_runtime.clone().block_on(async move { 
-            let tube = {
-                let registry = REGISTRY.read().await;
-                registry.get_by_tube_id(&tube_id_owned).await
-                    .ok_or_else(|| PyRuntimeError::new_err(format!("Tube not found: {}", tube_id_owned)))?
-            };
-            
-            tube.close_channel(&connection_id_owned).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to close connection: {}", e)))
+        py.allow_threads(move || {
+            master_runtime.clone().block_on(async move {
+                let tube_result = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                };
+
+                if let Some(tube) = tube_result {
+                    tube.close_channel(&connection_id_owned).await
+                        .map_err(|e| PyRuntimeError::new_err(format!("Rust: Failed to close connection {} on tube {}: {}", connection_id_owned, tube_id_owned, e)))
+                } else {
+                    // Tube not found, perhaps already closed. Consider if this should be an error or a warning.
+                    // For now, mirroring the PyRuntimeError pattern for consistency if an action was expected.
+                    // However, if closing a non-existent connection is acceptable, Ok(()) might be better here.
+                    // Let's make it an error if the tube itself isn't found, as an action was requested on it.
+                    Err(PyRuntimeError::new_err(format!("Rust: Tube not found {} during close_connection for connection {}", tube_id_owned, connection_id_owned)))
+                }
+            })
         })
     }
     
     /// Close an entire tube
-    fn close_tube(&self, tube_id: &str) -> PyResult<()> {
+    fn close_tube(&self, py: Python<'_>, tube_id: &str) -> PyResult<()> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
         
-        master_runtime.clone().block_on(async move { 
-            let mut registry = REGISTRY.write().await;
-            registry.close_tube(&tube_id_owned).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to close tube: {}", e)))
+        py.allow_threads(move || {
+            master_runtime.clone().block_on(async move { 
+                let mut registry = REGISTRY.write().await;
+                registry.close_tube(&tube_id_owned).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Rust: Failed to close tube {}: {}", tube_id_owned, e)))
+            })
         })
     }
     
@@ -471,70 +470,42 @@ impl PyTubeRegistry {
         tube_id: &str,
         settings: PyObject,
         signal_callback: Option<PyObject>,
-    ) -> PyResult<PyObject> { 
+    ) -> PyResult<()> {
         let master_runtime = get_runtime();
         
         let settings_json = pyobj_to_json_hashmap(py, &settings)?;
         let tube_id_owned = tube_id.to_string();
         let connection_id_owned = connection_id.to_string();
 
-        if let Some(callback) = signal_callback {
-             master_runtime.clone().block_on(async { 
-                let mut callbacks = PYTHON_CALLBACKS.write().await;
-                callbacks.insert(tube_id_owned.clone(), callback); 
-            });
-
-            let (receiver_to_use, new_receiver_created) = master_runtime.clone().block_on(async { 
-                let mut registry_w = REGISTRY.write().await;
-                if registry_w.signal_channels.contains_key(&tube_id_owned) {
-                     let (sender, receiver) = unbounded_channel();
-                     registry_w.signal_channels.entry(tube_id_owned.clone()).or_insert(sender);
-                     (Some(receiver), true) 
-                } else {
-                    let (sender, receiver) = unbounded_channel();
-                    registry_w.signal_channels.insert(tube_id_owned.clone(), sender);
-                    (Some(receiver), true)
-                }
-            });
-            
-            if new_receiver_created {
-                if let Some(receiver) = receiver_to_use {
-                     setup_signal_handler(tube_id_owned.clone(), receiver, master_runtime.clone()); 
-                }
-            }
+        if signal_callback.is_some() {
+            warn!(target: "python_bindings", "PyTubeRegistry.create_channel was called with a signal_callback, but this is currently ignored for existing tubes.");
         }
         
-        master_runtime.clone().block_on(async move { 
-            let mut registry = REGISTRY.write().await;
-            registry.register_channel(&connection_id_owned, &tube_id_owned, &settings_json).await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to register channel: {}", e)))
-        })?;
-        
-        Ok(py.None()) 
-    }
-    
-    /// Unregister a signal callback for a tube
-    fn unregister_signal_callback(&self, tube_id: &str) -> PyResult<()> {
-        let master_runtime = get_runtime();
-        let tube_id_owned = tube_id.to_string();
-        master_runtime.clone().block_on(async move { 
-            let mut callbacks = PYTHON_CALLBACKS.write().await;
-            callbacks.remove(&tube_id_owned);
-        });
-        Ok(())
+        py.allow_threads(move || {
+            master_runtime.clone().block_on(async move { 
+                let mut registry = REGISTRY.write().await;
+                registry.register_channel(&connection_id_owned, &tube_id_owned, &settings_json).await
+                    .map_err(|e| PyRuntimeError::new_err(format!(
+                        "Rust: Failed to register channel {} on tube {}: {}", 
+                        connection_id_owned, tube_id_owned, e
+                    )))
+            })
+        })
     }
     
     /// Get a tube object by conversation ID
-    fn get_tube_id_by_conversation_id(&self, conversation_id: &str) -> PyResult<String> {
+    fn get_tube_id_by_conversation_id(&self, py: Python<'_>, conversation_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let conversation_id_owned = conversation_id.to_string();
-        master_runtime.clone().block_on(async move { 
-            let registry = REGISTRY.read().await;
-            if let Some(tube) = registry.get_by_conversation_id(&conversation_id_owned).await {
-                Ok(tube.id().to_string())
-            } else {
-                Err(PyRuntimeError::new_err(format!("No tube found for conversation: {}", conversation_id)))
-            }
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move { 
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_conversation_id(&conversation_id_owned) {
+                    Ok(tube.id().to_string())
+                } else {
+                    Err(PyRuntimeError::new_err(format!("No tube found for conversation: {}", conversation_id_owned)))
+                }
+            })
         })
     }
 }
@@ -543,47 +514,54 @@ impl PyTubeRegistry {
 fn setup_signal_handler(
     tube_id_key: String,
     mut signal_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::tube_registry::SignalMessage>,
-    runtime: std::sync::Arc<tokio::runtime::Runtime>, // Takes ownership of a cloned Arc
+    runtime: std::sync::Arc<tokio::runtime::Runtime>, 
+    callback_pyobj: PyObject, // Use the passed callback object
 ) {
-    runtime.spawn(async move { // Uses the owned Arc to spawn
-        while let Some(signal) = signal_receiver.recv().await {
-            // Acquire the lock and retrieve the callback PyObject outside Python::with_gil
-            let callback_pyobj_opt: Option<PyObject> = {
-                let callbacks_guard = PYTHON_CALLBACKS.read().await;
-                // Clone the PyObject while the guard is held, if it exists
-                callbacks_guard.get(&tube_id_key).map(|py_obj_ref| {
-                    Python::with_gil(|py| py_obj_ref.clone_ref(py))
-                })
-            };
-
-            if let Some(actual_callback) = callback_pyobj_opt {
-                Python::with_gil(|py| {
-                    let py_dict = PyDict::new(py);
-                    if let Err(e) = py_dict.set_item("tube_id", &signal.tube_id) {
-                        warn!("Failed to set 'tube_id' in signal dict for {}: {:?}", tube_id_key, e);
-                        return;
-                    }
+    let task_tube_id = tube_id_key.clone(); 
+    runtime.spawn(async move {
+        info!(target: "python_bindings", "Signal handler task started for tube_id: {}", task_tube_id);
+        let mut signal_count = 0;
+        while let Some(signal) = signal_receiver.recv().await { 
+            signal_count += 1;
+            debug!(target: "python_bindings", "Rust task received signal {}: {:?} for tube {}. Preparing Python callback.", signal_count, signal.kind, task_tube_id);
+            
+            Python::with_gil(|py| {
+                let py_dict = PyDict::new(py);
+                let mut success = true;
+                if let Err(e) = py_dict.set_item("tube_id", &signal.tube_id) {
+                    warn!("Failed to set 'tube_id' in signal dict for {}: {:?}", task_tube_id, e);
+                    success = false;
+                }
+                if success {
                     if let Err(e) = py_dict.set_item("kind", &signal.kind) {
-                        warn!("Failed to set 'kind' in signal dict for {}: {:?}", tube_id_key, e);
-                        return;
+                        warn!("Failed to set 'kind' in signal dict for {}: {:?}", task_tube_id, e);
+                        success = false;
                     }
+                }
+                if success {
                     if let Err(e) = py_dict.set_item("data", &signal.data) {
-                        warn!("Failed to set 'data' in signal dict for {}: {:?}", tube_id_key, e);
-                        return;
+                        warn!("Failed to set 'data' in signal dict for {}: {:?}", task_tube_id, e);
+                        success = false;
                     }
+                }
+                if success {
                     if let Err(e) = py_dict.set_item("conversation_id", &signal.conversation_id) {
-                        warn!("Failed to set 'conversation_id' in signal dict for {}: {:?}", tube_id_key, e);
-                        return;
+                        warn!("Failed to set 'conversation_id' in signal dict for {}: {:?}", task_tube_id, e);
+                        success = false;
                     }
-                    
-                    let result = actual_callback.call1(py, (py_dict,));
+                }
+                
+                if success {
+                    let result = callback_pyobj.call1(py, (py_dict,));
                     if let Err(e) = result {
-                        warn!("Error in Python signal callback for tube {}: {:?}", tube_id_key, e);
+                        warn!("Error in Python signal callback for tube {}: {:?}", task_tube_id, e);
                     }
-                });
-            } else {
-                warn!("No Python callback found for tube_id_key: {}", tube_id_key);
-            }
+                } else {
+                    warn!("Skipping Python callback for tube {} due to error setting dict items for signal {:?}", task_tube_id, signal.kind);
+                }
+            });
+            debug!(target: "python_bindings", "Rust task completed Python callback GIL block for signal {}: {:?} for tube {}", signal_count, signal.kind, task_tube_id);
         }
+        warn!(target: "python_bindings", "Signal handler task FOR TUBE {} IS TERMINATING (processed {} signals) because MPSC channel receive loop ended.", task_tube_id, signal_count);
     });
 }

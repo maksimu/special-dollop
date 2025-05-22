@@ -191,6 +191,7 @@ class AckServer(threading.Thread):
 def run_ack_server_in_thread(host="127.0.0.1", port=0):
     server = AckServer(host, port)
     server.start()
+    time.sleep(0.1) # Allow server thread to initialize
     timeout = 5  # seconds
     start_time = time.time()
 

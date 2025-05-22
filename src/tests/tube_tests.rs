@@ -19,7 +19,7 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 
 // Get a tube by ID from the registry
 pub async fn get_tube(tube_id: &str) -> Option<Arc<Tube>> {
-    REGISTRY.read().await.get_by_tube_id(tube_id).await
+    REGISTRY.read().await.get_by_tube_id(tube_id)
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn test_tube_creation() {
             Err(_) => {
                 println!("Timeout creating data channel, skipping data channel tests");
                 // Skip the rest of the data channel tests
-                tube.close().await.expect("Failed to close tube");
+                { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube");
                 return;
             }
         };
@@ -84,7 +84,7 @@ fn test_tube_creation() {
             Err(_) => {
                 println!("Timeout creating control channel, skipping verification");
                 // Skip the verification
-                tube.close().await.expect("Failed to close tube");
+                { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube");
                 return;
             }
         };
@@ -93,12 +93,13 @@ fn test_tube_creation() {
         assert_eq!(control_channel.label(), "control");
 
         // Close the tube with timeout
-        let close_fut = tube.close();
-        tokio::time::timeout(Duration::from_secs(3), close_fut)
-            .await
+        tokio::time::timeout(Duration::from_secs(3), async { // Pass async block directly
+            let mut registry = REGISTRY.write().await;
+            tube.close(&mut registry).await
+        }).await
             .unwrap_or_else(|_| {
                 println!("Timeout closing tube, but continuing");
-                Ok(())
+                Ok(()) // This Ok(()) matches the inner Result from tube.close()
             })
             .expect("Failed to close tube");
 
@@ -137,7 +138,7 @@ fn test_tube_channel_creation() {
             Ok(Err(e)) => panic!("Failed to create data channel: {}", e),
             Err(_) => {
                 println!("Timeout creating data channel, skipping channel tests");
-                tube.close().await.expect("Failed to close tube during data channel timeout");
+                { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube during data channel timeout");
                 return;
             }
         };
@@ -160,7 +161,7 @@ fn test_tube_channel_creation() {
         // Try to close a non-existent channel
         assert!(tube.close_channel("nonexistent").await.is_err(), "Non-existent channel should return an error on close");
 
-        tube.close().await.expect("Failed to close tube");
+        { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube");
 
         for _ in 0..3 {
             if get_tube(&tube_id).await.is_none() {
@@ -585,8 +586,8 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     info!("[E2E_TEST] Closing tubes.");
     let tube1_id = tube1.id(); 
     let tube2_id = tube2.id();
-    if let Err(e) = tube1.close().await { error!("[E2E_TEST] Error closing tube1 ({}): {}", tube1_id, e); }
-    if let Err(e) = tube2.close().await { error!("[E2E_TEST] Error closing tube2 ({}): {}", tube2_id, e); }
+    if let Err(e) = { let mut registry = REGISTRY.write().await; tube1.close(&mut registry).await } { error!("[E2E_TEST] Error closing tube1 ({}): {}", tube1_id, e); }
+    if let Err(e) = { let mut registry = REGISTRY.write().await; tube2.close(&mut registry).await } { error!("[E2E_TEST] Error closing tube2 ({}): {}", tube2_id, e); }
     
     tokio::time::sleep(Duration::from_millis(200)).await;
     info!("[E2E_TEST] Test finished successfully.");

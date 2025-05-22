@@ -9,10 +9,12 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use crate::tube_registry::SignalMessage;
 
 // Cached API instance for reuse
@@ -83,7 +85,7 @@ pub async fn create_data_channel(
 // Async-first wrapper for core WebRTC operations
 pub struct WebRTCPeerConnection {
     pub peer_connection: Arc<RTCPeerConnection>,
-    trickle_ice: bool,
+    pub(crate) trickle_ice: bool,
     is_closing: Arc<AtomicBool>,
     ksm_config: String,
     answer_sent: Arc<AtomicBool>,
@@ -291,69 +293,136 @@ impl WebRTCPeerConnection {
         }
     }
 
-    // Create an offer (returns SDP string)
-    pub async fn create_offer(&self) -> Result<String, String> {
-        // Check if closing
+    pub(crate) async fn create_description_with_checks(&self, is_offer: bool) -> Result<String, String> {
         if self.is_closing.load(Ordering::Acquire) {
             return Err("Connection is closing".to_string());
         }
 
-        // Check the current signaling state
         let current_state = self.peer_connection.signaling_state();
-        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before create_offer");
-        
-        // Validate that we can create an offer in the current state
-        match current_state {
-            webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer => {
-                return Err("Cannot create offer when already have local offer".to_string());
-            },
-            _ => {}
+        let sdp_type_str = if is_offer { "offer" } else { "answer" };
+        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, state = ?current_state, "Current signaling state before create_{}", sdp_type_str);
+
+        if is_offer {
+            // Offer-specific signaling state validation
+            match current_state {
+                webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer => {
+                    return if !self.trickle_ice {
+                        if let Some(desc) = self.peer_connection.local_description().await {
+                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Already have local offer and non-trickle, returning existing SDP");
+                            Ok(desc.sdp)
+                        } else {
+                            Err("Cannot create offer: already have local offer but failed to retrieve it (non-trickle)".to_string())
+                        }
+                    } else {
+                        Err("Cannot create offer when already have local offer (trickle ICE)".to_string())
+                    }
+                },
+                _ => {} // Other states are generally fine for creating an offer
+            }
+        } else {
+            // Answer-specific signaling state validation
+            match current_state {
+                webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer => {} // This is the expected state
+                _ => {
+                    return Err(format!(
+                        "Cannot create answer when in state {:?} - must have remote offer",
+                        current_state
+                    ));
+                }
+            }
         }
 
-        // Create the offer
-        let offer = self.peer_connection
-            .create_offer(None)
-            .await
-            .map_err(|e| format!("Failed to create offer: {}", e))?;
+        self.generate_sdp_and_maybe_gather_ice(is_offer).await
+    }
+
+    async fn generate_sdp_and_maybe_gather_ice(&self, is_offer: bool) -> Result<String, String> {
+        let sdp_type_str = if is_offer { "offer" } else { "answer" };
+
+        let sdp_obj = if is_offer {
+            self.peer_connection
+                .create_offer(None)
+                .await
+                .map_err(|e| format!("Failed to create initial {}: {}", sdp_type_str, e))?
+        } else {
+            self.peer_connection
+                .create_answer(None)
+                .await
+                .map_err(|e| format!("Failed to create initial {}: {}", sdp_type_str, e))?
+        };
+
+        if !self.trickle_ice {
+            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Non-trickle ICE: gathering candidates before returning {}.", sdp_type_str);
+
+            let initial_desc = if is_offer {
+                RTCSessionDescription::offer(sdp_obj.sdp.clone())
+            } else {
+                RTCSessionDescription::answer(sdp_obj.sdp.clone())
+            }
+            .map_err(|e| format!("Failed to create RTCSessionDescription for initial {}: {}", sdp_type_str, e))?;
             
-        // Convert to a string
-        offer.sdp
-            .parse()
-            .map_err(|e| format!("Failed to parse offer SDP: {}", e))
+            self.peer_connection
+                .set_local_description(initial_desc)
+                .await
+                .map_err(|e| format!("Failed to set initial local description for {} (non-trickle): {}", sdp_type_str, e))?;
+            
+            let (tx, rx) = oneshot::channel();
+            let tx_arc = Arc::new(Mutex::new(Some(tx))); // Wrap sender in Arc<Mutex<Option<T>>>
+            
+            let pc_clone = Arc::clone(&self.peer_connection); 
+            let tube_id_clone = self.tube_id.clone(); 
+            let sdp_type_str_clone = sdp_type_str.to_string(); // Clone for closure
+            let captured_tx_arc = Arc::clone(&tx_arc); // Clone Arc for closure
+
+            self.peer_connection.on_ice_gathering_state_change(Box::new(move |state: RTCIceGathererState| {
+                let tx_for_handler = Arc::clone(&captured_tx_arc); // Clone Arc for the async block
+                let pc_on_gather = Arc::clone(&pc_clone); 
+                let tube_id_log = tube_id_clone.clone(); 
+                let sdp_type_log = sdp_type_str_clone.clone(); // Clone for async block logging
+                Box::pin(async move {
+                    debug!(target: "webrtc_ice", tube_id = %tube_id_log, new_state = ?state, "ICE gathering state changed (non-trickle {})", sdp_type_log);
+                    if state == RTCIceGathererState::Complete {
+                        if let Some(sender) = tx_for_handler.lock().unwrap().take() { // Use the Arc<Mutex<Option<Sender>>>
+                            let _ = sender.send(());
+                        }
+                        // Clear the handler after completion by setting a no-op one.
+                        pc_on_gather.on_ice_gathering_state_change(Box::new(|_| Box::pin(async {})));
+                    }
+                })
+            }));
+
+            match tokio::time::timeout(Duration::from_secs(15), rx).await {
+                Ok(Ok(_)) => {
+                    debug!(target: "webrtc_ice", tube_id = %self.tube_id, "ICE gathering complete for non-trickle {}.", sdp_type_str);
+                    if let Some(final_desc) = self.peer_connection.local_description().await {
+                        Ok(final_desc.sdp)
+                    } else {
+                        Err(format!("Failed to get local description after ICE gathering (non-trickle {})", sdp_type_str))
+                    }
+                }
+                Ok(Err(e)) => Err(format!("ICE gathering channel error (non-trickle {}): {:?}", sdp_type_str, e)),
+                Err(_) => {
+                    warn!(target: "webrtc_ice", tube_id = %self.tube_id, "Timeout waiting for ICE gathering to complete for non-trickle {}.", sdp_type_str);
+                    // Clear the handler on timeout as well.
+                    self.peer_connection.on_ice_gathering_state_change(Box::new(|_| Box::pin(async {})));
+                    Err(format!("Timeout waiting for ICE gathering (non-trickle {})", sdp_type_str))
+                }
+            }
+        } else {
+            // Trickle ICE: return the SDP immediately.
+            // The calling Tube will set the local description if this is an offer/answer being created by self.
+            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Trickle ICE: returning {} immediately.", sdp_type_str);
+            Ok(sdp_obj.sdp) // sdp_obj.sdp is already a String
+        }
+    }
+
+    // Create an offer (returns SDP string)
+    pub async fn create_offer(&self) -> Result<String, String> {
+        self.create_description_with_checks(true).await
     }
 
     // Create an answer (returns SDP string)
     pub async fn create_answer(&self) -> Result<String, String> {
-        // Check if closing
-        if self.is_closing.load(Ordering::Acquire) {
-            return Err("Connection is closing".to_string());
-        }
-
-        // Check the current signaling state
-        let current_state = self.peer_connection.signaling_state();
-        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before create_answer");
-        
-        // Validate that we can create an answer in the current state
-        match current_state {
-            webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer => {},
-            _ => {
-                return Err(format!(
-                    "Cannot create answer when in state {:?} - must have remote offer",
-                    current_state
-                ));
-            }
-        }
-
-        // Create the answer
-        let answer = self.peer_connection
-            .create_answer(None)
-            .await
-            .map_err(|e| format!("Failed to create answer: {}", e))?;
-            
-        // Convert to a string
-        answer.sdp
-            .parse()
-            .map_err(|e| format!("Failed to parse answer SDP: {}", e))
+        self.create_description_with_checks(false).await
     }
 
     pub async fn set_remote_description(&self, sdp: String, is_answer: bool) -> Result<(), String> {
@@ -364,9 +433,9 @@ impl WebRTCPeerConnection {
 
         // Create SessionDescription based on type
         let desc = if is_answer {
-            session_description::RTCSessionDescription::answer(sdp)
+            RTCSessionDescription::answer(sdp)
         } else {
-            session_description::RTCSessionDescription::offer(sdp)
+            RTCSessionDescription::offer(sdp)
         }
         .map_err(|e| format!("Failed to create session description: {}", e))?;
 
@@ -429,7 +498,7 @@ impl WebRTCPeerConnection {
             return Ok(()); // Already closing or closed
         }
 
-        // First, clear all callbacks to prevent more mDNS lookups
+        // First, clear all callbacks 
         self.peer_connection
             .on_ice_candidate(Box::new(|_| Box::pin(async {})));
         self.peer_connection
@@ -445,8 +514,10 @@ impl WebRTCPeerConnection {
         match tokio::time::timeout(Duration::from_secs(5), self.peer_connection.close()).await {
             Ok(result) => result.map_err(|e| format!("Failed to close peer connection: {}", e)),
             Err(_) => {
-                warn!(target: "webrtc_lifecycle", "Close operation timed out, forcing abandonment");
-                Ok(())
+                // The timeout elapsed.
+                warn!(target: "webrtc_lifecycle", tube_id = %self.tube_id, "Close operation timed out for peer connection. The underlying webrtc-rs close() did not complete in 5 seconds.");
+                // Return an error instead of Ok(())
+                Err(format!("Peer connection close operation timed out for tube {}", self.tube_id))
             }
         }
     }
@@ -486,9 +557,9 @@ impl WebRTCPeerConnection {
 
         // Create SessionDescription based on type
         let desc = if is_answer {
-            session_description::RTCSessionDescription::answer(sdp)
+            RTCSessionDescription::answer(sdp)
         } else {
-            session_description::RTCSessionDescription::offer(sdp)
+            RTCSessionDescription::offer(sdp)
         }
         .map_err(|e| format!("Failed to create session description: {}", e))?;
 

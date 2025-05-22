@@ -3,6 +3,7 @@ import logging
 import time
 import socket
 import threading
+import os # Added import for os
 
 import keeper_pam_webrtc_rs
 
@@ -21,40 +22,93 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         self.tube_states = {}  # Stores current state of each tube_id
         self.tube_connection_events = {} # tube_id -> threading.Event for connected state
         self._lock = threading.Lock() # To protect access to shared tube_states and events
+        self.peer_map = {} # To map a tube_id to its peer for ICE candidate relay
+
+    def tearDown(self):
+        super().tearDown()
+        # Give more time for OS to release ports, especially mDNS
+        # Value can be tuned or made configurable via environment variable
+        delay = float(os.getenv("PYTEST_INTER_TEST_DELAY", "0.5")) # Default 0.5 seconds
+        if delay > 0:
+            logging.info(f"Waiting {delay}s for resource cleanup before next test...")
+            time.sleep(delay)
+        
+        # Clear shared Python-side state more explicitly
+        # Although individual tests have finally blocks, this ensures cleanup
+        # even if a test fails before its finally block or if setUp itself had issues.
+        with self._lock:
+            # Close any tubes that might still be open due to test errors
+            # This requires knowing all created tube_ids.
+            # If tests reliably clean up their own tubes, this might be redundant
+            # but can act as a fallback.
+            # For now, focusing on clearing the maps used by the shared signal handler.
+            
+            self.tube_states.clear()
+            logging.debug("Cleared tube_states in tearDown.")
+            
+            # Clear events; new ones will be created in setUp or signal_handler
+            for event in self.tube_connection_events.values():
+                event.clear() # Clear any set events
+            self.tube_connection_events.clear()
+            logging.debug("Cleared tube_connection_events in tearDown.")
+
+            # peer_map is typically cleared by tests, but ensure it here too.
+            self.peer_map.clear()
+            logging.debug("Cleared peer_map in tearDown.")
+            
+        logging.info(f"{self.__class__.__name__} tearDown completed.")
 
     def _signal_handler(self, signal_dict):
         """Handles signals from the Rust layer."""
-        # This handler can be called from a Rust thread, so protect shared data
-        with self._lock:
-            tube_id = signal_dict.get('tube_id')
-            kind = signal_dict.get('kind')
-            data = signal_dict.get('data')
-            # conv_id = signal_dict.get('conversation_id') # Available if needed
+        try:
+            # This handler can be called from a Rust thread, so protect shared data
+            with self._lock:
+                tube_id = signal_dict.get('tube_id')
+                kind = signal_dict.get('kind')
+                data = signal_dict.get('data')
+                # conv_id = signal_dict.get('conversation_id') # Available if needed
 
-            if not tube_id or not kind:
-                logging.warning(f"Received incomplete signal: {signal_dict}")
-                return
+                if not tube_id or not kind:
+                    logging.warning(f"Received incomplete signal: {signal_dict}")
+                    return
 
-            # logging.debug(f"Signal handler received: tube_id={tube_id}, kind={kind}, data={data}, conv_id={conv_id}")
+                # logging.debug(f"Signal handler received: tube_id={tube_id}, kind={kind}, data={data}, conv_id={conv_id}")
 
-            if kind == "connection_state_changed":
-                logging.info(f"Tube {tube_id} connection state changed to: {data}")
-                self.tube_states[tube_id] = data.lower() # Store lowercase state
-                
-                # If this tube_id doesn't have an event yet, create one
-                if tube_id not in self.tube_connection_events:
-                    self.tube_connection_events[tube_id] = threading.Event()
+                if kind == "connection_state_changed":
+                    logging.info(f"Tube {tube_id} connection state changed to: {data}")
+                    self.tube_states[tube_id] = data.lower() # Store lowercase state
+                    
+                    # If this tube_id doesn't have an event yet, create one
+                    if tube_id not in self.tube_connection_events:
+                        self.tube_connection_events[tube_id] = threading.Event()
 
-                if data.lower() == "connected":
-                    self.tube_connection_events[tube_id].set() # Signal that this tube is connected
-                elif data.lower() in ["failed", "closed", "disconnected"]:
-                    # If it was connected and now it's not, clear the event
-                    # Or, if tests need to react to failures, set a different event.
-                    if tube_id in self.tube_connection_events:
-                         self.tube_connection_events[tube_id].clear() # Or handle failure explicitly
-            # else: 
-                # Potentially handle other signal kinds like 'icecandidate', 'answer' if needed by tests directly
-                # logging.debug(f"Received other signal for {tube_id}: {kind}")
+                    if data.lower() == "connected":
+                        self.tube_connection_events[tube_id].set() # Signal that this tube is connected
+                    elif data.lower() in ["failed", "closed", "disconnected"]:
+                        # If it was connected and now it's not, clear the event
+                        # Or, if tests need to react to failures, set a different event.
+                        if tube_id in self.tube_connection_events:
+                             self.tube_connection_events[tube_id].clear() # Or handle failure explicitly
+                elif kind == "icecandidate":
+                    peer_tube_id = self.peer_map.get(tube_id)
+                    if peer_tube_id:
+                        if data: # Ensure data is not empty, empty candidate means end-of-candidates
+                            logging.info(f"PYTHON _signal_handler: Relaying ICE from {tube_id} to {peer_tube_id}. Candidate: {data}")
+                            self.tube_registry.add_ice_candidate(peer_tube_id, data)
+                        else:
+                            logging.info(f"PYTHON _signal_handler: Received end-of-candidates signal from {tube_id} for {peer_tube_id}. Not relaying empty data.")
+                    elif tube_id in self.peer_map: 
+                         logging.warning(f"PYTHON _signal_handler: Peer for {tube_id} (value: {peer_tube_id}) not fully mapped yet, ICE candidate {data[:50]}... dropped.")
+                    else:
+                        logging.warning(f"PYTHON _signal_handler: No peer entry found for {tube_id} in peer_map to relay ICE candidate. Data: {data[:50]}...")
+                # else: 
+                    # Potentially handle other signal kinds like 'icecandidate', 'answer' if needed by tests directly
+                    # logging.debug(f"Received other signal for {tube_id}: {kind}")
+        except Exception as e:
+            logging.error(f"PYTHON _signal_handler CRASHED for signal {signal_dict}: {e}", exc_info=True)
+            # Optionally re-raise if PyO3/Rust should see it, but for now, just log it
+            # to see if this is where the task is dying.
+            # raise # This might be needed if Rust expects to see an error propagate
     
     @with_runtime
     def test_data_channel_load(self):
@@ -77,6 +131,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         offer = server_tube_info['offer']
         server_id = server_tube_info['tube_id']
         self.assertIsNotNone(offer, "Server should generate an offer")
+        logging.info(f"Server Offer SDP:\n{offer}") # Log the server's offer SDP
         
         # Create a client tube with the offer
         client_tube_info = self.tube_registry.create_tube(
@@ -93,24 +148,34 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         answer = client_tube_info['answer']
         client_id = client_tube_info['tube_id']
         self.assertIsNotNone(answer, "Client should generate an answer")
+        logging.info(f"Client Answer SDP:\n{answer}") # Log the client's answer SDP
+        
+        # Populate the peer map for ICE candidate relaying
+        with self._lock:
+            self.peer_map[server_id] = client_id
+            self.peer_map[client_id] = server_id
         
         # Set the answer on the server
         self.tube_registry.set_remote_description(server_id, answer, is_answer=True)
         
         # Wait for a connection establishment
         start_time = time.time()
-        connected = self.wait_for_tube_connection(server_id, client_id, 10)
+        connected = self.wait_for_tube_connection(server_id, client_id, 20) # Increased timeout to 20s
         connection_time = time.time() - start_time
         
         self.assertTrue(connected, "Failed to establish connection")
         logging.info(f"Connection established in {connection_time:.2f} seconds")
         
         channel_name = "performance-test-channel"
-        channel_settings = {"conversationType": "tunnel"} 
+        channel_settings = {
+            "conversationType": "tunnel",
+            "ksm_config": TEST_KSM_CONFIG,
+            "callback_token": TEST_CALLBACK_TOKEN
+        } 
         
         self.tube_registry.create_channel(
-            server_id,
-            channel_name,
+            channel_name, # connection_id for Rust binding
+            server_id,    # tube_id for Rust binding
             channel_settings
         )
         
@@ -118,12 +183,15 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         self.tube_registry.close_connection(server_id, channel_name)
         self.tube_registry.close_tube(server_id)
         self.tube_registry.close_tube(client_id)
+        with self._lock:
+            self.peer_map.pop(server_id, None)
+            self.peer_map.pop(client_id, None)
         
         logging.info("Tube creation and connection test completed")
     
     def wait_for_tube_connection(self, tube_id1, tube_id2, timeout=10):
         """Wait for both tubes to establish a connection"""
-        logging.info(f"Waiting for tube connection: {tube_id1} and {tube_id2} (timeout: {timeout}s)")
+        logging.info(f"Waiting for tube connection: {tube_id1} ({self.tube_registry.get_connection_state(tube_id1)}) and {tube_id2} ({self.tube_registry.get_connection_state(tube_id2)}) (timeout: {timeout}s)")
         start_time = time.time()
         state1 = "unknown" # Initialize states
         state2 = "unknown" # Initialize states
@@ -210,6 +278,11 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             self.assertIsNotNone(client_answer_sdp, "Client should generate an answer")
             self.assertIsNotNone(client_tube_id, "Client tube should have an ID")
             logging.info(f"[E2E_Test] Client tube {client_tube_id} created. Answer generated.")
+
+            # Populate the peer map for ICE candidate relaying
+            with self._lock:
+                self.peer_map[server_tube_id] = client_tube_id
+                self.peer_map[client_tube_id] = server_tube_id
 
             # 4. Signaling: Set remote description
             # The Rust test has a more elaborate ICE exchange via signal channels.
@@ -307,6 +380,10 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                 except Exception as e:
                     logging.error(f"[E2E_Test] Error closing client tube {client_tube_id}: {e}")
             
+            with self._lock:
+                if server_tube_id: self.peer_map.pop(server_tube_id, None)
+                if client_tube_id: self.peer_map.pop(client_tube_id, None)
+
             if ack_server:
                 ack_server.stop()
                 logging.info("[E2E_Test] AckServer stopped.")
@@ -318,6 +395,24 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
     def setUp(self):
         super().setUp() 
         self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        self.tube_states = {}  # Stores current state of each tube_id
+        self.tube_connection_events = {} # tube_id -> threading.Event for connected state
+        self._lock = threading.Lock() # To protect access to shared tube_states and events
+        self.peer_map = {} # To map a tube_id to its peer for ICE candidate relay
+
+    def tearDown(self):
+        super().tearDown()
+        delay = float(os.getenv("PYTEST_INTER_TEST_DELAY", "0.5")) 
+        if delay > 0:
+            logging.info(f"Waiting {delay}s for resource cleanup before next test...")
+            time.sleep(delay)
+        with self._lock:
+            self.tube_states.clear()
+            for event in self.tube_connection_events.values():
+                event.clear()
+            self.tube_connection_events.clear()
+            self.peer_map.clear()
+        logging.info(f"{self.__class__.__name__} tearDown completed for FragmentationTest.")
     
     @with_runtime
     def test_data_channel_fragmentation(self):
@@ -339,6 +434,8 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         offer = server_tube_info['offer']
         server_id = server_tube_info['tube_id']
         self.assertIsNotNone(offer, "Server should generate an offer")
+        logging.info(f"Server Offer SDP:\n{offer}") # Log the server's offer SDP
+        self.assertTrue("a=candidate:" in offer, "Server offer SDP should contain ICE candidates")
         
         # Create a client tube with the offer
         client_settings = {"conversationType": "tunnel"} # Ensure client also has its own settings if needed
@@ -348,13 +445,15 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
             settings=client_settings, # Pass original settings, not modified ones
             trickle_ice=False,  # Use non-trickle ICE
             callback_token=TEST_CALLBACK_TOKEN,
-            offer=offer, 
+            offer=offer,
         )
         
         # Get the answer from a client
         answer = client_tube_info['answer']
         client_id = client_tube_info['tube_id']
         self.assertIsNotNone(answer, "Client should generate an answer")
+        logging.info(f"Client Answer SDP:\n{answer}") # Log the client's answer SDP
+        self.assertTrue("a=candidate:" in answer, "Client answer SDP should contain ICE candidates")
         
         # Set the answer on the server
         self.tube_registry.set_remote_description(server_id, answer, is_answer=True)

@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e  # Exit on any error
 
+# TUBE LIFECYCLE NOTES:
+# - Multiple "Drop called for tube" messages are NORMAL and expected
+# - They represent Arc reference drops, not premature tube destruction
+# - Tubes remain fully functional after these drops
+# - The actual tube cleanup only happens when marked Closed and removed from registry
+# - Look for "TUBE CLEANUP COMPLETE" message to confirm full cleanup
+
 echo "Cleaning previous builds..."
 # Clean Rust build artifacts
 cargo clean

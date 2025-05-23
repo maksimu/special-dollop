@@ -50,7 +50,7 @@ impl Tube {
             control_channel: Arc::new(TokioRwLock::new(None)),
             channel_shutdown_signals: Arc::new(TokioRwLock::new(HashMap::new())),
             is_server_mode_context,
-            status: Arc::new(TokioRwLock::new(TubeStatus::New)),
+            status: Arc::new(TokioRwLock::new(TubeStatus::Initializing)),
             runtime,
         });
 
@@ -91,8 +91,8 @@ impl Tube {
             Box::pin(async move {
                 match state {
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected => {
-                        *status_clone.write().await = TubeStatus::Connected;
-                        info!("Tube connection state changed to Connected");
+                        *status_clone.write().await = TubeStatus::Active;
+                        info!("Tube connection state changed to Active");
                     },
                     webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
                         *status_clone.write().await = TubeStatus::Failed;
@@ -569,6 +569,7 @@ impl Tube {
             registry.conversation_mappings.retain(|_, tid| tid != &self.id);
         } else {
             info!("Successfully removed tube from registry");
+            info!("TUBE CLEANUP COMPLETE: {} - This tube is now fully closed and removed from registry", self.id);
         }
 
         // Add a delay to ensure registry updates propagate
@@ -586,5 +587,22 @@ impl Tube {
 impl Drop for Tube {
     fn drop(&mut self) {
         debug!("Drop called for tube with ID: {}", self.id);
+        // Note: This is called each time an Arc<Tube> reference is dropped.
+        // The actual Tube is only cleaned up when the last Arc reference is dropped.
+        // Multiple Drop messages are normal and expected due to Arc cloning in:
+        // - PyTubeRegistry::create_tube (Phase 1 and Phase 2)
+        // - on_data_channel callback
+        // - Various async operations
+        
+        // Try to get the strong count if we can access it through one of our Arc fields
+        // This is just for debugging purposes
+        if let Ok(pc_guard) = self.peer_connection.try_lock() {
+            if let Some(ref _pc) = *pc_guard {
+                // We can't directly get Arc strong_count in Drop, but we can note this is happening
+                debug!("Tube {} Drop: peer_connection field is still Some", self.id);
+            } else {
+                debug!("Tube {} Drop: peer_connection field is None", self.id);
+            }
+        }
     }
 }

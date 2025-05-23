@@ -8,7 +8,7 @@ use crate::models::{Conn, ConnectionStats, StreamHalf};
 use crate::tube_protocol::Frame;
 use crate::channel::types::ActiveProtocol;
 use crate::channel::guacd_parser::GuacdParser;
-use bytes::Bytes;
+use bytes::{Bytes, BufMut};
 use tracing::{debug, error, warn};
 
 use super::core::Channel;
@@ -64,9 +64,14 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         // Get a single reusable buffer from the pool
         let mut read_buffer = buffer_pool.acquire();
         
-        // Initialize to a reasonable size (this will grow if needed)
-        if read_buffer.capacity() < 16 * 1024 {
-            read_buffer.reserve(16 * 1024);
+        // Use a smaller read size to ensure we don't exceed SCTP limits
+        // Frame overhead is approximately 17 bytes (4 + 8 + 4 + 1)
+        // To stay safely under 16KB SCTP limit, use 8KB reads
+        const MAX_READ_SIZE: usize = 8 * 1024; // 8KB
+        
+        // Initialize buffer with our max read size
+        if read_buffer.capacity() < MAX_READ_SIZE {
+            read_buffer.reserve(MAX_READ_SIZE);
         }
         
         // Create a second buffer for encoding frames
@@ -76,11 +81,21 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             // Clear the buffer for reuse (but keep capacity)
             read_buffer.clear();
             
-            // Make sure we have room to read into
-            read_buffer.reserve(16 * 1024);
+            // Ensure we have exactly MAX_READ_SIZE capacity
+            if read_buffer.capacity() < MAX_READ_SIZE {
+                read_buffer.reserve(MAX_READ_SIZE - read_buffer.capacity());
+            }
             
-            // Read directly into a pooled buffer
-            match reader.read_buf(&mut read_buffer).await {
+            // Limit the read to MAX_READ_SIZE to control message sizes
+            let max_to_read = std::cmp::min(read_buffer.capacity(), MAX_READ_SIZE);
+            
+            // Correctly create a mutable slice for reading
+            let ptr = read_buffer.chunk_mut().as_mut_ptr();
+            let current_chunk_len = read_buffer.chunk_mut().len();
+            let slice_len = std::cmp::min(current_chunk_len, max_to_read);
+            let read_slice = unsafe { std::slice::from_raw_parts_mut(ptr, slice_len) };
+
+            match reader.read(read_slice).await {
                 Ok(0) => {
                     // EOF handling
                     if !eof_sent {
@@ -103,19 +118,23 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     }
                 }
                 Ok(n) if n > 0 => {
+                    // Advance the buffer by the number of bytes read
+                    unsafe {
+                        read_buffer.advance_mut(n);
+                    }
+                    
                     // Data handling - got data in read_buffer
                     eof_sent = false;
 
                     // We use a view of just the filled part
                     let current_payload_bytes_slice = &read_buffer[0..n];
                     
-                    let mut frames_to_send_payloads: Vec<Bytes> = Vec::new();
+                    let mut frames_to_send: Vec<Bytes> = Vec::new(); // Changed name for clarity
 
                     if active_protocol == ActiveProtocol::Guacd {
                         if let Some(parser) = &mut task_guacd_parser {
                             if let Err(e) = parser.receive(conn_no, current_payload_bytes_slice) {
                                 error!("Channel({}): GuacdParser receive error conn_no {}: {}", channel_id, conn_no, e);
-                                // On parser error, might be good to break and initiate close
                                 break; 
                             } else {
                                 let mut close_conn_and_break = false;
@@ -127,35 +146,51 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                                             channel_id, instruction.opcode, conn_no, instruction.args
                                         );
                                         let close_payload = conn_no.to_be_bytes();
-                                        let close_frame = Frame::new_control_with_pool(crate::tube_protocol::ControlMessage::CloseConnection, &close_payload, &buffer_pool);
+                                        let mut temp_control_payload_buf = buffer_pool.acquire();
+                                        temp_control_payload_buf.clear();
+                                        temp_control_payload_buf.extend_from_slice(&close_payload);
+                                        let close_frame = Frame::new_control_with_buffer(crate::tube_protocol::ControlMessage::CloseConnection, &mut temp_control_payload_buf);
+                                        buffer_pool.release(temp_control_payload_buf); 
+
                                         if let Err(e) = dc.send(close_frame.encode_with_pool(&buffer_pool)).await {
                                             error!("Channel({}): Failed to send CloseConnection for Guacd error on conn_no {}: {}", channel_id, conn_no, e);
                                         }
                                         close_conn_and_break = true;
-                                        break; // Stop processing further instructions from this batch for this conn_no
+                                        break; 
                                     }
-                                    frames_to_send_payloads.push(GuacdParser::guacd_encode_instruction(&instruction));
+                                    frames_to_send.push(GuacdParser::guacd_encode_instruction(&instruction));
                                 }
                                 if close_conn_and_break {
-                                    break; // Break from the outer read loop for this connection
+                                    break; 
                                 }
                             }
                         } else {
-                            error!("Channel({}): GuacdParser missing for conn_no {} but protocol is Guacd.", channel_id, conn_no);
-                            frames_to_send_payloads.push(Bytes::copy_from_slice(current_payload_bytes_slice)); // Fallback: send raw
+                            error!("Channel({}): Guacd protocol active for conn_no {} but GuacdParser is missing. This is a critical error. Terminating task for this connection.", channel_id, conn_no);
+                            break; // Critical error, terminate the task for this connection
                         }
                     } else {
-                        // For PortForward, SOCKS5 data phase - forward raw data
-                        frames_to_send_payloads.push(Bytes::copy_from_slice(current_payload_bytes_slice));
+                        // For PortForward, SOCKS5 data phase - use direct encoding to avoid intermediate Frame/Bytes copy
+                        encode_buffer.clear(); // encode_buffer is from the pool
+                        let bytes_written = Frame::encode_data_frame_from_slice(
+                            &mut encode_buffer,
+                            conn_no,
+                            current_payload_bytes_slice,
+                        );
+                        frames_to_send.push(encode_buffer.split_to(bytes_written).freeze());
                     }
 
-                    for payload_bytes_to_send in frames_to_send_payloads {
-                        if payload_bytes_to_send.is_empty() { continue; }
+                    for encoded_frame_bytes in frames_to_send {
+                        if encoded_frame_bytes.is_empty() { continue; }
 
-                        let frame = Frame::new_data_with_pool(conn_no, &payload_bytes_to_send, &buffer_pool);
-                        encode_buffer.clear();
-                        let bytes_written = frame.encode_into(&mut encode_buffer);
-                        let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+                        // Log frame sizes for debugging SCTP issues
+                        // Note: For the direct encoding path, we don't have separate payload_len easily here
+                        // We log the total encoded_frame_bytes.len()
+                        if encoded_frame_bytes.len() > 4096 {
+                            debug!(
+                                "Channel({}): Sending large frame for conn_no {}: encoded_size={} bytes",
+                                channel_id, conn_no, encoded_frame_bytes.len()
+                            );
+                        }
 
                         let buffered_amount = dc.buffered_amount().await;
                         if buffered_amount >= buffer_low_threshold {

@@ -9,6 +9,7 @@ use std::error::Error;
 use std::time::Duration;
 use anyhow::anyhow;
 use tracing::debug;
+use log::warn;
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -63,7 +64,7 @@ mod challenge_response {
     use anyhow::Result;
     use tracing::{debug, error};
 
-    const CHALLENGE_RESPONSE_TIMEOUT_SEC: u64 = 300; // 5 minutes
+    const CHALLENGE_RESPONSE_TIMEOUT_SEC: u64 = 10; // Set to 10 seconds
     const WEBSOCKET_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
     lazy_static! {
@@ -133,12 +134,22 @@ mod challenge_response {
                     resp
                 }
                 Err(e) => {
+                    let mut error_detail_parts: Vec<String> = Vec::new();
+                    error_detail_parts.push(format!("Main error: {:?}", e));
+                    let mut current_err: Option<&dyn std::error::Error> = Some(&e);
+                    while let Some(source) = current_err.and_then(std::error::Error::source) {
+                        error_detail_parts.push(format!("Caused by: {:?}", source));
+                        current_err = Some(source);
+                    }
+                    let detailed_error_log = error_detail_parts.join("\n");
+
                     error!(
                         target: "challenge_response",
-                        error = %e,
+                        error_message = %e, // Original brief message
+                        detailed_error = %detailed_error_log,
                         "HTTP error received fetching challenge string from Keeper"
                     );
-                    return Err(Box::new(e));
+                    return Err(Box::new(e)); // Propagate the original error type
                 }
             };
 
@@ -303,27 +314,33 @@ fn is_base64(s: &str) -> bool {
     })
 }
 
-// Function to get WebSocket router URL
-fn ws_router_url_from_ksm_config(ksm_config_str: &str) -> Result<String, Box<dyn Error>> {
+// Function to get HTTP router URL
+fn http_router_url_from_ksm_config(ksm_config_str: &str) -> Result<String, Box<dyn Error>> {
     let router_host = router_url_from_ksm_config(ksm_config_str)?;
 
-    if router_host.starts_with("ws") {
-        return Ok(router_host);
-    }
-
-    let disable_ssl = env::var("KPAM_ROUTER_DISABLE_SSL").is_ok();
-
-    if disable_ssl {
-        Ok(format!("ws://{}", router_host))
+    if router_host.starts_with("wss://") {
+        // Convert wss:// to https://
+        Ok(router_host.replacen("wss://", "https://", 1))
+    } else if router_host.starts_with("ws://") {
+        // Convert ws:// to http://
+        Ok(router_host.replacen("ws://", "http://", 1))
+    } else if router_host.starts_with("http://") || router_host.starts_with("https://") {
+        // Already a full HTTP/S URL, return as is
+        Ok(router_host)
     } else {
-        Ok(format!("wss://{}", router_host))
+        // Assume it's a hostname and prepend https:// (since VERIFY_SSL is typically true)
+        Ok(format!("https://{}", router_host))
     }
 }
 
-// Function to get HTTP router URL
-fn http_router_url_from_ksm_config(ksm_config_str: &str) -> Result<String, Box<dyn Error>> {
-    let router_http_host = ws_router_url_from_ksm_config(ksm_config_str)?;
-    Ok(router_http_host.replace("ws", "http"))
+pub(crate) fn krealy_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result<String> {
+    let router_host = router_url_from_ksm_config(ksm_config_str)?;
+
+    if router_host.starts_with("connect") {
+        return Ok(router_host.replace("connect", "krelay"));
+    }
+    warn!("Router host is not what was is expected: {}", router_host);
+    Ok(Err(Box::new(KRouterError(format!("Invalid router host: {}", router_host))))?)
 }
 
 // Main router request function

@@ -143,6 +143,34 @@ impl Frame {
             payload: bytes,
         }
     }
+
+    /// Encodes a data frame directly from a payload slice into the target buffer.
+    /// This avoids creating an intermediate Frame instance with an owned Bytes payload if the
+    /// goal is to immediately encode.
+    /// Returns the number of bytes written.
+    pub(crate) fn encode_data_frame_from_slice(
+        target_buf: &mut BytesMut,
+        conn_no: u32,
+        payload_slice: &[u8],
+        // pool: &BufferPool, // Pool is not directly used here; target_buf should be from a pool
+    ) -> usize {
+        target_buf.clear(); // Ensure buffer is ready for new frame
+        let timestamp_ms = now_ms();
+        let payload_len = payload_slice.len();
+
+        let needed_capacity = CONN_NO_LEN + TS_LEN + LEN_LEN + payload_len + TERMINATOR.len();
+        if target_buf.capacity() < needed_capacity {
+            target_buf.reserve(needed_capacity - target_buf.capacity());
+        }
+
+        target_buf.put_u32(conn_no);
+        target_buf.put_u64(timestamp_ms);
+        target_buf.put_u32(payload_len as u32);
+        target_buf.extend_from_slice(payload_slice); // Payload copied directly from source slice
+        target_buf.extend_from_slice(TERMINATOR);
+        
+        needed_capacity // Return total bytes written for this frame
+    }
     
     /// Encode into bytes ready to send using the provided buffer pool
     pub(crate) fn encode_with_pool(&self, pool: &BufferPool) -> Bytes {

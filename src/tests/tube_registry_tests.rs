@@ -72,7 +72,7 @@ async fn test_associate_and_get_by_conversation_id() -> Result<()> {
     let conversation_id = "conv_123";
 
     registry.add_tube(Arc::clone(&tube));
-    registry.associate_conversation(&tube_id, conversation_id);
+    let _ = registry.associate_conversation(&tube_id, conversation_id);
 
     let retrieved_tube = registry.get_by_conversation_id(conversation_id);
     assert!(retrieved_tube.is_some(), "Tube should be found by conversation ID");
@@ -115,7 +115,7 @@ async fn test_find_tubes() -> Result<()> {
     registry.add_tube(Arc::clone(&tube1));
     registry.add_tube(Arc::clone(&tube2));
     registry.add_tube(Arc::clone(&tube3));
-    registry.associate_conversation(&tube3.id(), &conv_id_for_tube3);
+    let _ = registry.associate_conversation(&tube3.id(), &conv_id_for_tube3);
 
     if tube1_id_str.len() >= 5 {
         let partial_id1 = &tube1_id_str[0..5];
@@ -252,9 +252,12 @@ async fn perform_tube_signaling(
     let client_tube = client_registry.get_by_tube_id(client_tube_id)
         .ok_or_else(|| format!("Client tube {} not found in registry", client_tube_id))?;
 
-    server_tube.set_remote_description(client_answer_sdp.clone(), true).await
-        .map_err(|e| format!("ServerTube ({}) set_remote_description (answer) error: {}", server_tube.id(), e))?;
-    info!("[Signaling] ServerTube ({}) set remote answer from client.", server_tube.id());
+    // Use server_registry to set remote description, which handles base64 decoding
+    server_registry.set_remote_description(server_tube_id, &client_answer_sdp, true).await
+        .map_err(|e| format!("ServerTube ({}) set_remote_description (answer) error via registry: {}", server_tube.id(), e))?
+        .map_or(Ok(()), |_| Err(format!("ServerTube ({}) set_remote_description (answer) via registry returned unexpected Some(answer)", server_tube.id())))?;
+
+    info!("[Signaling] ServerTube ({}) set remote answer from client via registry.", server_tube.id());
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 

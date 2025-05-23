@@ -4,15 +4,18 @@ use tokio::sync::mpsc;
 use crate::channel::Channel;
 use crate::models::{NetworkAccessChecker, TunnelTimeouts};
 use crate::webrtc_data_channel::WebRTCDataChannel;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 // Tube Status
 #[derive(Debug, Clone, PartialEq)]
 pub enum TubeStatus {
     New,
-    Connecting,
-    Connected,
+    Initializing, // Tube is being set up by PyTubeRegistry::create_tube
+    Connecting,   // ICE/DTLS negotiation in progress
+    Active,       // ICE/DTLS connected, initial channels (like control) are open and ready
+    Ready,        // All initial setup complete, data channels are open and operational
     Failed,
+    Closing,      // Close has been initiated
     Closed,
 }
 
@@ -20,9 +23,12 @@ impl std::fmt::Display for TubeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TubeStatus::New => write!(f, "new"),
+            TubeStatus::Initializing => write!(f, "initializing"),
             TubeStatus::Connecting => write!(f, "connecting"),
-            TubeStatus::Connected => write!(f, "connected"),
+            TubeStatus::Active => write!(f, "active"),
+            TubeStatus::Ready => write!(f, "ready"),
             TubeStatus::Failed => write!(f, "failed"),
+            TubeStatus::Closing => write!(f, "closing"),
             TubeStatus::Closed => write!(f, "closed"),
         }
     }
@@ -56,6 +62,7 @@ pub(crate) async fn setup_channel_for_data_channel(
     
     // tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
     data_channel_ref.on_message(Box::new(move |msg| {
+        trace!( target: "on_message", message_size = msg.data.len(), "Channel got message");
         let tx_clone = tx.clone(); // Clone tx for the async block
         let buffer_pool_clone = buffer_pool.clone();
         let label_clone = label.clone(); // Clone label for the async block

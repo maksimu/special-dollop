@@ -38,6 +38,7 @@ hex = "0.4.3"
 sha2 = "0.10.8"
 hkdf = "0.12.4"
 aes-gcm = "0.10.3"
+log = "0.4.27"
 
 [package.metadata.maturin]
 name = "keeper_pam_webrtc_rs"

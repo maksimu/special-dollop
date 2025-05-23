@@ -1043,6 +1043,7 @@ dependencies = [
  "hex",
  "hkdf",
  "lazy_static",
+ "log",
  "once_cell",
  "p256",
  "pyo3",

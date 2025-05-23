@@ -43,7 +43,14 @@ pub fn initialize_logger(
     let rust_level = convert_py_level_to_tracing_level(level, verbose.unwrap_or(false));
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("{}", rust_level)));
+        .unwrap_or_else(|_| {
+            if verbose.unwrap_or(false) {
+                // When verbose is true, ensure lifecycle logs are always visible
+                EnvFilter::new(format!("{},lifecycle=trace", rust_level))
+            } else {
+                EnvFilter::new(format!("{}", rust_level))
+            }
+        });
 
     // Get the filter's string representation for logging *before* it's consumed
     let filter_str = filter.to_string();

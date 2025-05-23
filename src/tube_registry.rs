@@ -3,12 +3,13 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 use crate::Tube;
-use tracing::{debug, info, warn};
-use anyhow::{Result, anyhow};
+use tracing::{debug, info, warn, error};
+use anyhow::{Result, anyhow, Context};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
-use crate::router_helpers::{get_relay_access_creds, router_url_from_ksm_config};
+use crate::router_helpers::{get_relay_access_creds, krealy_url_from_ksm_config};
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(test)]
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -85,7 +86,7 @@ impl TubeRegistry {
     pub(crate) fn add_tube(&mut self, tube: Arc<Tube>) {
         let id = tube.id();
         debug!(target: "registry", tube_id = %id, "TubeRegistry::add_tube - Adding tube");
-        self.tubes_by_id.insert(id.clone(), Arc::clone(&tube));
+        self.tubes_by_id.insert(id.clone(), tube);
     }
 
     // Set server mode
@@ -204,7 +205,14 @@ impl TubeRegistry {
         ksm_config: &str,
         signal_sender: UnboundedSender<SignalMessage>,
     ) -> Result<HashMap<String, String>> {
-        let is_server_mode = initial_offer_sdp.is_none();
+        let initial_offer_sdp_decoded = if let Some(ref b64_offer) = initial_offer_sdp {
+            let bytes = BASE64_STANDARD.decode(b64_offer).context("Failed to decode initial_offer_sdp from base64")?;
+            Some(String::from_utf8(bytes).context("Failed to convert decoded initial_offer_sdp to String")?)
+        } else {
+            None
+        };
+
+        let is_server_mode = initial_offer_sdp_decoded.is_none();
 
         let tube_arc = Tube::new(is_server_mode)?;
         let tube_id = tube_arc.id();
@@ -231,7 +239,7 @@ impl TubeRegistry {
                 credential: String::new(),
             });
         } else {
-            let relay_server = router_url_from_ksm_config(ksm_config)?;
+            let relay_server = krealy_url_from_ksm_config(ksm_config)?;
             if !turn_only_for_config {
                 ice_servers.push(RTCIceServer {
                     urls: vec![format!("stun:{}:3478", relay_server)],
@@ -246,26 +254,28 @@ impl TubeRegistry {
             }
             let use_turn_for_config_from_settings = settings.get("use_turn").map_or(true, |v| v.as_bool().unwrap_or(true));
             if use_turn_for_config_from_settings { 
-                match get_relay_access_creds(ksm_config, None).await {
-                    Ok(creds) => {
-                        let username = creds.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string();
-                        let credential = creds.get("password").and_then(|p| p.as_str()).unwrap_or("").to_string();
-                        if !username.is_empty() && !credential.is_empty() {
-                            ice_servers.push(RTCIceServer {
-                                urls: vec![format!("turn:{}:3478", relay_server)],
-                                username: username.clone(),
-                                credential: credential.clone(),
-                            });
-                            ice_servers.push(RTCIceServer {
-                                urls: vec![format!("turn:{}:3478?transport=tcp", relay_server)],
-                                username,
-                                credential,
-                            });
-                        } else {
-                            warn!("TURN credentials are empty, not adding TURN servers for {}.", relay_server);
-                        }
-                    },
-                    Err(e) => warn!("Failed to get relay access credentials for TURN, not adding TURN servers: {}", e),
+                // Attempt to get relay access credentials.
+                // If this call fails, map the error to anyhow::Error and propagate it.
+                let creds = get_relay_access_creds(ksm_config, None).await
+                    .map_err(|e| anyhow!("Failed to get relay access credentials for TURN from {}: {}", relay_server, e))?;
+
+                let username = creds.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                let credential = creds.get("password").and_then(|p| p.as_str()).unwrap_or("").to_string();
+
+                if !username.is_empty() && !credential.is_empty() {
+                    ice_servers.push(RTCIceServer {
+                        urls: vec![format!("turn:{}:3478", relay_server)],
+                        username: username.clone(),
+                        credential: credential.clone(),
+                    });
+                    ice_servers.push(RTCIceServer {
+                        urls: vec![format!("turn:{}:3478?transport=tcp", relay_server)],
+                        username,
+                        credential,
+                    });
+                } else {
+                    // If TURN is configured but credentials are empty, this is an error.
+                    return Err(anyhow!("Failed to obtain usable TURN credentials (empty username/password) for {}", relay_server));
                 }
             }
         }
@@ -309,12 +319,12 @@ impl TubeRegistry {
 
         if is_server_mode {
             let offer_sdp = tube_arc.create_offer().await.map_err(|e| anyhow!("Failed to create offer: {}", e))?;
-            result_map.insert("offer".to_string(), offer_sdp);
+            result_map.insert("offer".to_string(), BASE64_STANDARD.encode(offer_sdp));
         } else {
-            let offer_sdp_str = initial_offer_sdp.ok_or_else(|| anyhow!("Initial offer SDP is required for client mode"))?;
+            let offer_sdp_str = initial_offer_sdp_decoded.ok_or_else(|| anyhow!("Initial offer SDP is required for client mode (after potential base64 decoding)"))?;
             tube_arc.set_remote_description(offer_sdp_str, false).await.map_err(|e| anyhow!("Client: Failed to set remote description (offer): {}", e))?;
             let answer_sdp = tube_arc.create_answer().await.map_err(|e| anyhow!("Client: Failed to create answer: {}", e))?;
-            result_map.insert("answer".to_string(), answer_sdp);
+            result_map.insert("answer".to_string(), BASE64_STANDARD.encode(answer_sdp));
         }
 
         info!(
@@ -340,8 +350,11 @@ impl TubeRegistry {
         let tube = self.get_by_tube_id(tube_id)
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
         
+        let sdp_bytes = BASE64_STANDARD.decode(sdp).context(format!("Failed to decode SDP from base64 for tube_id: {}", tube_id))?;
+        let sdp_decoded = String::from_utf8(sdp_bytes).context(format!("Failed to convert decoded SDP to String for tube_id: {}", tube_id))?;
+        
         // Set the remote description
-        tube.set_remote_description(sdp.to_string(), is_answer).await
+        tube.set_remote_description(sdp_decoded, is_answer).await
             .map_err(|e| anyhow!("Failed to set remote description: {}", e))?;
         
         // If this is an offer, create an answer
@@ -349,7 +362,7 @@ impl TubeRegistry {
             let answer = tube.create_answer().await
                 .map_err(|e| anyhow!("Failed to create answer: {}", e))?;
             
-            return Ok(Some(answer));
+            return Ok(Some(BASE64_STANDARD.encode(answer))); // Encode the answer to base64
         }
         
         Ok(None)
@@ -365,16 +378,35 @@ impl TubeRegistry {
     
     /// Close a tube
     pub(crate) async fn close_tube(&mut self, tube_id: &str) -> Result<()> {
-        let tube = self.get_by_tube_id(tube_id)
-            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
-        
-        // Close the tube, passing the mutable reference to self (the TubeRegistry)
-        tube.close(self).await?;
-        
-        // Tube::close() now handles its own removal from the registry's maps, using the passed &mut TubeRegistry.
-        // So, no explicit self.remove_tube(tube_id) call is needed here anymore.
-        
-        Ok(())
+        let tube_arc = self.get_by_tube_id(tube_id)
+            .ok_or_else(|| {
+                warn!(target: "registry", tube_id = %tube_id, "close_tube: Tube not found in registry.");
+                anyhow!("Tube not found: {}", tube_id)
+            })?;
+
+        let current_status = tube_arc.status.read().await.clone();
+        info!(target: "registry", tube_id = %tube_id, status = %current_status, "close_tube: Attempting to close tube.");
+
+        match current_status {
+            crate::tube_and_channel_helpers::TubeStatus::Initializing => {
+                error!(target: "registry", tube_id = %tube_id, "close_tube: Attempted to close tube while it is still initializing. Operation aborted.");
+                Err(anyhow!("Cannot close tube {}: still initializing.", tube_id))
+            }
+            crate::tube_and_channel_helpers::TubeStatus::Closing | crate::tube_and_channel_helpers::TubeStatus::Closed => {
+                info!(target: "registry", tube_id = %tube_id, status = %current_status, "close_tube: Tube is already closing or closed. No action needed.");
+                Ok(())
+            }
+            _ => { // New, Connecting, Active, Ready, Failed
+                // Transition to Closing state first
+                *tube_arc.status.write().await = crate::tube_and_channel_helpers::TubeStatus::Closing;
+                info!(target: "registry", tube_id = %tube_id, "close_tube: Transitioned tube status to Closing. Proceeding with close.");
+                
+                tube_arc.close(self).await.map_err(|e| {
+                    error!(target: "registry", tube_id = %tube_id, "close_tube: tube.close() failed: {}", e);
+                    anyhow!("Failed during tube.close() for {}: {}", tube_id, e)
+                })
+            }
+        }
     }
     
     /// Register a channel and set up a data channel on an EXISTING tube.

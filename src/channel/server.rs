@@ -8,10 +8,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason};
 use tracing::{debug, info, error, warn};
+use bytes::BufMut;
+use crate::webrtc_data_channel::WebRTCDataChannel;
 
 use super::core::Channel;
 use super::types::ActiveProtocol;
-use crate::webrtc_data_channel::WebRTCDataChannel;
 
 // Constants for SOCKS5 protocol
 const SOCKS5_VERSION: u8 = 0x05;
@@ -324,11 +325,25 @@ async fn handle_socks5_connection(
         let mut read_buffer = buffer_pool_clone.acquire();
         let mut encode_buffer = buffer_pool_clone.acquire();
         
+        // Use 8KB max read size to stay under SCTP limits
+        const MAX_READ_SIZE: usize = 8 * 1024;
+        
         loop {
             read_buffer.clear();
-            read_buffer.reserve(16 * 1024);
+            if read_buffer.capacity() < MAX_READ_SIZE {
+                read_buffer.reserve(MAX_READ_SIZE - read_buffer.capacity());
+            }
             
-            match reader.read_buf(&mut read_buffer).await {
+            // Limit read size to prevent SCTP issues
+            let max_to_read = std::cmp::min(read_buffer.capacity(), MAX_READ_SIZE);
+            
+            // Correctly create a mutable slice for reading
+            let ptr = read_buffer.chunk_mut().as_mut_ptr();
+            let current_chunk_len = read_buffer.chunk_mut().len();
+            let slice_len = std::cmp::min(current_chunk_len, max_to_read);
+            let read_slice = unsafe { std::slice::from_raw_parts_mut(ptr, slice_len) };
+            
+            match reader.read(read_slice).await {
                 Ok(0) => {
                     // EOF
                     debug!("Channel({}): Client connection {} closed", endpoint_name, conn_no);
@@ -360,6 +375,11 @@ async fn handle_socks5_connection(
                     break;
                 },
                 Ok(n) => {
+                    // Advance the buffer by the number of bytes read
+                    unsafe {
+                        read_buffer.advance_mut(n);
+                    }
+                    
                     // Data from a client
                     encode_buffer.clear();
                     
@@ -453,17 +473,29 @@ async fn handle_generic_server_connection(
     let read_task = tokio::spawn(async move {
         let mut read_buffer = buffer_pool_clone.acquire();
         let mut encode_buffer = buffer_pool_clone.acquire();
+        
+        // Use 8KB max read size to stay under SCTP limits
+        const MAX_READ_SIZE: usize = 8 * 1024;
 
         // Add a print statement to see the conn_no being used
         debug!("Server-side TCP reader task started for conn_no: {}", conn_no);
 
         loop {
             read_buffer.clear();
-            if read_buffer.capacity() < 16 * 1024 {
-                read_buffer.reserve(16 * 1024 - read_buffer.capacity());
+            if read_buffer.capacity() < MAX_READ_SIZE {
+                read_buffer.reserve(MAX_READ_SIZE - read_buffer.capacity());
             }
-
-            match reader.read_buf(&mut read_buffer).await {
+            
+            // Limit read size to prevent SCTP issues
+            let max_to_read = std::cmp::min(read_buffer.capacity(), MAX_READ_SIZE);
+            
+            // Correctly create a mutable slice for reading
+            let ptr = read_buffer.chunk_mut().as_mut_ptr();
+            let current_chunk_len = read_buffer.chunk_mut().len();
+            let slice_len = std::cmp::min(current_chunk_len, max_to_read);
+            let read_slice = unsafe { std::slice::from_raw_parts_mut(ptr, slice_len) };
+            
+            match reader.read(read_slice).await {
                 Ok(0) => {
                     debug!("Server-side TCP reader received EOF for conn_no: {}", conn_no);
                     debug!("Channel({}): Client on server port (conn_no {}) sent EOF.", channel_id_clone, conn_no);
@@ -475,6 +507,11 @@ async fn handle_generic_server_connection(
                     break; 
                 }
                 Ok(n) if n > 0 => {
+                    // Advance the buffer by the number of bytes read
+                    unsafe {
+                        read_buffer.advance_mut(n);
+                    }
+                    
                     debug!("Server-side TCP reader received {} bytes for conn_no: {}", n, conn_no);
                 
                     // Print part of the data for debugging

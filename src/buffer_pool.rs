@@ -17,7 +17,7 @@ pub struct BufferPoolConfig {
 impl Default for BufferPoolConfig {
     fn default() -> Self {
         Self {
-            buffer_size: 16 * 1024, // 16KB default buffer size
+            buffer_size: 8 * 1024,  // 8KB default buffer size (matches MAX_READ_SIZE)
             max_pooled: 32,         // Keep up to 32 buffers in the pool
             resize_on_return: true, // Resize buffers when returning to pool
         }

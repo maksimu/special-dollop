@@ -71,11 +71,16 @@ pub async fn create_data_channel(
 ) -> webrtc::error::Result<Arc<RTCDataChannel>> {
     let config = RTCDataChannelInit {
         ordered: Some(true),        // Guarantee message order
-        max_retransmits: Some(0),   // Don't retransmit lost messages
+        max_retransmits: None,      // Reliable delivery (unlimited retransmits)
         max_packet_life_time: None, // No timeout for packets
         protocol: None,             // No specific protocol
         negotiated: None,           // Let WebRTC handle negotiation
     };
+
+    debug!(
+        "Creating data channel '{}' with config: ordered={:?}, reliable delivery", 
+        label, config.ordered
+    );
 
     peer_connection
         .create_data_channel(label, Some(config))

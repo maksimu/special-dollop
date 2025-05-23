@@ -4,6 +4,7 @@ import time
 import socket
 import threading
 import os # Added import for os
+import base64 # Add base64 import
 
 import keeper_pam_webrtc_rs
 
@@ -431,11 +432,20 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         )
         
         # Get the offer from a server
-        offer = server_tube_info['offer']
+        offer_b64 = server_tube_info['offer']
         server_id = server_tube_info['tube_id']
-        self.assertIsNotNone(offer, "Server should generate an offer")
-        logging.info(f"Server Offer SDP:\n{offer}") # Log the server's offer SDP
-        self.assertTrue("a=candidate:" in offer, "Server offer SDP should contain ICE candidates")
+        self.assertIsNotNone(offer_b64, "Server should generate an offer")
+        
+        # Decode the offer before logging and checking for candidates
+        try:
+            offer_decoded_bytes = base64.b64decode(offer_b64)
+            offer_decoded_str = offer_decoded_bytes.decode('utf-8')
+        except Exception as e:
+            logging.error(f"Failed to decode server offer from base64: {e}\nOffer b64: {offer_b64}")
+            self.fail(f"Failed to decode server offer: {e}")
+            
+        logging.info(f"Server Offer SDP (decoded):\n{offer_decoded_str}")
+        self.assertTrue("a=candidate:" in offer_decoded_str, "Server offer SDP (decoded) should contain ICE candidates")
         
         # Create a client tube with the offer
         client_settings = {"conversationType": "tunnel"} # Ensure client also has its own settings if needed
@@ -445,18 +455,27 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
             settings=client_settings, # Pass original settings, not modified ones
             trickle_ice=False,  # Use non-trickle ICE
             callback_token=TEST_CALLBACK_TOKEN,
-            offer=offer,
+            offer=offer_b64, # Pass the original base64 encoded offer
         )
         
         # Get the answer from a client
-        answer = client_tube_info['answer']
+        answer_b64 = client_tube_info['answer']
         client_id = client_tube_info['tube_id']
-        self.assertIsNotNone(answer, "Client should generate an answer")
-        logging.info(f"Client Answer SDP:\n{answer}") # Log the client's answer SDP
-        self.assertTrue("a=candidate:" in answer, "Client answer SDP should contain ICE candidates")
+        self.assertIsNotNone(answer_b64, "Client should generate an answer")
+
+        # Decode the answer before logging and checking for candidates
+        try:
+            answer_decoded_bytes = base64.b64decode(answer_b64)
+            answer_decoded_str = answer_decoded_bytes.decode('utf-8')
+        except Exception as e:
+            logging.error(f"Failed to decode client answer from base64: {e}\nAnswer b64: {answer_b64}")
+            self.fail(f"Failed to decode client answer: {e}")
+
+        logging.info(f"Client Answer SDP (decoded):\n{answer_decoded_str}") 
+        self.assertTrue("a=candidate:" in answer_decoded_str, "Client answer SDP (decoded) should contain ICE candidates")
         
         # Set the answer on the server
-        self.tube_registry.set_remote_description(server_id, answer, is_answer=True)
+        self.tube_registry.set_remote_description(server_id, answer_b64, is_answer=True) # Pass original base64 encoded answer
         
         # Wait for a connection establishment
         # server_id and client_id are already assigned
@@ -468,6 +487,8 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         
         self.assertTrue(connected, "Failed to establish connection")
         logging.info(f"Non-trickle ICE connection established in {connection_time:.2f} seconds")
+
+        # TODO:
         
         # Clean up
         self.tube_registry.close_tube(server_id)

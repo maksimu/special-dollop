@@ -8,15 +8,25 @@ output "turn_server_hostname" {
   value       = aws_route53_record.turn_server_dns.fqdn
 }
 
-output "turn_server_username" {
-  description = "Username for the TURN server."
-  value       = var.turn_username
+output "turn_server_credential_info" {
+  description = "Information about TURN server dynamic credentials (static username/password not used)."
+  value = "TURN server uses dynamic authentication with shared secret. Use './test_turn_credentials.sh' or generate manually with HMAC-SHA1."
 }
 
-output "turn_server_password" {
-  description = "Password for the TURN server."
-  value       = var.turn_password
-  sensitive   = true
+output "turn_server_auth_secret" {
+  description = "Authentication secret for the TURN server (used with use-auth-secret)."
+  value       = var.turn_auth_secret
+  sensitive   = false
+}
+
+output "turn_server_generate_credentials" {
+  description = "Generate TURN credentials (48h default, with options)."
+  value = "./test_turn_credentials.sh"
+}
+
+output "turn_server_test_with_credentials" {
+  description = "Generate credentials and test TURN server."
+  value = "./test_turn_credentials.sh --test"
 }
 
 output "turn_server_realm" {

@@ -215,6 +215,7 @@ resource "aws_instance" "webrtc_server" {
     # turn_user_credentials  = local.turn_user_credentials # Removed for open TURN server
     turn_realm             = local.full_domain_name # Use the dynamically generated domain name, correctly referencing local
     coturn_version_tf_var  = "4.6.2" # Added coturn version
+    turn_auth_secret       = var.turn_auth_secret # Authentication secret for TURN server
   })
 
   tags = {

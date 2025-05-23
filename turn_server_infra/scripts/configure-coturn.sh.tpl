@@ -113,15 +113,16 @@ external-ip=$MY_PUBLIC_IP
 realm="${turn_realm}"
 server-name="${turn_realm}"
 
-# user setting removed for open TURN server
-# Added for open TURN server
-no-auth
+# Use authentication with shared secret
+use-auth-secret
+static-auth-secret=${turn_auth_secret}
 
 # Use fingerprint for STUN messages
 fingerprint
 
 # Log to stdout for systemd/journald
 log-file=stdout
+verbose
 
 # Verbosity is handled by systemd logging and absence of -v on command line
 # no-verbose # Removed, default is not verbose
@@ -131,8 +132,8 @@ min-port=49152
 max-port=65535
 
 # Other common options for security/stability:
-# lt-cred-mech # Commented out because no-auth is enabled
-# stale-nonce # Commented out because no-auth is enabled
+# lt-cred-mech and stale-nonce are NOT used with use-auth-secret
+# These are for username/password authentication, not shared secret auth
 # no-loopback-peers # Removed, default is to disallow loopback peers
 no-multicast-peers
 

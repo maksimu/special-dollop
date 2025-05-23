@@ -82,19 +82,19 @@ echo "TURN Server Details (JSON):"
 echo "${TURN_DETAILS_JSON}"
 
 # Example of how to parse with 'jq' (ensure jq is installed: sudo yum install jq / sudo apt install jq / brew install jq)
-# PUBLIC_IP=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_public_ip.value')
-# HOSTNAME=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_hostname.value')
-# USERNAME=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_username.value')
-# PASSWORD=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_password.value') # Be careful with sensitive data
-# REALM=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_realm.value')
+PUBLIC_IP=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_public_ip.value')
+HOSTNAME=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_hostname.value')
+USERNAME=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_username.value')
+PASSWORD=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_password.value') # Be careful with sensitive data
+REALM=$(echo "${TURN_DETAILS_JSON}" | jq -r '.turn_server_realm.value')
 
-# echo ""
-# echo "Parsed details:"
-# echo "Public IP: ${PUBLIC_IP}"
-# echo "Hostname:  ${HOSTNAME}"
-# echo "Username:  ${USERNAME}"
-# echo "Password:  ${PASSWORD}" # Consider not printing this directly
-# echo "Realm:     ${REALM}"
+echo ""
+echo "Parsed details:"
+echo "Public IP: ${PUBLIC_IP}"
+echo "Hostname:  ${HOSTNAME}"
+echo "Username:  ${USERNAME}"
+echo "Password:  ${PASSWORD}" # Consider not printing this directly
+echo "Realm:     ${REALM}"
 
 echo ""
 echo "--- (Simulating tests using the TURN server) ---"

@@ -10,22 +10,17 @@ variable "instance_type" {
   default     = "t3.small"
 }
 
-variable "turn_username" {
-  description = "Username for TURN server authentication"
+variable "turn_auth_secret" {
+  description = "Static authentication secret for TURN server (used with use-auth-secret and static-auth-secret)"
   type        = string
-  default     = "turnuser"
-}
-
-variable "turn_password" {
-  description = "Password for TURN server authentication"
-  type        = string
-  default     = "turnpassword"
-  sensitive   = true
+  default     = "your-secure-turn-secret-123"
+  sensitive   = false
 }
 
 variable "domain_name_prefix" {
   description = "Prefix for the domain name (e.g., rustunnel-test-[timestamp])"
   type        = string
+  default     = "rustunnel-test"
 }
 
 variable "base_domain_name" {

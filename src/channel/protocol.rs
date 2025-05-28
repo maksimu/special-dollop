@@ -3,8 +3,8 @@ use anyhow::{anyhow, Result};
 use bytes::Buf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::ToSocketAddrs;
-use tracing::{debug, error, info, warn};
-use tokio::io::AsyncWriteExt;
+use tracing::{debug, error, info, warn, trace};
+use tokio::io::{AsyncWriteExt};
 
 use super::core::Channel;
 use crate::tube_protocol::{ControlMessage, CloseConnectionReason, CONN_NO_LEN};
@@ -167,7 +167,27 @@ impl Channel {
         let mut cursor = std::io::Cursor::new(data);
         let target_connection_no = cursor.get_u32();
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received OpenConnection request for connection {} with payload size {}. Server mode: {}, Active Protocol: {:?}", target_connection_no, cursor.remaining(), self.server_mode, self.active_protocol);
+        debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = target_connection_no, payload_len = cursor.remaining(), server_mode = self.server_mode, active_protocol = ?self.active_protocol, "Endpoint Received OpenConnection request");
+
+        // Prepare data for the detailed trace log BEFORE the trace! macro
+        let guacd_host_clone = self.guacd_host.clone();
+        let guacd_port_clone = self.guacd_port; // Option<u16> is Copy
+        let connect_as_settings_clone = self.connect_as_settings.clone();
+        
+        // Lock and prepare the guacd_params for logging
+        let guacd_params_locked = self.guacd_params.lock().await;
+        let guacd_params_for_log = format!("{:?}", *guacd_params_locked);
+        drop(guacd_params_locked); // Release the lock as soon as possible
+
+        trace!(target: "protocol_event",
+            channel_id = %self.channel_id,
+            conn_no = target_connection_no,
+            guacd_host = ?guacd_host_clone,
+            guacd_port = ?guacd_port_clone,
+            connect_as_settings = ?connect_as_settings_clone,
+            guacd_params_map = %guacd_params_for_log, // Log the prepared string
+            "Channel state at OpenConnection for Guacd target determination"
+        );
 
         // If this channel is a server-mode PortForwarder, it originates connections locally.
         // An incoming OpenConnection for a specific conn_no is an ack/part of handshake from the client-side of the tunnel.
@@ -377,7 +397,7 @@ impl Channel {
     /// Helper function to establish backend connection and send ConnectionOpened
     async fn establish_backend_connection(&mut self, conn_no: u32, host: &str, port: u16) -> Result<()> {
         let target_str = format!("{}:{}", host, port);
-        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Attempting to open backend connection {} to {}", conn_no, target_str);
+        info!(target: "protocol_connect", channel_id = %self.channel_id, conn_no, target_address = %target_str, active_protocol = ?self.active_protocol, "Attempting to establish backend connection to target.");
 
         // Check network access rules if configured (primarily for client-side initiated from OpenConnection)
         if let Some(ref checker) = self.network_checker {

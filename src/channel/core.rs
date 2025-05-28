@@ -1,6 +1,6 @@
 // Core Channel implementation
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::{Buf, BytesMut};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
@@ -17,7 +17,9 @@ use crate::webrtc_data_channel::WebRTCDataChannel;
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
 use super::types::ActiveProtocol;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
+use serde::Deserialize; // Add this
 
 // Import from sibling modules
 use super::frame_handling::handle_incoming_frame;
@@ -62,11 +64,16 @@ impl Default for ProtocolLogicState {
 // --- End Protocol-specific state definitions ---
 
 // --- ConnectAs Settings Definition ---
-#[derive(Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone, Default)] // Added Deserialize
 pub struct ConnectAsSettings {
+    #[serde(alias = "allow_supply_user", default)]
     pub allow_supply_user: bool,
+    #[serde(alias = "allow_supply_host", default)]
     pub allow_supply_host: bool,
-    pub gateway_private_key: Option<String>, // Hex-encoded private key
+    #[serde(alias = "gateway_private_key")]
+    pub gateway_private_key: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<String>, // Added nonce
 }
 // --- End ConnectAs Settings Definition ---
 
@@ -103,7 +110,7 @@ pub struct Channel {
     pub(crate) guacd_host: Option<String>,
     pub(crate) guacd_port: Option<u16>,
     pub(crate) connect_as_settings: ConnectAsSettings,
-    pub(crate) guacd_params: Arc<Mutex<HashMap<String, String>>>, // Base Guacd params can be augmented by connect_as
+    pub(crate) guacd_params: Arc<Mutex<HashMap<String, String>>>, // Kept for now for minimal diff
 
     // Pending message queues for each connection
     pub(crate) pending_messages: Arc<Mutex<HashMap<u32, VecDeque<Bytes>>>>,
@@ -175,10 +182,11 @@ impl Channel {
         rx_from_dc: mpsc::UnboundedReceiver<Bytes>, // This receiver is from the WebRTC data channel
         channel_id: String,
         timeouts: Option<TunnelTimeouts>,
-        protocol_settings: HashMap<String, serde_json::Value>, // This is the main settings object
+        protocol_settings: HashMap<String, JsonValue>, // Using JsonValue alias
         server_mode: bool,
     ) -> Result<Self> {
         info!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
+        trace!(target: "channel_setup", channel_id = %channel_id, ?protocol_settings, "Initial protocol_settings received by Channel::new");
 
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
         let (f_input_tx, f_input_rx) = mpsc::unbounded_channel::<Frame>();
@@ -197,45 +205,73 @@ impl Channel {
         
         let network_checker = parse_network_rules_from_settings(&protocol_settings);
 
-        // --- Determine Active Protocol and State ---
-        let determined_protocol;
-        let initial_protocol_state;
+        let mut determined_protocol = ActiveProtocol::PortForward; // Default
+        let mut initial_protocol_state = ProtocolLogicState::default();
 
-        // --- Parse Guacd specific settings ---
         let mut guacd_host_setting: Option<String> = None;
         let mut guacd_port_setting: Option<u16> = None;
-        let mut parsed_connect_as_settings = ConnectAsSettings::default();
-        let mut initial_guacd_params = HashMap::new(); // For base params from settings
+        let mut temp_initial_guacd_params_map = HashMap::new();
         
-        let mut local_listen_addr_setting: Option<String> = None; // <<< ADDED FOR PARSING
+        let mut local_listen_addr_setting: Option<String> = None;
 
-        // Determine protocol
-        if let Some(protocol_name_val) = protocol_settings.get("conversationType") { 
+        if let Some(protocol_name_val) = protocol_settings.get("conversationType") {
             if let Some(protocol_name_str) = protocol_name_val.as_str() {
                 match protocol_name_str.parse::<ConversationType>() {
                     Ok(parsed_conversation_type) => {
                         if is_guacd_session(&parsed_conversation_type) {
                             debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for GuacD protocol");
                             determined_protocol = ActiveProtocol::Guacd;
-                            // Guacd host/port from specific guacd settings take precedence
-                            // If not found, it will remain None, and protocol_tests will use defaults or error
-                            if let Some(guacd_settings_val) = protocol_settings.get("guacd") {
-                                if let Some(guacd_settings_map) = guacd_settings_val.as_object() {
-                                    guacd_host_setting = guacd_settings_map.get("guacd_host").and_then(|v| v.as_str()).map(String::from);
-                                    guacd_port_setting = guacd_settings_map.get("guacd_port").and_then(|v| v.as_u64()).map(|p| p as u16); // Corrected: guacd_port, not guacd_host
-                                }
-                            }
-                            if let Some(guacd_params_settings_val) = protocol_settings.get("guacd_params") {
-                                if let Some(params_map) = guacd_params_settings_val.as_object() {
-                                    // Parse initial guacd_params
-                                    for (k, v) in params_map {
-                                        if let Some(val_str) = v.as_str() {
-                                            initial_guacd_params.insert(k.clone(), val_str.to_string());
-                                        }
-                                    }
-                                }
-                            }
                             initial_protocol_state = ProtocolLogicState::Guacd(ChannelGuacdState::default());
+
+                            if let Some(guacd_dedicated_settings_val) = protocol_settings.get("guacd") {
+                                trace!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd' block in protocol_settings: {:?}", guacd_dedicated_settings_val);
+                                if let JsonValue::Object(guacd_map) = guacd_dedicated_settings_val {
+                                    guacd_host_setting = guacd_map.get("guacd_host").and_then(|v| v.as_str()).map(String::from);
+                                    guacd_port_setting = guacd_map.get("guacd_port").and_then(|v| v.as_u64()).map(|p| p as u16);
+                                    info!(target: "channel_setup", channel_id = %channel_id, ?guacd_host_setting, ?guacd_port_setting, "Parsed from dedicated 'guacd' settings block.");
+                                } else {
+                                    warn!(target: "channel_setup", channel_id = %channel_id, "'guacd' block was not a JSON Object.");
+                                }
+                            } else {
+                                 trace!(target: "channel_setup", channel_id = %channel_id, "No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults.");
+                            }
+
+                            if let Some(guacd_params_json_val) = protocol_settings.get("guacd_params") {
+                                info!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd_params' in protocol_settings.");
+                                trace!(target: "channel_setup", channel_id = %channel_id, guacd_params_value = ?guacd_params_json_val, "Raw guacd_params value for direct processing.");
+
+                                if let JsonValue::Object(map) = guacd_params_json_val {
+                                    temp_initial_guacd_params_map = map.iter().filter_map(|(k, v)| {
+                                        match v {
+                                            JsonValue::String(s) => Some((k.clone(), s.clone())),
+                                            JsonValue::Bool(b) => Some((k.clone(), b.to_string())),
+                                            JsonValue::Number(n) => Some((k.clone(), n.to_string())),
+                                            JsonValue::Array(arr) => {
+                                                let str_arr: Vec<String> = arr.iter()
+                                                    .filter_map(|val| val.as_str().map(String::from))
+                                                    .collect();
+                                                if !str_arr.is_empty() {
+                                                    Some((k.clone(), str_arr.join(",")))
+                                                } else {
+                                                    // For arrays not of strings, or empty string arrays, produce empty string or skip.
+                                                    // Guacamole usually expects comma-separated for multiple values like image/audio mimetypes.
+                                                    // If it's an array of other things, stringifying the whole array might be an option.
+                                                    Some((k.clone(), "".to_string())) // Or None to skip
+                                                }
+                                            }
+                                            JsonValue::Null => None, // Omit null values by not adding them
+                                            // For JsonValue::Object, stringify the nested object.
+                                            // This matches behavior if a struct field was Option<JsonValue> and then stringified.
+                                            JsonValue::Object(obj_map) => serde_json::to_string(obj_map).ok().map(|s_val| (k.clone(), s_val)),
+                                        }
+                                    }).collect();
+                                    debug!(target: "channel_setup", channel_id = %channel_id, ?temp_initial_guacd_params_map, "Populated guacd_params map directly from JSON Value.");
+                                } else {
+                                    error!(target: "channel_setup", channel_id = %channel_id, "guacd_params was not a JSON object. Value: {:?}", guacd_params_json_val);
+                                }
+                            } else {
+                                warn!(target: "channel_setup", channel_id = %channel_id, "'guacd_params' key not found in protocol_settings.");
+                            }
                         } else {
                             // Handle non-Guacd types like Tunnel or SOCKS5 if network rules are present
                             match parsed_conversation_type {
@@ -308,20 +344,27 @@ impl Channel {
             error!(target:"channel_setup", channel_id = %channel_id, "No specific protocol defined (conversationType missing). Erroring out.");
             return Err(anyhow::anyhow!("No specific protocol defined (conversationType missing)"));
         }
-        // --- End Protocol Determination ---
 
-        if let Some(connect_as_settings_val) = protocol_settings.get("connect_as") {
-            if let Some(connect_as_settings_map) = connect_as_settings_val.as_object() {
-                if let Some(cas_val) = connect_as_settings_map.get("connect_as") {
-                    if let Some(cas_map) = cas_val.as_object() {
-                        parsed_connect_as_settings.allow_supply_user = cas_map.get("allow_supply_user").and_then(|v| v.as_bool()).unwrap_or(false);
-                        parsed_connect_as_settings.allow_supply_host = cas_map.get("allow_supply_host").and_then(|v| v.as_bool()).unwrap_or(false);
-                        parsed_connect_as_settings.gateway_private_key = cas_map.get("gateway_private_key").and_then(|v| v.as_str()).map(String::from);
-                    }
+        let mut final_connect_as_settings = ConnectAsSettings::default();
+        if let Some(connect_as_settings_val) = protocol_settings.get("connect_as_settings") {
+            info!(target: "channel_setup", channel_id = %channel_id, "Found 'connect_as_settings' in protocol_settings.");
+            trace!(target: "channel_setup", channel_id = %channel_id, cas_value = ?connect_as_settings_val, "Raw connect_as_settings value.");
+            match serde_json::from_value::<ConnectAsSettings>(connect_as_settings_val.clone()) {
+                Ok(parsed_settings) => {
+                    final_connect_as_settings = parsed_settings;
+                    info!(target: "channel_setup", channel_id = %channel_id, "Successfully deserialized connect_as_settings into ConnectAsSettings struct.");
+                    trace!(target: "channel_setup", channel_id = %channel_id, ?final_connect_as_settings);
+                }
+                Err(e) => {
+                    error!(target: "channel_setup", channel_id = %channel_id, "CRITICAL: Failed to deserialize connect_as_settings: {}. Value was: {:?}", e, connect_as_settings_val);
+                    // Returning an error here if connect_as_settings are vital
+                    return Err(anyhow!("Failed to deserialize connect_as_settings: {}", e));
                 }
             }
+        } else {
+            warn!(target: "channel_setup", channel_id = %channel_id, "'connect_as_settings' key not found in protocol_settings. Using default.");
         }
-
+        
         let channel_id_clone = channel_id.clone();
         let process_pending_trigger_tx_clone = pending_tx.clone();
 
@@ -358,11 +401,10 @@ impl Channel {
             active_protocol: determined_protocol,
             protocol_state: initial_protocol_state,
             
-            // Initialize new fields
             guacd_host: guacd_host_setting,
             guacd_port: guacd_port_setting,
-            connect_as_settings: parsed_connect_as_settings,
-            guacd_params: Arc::new(Mutex::new(initial_guacd_params)),
+            connect_as_settings: final_connect_as_settings,
+            guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
 
             pending_messages,
             buffer_pool,

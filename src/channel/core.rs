@@ -1,7 +1,7 @@
 // Core Channel implementation
 
 use anyhow::Result;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use crate::error::ChannelError;
+pub(crate) use crate::error::ChannelError;
 use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason, try_parse_frame};
 use crate::models::{Conn, TunnelTimeouts, NetworkAccessChecker, StreamHalf, ConnectionStats, is_guacd_session, ConversationType};
 use crate::runtime::get_runtime;
@@ -49,7 +49,6 @@ pub(crate) struct ChannelPortForwardState {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProtocolLogicState {
-    None, // Should not typically be used once initialized unless as a default before settings apply
     Socks5(ChannelSocks5State),
     Guacd(ChannelGuacdState),
     PortForward(ChannelPortForwardState),
@@ -116,6 +115,8 @@ pub struct Channel {
     // Trigger for processing pending messages when the buffer is low
     pub(crate) process_pending_trigger_tx: mpsc::UnboundedSender<()>, 
     pub(crate) process_pending_trigger_rx: Arc<Mutex<mpsc::UnboundedReceiver<()>>>,
+    // Timestamp for the last channel-level ping sent (conn_no=0)
+    pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
 }
 
 // Implement Clone for Channel
@@ -163,6 +164,7 @@ impl Clone for Channel {
             process_pending_trigger_rx: Arc::new(Mutex::new(pending_trigger_rx)),
             cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             connection_tx: None,
+            channel_ping_sent_time: Mutex::new(None), // Initialize for clone
         }
     }
 }
@@ -370,6 +372,7 @@ impl Channel {
             process_pending_trigger_rx: Arc::new(Mutex::new(pending_rx)),
             cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             connection_tx: None,
+            channel_ping_sent_time: Mutex::new(None),
         };
         
         info!(target: "channel_lifecycle", channel_id = %new_channel.channel_id, server_mode = new_channel.server_mode, "Channel initialized");
@@ -477,63 +480,84 @@ impl Channel {
     pub(crate) async fn process_pending_messages(&mut self) -> Result<()> {
         let mut pending_guard = self.pending_messages.lock().await;
         if pending_guard.iter().all(|(_, queue)| queue.is_empty()) {
+            debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages in any queue.");
             return Ok(());
         }
-        debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "Processing pending messages");
+        debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "process_pending_messages: Starting.");
+        
+        for (conn_no, queue) in pending_guard.iter() {
+            if !queue.is_empty() {
+                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, queue_size = queue.len(), "process_pending_messages: Connection has pending messages.");
+            }
+        }
+
         let max_to_process = 100;
         let mut total_processed = 0;
         let total_messages: usize = pending_guard.values().map(|q| q.len()).sum();
         if total_messages > 0 {
-           debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "Total pending messages across all connections");
+           debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "process_pending_messages: Total pending messages across all connections.");
         }
         let conn_nos: Vec<u32> = pending_guard.keys().filter(|&conn_no| !pending_guard[conn_no].is_empty()).copied().collect();
         let mut current_index = 0;
-        let encode_buffer = self.buffer_pool.acquire();
+        let encode_buffer = self.buffer_pool.acquire(); // Though encode_buffer is not used in this version of the loop. Consider removing if not needed.
         let buffer_threshold = BUFFER_LOW_THRESHOLD;
         
         while total_processed < max_to_process && !conn_nos.is_empty() {
-            if conn_nos.is_empty() { break; } // safeguard for empty conn_nos
+            if conn_nos.is_empty() { 
+                debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: conn_nos became empty, breaking.");
+                break; 
+            }
             let conn_index = current_index % conn_nos.len();
             let conn_no = conn_nos[conn_index];
             
+            debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Attempting to process queue for connection.");
+
             if let Some(queue) = pending_guard.get_mut(&conn_no) {
-                if queue.is_empty() { // Check if the queue became empty
+                if queue.is_empty() { 
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue is now empty for connection, skipping.");
                     current_index += 1;
                     continue;
                 }
                 let message_to_send = if let Some(message) = queue.front() {
                     message.clone()
                 } else {
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue front is None after checking not empty, skipping.");
                     current_index += 1;
                     continue;
                 };
                 
+                let current_buffered_amount_before_send = self.webrtc.buffered_amount().await;
+                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, message_size = message_to_send.len(), buffered_amount_before_send = current_buffered_amount_before_send, "process_pending_messages: Sending message from queue.");
+
                 if let Err(e) = self.webrtc.send(message_to_send).await {
-                    error!(target: "channel_flow", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send queued message for connection");
+                    error!(target: "channel_flow", channel_id = %self.channel_id, conn_no, error = %e, "process_pending_messages: Failed to send queued message for connection. Breaking loop.");
                     break;
                 }
 
                 queue.pop_front();
                 total_processed += 1;
+                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, total_processed_in_loop = total_processed, remaining_in_queue = queue.len(), "process_pending_messages: Successfully sent message, popped from queue.");
                 
                 if total_processed % 10 == 0 {
-                    let current_buffer = self.webrtc.buffered_amount().await;
-                    if current_buffer >= buffer_threshold {
-                        debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, "Buffer threshold reached during processing, pausing");
+                    let current_buffer_after_batch = self.webrtc.buffered_amount().await;
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, current_buffered_amount = current_buffer_after_batch, "process_pending_messages: Checking buffer threshold mid-batch.");
+                    if current_buffer_after_batch >= buffer_threshold {
+                        debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, "process_pending_messages: Buffer threshold reached during processing, pausing.");
                         break;
                     }
 
                 }
             } else {
-                 // This case should ideally not happen if conn_nos is derived from pending_guard keys
-                 warn!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "Connection not found in pending_messages during processing.");
+                 warn!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Connection not found in pending_messages during processing. This should not happen.");
             }
             current_index += 1;
         }
         
         self.buffer_pool.release(encode_buffer);
         if total_processed > 0 {
-           debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "Processed pending messages in this batch");
+           debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
+        } else {
+           debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
         }
         Ok(())
     }
@@ -551,6 +575,25 @@ impl Channel {
     pub(crate) async fn send_control_message(&mut self, message: ControlMessage, data: &[u8]) -> Result<()> {
         let frame = Frame::new_control_with_pool(message, data, &self.buffer_pool);
         let encoded = frame.encode_with_pool(&self.buffer_pool);
+
+        if message == ControlMessage::Ping {
+            // Check if this ping is for conn_no 0 (channel ping)
+            // The `data` for a Ping should contain the conn_no it's for.
+            // Assuming the first 4 bytes of Ping data payload is the conn_no.
+            if data.len() >= 4 {
+                let ping_conn_no = (&data[0..4]).get_u32();
+                if ping_conn_no == 0 {
+                    let mut sent_time = self.channel_ping_sent_time.lock().await;
+                    *sent_time = Some(crate::tube_protocol::now_ms());
+                    debug!("Channel({}): Sent channel PING (conn_no=0), recorded send time.", self.channel_id);
+                }
+            } else if data.is_empty() { // Convention: empty data for Ping implies channel ping
+                 let mut sent_time = self.channel_ping_sent_time.lock().await;
+                 *sent_time = Some(crate::tube_protocol::now_ms());
+                 debug!("Channel({}): Sent channel PING (conn_no=0, empty payload convention), recorded send time.", self.channel_id);
+            }
+        }
+
         let buffered_amount = self.webrtc.buffered_amount().await;
         if buffered_amount >= BUFFER_LOW_THRESHOLD {
            debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");

@@ -132,6 +132,7 @@ pub struct TunnelTimeouts {
     pub ping_timeout: Duration,
     pub open_connection: Duration,
     pub close_connection: Duration,
+    pub guacd_handshake: Duration,
 }
 
 impl Default for TunnelTimeouts {
@@ -141,6 +142,7 @@ impl Default for TunnelTimeouts {
             ping_timeout: Duration::from_secs(5),
             open_connection: Duration::from_secs(10),
             close_connection: Duration::from_secs(5),
+            guacd_handshake: Duration::from_secs(10),
         }
     }
 }

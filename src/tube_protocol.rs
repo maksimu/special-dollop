@@ -92,6 +92,26 @@ impl CloseConnectionReason {
     }
 }
 
+impl TryFrom<u16> for CloseConnectionReason {
+    type Error = anyhow::Error; // Or a more specific error type
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(CloseConnectionReason::Normal),
+            1 => Ok(CloseConnectionReason::ConnectionFailed),
+            2 => Ok(CloseConnectionReason::ConnectionLost),
+            3 => Ok(CloseConnectionReason::Timeout),
+            4 => Ok(CloseConnectionReason::AIClosed),
+            5 => Ok(CloseConnectionReason::AddressResolutionFailed),
+            6 => Ok(CloseConnectionReason::DecryptionFailed),
+            7 => Ok(CloseConnectionReason::ConfigurationError),
+            8 => Ok(CloseConnectionReason::ProtocolError),
+            0xFFFF => Ok(CloseConnectionReason::Unknown),
+            _ => Err(anyhow::anyhow!("Invalid u16 value for CloseConnectionReason: {}", value)),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Frame {
     pub(crate) connection_no: u32,

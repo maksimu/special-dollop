@@ -1,6 +1,6 @@
 // Buffer pool implementation for efficient buffer reuse
 
-use bytes::{BytesMut, Bytes};
+use bytes::{BytesMut, Bytes, BufMut};
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 
@@ -86,10 +86,33 @@ impl BufferPool {
     
     /// Create a new Bytes object from a slice, using a pooled buffer
     pub fn create_bytes(&self, data: &[u8]) -> Bytes {
+        if data.is_empty() {
+            return Bytes::new();
+        }
+
         let mut buf = self.acquire();
-        buf.clear(); // Ensure the buffer is empty
-        buf.extend_from_slice(data);
-        buf.freeze() // Convert to Bytes
+        buf.clear(); // Ensure the buffer is empty before use
+
+        // Ensure buf has enough capacity for data.
+        if data.len() > buf.capacity() {
+            // If data.len() is larger than current capacity, reserve more space.
+            // This might involve a reallocation if the pooled buffer was smaller.
+            buf.reserve(data.len() - buf.capacity());
+        }
+        
+        buf.put_slice(data); // Copy data into buf. buf.len() is now data.len().
+
+        // Split off the part of the buffer that contains the data.
+        // `result_data_buf` will have length == capacity == data.len().
+        let result_data_buf = buf.split_to(data.len());
+        
+        // The original `buf` is now empty (or contains data after what was split).
+        // In this case, since we split up to data.len() which was its full content, `buf` is empty.
+        // Release the (now empty) original buffer back to the pool.
+        self.release(buf); 
+
+        // Freeze the exact-sized buffer. This is a cheap O(1) operation.
+        result_data_buf.freeze()
     }
 
     /// Get the number of buffers currently in the pool

@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error, warn};
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use crate::tube_registry::{SignalMessage, TubeRegistry};
+use tracing_subscriber::{EnvFilter};
 
 // Helper to create a default tube for testing
 // This helper will create a tube that is NOT automatically added to the global REGISTRY
@@ -338,10 +339,30 @@ async fn perform_tube_signaling(
     ))
 }
 
+// Helper function for test logging setup within this module
+fn setup_test_logging() {
+    static LOGGING_INIT: std::sync::Once = std::sync::Once::new();
+    LOGGING_INIT.call_once(|| {
+        let filter = EnvFilter::builder()
+            .with_default_directive(tracing::metadata::LevelFilter::TRACE.into())
+            .from_env_lossy(); 
+
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(true)
+            .with_level(true)
+            .with_test_writer()
+            .try_init()
+            .ok();
+    });
+}
 
 #[tokio::test]
 async fn test_registry_e2e_server_client_echo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _runtime = get_runtime(); 
+    setup_test_logging(); // Call the setup
+
+    let _runtime = get_runtime();
 
     // Start the external Ack Server
     let (ack_server_kill_tx, ack_server_kill_rx_for_server_task) = tokio::sync::oneshot::channel();

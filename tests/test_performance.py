@@ -488,7 +488,7 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         self.assertTrue(connected, "Failed to establish connection")
         logging.info(f"Non-trickle ICE connection established in {connection_time:.2f} seconds")
 
-        # TODO:
+        # TODO: send different sized messages through the tube and verify we got them
         
         # Clean up
         self.tube_registry.close_tube(server_id)

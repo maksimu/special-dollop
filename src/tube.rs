@@ -380,6 +380,7 @@ impl Tube {
                 ping_timeout: std::time::Duration::from_secs_f64(timeout / 3.0),
                 open_connection: std::time::Duration::from_secs_f64(timeout),
                 close_connection: std::time::Duration::from_secs_f64(timeout / 2.0),
+                guacd_handshake: std::time::Duration::from_secs_f64(timeout / 1.5),
             })
         } else {
             None

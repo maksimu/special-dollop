@@ -1,9 +1,9 @@
 // Channel module - provides WebRTC data channel integration with TCP connections
 
 // Internal modules
-mod core;
+pub(crate) mod core;
 mod server;
-mod connections;
+pub(crate) mod connections;
 pub(crate) mod frame_handling; // Logic to be merged into core.rs
 mod utils;
 pub mod types; // Added new types module

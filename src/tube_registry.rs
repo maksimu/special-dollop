@@ -222,63 +222,80 @@ impl TubeRegistry {
         self.set_server_mode(is_server_mode);
         self.signal_channels.insert(tube_id.clone(), signal_sender.clone());
 
+        info!(target: "ice_config", tube_id = %tube_id, ksm_config = %ksm_config, "Received ksm_config for ICE server setup");
+
         let mut ice_servers = Vec::new();
         let mut turn_only_for_config = settings.get("turn_only").map_or(false, |v| v.as_bool().unwrap_or(false));
+        info!(target: "ice_config", tube_id = %tube_id, turn_only_setting = turn_only_for_config, "Initial 'turn_only' setting from input");
 
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
-            info!("TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration.");
+            info!(target: "ice_config", tube_id = %tube_id, "TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration.");
             turn_only_for_config = false;
             ice_servers.push(RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302?transport=udp&family=ipv4".to_string()],
                 username: String::new(),
                 credential: String::new(),
             });
+            info!(target: "ice_config", tube_id = %tube_id, stun_url = "stun:stun.l.google.com:19302?transport=udp&family=ipv4", "Added Google STUN server");
             ice_servers.push(RTCIceServer {
                 urls: vec!["stun:stun1.l.google.com:19302?transport=udp&family=ipv4".to_string()],
                 username: String::new(),
                 credential: String::new(),
             });
+            info!(target: "ice_config", tube_id = %tube_id, stun_url = "stun:stun1.l.google.com:19302?transport=udp&family=ipv4", "Added Google STUN server");
         } else {
-            let relay_server = krealy_url_from_ksm_config(ksm_config)?;
-            if !turn_only_for_config {
-                ice_servers.push(RTCIceServer {
-                    urls: vec![format!("stun:{}:3478", relay_server)],
-                    username: String::new(),
-                    credential: String::new(),
-                });
-                ice_servers.push(RTCIceServer {
-                    urls: vec![format!("stun:{}:3478?transport=tcp", relay_server)],
-                    username: "".to_string(),
-                    credential: "".to_string(),
-                });
-            }
-            let use_turn_for_config_from_settings = settings.get("use_turn").map_or(true, |v| v.as_bool().unwrap_or(true));
-            if use_turn_for_config_from_settings { 
-                // Attempt to get relay access credentials.
-                // If this call fails, map the error to anyhow::Error and propagate it.
-                let creds = get_relay_access_creds(ksm_config, None).await
-                    .map_err(|e| anyhow!("Failed to get relay access credentials for TURN from {}: {}", relay_server, e))?;
+            match krealy_url_from_ksm_config(ksm_config) {
+                Ok(relay_server) => {
+                    info!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Extracted relay server host from ksm_config");
+                    if !turn_only_for_config {
+                        let stun_url_udp = format!("stun:{}:3478", relay_server);
+                        ice_servers.push(RTCIceServer {
+                            urls: vec![stun_url_udp.clone()],
+                            username: String::new(),
+                            credential: String::new(),
+                        });
+                        info!(target: "ice_config", tube_id = %tube_id, stun_url = %stun_url_udp, "Added STUN server (UDP)");
+                    }
 
-                let username = creds.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string();
-                let credential = creds.get("password").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    let use_turn_for_config_from_settings = settings.get("use_turn").map_or(true, |v| v.as_bool().unwrap_or(true));
+                    info!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
 
-                if !username.is_empty() && !credential.is_empty() {
-                    ice_servers.push(RTCIceServer {
-                        urls: vec![format!("turn:{}:3478", relay_server)],
-                        username: username.clone(),
-                        credential: credential.clone(),
-                    });
-                    ice_servers.push(RTCIceServer {
-                        urls: vec![format!("turn:{}:3478?transport=tcp", relay_server)],
-                        username,
-                        credential,
-                    });
-                } else {
-                    // If TURN is configured but credentials are empty, this is an error.
-                    return Err(anyhow!("Failed to obtain usable TURN credentials (empty username/password) for {}", relay_server));
+                    if use_turn_for_config_from_settings { 
+                        match get_relay_access_creds(ksm_config, None).await {
+                            Ok(creds) => {
+                                let username = creds.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                                let credential = creds.get("password").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                info!(target: "ice_config", tube_id = %tube_id, turn_username = %username, turn_password_is_empty = credential.is_empty(), "Fetched TURN credentials");
+
+                                if !username.is_empty() && !credential.is_empty() {
+                                    let turn_url_udp = format!("turn:{}:3478", relay_server);
+                                    ice_servers.push(RTCIceServer {
+                                        urls: vec![turn_url_udp.clone()],
+                                        username: username.clone(),
+                                        credential: credential.clone(),
+                                    });
+                                    info!(target: "ice_config", tube_id = %tube_id, turn_url = %turn_url_udp, "Added TURN server (UDP)");
+                                } else {
+                                    warn!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Failed to add TURN servers: Usable TURN credentials (empty username/password) not obtained.");
+                                    // Potentially return an error or handle as a configuration issue
+                                    // For now, just log and continue without these specific TURN servers
+                                }
+                            },
+                            Err(e) => {
+                                warn!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, error = %e, "Failed to get relay access credentials for TURN. TURN servers will not be added.");
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!(target: "ice_config", tube_id = %tube_id, error = %e, "Failed to extract relay server URL from ksm_config. STUN/TURN servers (except potentially Google STUN) will not be configured based on ksm_config.");
                 }
             }
         }
+
+        // Log all configured ICE server URLs before creating RTCConfiguration
+        let all_configured_urls: Vec<String> = ice_servers.iter().flat_map(|s| s.urls.clone()).collect();
+        info!(target: "ice_config", tube_id = %tube_id, configured_ice_urls = ?all_configured_urls, "Final list of ICE server URLs to be used");
 
         let rtc_config_obj = {
             let mut rtc_config = RTCConfiguration {
@@ -303,18 +320,50 @@ impl TubeRegistry {
             signal_sender.clone(),
         ).await?;
 
-        if let Err(e) = tube_arc.create_control_channel(ksm_config.to_string(), callback_token.to_string()).await {
-            warn!("Failed to create control channel for tube {}: {}", tube_id, e);
-        }
+        let mut listening_port_option: Option<u16> = None; // Initialize outside the if
 
-        let data_channel_arc = tube_arc.create_data_channel(conversation_id, ksm_config.to_string(), callback_token.to_string()).await?;
-        let listening_port_option = tube_arc.create_channel(conversation_id, &data_channel_arc, None, settings.clone()).await?;
+        // Conditionally create channels only if in server mode (no initial offer from client)
+        if is_server_mode {
+            info!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: Proactively creating control and main data channels.");
+            if let Err(e) = tube_arc.create_control_channel(ksm_config.to_string(), callback_token.to_string()).await {
+                warn!("Failed to create control channel for tube {}: {}", tube_id, e);
+                // Decide if this is a fatal error for server mode. For now, just warning.
+            }
+
+            // Create the main data channel, using conversation_id as its label.
+            // The settings for this channel are also passed to tube_arc.create_channel
+            match tube_arc.create_data_channel(conversation_id, ksm_config.to_string(), callback_token.to_string()).await {
+                Ok(data_channel_arc) => {
+                    // Assign to listening_port_option here
+                    match tube_arc.create_channel(conversation_id, &data_channel_arc, None, settings.clone()).await {
+                        Ok(port_opt) => listening_port_option = port_opt,
+                        Err(e) => {
+                            warn!(target: "tube_lifecycle", tube_id = %tube_id, channel_id = %conversation_id, "Server mode: Failed to create logical channel for main data channel: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "tube_lifecycle", tube_id = %tube_id, channel_id = %conversation_id, "Server mode: Failed to create main data channel: {}", e);
+                    // Decide if this is fatal.
+                }
+            }
+        } else {
+            info!(target: "tube_lifecycle", tube_id = %tube_id, "Client mode: Expecting client to create data channels via its offer.");
+            // In client mode (offer provided), we rely on the on_data_channel callback
+            // in Tube::create_peer_connection to handle incoming channels defined by the client.
+        }
 
         let mut result_map = HashMap::new();
         result_map.insert("tube_id".to_string(), tube_id.clone());
 
-        if let Some(port) = listening_port_option {
-            result_map.insert("actual_local_listen_addr".to_string(), format!("127.0.0.1:{}", port));
+        // Conditionally add actual_local_listen_addr if in server mode AND a port was obtained
+        if is_server_mode {
+            if let Some(port) = listening_port_option {
+                result_map.insert("actual_local_listen_addr".to_string(), format!("127.0.0.1:{}", port));
+                info!(target: "tube_lifecycle", tube_id = %tube_id, listen_addr = format!("127.0.0.1:{}", port), "Server mode: Reporting listening address.");
+            } else {
+                 warn!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: No listening port obtained for main data channel, not adding actual_local_listen_addr to result.");
+            }
         }
 
         if is_server_mode {

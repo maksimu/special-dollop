@@ -9,15 +9,15 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["python"]
-python = ["pyo3"]
+python = ["pyo3", "pyo3-log"]
 
 [dependencies]
 bytes = "1.10.1"
 chrono = "0.4.41"
-tracing = { version = "0.1.41" } # Removed "log" feature
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] } # Added tracing-subscriber with json for structured logging
+tracing = { version = "0.1.41" }
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
 pyo3 = { version = "0.25.0", features = ["extension-module", "abi3-py37"], optional = true }
-pyo3-log = "0.12.4" # Update pyo3-log to use tracing feature
+pyo3-log = { version = "0.12.4", optional = true }
 # Not directly used - included to enforce a minimum version for security (CVE fixes in 0.17.12+)
 # Dependency comes through webrtc crate
 ring = "0.17.14"

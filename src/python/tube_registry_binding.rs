@@ -7,8 +7,6 @@ use tracing::{debug, info, trace, warn, error};
 use crate::runtime::get_runtime;
 use crate::tube_registry::REGISTRY;
 use std::sync::Arc;
-use base64::{Engine as _};
-use serde_json::json;
 
 /// Python bindings for the Rust TubeRegistry.
 ///
@@ -267,203 +265,62 @@ impl PyTubeRegistry {
     ) -> PyResult<PyObject> {
         let master_runtime = get_runtime();
         
+        // Convert Python settings dictionary to Rust HashMap<String, serde_json::Value>
         let settings_json = pyobj_to_json_hashmap(py, &settings)?;
         
-        let (signal_sender, signal_receiver) = unbounded_channel();
+        // Create an MPSC channel for signaling between Rust and Python
+        let (signal_sender_rust, signal_receiver_py) = unbounded_channel::<crate::tube_registry::SignalMessage>();
         
-        let offer_string = offer.map(String::from);
+        // Prepare owned versions of string parameters to move into async blocks
+        let offer_string_owned = offer.map(String::from);
         let conversation_id_owned = conversation_id.to_string();
         let callback_token_owned = callback_token.to_string();
         let ksm_config_owned = ksm_config.to_string();
 
-        // Clone values that need to be used in the second async block, 
-        // as the originals will be moved into the first block.
-        let offer_string_for_second_block = offer_string.clone();
-        let conversation_id_for_second_block = conversation_id_owned.clone();
-        // Ksm_config_owned and callback_token_owned are already cloned inside the second block where needed,
-        // or they can be cloned here too if a more consistent pattern is desired.
-        // For now, let's stick to cloning only what's strictly necessary for the reported errors.
-
-        let (tube_arc_for_async_ops, initial_tube_id_for_async_ops) = py.allow_threads(|| {
+        // This outer block_on will handle the call to the registry's create_tube and setup signal handler
+        let creation_result_map = py.allow_threads(|| {
             master_runtime.clone().block_on(async move {
-                trace!(target: "lifecycle", "PyBind: Acquiring REGISTRY write lock (Phase 1)");
+                trace!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: Acquiring REGISTRY write lock for create_tube.");
                 let mut registry = REGISTRY.write().await;
-                trace!(target: "lifecycle", "PyBind: REGISTRY write lock acquired (Phase 1)");
+                trace!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: REGISTRY write lock acquired.");
 
-                // Check if a tube for this conversation_id already exists. 
-                // This is a guard against re-creating a tube that might be in the process of being set up elsewhere
-                // or if there's a rapid re-request for the same conversation.
-                if let Some(existing_tube_id) = registry.conversation_mappings.get(&conversation_id_owned) {
-                    if let Some(tube) = registry.tubes_by_id.get(existing_tube_id) {
-                        warn!(target: "lifecycle", tube_id = %existing_tube_id, conversation_id = %conversation_id_owned, "PyBind: Tube for this conversation_id already exists. Returning existing tube Arc.");
-                        // It's crucial that the returned tube_id here matches what Python expects for subsequent operations.
-                        // The original conversation_id_owned is what Python used to make the request.
-                        return Ok::<_, PyErr>((Arc::clone(tube), existing_tube_id.clone())); 
-                    }
-                }
-
-                trace!(target: "lifecycle", conversation_id = %conversation_id_owned, "PyBind: Phase 1: About to call Tube::new().");
-                let tube_arc = crate::tube::Tube::new(offer_string.is_none())
-                    .map_err(|e| {
-                        error!(target: "lifecycle", conversation_id = %conversation_id_owned, "PyBind: Phase 1: Tube::new() CRITICAL FAILURE: {}", e);
-                        PyRuntimeError::new_err(format!("Failed to create tube instance: {}", e))
-                    })?;
-                let tube_id = tube_arc.id(); // Get ID right after creation
-                trace!(target: "lifecycle", tube_id = %tube_id, conversation_id = %conversation_id_owned, "PyBind: Phase 1: Tube::new() successful, tube_id obtained.");
-
-                // Existing trace log, slightly reworded for clarity in new sequence
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: Tube instance created and ID confirmed."); 
-
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: About to call registry.add_tube().");
-                registry.add_tube(Arc::clone(&tube_arc));
-                // Combined existing log with more detail
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: registry.add_tube() called. Tube Arc cloned into registry.");
-
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: About to call registry.associate_conversation().");
-                registry.associate_conversation(&tube_id, &conversation_id_owned)
-                    .map_err(|e| {
-                        error!(target: "lifecycle", tube_id = %tube_id, conversation_id = %conversation_id_owned, "PyBind: Phase 1: associate_conversation() CRITICAL FAILURE: {}", e);
-                        PyRuntimeError::new_err(format!("Failed to associate conversation: {}", e))
-                    })?;
-                // Combined existing log
-                trace!(target: "lifecycle", tube_id = %tube_id, conversation_id = %conversation_id_owned, "PyBind: Phase 1: Conversation associated.");
-
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: About to call registry.set_server_mode().");
-                registry.set_server_mode(offer_string.is_none());
-                // Combined existing log
-                trace!(target: "lifecycle", tube_id = %tube_id, server_mode = offer_string.is_none(), "PyBind: Phase 1: Server mode set.");
-                
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: About to insert signal_sender into registry.signal_channels.");
-                registry.signal_channels.insert(tube_id.clone(), signal_sender.clone());
-                // Combined existing log
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: Signal channel inserted. REGISTRY write lock will be released upon exiting block.");
-                
-                trace!(target: "lifecycle", tube_id = %tube_id, "PyBind: Phase 1: About to return Ok from block_on.");
-                Ok::<_, PyErr>((tube_arc, tube_id))
-            })
-        })?;
-        trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 1 complete. REGISTRY lock released.");
-
-        let tube_id_for_error_path = initial_tube_id_for_async_ops.clone();
-
-        let creation_outcome = py.allow_threads(|| {
-            master_runtime.clone().block_on(async move {
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2 (async ops) started.");
-                
-                // Before starting long async ops, verify the tube is still in the registry.
-                // This helps detect if it was removed by another thread between Phase 1 and Phase 2.
-                {
-                    let registry_guard = REGISTRY.read().await;
-                    if !registry_guard.tubes_by_id.contains_key(&initial_tube_id_for_async_ops) {
-                        error!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Tube disappeared from registry before Phase 2! Aborting Phase 2.");
-                        return Err(PyRuntimeError::new_err(format!("Tube {} was removed from registry prematurely before Phase 2 operations could start.", initial_tube_id_for_async_ops)));
-                    }
-                    trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Tube confirmed in registry at start of Phase 2.");
-                }
-
-                tube_arc_for_async_ops.create_peer_connection(
-                    None,
+                // Delegate to the main TubeRegistry::create_tube method
+                // This method now encapsulates Tube creation, ICE config, peer connection setup, and offer/answer generation.
+                registry.create_tube(
+                    &conversation_id_owned,
+                    settings_json, // Already a HashMap<String, serde_json::Value>
+                    offer_string_owned,
                     trickle_ice,
-                    settings_json.get("turn_only").map_or(false, |v| v.as_bool().unwrap_or(false)),
-                    ksm_config_owned.clone(),
-                    callback_token_owned.clone(),
-                    settings_json.clone(),
-                    {
-                        let registry_guard = REGISTRY.read().await;
-                        registry_guard.signal_channels.get(&initial_tube_id_for_async_ops)
-                            .cloned()
-                            .ok_or_else(|| PyRuntimeError::new_err(format!("Signal sender not found for tube {} after initial registration", initial_tube_id_for_async_ops)))?
-                    },
-                ).await.map_err(|e| PyRuntimeError::new_err(format!("Failed to create peer connection: {}", e)))?;
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: create_peer_connection completed.");
-
-                if let Err(e) = tube_arc_for_async_ops.create_control_channel(ksm_config_owned.clone(), callback_token_owned.clone()).await {
-                    warn!("Failed to create control channel for tube {}: {}", initial_tube_id_for_async_ops, e);
-                }
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: create_control_channel attempt completed.");
-
-                let data_channel_arc = tube_arc_for_async_ops.create_data_channel(&conversation_id_for_second_block, ksm_config_owned.clone(), callback_token_owned.clone()).await.map_err(|e| PyRuntimeError::new_err(format!("Failed to create data channel: {}",e)))?;
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: create_data_channel completed.");
-                
-                let listening_port_option = tube_arc_for_async_ops.create_channel(&conversation_id_for_second_block, &data_channel_arc, None, settings_json.clone()).await.map_err(|e| PyRuntimeError::new_err(format!("Failed to create logical channel: {}", e)))?;
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: create_channel (logical) completed.");
-
-                let mut result_map = HashMap::new();
-                result_map.insert("tube_id".to_string(), initial_tube_id_for_async_ops.clone());
-
-                if let Some(port) = listening_port_option {
-                    // Assuming 127.0.0.1 as host, consistent with how Channel::start_server often works for local listeners.
-                    // If host can be dynamic, this might need adjustment or to be sourced from channel info.
-                    result_map.insert("actual_local_listen_addr".to_string(), format!("127.0.0.1:{}", port));
-                }
-
-                if offer_string_for_second_block.is_none() { // Server mode
-                    trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Server mode, creating offer.");
-                    let offer_sdp = tube_arc_for_async_ops.create_offer().await.map_err(|e| PyRuntimeError::new_err(format!("Failed to create offer: {}", e)))?;
-                    result_map.insert("offer".to_string(), base64::engine::general_purpose::STANDARD.encode(offer_sdp)); 
-                } else { // Client mode
-                    trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Client mode, processing offer.");
-                    if let Some(offer_sdp_b64_str) = &offer_string_for_second_block { 
-                        trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Decoding offer SDP.");
-                        let offer_decoded_bytes = base64::engine::general_purpose::STANDARD.decode(offer_sdp_b64_str)
-                            .map_err(|e| PyRuntimeError::new_err(format!("Failed to decode offer SDP from base64: {}", e)))?;
-                        let offer_plain_sdp = String::from_utf8(offer_decoded_bytes)
-                            .map_err(|e| PyRuntimeError::new_err(format!("Failed to convert decoded offer SDP to String: {}", e)))?;
-                        trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Offer SDP decoded. Setting remote description.");
-
-                        tube_arc_for_async_ops.set_remote_description(offer_plain_sdp, false).await.map_err(|e| PyRuntimeError::new_err(format!("Client: Failed to set remote description (offer): {}", e)))?;
-                        trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Remote description (offer) set. Creating answer.");
-                        let answer_sdp = tube_arc_for_async_ops.create_answer().await.map_err(|e| PyRuntimeError::new_err(format!("Client: Failed to create answer: {}", e)))?;
-                        trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Answer created. Encoding answer.");
-                        result_map.insert("answer".to_string(), base64::engine::general_purpose::STANDARD.encode(answer_sdp)); 
-                    } else {
-                        // This path should ideally not be hit if offer_string_for_second_block was Some initially.
-                        error!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Phase 2: Client mode, but offer_sdp_b64_str is None unexpectedly!");
-                        return Err(PyRuntimeError::new_err("Offer SDP is required for client mode but was None after initial check"));
-                    }
-                }
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Offer/Answer logic completed.");
-                
-                // Set status to Active as all setup is complete from create_tube's perspective
-                *tube_arc_for_async_ops.status.write().await = crate::tube_and_channel_helpers::TubeStatus::Active;
-                trace!(target: "lifecycle", tube_id = %initial_tube_id_for_async_ops, "PyBind: Tube status set to Active.");
-
-                Ok::<(HashMap<String, String>, String), PyErr>((result_map, initial_tube_id_for_async_ops.clone()))
+                    &callback_token_owned,
+                    &ksm_config_owned,
+                    signal_sender_rust, // Pass the sender part of the MPSC channel
+                ).await
+                 .map_err(|e| {
+                    error!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube CRITICAL FAILURE: {}", e);
+                    PyRuntimeError::new_err(format!("Failed to create tube via registry: {}", e))
+                 })
             })
-        });
+        })?; // Propagate errors from block_on or create_tube
 
-        match creation_outcome {
-            Ok((result_map_final, final_tube_id)) => {
-                trace!(target: "lifecycle", tube_id = %final_tube_id, "PyBind: Phase 2 (async ops) complete. Result map has {} keys.", result_map_final.len());
-                if let Some(cb) = signal_callback {
-                    setup_signal_handler(final_tube_id.clone(), signal_receiver, master_runtime.clone(), cb);
-                }
-                let py_dict = PyDict::new(py);
-                for (key, value) in result_map_final.iter() {
-                    py_dict.set_item(key, value)?;
-                }
-                Ok(py_dict.into())
-            }
-            Err(e) => {
-                error!(target: "lifecycle", tube_id = %tube_id_for_error_path, "PyBind: Phase 2 CRITICAL FAILURE: {}", e);
-                let tube_id_for_cleanup = tube_id_for_error_path.clone();
-                // Attempt to mark the tube as Failed in the registry.
-                // This runs in a new block_on to ensure it executes even if the main runtime is unwinding parts of Phase 2.
-                master_runtime.clone().block_on(async move {
-                    let registry = REGISTRY.read().await;
-                    if let Some(tube_to_mark_failed) = registry.get_by_tube_id(&tube_id_for_cleanup) {
-                        let mut status = tube_to_mark_failed.status.write().await;
-                        if *status != crate::tube_and_channel_helpers::TubeStatus::Closed 
-                            && *status != crate::tube_and_channel_helpers::TubeStatus::Closing
-                            && *status != crate::tube_and_channel_helpers::TubeStatus::Ready {
-                            *status = crate::tube_and_channel_helpers::TubeStatus::Failed;
-                            warn!(target: "lifecycle", tube_id = %tube_id_for_cleanup, "PyBind: Marked tube as Failed due to Phase 2 error.");
-                        }
-                    }
-                });
-                Err(e) // Propagate the original error to Python
-            }
+        trace!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube call complete. Result map has {} keys.", creation_result_map.len());
+
+        // Extract tube_id for signal handler setup (it must be in the map)
+        let final_tube_id = creation_result_map.get("tube_id")
+            .ok_or_else(|| PyRuntimeError::new_err("Tube ID missing from create_tube response"))?
+            .clone();
+
+        // Setup Python signal handler if a callback was provided
+        if let Some(cb) = signal_callback {
+            setup_signal_handler(final_tube_id.clone(), signal_receiver_py, master_runtime.clone(), cb);
         }
+
+        // Convert the resulting HashMap to a Python dictionary to return
+        let py_dict = PyDict::new(py);
+        for (key, value) in creation_result_map.iter() {
+            py_dict.set_item(key, value)?;
+        }
+        
+        Ok(py_dict.into())
     }
     
     /// Create an offer for a tube

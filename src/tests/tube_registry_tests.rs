@@ -443,7 +443,7 @@ async fn test_registry_e2e_server_client_echo() -> Result<(), Box<dyn std::error
     let server_tube_from_reg = server_registry.get_by_tube_id(&server_tube_id).ok_or_else(|| anyhow!("Failed to get server tube from registry"))?;
     let client_tube_from_reg = client_registry.get_by_tube_id(&client_tube_id).ok_or_else(|| anyhow!("Failed to get client tube from registry"))?;
     let server_dc = server_tube_from_reg.get_data_channel(server_conversation_id).await.ok_or_else(|| anyhow!("Server DC not found"))?;
-    let client_dc = client_tube_from_reg.get_data_channel(client_conversation_id).await.ok_or_else(|| anyhow!("Client DC not found"))?;
+    let client_dc = client_tube_from_reg.get_data_channel(server_conversation_id).await.ok_or_else(|| anyhow!(format!("Client DC (expected label '{}') not found after processing server's offer", server_conversation_id)))?;
     
     tokio::time::timeout(Duration::from_secs(10), server_dc.wait_for_channel_open(None)).await??;
     info!("[E2E_Test] Server DC '{}' is open.", server_dc.label());

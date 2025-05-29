@@ -25,6 +25,20 @@ const CONNECT_AS_DETAILS_LEN_FIELD_BYTES: usize = 2;
 const CONNECT_AS_PUBLIC_KEY_BYTES: usize = 65; // As per Python: 65-byte public key
 const CONNECT_AS_NONCE_BYTES: usize = 12;    // As per Python: 12 byte nonce
 
+// Helper function to convert camelCase to kebab-case
+fn camel_to_kebab(s: &str) -> String {
+    let mut result = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('-');
+            result.push(ch.to_lowercase().next().unwrap());
+        } else {
+            result.push(ch.to_lowercase().next().unwrap_or(ch));
+        }
+    }
+    result
+}
+
 // Open a backend connection to a given address
 pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr, active_protocol: ActiveProtocol) -> Result<()> {
     debug!(
@@ -646,6 +660,12 @@ where
         for arg_name_from_guacd in args_instruction.args.iter().skip(1) { 
             let param_value = connect_params_for_new_conn.get(arg_name_from_guacd.replace('_', "-").as_str()) 
                                 .or_else(|| connect_params_for_new_conn.get(arg_name_from_guacd.as_str()))
+                                .or_else(|| {
+                                    // Try to find the camelCase version of the parameter
+                                    connect_params_for_new_conn.keys()
+                                        .find(|k| camel_to_kebab(k) == *arg_name_from_guacd)
+                                        .and_then(|k| connect_params_for_new_conn.get(k))
+                                })
                                 .cloned()
                                 .unwrap_or_else(String::new);
             connect_args.push(param_value);

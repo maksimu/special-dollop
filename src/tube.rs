@@ -117,7 +117,7 @@ impl Tube {
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
-            let rtc_data_channel_label = rtc_data_channel.label().to_string(); // Get label once for logging
+            let rtc_data_channel_label = rtc_data_channel.label().to_string(); // Get the label once for logging
             let rtc_data_channel_id = rtc_data_channel.id();
 
             Box::pin(async move {
@@ -138,7 +138,6 @@ impl Tube {
                 if rtc_data_channel_label == "control" {
                     *tube.control_channel.write().await = Some(data_channel.clone());
                     info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Set as control channel.");
-                    return; // Control channel usually doesn't go through full guacd setup here.
                 }
 
                 // Determine server_mode for the new channel based on the Tube's context
@@ -416,7 +415,7 @@ impl Tube {
             data_channel, 
             name.to_string(), 
             timeouts,
-            protocol_settings.clone(), // protocol_settings is already cloned if needed by caller or passed as value
+            protocol_settings.clone(), // protocol_settings is already cloned if needed by the caller or passed as value
             self.is_server_mode_context
         ).await;
 
@@ -476,7 +475,7 @@ impl Tube {
             // Use the cloned tube_id_for_spawn which is 'static
             debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task started.");
             if let Err(e) = owned_channel.run().await {
-                // Update error log to also use the 'static tube_id_for_spawn
+                // Update the error log to also use the 'static tube_id_for_spawn
                 error!("Channel '{}' (tube_id: {}) encountered an error in run(): {}", name_clone, tube_id_for_spawn, e);
             }
             // Use the cloned tube_id_for_spawn

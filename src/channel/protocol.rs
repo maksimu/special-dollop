@@ -191,17 +191,17 @@ impl Channel {
 
         // If this channel is a server-mode PortForwarder, it originates connections locally.
         // An incoming OpenConnection for a specific conn_no is an ack/part of handshake from the client-side of the tunnel.
-        // The server should already have (or be in the process of setting up) this conn_no from a local TCP accept.
+        // The server should already have (or be in the process of setting up) this conn_no from a local TCP acceptance.
         // It should not try to establish a new outbound connection based on this message.
         if self.server_mode && self.active_protocol == super::types::ActiveProtocol::PortForward {
             debug!(target: "protocol_event", channel_id=%self.channel_id, "Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened.", target_connection_no);
-            // The connection should be in self.conns or will be shortly via the local TCP accept path.
+            // The connection should be in self.conns, or it will be shortly. Via the local TCP accept path.
             // Sending ConnectionOpened confirms to the client that this conn_no is active on the server side.
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
             return Ok(());
         }
 
-        // Existing check: if connection already processed and in conns map (e.g. client mode, or SOCKS5 server after target resolution)
+        // Existing check: if connection already processed and in conns map (e.g., client mode, or SOCKS5 server after target resolution)
         if self.conns.lock().await.contains_key(&target_connection_no) {
             debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened.", target_connection_no);
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;

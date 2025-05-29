@@ -17,6 +17,10 @@ use tokio::sync::oneshot;
 use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use crate::tube_registry::SignalMessage;
 
+// Constants for SCTP max message size negotiation
+const DEFAULT_MAX_MESSAGE_SIZE: u32 = 262144; // 256KB - Common default for WebRTC
+const OUR_MAX_MESSAGE_SIZE: u32 = 65536;      // 64KB - Safe limit for webrtc-rs
+
 // Cached API instance for reuse
 static API: once_cell::sync::Lazy<webrtc::api::API> =
     once_cell::sync::Lazy::new(|| APIBuilder::new().build());
@@ -71,7 +75,7 @@ pub async fn create_data_channel(
 ) -> webrtc::error::Result<Arc<RTCDataChannel>> {
     let config = RTCDataChannelInit {
         ordered: Some(true),        // Guarantee message order
-        max_retransmits: None,      // Reliable delivery (unlimited retransmits)
+        max_retransmits: Some(0),   // No retransmits
         max_packet_life_time: None, // No timeout for packets
         protocol: None,             // No specific protocol
         negotiated: None,           // Let WebRTC handle negotiation
@@ -399,24 +403,83 @@ impl WebRTCPeerConnection {
                 Ok(Ok(_)) => {
                     debug!(target: "webrtc_ice", tube_id = %self.tube_id, "ICE gathering complete for non-trickle {}.", sdp_type_str);
                     if let Some(final_desc) = self.peer_connection.local_description().await {
-                        Ok(final_desc.sdp)
+                        let mut sdp_str = final_desc.sdp;
+                        
+                        // Add max-message-size to answer SDP for non-trickle ICE only
+                        if !is_offer && !sdp_str.contains("a=max-message-size") {
+                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Answer SDP missing max-message-size, attempting to add it");
+                            
+                            // Extract max-message-size from the offer (remote description)
+                            let max_message_size = if let Some(remote_desc) = self.peer_connection.remote_description().await {
+                                debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Remote description found, searching for max-message-size");
+                                
+                                // Extract the max-message-size from the remote offer
+                                let offer_sdp = &remote_desc.sdp;
+                                if let Some(pos) = offer_sdp.find("a=max-message-size:") {
+                                    let start = pos + "a=max-message-size:".len();
+                                    if let Some(end) = offer_sdp[start..].find('\r').or_else(|| offer_sdp[start..].find('\n')) {
+                                        if let Ok(size) = offer_sdp[start..start + end].trim().parse::<u32>() {
+                                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Successfully extracted max-message-size from offer: {}", size);
+                                            size
+                                        } else {
+                                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Failed to parse max-message-size value from offer");
+                                            DEFAULT_MAX_MESSAGE_SIZE // Default if parsing fails
+                                        }
+                                    } else {
+                                        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "No line ending found after max-message-size in offer");
+                                        DEFAULT_MAX_MESSAGE_SIZE // Default if no line ending
+                                    }
+                                } else {
+                                    debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "No max-message-size found in remote offer SDP");
+                                    DEFAULT_MAX_MESSAGE_SIZE // Default if isn't found in offer
+                                }
+                            } else {
+                                debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "No remote description available");
+                                DEFAULT_MAX_MESSAGE_SIZE // Default if no remote description
+                            };
+
+                            // Use the minimum of the client's requested size and our maximum
+                            let our_max = OUR_MAX_MESSAGE_SIZE;
+                            let negotiated_size = max_message_size.min(our_max);
+                            
+                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Negotiating max-message-size: client_requested={} ({}KB), our_max={} ({}KB), negotiated={} ({}KB)", 
+                                   max_message_size, max_message_size/1024, our_max, our_max/1024, negotiated_size, negotiated_size/1024);
+
+                            // Find the position to insert after sctp-port
+                            if let Some(sctp_pos) = sdp_str.find("a=sctp-port:") {
+                                // Find the end of the sctp-port line
+                                if let Some(line_end) = sdp_str[sctp_pos..].find('\n') {
+                                    let insert_pos = sctp_pos + line_end + 1;
+                                    debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Found sctp-port at position {}", sctp_pos);
+                                    debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Inserting 'a=max-message-size:{}' at position {}", negotiated_size, insert_pos);
+                                    sdp_str.insert_str(insert_pos, &format!("a=max-message-size:{}\r\n", negotiated_size));
+                                    info!(target: "webrtc_sdp", tube_id = %self.tube_id, 
+                                          "Successfully added max-message-size={} ({}KB) to answer SDP (client requested: {} ({}KB), our max: {} ({}KB))",
+                                          negotiated_size, negotiated_size/1024, max_message_size, max_message_size/1024, our_max, our_max/1024);
+                                }
+                            }
+                        }
+                        
+                        Ok(sdp_str)
                     } else {
-                        Err(format!("Failed to get local description after ICE gathering (non-trickle {})", sdp_type_str))
+                        Err(format!("Failed to get local description after gathering for {}", sdp_type_str))
                     }
                 }
-                Ok(Err(e)) => Err(format!("ICE gathering channel error (non-trickle {}): {:?}", sdp_type_str, e)),
+                Ok(Err(_)) => {
+                    Err(format!("ICE gathering was cancelled for {}", sdp_type_str))
+                }
                 Err(_) => {
-                    warn!(target: "webrtc_ice", tube_id = %self.tube_id, "Timeout waiting for ICE gathering to complete for non-trickle {}.", sdp_type_str);
-                    // Clear the handler on timeout as well.
-                    self.peer_connection.on_ice_gathering_state_change(Box::new(|_| Box::pin(async {})));
-                    Err(format!("Timeout waiting for ICE gathering (non-trickle {})", sdp_type_str))
+                    Err(format!("ICE gathering timeout for {}", sdp_type_str))
                 }
             }
         } else {
             // Trickle ICE: return the SDP immediately.
             // The calling Tube will set the local description if this is an offer/answer being created by self.
             debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Trickle ICE: returning {} immediately.", sdp_type_str);
-            Ok(sdp_obj.sdp) // sdp_obj.sdp is already a String
+            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Initial {} SDP", sdp_obj.sdp.clone());
+            
+            // For trickle ICE, do not modify the SDP
+            Ok(sdp_obj.sdp)
         }
     }
 
@@ -434,6 +497,16 @@ impl WebRTCPeerConnection {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
             return Err("Connection is closing".to_string());
+        }
+
+        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, 
+               "set_remote_description called with {} (length: {} bytes)", 
+               if is_answer { "answer" } else { "offer" }, sdp.len());
+        
+        // Check if the offer contains max-message-size
+        if !is_answer && sdp.contains("a=max-message-size:") {
+            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, 
+                   "Incoming offer contains max-message-size attribute");
         }
 
         // Create SessionDescription based on type
@@ -599,3 +672,4 @@ impl WebRTCPeerConnection {
         candidates.clone()
     }
 }
+

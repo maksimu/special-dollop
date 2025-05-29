@@ -286,8 +286,9 @@ impl Channel {
                                         if server_mode {
                                             initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState::default());
                                         } else {
-                                            let dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
-                                            let dest_port = protocol_settings.get("target_port")
+                                            // Try to get target host/port from either target_host/target_port or guacd field
+                                            let mut dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
+                                            let mut dest_port = protocol_settings.get("target_port")
                                                 .and_then(|v| {
                                                     // First, try to get it as an u64 directly
                                                     if let Some(num) = v.as_u64() {
@@ -302,6 +303,26 @@ impl Channel {
                                                         None
                                                     }
                                                 });
+                                            
+                                            // If not found, check the guacd field for tunnel connections
+                                            if dest_host.is_none() || dest_port.is_none() {
+                                                if let Some(guacd_obj) = protocol_settings.get("guacd").and_then(|v| v.as_object()) {
+                                                    if dest_host.is_none() {
+                                                        dest_host = guacd_obj.get("guacd_host")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.trim().to_string()); // Trim whitespace
+                                                    }
+                                                    if dest_port.is_none() {
+                                                        dest_port = guacd_obj.get("guacd_port")
+                                                            .and_then(|v| v.as_u64())
+                                                            .map(|p| p as u16);
+                                                    }
+                                                    debug!(target:"channel_setup", channel_id = %channel_id, 
+                                                           "Extracted target from guacd field: host={:?}, port={:?}", 
+                                                           dest_host, dest_port);
+                                                }
+                                            }
+                                            
                                             initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState {
                                                 target_host: dest_host,
                                                 target_port: dest_port,
@@ -320,8 +341,28 @@ impl Channel {
                                     } else {
                                         debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for PortForward protocol (defaulting)");
                                         determined_protocol = ActiveProtocol::PortForward;
-                                        let dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
-                                        let dest_port = protocol_settings.get("target_port").and_then(|v| v.as_u64()).map(|p| p as u16);
+                                        let mut dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
+                                        let mut dest_port = protocol_settings.get("target_port").and_then(|v| v.as_u64()).map(|p| p as u16);
+                                        
+                                        // If not found, check the guacd field
+                                        if dest_host.is_none() || dest_port.is_none() {
+                                            if let Some(guacd_obj) = protocol_settings.get("guacd").and_then(|v| v.as_object()) {
+                                                if dest_host.is_none() {
+                                                    dest_host = guacd_obj.get("guacd_host")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.trim().to_string()); // Trim whitespace
+                                                }
+                                                if dest_port.is_none() {
+                                                    dest_port = guacd_obj.get("guacd_port")
+                                                        .and_then(|v| v.as_u64())
+                                                        .map(|p| p as u16);
+                                                }
+                                                debug!(target:"channel_setup", channel_id = %channel_id, 
+                                                       "Extracted target from guacd field (default case): host={:?}, port={:?}", 
+                                                       dest_host, dest_port);
+                                            }
+                                        }
+                                        
                                         initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState {
                                             target_host: dest_host,
                                             target_port: dest_port,

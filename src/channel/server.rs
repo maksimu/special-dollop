@@ -96,7 +96,7 @@ impl Channel {
                                         }
                                     } else {
                                         // For other versions, send general failure
-                                        if let Err(e) = send_socks5_response(&mut writer, SOCKS5_FAIL, &[0, 0, 0, 0], 0).await {
+                                        if let Err(e) = send_socks5_response(&mut writer, SOCKS5_FAIL, &[0, 0, 0, 0], 0, &buffer_pool).await {
                                             error!("Channel({}): Failed to send SOCKS5 failure response: {}", channel_id, e);
                                         }
                                     }
@@ -239,13 +239,13 @@ async fn handle_socks5_connection(
     
     if version != SOCKS5_VERSION {
         error!("Channel({}): Invalid SOCKS version in request: {}", channel_id, version);
-        send_socks5_response(&mut writer, SOCKS5_FAIL, &[0, 0, 0, 0], 0).await?;
+        send_socks5_response(&mut writer, SOCKS5_FAIL, &[0, 0, 0, 0], 0, &buffer_pool).await?;
         return Err(anyhow!("Invalid SOCKS version in request"));
     }
     
     if cmd != SOCKS5_CMD_CONNECT {
         error!("Channel({}): Unsupported SOCKS command: {}", channel_id, cmd);
-        send_socks5_response(&mut writer, 0x07, &[0, 0, 0, 0], 0).await?; // Command isn't supported
+        send_socks5_response(&mut writer, 0x07, &[0, 0, 0, 0], 0, &buffer_pool).await?; // Command isn't supported
         return Err(anyhow!("Unsupported SOCKS command"));
     }
     
@@ -282,7 +282,7 @@ async fn handle_socks5_connection(
         },
         _ => {
             error!("Channel({}): Unsupported address type: {}", channel_id, addr_type);
-            send_socks5_response(&mut writer, 0x08, &[0, 0, 0, 0], 0).await?; // Address type isn't supported
+            send_socks5_response(&mut writer, 0x08, &[0, 0, 0, 0], 0, &buffer_pool).await?; // Address type isn't supported
             return Err(anyhow!("Unsupported address type"));
         }
     };
@@ -296,7 +296,9 @@ async fn handle_socks5_connection(
     
     // ===== Step 3: Send OpenConnection message to the tunnel =====
     // Build and send the OpenConnection message
-    let mut open_data = Vec::with_capacity(32);
+    // **PERFORMANCE: Use buffer pool for zero-copy**
+    let mut open_data = buffer_pool.acquire();
+    open_data.clear();
     
     // Connection number
     open_data.extend_from_slice(&conn_no.to_be_bytes());
@@ -313,6 +315,8 @@ async fn handle_socks5_connection(
     let frame = Frame::new_control_with_pool(ControlMessage::OpenConnection, &open_data, &buffer_pool);
     let encoded = frame.encode_with_pool(&buffer_pool);
     
+    buffer_pool.release(open_data);
+    
     webrtc.send(encoded).await
         .map_err(|e| anyhow!("Failed to send OpenConnection: {}", e))?;
     
@@ -328,6 +332,9 @@ async fn handle_socks5_connection(
         // Use 8KB max read size to stay under SCTP limits
         const MAX_READ_SIZE: usize = 8 * 1024;
         
+        // **BOLD WARNING: ENTERING HOT PATH - TCP→WEBRTC FORWARDING LOOP**
+        // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**
+        // **USE BUFFER POOLS AND ZERO-COPY TECHNIQUES**
         loop {
             read_buffer.clear();
             if read_buffer.capacity() < MAX_READ_SIZE {
@@ -346,7 +353,9 @@ async fn handle_socks5_connection(
             match reader.read(read_slice).await {
                 Ok(0) => {
                     // EOF
-                    debug!("Channel({}): Client connection {} closed", endpoint_name, conn_no);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!("Channel({}): Client connection {} closed", endpoint_name, conn_no);
+                    }
                     
                     // Send EOF to tunnel
                     let eof_frame = Frame::new_control_with_pool(
@@ -404,7 +413,9 @@ async fn handle_socks5_connection(
         buffer_pool_clone.release(read_buffer);
         buffer_pool_clone.release(encode_buffer);
         
-        debug!("Channel({}): Client read task for connection {} exited", endpoint_name, conn_no);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!("Channel({}): Client read task for connection {} exited", endpoint_name, conn_no);
+        }
     });
     
     // ===== Step 5: Send a deferred SOCKS5 success response =====
@@ -424,16 +435,20 @@ async fn send_socks5_response(
     rep: u8,
     addr: &[u8],
     port: u16,
+    buffer_pool: &crate::buffer_pool::BufferPool,
 ) -> Result<()> {
-    let mut response = Vec::with_capacity(10);
-    response.push(SOCKS5_VERSION);
-    response.push(rep);
-    response.push(0x00); // Reserved
-    response.push(SOCKS5_ADDR_TYPE_IPV4); // Address type
+    // **PERFORMANCE: Use buffer pool for zero-copy response**
+    let mut response = buffer_pool.acquire();
+    response.clear();
+    response.put_u8(SOCKS5_VERSION);
+    response.put_u8(rep);
+    response.put_u8(0x00); // Reserved
+    response.put_u8(SOCKS5_ADDR_TYPE_IPV4); // Address type
     response.extend_from_slice(addr);
     response.extend_from_slice(&port.to_be_bytes());
     
     writer.write_all(&response).await?;
+    buffer_pool.release(response);
     Ok(())
 }
 
@@ -478,8 +493,13 @@ async fn handle_generic_server_connection(
         const MAX_READ_SIZE: usize = 8 * 1024;
 
         // Add a print statement to see the conn_no being used
-        debug!("Server-side TCP reader task started for conn_no: {}", conn_no);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!("Server-side TCP reader task started for conn_no: {}", conn_no);
+        }
 
+        // **BOLD WARNING: ENTERING HOT PATH - TCP→WEBRTC FORWARDING LOOP**
+        // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**
+        // **USE BUFFER POOLS AND ZERO-COPY TECHNIQUES**
         loop {
             read_buffer.clear();
             if read_buffer.capacity() < MAX_READ_SIZE {
@@ -497,8 +517,10 @@ async fn handle_generic_server_connection(
             
             match reader.read(read_slice).await {
                 Ok(0) => {
-                    debug!("Server-side TCP reader received EOF for conn_no: {}", conn_no);
-                    debug!("Channel({}): Client on server port (conn_no {}) sent EOF.", channel_id_clone, conn_no);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!("Server-side TCP reader received EOF for conn_no: {}", conn_no);
+                        debug!("Channel({}): Client on server port (conn_no {}) sent EOF.", channel_id_clone, conn_no);
+                    }
                     let eof_payload = conn_no.to_be_bytes();
                     let eof_frame = Frame::new_control_with_pool(ControlMessage::SendEOF, &eof_payload, &buffer_pool_clone);
                     if let Err(e) = dc_clone.send(eof_frame.encode_with_pool(&buffer_pool_clone)).await {
@@ -512,13 +534,15 @@ async fn handle_generic_server_connection(
                         read_buffer.advance_mut(n);
                     }
                     
-                    debug!("Server-side TCP reader received {} bytes for conn_no: {}", n, conn_no);
-                
-                    // Print part of the data for debugging
-                    if n <= 100 {
-                        debug!("Data: {:?}", &read_buffer[0..n]);
-                    } else {
-                        debug!("Data (first 50 bytes): {:?}", &read_buffer[0..50]);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!("Server-side TCP reader received {} bytes for conn_no: {}", n, conn_no);
+                    
+                        // Print part of the data for debugging
+                        if n <= 100 {
+                            debug!("Data: {:?}", &read_buffer[0..n]);
+                        } else {
+                            debug!("Data (first 50 bytes): {:?}", &read_buffer[0..50]);
+                        }
                     }
                 
                     let current_payload_bytes_slice = &read_buffer[0..n];
@@ -530,8 +554,10 @@ async fn handle_generic_server_connection(
                     encode_buffer.clear();
                     let bytes_written = data_frame.encode_into(&mut encode_buffer);
                 
-                    debug!("Encoded frame with conn_no {} and {} bytes payload into {} total bytes",
-                        conn_no, n, bytes_written);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!("Encoded frame with conn_no {} and {} bytes payload into {} total bytes",
+                            conn_no, n, bytes_written);
+                    }
                 
                     // Freeze to get a Bytes instance we can send
                     let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
@@ -539,17 +565,23 @@ async fn handle_generic_server_connection(
                     // Send it directly without checking the buffer amount
                     match dc_clone.send(encoded_frame_bytes).await {
                         Ok(_) => {
-                            debug!("Successfully sent data frame for conn_no {}", conn_no);
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!("Successfully sent data frame for conn_no {}", conn_no);
+                            }
                         }
                         Err(e) => {
-                            debug!("Failed to send data frame for conn_no {}: {}", conn_no, e);
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!("Failed to send data frame for conn_no {}: {}", conn_no, e);
+                            }
                             break;
                         }
                     }
                 }
                 Ok(_) => { /* n == 0 but not EOF, should not happen with read_buf if it doesn't return Ok(0) */ }
                 Err(e) => {
-                    debug!("Error reading from client on server port (conn_no {}): {}", conn_no, e);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!("Error reading from client on server port (conn_no {}): {}", conn_no, e);
+                    }
                     error!("Channel({}): Error reading from client on server port (conn_no {}): {}", channel_id_clone, conn_no, e);
                     break; // Exit read task
                 }
@@ -558,8 +590,10 @@ async fn handle_generic_server_connection(
         buffer_pool_clone.release(read_buffer);
         buffer_pool_clone.release(encode_buffer);
         // Add a print statement to see the conn_no being used
-        debug!("Server-side TCP reader task for conn_no {} exited", conn_no);
-        debug!("Channel({}): Server-side TCP reader task for conn_no {} ({:?}) exited.", channel_id_clone, conn_no, active_protocol);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!("Server-side TCP reader task for conn_no {} exited", conn_no);
+            debug!("Channel({}): Server-side TCP reader task for conn_no {} ({:?}) exited.", channel_id_clone, conn_no, active_protocol);
+        }
     });
 
     // 4. Send the writer half and the reader_task handle to the main Channel loop via conn_tx.

@@ -97,12 +97,16 @@ impl Channel {
     }
 
     /// Process a control message received from the data channel
+    // **BOLD WARNING: HOT PATH - CALLED FOR EVERY CONTROL MESSAGE**
+    // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
     pub(crate) async fn process_control_message(
         &mut self, 
         message_type: ControlMessage, 
         data: &[u8]
     ) -> Result<()> {
-        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Processing control message: {:?}", message_type);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Processing control message: {:?}", message_type);
+        }
 
         match message_type {
             ControlMessage::CloseConnection => {
@@ -146,7 +150,9 @@ impl Channel {
             CloseConnectionReason::Normal
         };
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Closing connection {} (reason: {:?})", target_connection_no, reason);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Closing connection {} (reason: {:?})", target_connection_no, reason);
+        }
 
         // Special case for connection 0 (control connection)
         if target_connection_no == 0 {
@@ -167,7 +173,9 @@ impl Channel {
         let mut cursor = std::io::Cursor::new(data);
         let target_connection_no = cursor.get_u32();
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = target_connection_no, payload_len = cursor.remaining(), server_mode = self.server_mode, active_protocol = ?self.active_protocol, "Endpoint Received OpenConnection request");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = target_connection_no, payload_len = cursor.remaining(), server_mode = self.server_mode, active_protocol = ?self.active_protocol, "Endpoint Received OpenConnection request");
+        }
 
         // Prepare data for the detailed trace log BEFORE the trace! macro
         let guacd_host_clone = self.guacd_host.clone();
@@ -225,10 +233,16 @@ impl Channel {
                 let pos_before_socks_parse = cursor.position();
                 let host_len = cursor.get_u32() as usize;
                 if cursor.remaining() >= host_len + 2 { 
-                    let mut host_bytes = vec![0u8; host_len];
-                    cursor.copy_to_slice(&mut host_bytes);
-                    let parsed_host = String::from_utf8(host_bytes)
-                        .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?;
+                    // **PERFORMANCE: Use buffer pool for host bytes**
+                    let mut host_buffer = self.buffer_pool.acquire();
+                    host_buffer.clear();
+                    host_buffer.resize(host_len, 0);
+                    cursor.copy_to_slice(&mut host_buffer[..]);
+                    let parsed_host = std::str::from_utf8(&host_buffer[..host_len])
+                        .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?
+                        .to_string();
+                    self.buffer_pool.release(host_buffer);
+                    
                     let parsed_port = cursor.get_u16();
 
                     if let Some(ref checker) = self.network_checker {
@@ -265,23 +279,25 @@ impl Channel {
                     let connect_as_declared_len = cursor.get_u32() as usize;
 
                     if cursor.remaining() >= (PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len) {
-                        let mut client_public_key = vec![0u8; PUBLIC_KEY_LENGTH];
-                        cursor.copy_to_slice(&mut client_public_key);
-
-                        let mut client_nonce = vec![0u8; NONCE_LENGTH];
-                        cursor.copy_to_slice(&mut client_nonce);
-
-                        let mut encrypted_connect_as_data = vec![0u8; connect_as_declared_len];
-                        cursor.copy_to_slice(&mut encrypted_connect_as_data);
+                        // **PERFORMANCE: Use buffer pool for crypto buffers**
+                        let mut crypto_buffer = self.buffer_pool.acquire();
+                        crypto_buffer.clear();
+                        crypto_buffer.resize(PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len, 0);
+                        
+                        cursor.copy_to_slice(&mut crypto_buffer[..PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len]);
+                        
+                        let client_public_key = &crypto_buffer[..PUBLIC_KEY_LENGTH];
+                        let client_nonce = &crypto_buffer[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH + NONCE_LENGTH];
+                        let encrypted_connect_as_data = &crypto_buffer[PUBLIC_KEY_LENGTH + NONCE_LENGTH..];
 
                         debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Extracted Guacd 'connect_as' fields for conn_no {}. Encrypted payload length: {}.", target_connection_no, connect_as_declared_len);
                         // Using self.connect_as_settings directly
                         if let Some(private_key_hex) = &self.connect_as_settings.gateway_private_key {
-                            match decrypt_connect_as_payload(
+                            let result = match decrypt_connect_as_payload(
                                 private_key_hex,
-                                &client_public_key,
-                                &client_nonce,
-                                &encrypted_connect_as_data,
+                                client_public_key,
+                                client_nonce,
+                                encrypted_connect_as_data,
                             ) {
                                 Ok(decrypted_payload) => {
                                     info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully decrypted 'connect_as' payload for conn_no {}: {:?}", target_connection_no, decrypted_payload);
@@ -339,8 +355,11 @@ impl Channel {
                                     error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to decrypt/process 'connect_as' payload for conn_no {}: {}. Check key configuration and payload structure.", target_connection_no, e);
                                     self.close_backend_and_notify(target_connection_no, CloseConnectionReason::DecryptionFailed, "Connect As decryption/processing failed").await
                                 }
-                            }
+                            };
+                            self.buffer_pool.release(crypto_buffer);
+                            result
                         } else {
+                            self.buffer_pool.release(crypto_buffer);
                             error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Gateway private key for 'connect_as' not configured (self.connect_as_settings). Cannot decrypt payload for conn_no {}.", target_connection_no);
                             self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConfigurationError, "Connect As private key missing").await
                         }
@@ -453,7 +472,9 @@ impl Channel {
     async fn handle_ping(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
             // Basic ping without connection info
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic Ping request");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic Ping request");
+            }
             self.send_control_message(
                 ControlMessage::Pong,
                 &[0, 0, 0, 0] // connection 0
@@ -464,27 +485,37 @@ impl Channel {
         // Extract connection number
         let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         
-        // Check if the connection exists
-        if !self.conns.lock().await.contains_key(&conn_no) {
-            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for Ping", conn_no);
-            return Ok(());
+        // Connection 0 is a special control connection that doesn't need to exist in the conns map
+        if conn_no != 0 {
+            // Check if the non-control connection exists
+            if !self.conns.lock().await.contains_key(&conn_no) {
+                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for Ping", conn_no);
+                return Ok(());
+            }
         }
         
         // Build response - include connection number
-        let mut response = Vec::with_capacity(4);
+        // **PERFORMANCE: Use buffer pool instead of Vec allocation**
+        let mut response = self.buffer_pool.acquire();
+        response.clear();
         response.extend_from_slice(&conn_no.to_be_bytes());
         
         // Handle timing information if present
         if data.len() > CONN_NO_LEN {
             // TODO: transfer_latency tracking implement here. 
             response.extend_from_slice(&data[CONN_NO_LEN..]);
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request with timing data for {}", conn_no);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request with timing data for {}", conn_no);
+            }
         } else {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request for {}", conn_no);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request for {}", conn_no);
+            }
         }
         
-        // Send response
+        // Send response - using buffer pool data
         self.send_control_message(ControlMessage::Pong, &response).await?;
+        self.buffer_pool.release(response);
         
         Ok(())
     }
@@ -492,7 +523,9 @@ impl Channel {
     /// Handle a Pong control message
     async fn handle_pong(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic pong");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic pong");
+            }
             self.ping_attempt = 0;
             return Ok(());
         }
@@ -507,9 +540,13 @@ impl Channel {
             conn.stats.message_counter = 0;
             
             if conn_no == 0 {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong");
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong");
+                }
             } else {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
+                }
             }
             
             // Handle round-trip latency calculation if ping time was set
@@ -517,6 +554,7 @@ impl Channel {
                 let latency = now_ms().saturating_sub(ping_time);
                 
                 // Add to a round-trip latency collection
+                // **PERFORMANCE WARNING: Lock acquisition for round_trip_latency**
                 {
                     let mut rtl_guard = self.round_trip_latency.lock().await;
                     rtl_guard.push(latency);
@@ -526,7 +564,9 @@ impl Channel {
                     }
                 }
                 
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Round trip latency: {} ms", latency);
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Round trip latency: {} ms", latency);
+                }
                 
                 // Reset ping time
                 conn.stats.ping_time = None;
@@ -535,7 +575,9 @@ impl Channel {
                 // In Python, there's additional transfer latency tracking that we'd implement here
             }
         } else {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong for unknown connection {}", conn_no);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong for unknown connection {}", conn_no);
+            }
         }
         
         // Reset ping attempt counter
@@ -556,13 +598,17 @@ impl Channel {
         // Check if the connection exists and send EOF
         let mut conns_guard = self.conns.lock().await;
         if let Some(conn) = conns_guard.get_mut(&conn_no) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending EOF to backend for connection {}", conn_no);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending EOF to backend for connection {}", conn_no);
+            }
             
             let backend = conn.backend.as_mut(); // Get a mutable reference to the Box<dyn BackendConnection>
             
             match backend.shutdown().await { // Call shutdown on the trait object
                 Ok(_) => {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully sent shutdown to backend for EOF on conn {}", conn_no);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully sent shutdown to backend for EOF on conn {}", conn_no);
+                    }
                 }
                 Err(e) => {
                     error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Error shutting down backend for EOF on conn {}: {}", conn_no, e);
@@ -581,7 +627,9 @@ impl Channel {
         // This is called when we receive a ConnectionOpened control message from WebRTC
         // In server_mode, this completes the connection setup
         if !self.server_mode {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ConnectionOpened in client mode (ignoring)");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ConnectionOpened in client mode (ignoring)");
+            }
             return Ok(());
         }
 
@@ -590,7 +638,9 @@ impl Channel {
         }
 
         let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Starting reader for connection {}", connection_no);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Starting reader for connection {}", connection_no);
+        }
         
         // Get the connection
         let mut conns_guard = self.conns.lock().await;
@@ -604,16 +654,22 @@ impl Channel {
         
         // If it's a SOCKS5 connection, send a success response to the client
         if self.active_protocol == super::types::ActiveProtocol::Socks5 {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
+            }
             
             let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             
             let backend = connection.backend.as_mut();
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
+            }
             
             match backend.write_all(&response).await {
                 Ok(_) => {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response sent for connection {}", connection_no);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response sent for connection {}", connection_no);
+                    }
                     if let Err(e) = backend.flush().await {
                         error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to flush SOCKS5 writer: {}", e);
                     }
@@ -706,6 +762,9 @@ impl Channel {
     // }
 
     /// Update connection statistics based on received data
+    // **BOLD WARNING: HOT PATH - CALLED FOR EVERY DATA FRAME**
+    // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
+    // **WARNING: MULTIPLE LOCK ACQUISITIONS - CONSIDER LOCK-FREE STATISTICS**
     async fn update_stats(&mut self, connection_no: u32, bytes: usize, timestamp: u64) {
         // Get current time
         let now = now_ms();
@@ -714,6 +773,7 @@ impl Channel {
         let receive_latency = now.saturating_sub(timestamp);
         
         // Update connection stats
+        // **PERFORMANCE WARNING: Lock acquisition in a hot path**
         let mut conns_guard = self.conns.lock().await;
         if let Some(conn) = conns_guard.get_mut(&connection_no) {
             // Update bytes received
@@ -727,7 +787,7 @@ impl Channel {
             conn.stats.receive_latency_count += 1;
             
             // Log stats periodically (every 1000 messages)
-            if conn.stats.message_counter % 1000 == 0 {
+            if conn.stats.message_counter % 1000 == 0 && tracing::enabled!(tracing::Level::DEBUG) {
                 let avg_latency = if conn.stats.receive_latency_count > 0 {
                     conn.stats.receive_latency_sum / conn.stats.receive_latency_count
                 } else {
@@ -736,7 +796,7 @@ impl Channel {
                 
                 debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Stats for connection {}: {} bytes received, avg latency {} ms", connection_no, conn.stats.receive_size, avg_latency);
             }
-        } else if connection_no != 0 {
+        } else if connection_no != 0 && tracing::enabled!(tracing::Level::DEBUG) {
             // Only log for non-control connections
             debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint No connection found for stats update: {}", connection_no);
         }

@@ -15,7 +15,7 @@ use crate::buffer_pool::BufferPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use crate::channel::core::ProtocolLogicState;
 use crate::channel::connect_as::decrypt_connect_as_payload;
 
@@ -107,7 +107,10 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                 let mut temp_control_payload_buf = buffer_pool.acquire(); // Use task's buffer_pool
                 temp_control_payload_buf.clear();
                 temp_control_payload_buf.extend_from_slice(&close_payload);
-                let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut temp_control_payload_buf);
+                let close_frame = Frame::new_control_with_buffer(
+                    ControlMessage::CloseConnection,
+                    &mut temp_control_payload_buf
+                );
                 buffer_pool.release(temp_control_payload_buf);
                 let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use task's dc and buffer_pool
                 return Err(e);
@@ -118,7 +121,10 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                 let mut temp_control_payload_buf = buffer_pool.acquire(); // Use task's buffer_pool
                 temp_control_payload_buf.clear();
                 temp_control_payload_buf.extend_from_slice(&close_payload);
-                let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut temp_control_payload_buf);
+                let close_frame = Frame::new_control_with_buffer(
+                    ControlMessage::CloseConnection,
+                    &mut temp_control_payload_buf
+                );
                 buffer_pool.release(temp_control_payload_buf);
                 let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use task's dc and buffer_pool
                 return Err(anyhow::anyhow!("Guacd handshake timed out"));
@@ -143,6 +149,55 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             channel_id_for_task, conn_no, active_protocol, is_channel_server_mode
         );
         
+        // Clone Arcs for the helper function
+        let dc_clone_for_helper = dc.clone(); // dc is Arc<WebRTCDataChannel>
+        let pending_messages_clone_for_helper = pending_messages.clone(); // pending_messages is Arc<Mutex<...>>
+
+        // Define an async helper function for sending or queueing a frame
+        // It returns Ok(()) if the operation was successful (sent or queued),
+        // and Err(()) if a direct send failed, indicating the connection should be closed.
+        async fn try_send_or_queue_frame(
+            frame_to_send: bytes::Bytes,
+            conn_no_local: u32,
+            data_channel: &crate::webrtc_data_channel::WebRTCDataChannel,
+            pending_messages_local: &Arc<Mutex<HashMap<u32, std::collections::VecDeque<bytes::Bytes>>>>,
+            buffer_low_threshold_local: u64,
+            channel_id_local: &str,
+            active_protocol_local: ActiveProtocol,
+            context_msg: &str
+        ) -> Result<(), ()> {
+            let buffered_amount = data_channel.buffered_amount().await;
+            if buffered_amount >= buffer_low_threshold_local {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "Endpoint {}: Buffer amount high ({} bytes), QUEUEING {} for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
+                        channel_id_local, buffered_amount, context_msg, conn_no_local, channel_id_local, active_protocol_local, frame_to_send.len()
+                    );
+                }
+                let mut pending_guard = pending_messages_local.lock().await;
+                if let Some(queue) = pending_guard.get_mut(&conn_no_local) {
+                    queue.push_back(frame_to_send);
+                }
+                Ok(())
+            } else {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "Endpoint {}: Buffer amount low ({} bytes), SENDING DIRECTLY {} for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
+                        channel_id_local, buffered_amount, context_msg, conn_no_local, channel_id_local, active_protocol_local, frame_to_send.len()
+                    );
+                }
+                if let Err(e) = data_channel.send(frame_to_send).await {
+                    error!(
+                        "Endpoint {}: Failed to send {} for connection {}: {}",
+                        channel_id_local, context_msg, conn_no_local, e
+                    );
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        
         // Original task logic starts here
         trace!( 
             "Channel({}): conn_no {}: setup_outbound_task ORIGINAL LOGIC START.",
@@ -156,59 +211,130 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         let mut main_read_buffer = buffer_pool.acquire(); 
         let mut encode_buffer = buffer_pool.acquire(); 
         const MAX_READ_SIZE: usize = 8 * 1024; 
+        const GUACD_BATCH_SIZE: usize = 16 * 1024; // Batch up to 16KB of Guacd instructions
+        const LARGE_INSTRUCTION_THRESHOLD: usize = MAX_READ_SIZE; // If a single instruction is this big, send it directly
 
-        // Hoist temp_buf_for_read out of the loop to avoid re-allocation
-        let mut temp_buf_for_read = vec![0u8; MAX_READ_SIZE];
+        // **BOLD WARNING: HOT PATH - NO STRING/OBJECT ALLOCATIONS ALLOWED IN MAIN LOOP**
+        // **USE BUFFER POOL FOR ALL ALLOCATIONS**
+        let mut temp_read_buffer = buffer_pool.acquire();
+        if active_protocol != ActiveProtocol::Guacd {
+            temp_read_buffer.clear();
+            if temp_read_buffer.capacity() < MAX_READ_SIZE {
+                temp_read_buffer.reserve(MAX_READ_SIZE - temp_read_buffer.capacity());
+            }
+        }
+        
+        // Batch buffer for Guacd instructions
+        let mut guacd_batch_buffer = if active_protocol == ActiveProtocol::Guacd {
+            Some(buffer_pool.acquire())
+        } else {
+            None
+        };
 
         trace!( 
             "Channel({}): conn_no {}: setup_outbound_task BEFORE main loop.",
             channel_id_for_task, conn_no
         );
+        
+        // **BOLD WARNING: ENTERING HOT PATH - BACKEND→WEBRTC MAIN LOOP**
+        // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**
+        // **USE BORROWED DATA, BUFFER POOLS, AND ZERO-COPY TECHNIQUES**
         loop { 
             loop_iterations += 1;
-            trace!( 
-                "Channel({}): conn_no {}: setup_outbound_task loop iteration {}, main_read_buffer.len(): {}",
-                channel_id_for_task, conn_no, loop_iterations, main_read_buffer.len()
-            );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                trace!( 
+                    "Channel({}): conn_no {}: setup_outbound_task loop iteration {}, main_read_buffer.len(): {}",
+                    channel_id_for_task, conn_no, loop_iterations, main_read_buffer.len()
+                );
+            }
 
             if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE / 2 { 
                  main_read_buffer.reserve(MAX_READ_SIZE);
             }
             
-            trace!( 
-                "Channel({}): conn_no {}: setup_outbound_task PRE-READ from backend",
-                channel_id_for_task, conn_no
-            );
-            match reader.read(&mut temp_buf_for_read[..]).await {
-                Ok(n_read) => {
-                    trace!( 
-                        "Channel({}): conn_no {}: setup_outbound_task POST-READ {} bytes from backend. EOF_sent: {}",
-                        channel_id_for_task, conn_no, n_read, eof_sent
-                    );
+            // Ensure temp_read_buffer has enough capacity if it's going to be used
+            // For Guacd, we read directly into main_read_buffer, so temp_read_buffer is not used for the read.
+            if active_protocol != ActiveProtocol::Guacd {
+                temp_read_buffer.clear();
+                if temp_read_buffer.capacity() < MAX_READ_SIZE {
+                    temp_read_buffer.reserve(MAX_READ_SIZE - temp_read_buffer.capacity());
+                }
+            }
+            
+            if tracing::enabled!(tracing::Level::TRACE) {
+                trace!( 
+                    "Channel({}): conn_no {}: setup_outbound_task PRE-READ from backend (active_protocol: {:?})",
+                    channel_id_for_task, conn_no, active_protocol
+                );
+            }
+            
+            // **ZERO-COPY READ: Use buffer pool buffer directly**
+            // For Guacd, read directly into main_read_buffer to append.
+            // For others, use temp_read_buffer for a single pass.
+            let n_read = if active_protocol == ActiveProtocol::Guacd {
+                // Ensure main_read_buffer has enough capacity *before* the read_buf call
+                // This is slightly different from its previous position but more direct for this path.
+                if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE {
+                    main_read_buffer.reserve(MAX_READ_SIZE); 
+                }
+                match reader.read_buf(&mut main_read_buffer).await { // Read appends to main_read_buffer
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Endpoint {}: Read error on connection {} (Guacd path): {}", channel_id_for_task, conn_no, e);
+                        break;
+                    }
+                }
+            } else {
+                match reader.read_buf(&mut temp_read_buffer).await { // read_buf clears and fills temp_read_buffer
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Endpoint {}: Read error on connection {} (Non-Guacd path): {}", channel_id_for_task, conn_no, e);
+                        break;
+                    }
+                }
+            };
+            
+            match n_read {
+                0 => {
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        trace!( 
+                            "Channel({}): conn_no {}: setup_outbound_task POST-READ 0 bytes (EOF). EOF_sent: {}",
+                            channel_id_for_task, conn_no, eof_sent
+                        );
+                    }
 
-                    if n_read == 0 { // EOF
-                        if !eof_sent {
-                            let eof_frame = Frame::new_control_with_pool(
-                                ControlMessage::SendEOF,
-                                &conn_no.to_be_bytes(),
-                                &buffer_pool
-                            );
-                            let encoded = eof_frame.encode_with_pool(&buffer_pool);
-                            let _ = dc.send(encoded).await;
-                            eof_sent = true;
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        } else {
-                            break;
-                        }
-                        continue; 
+                    if !eof_sent {
+                        let eof_frame = Frame::new_control_with_pool(
+                            ControlMessage::SendEOF,
+                            &conn_no.to_be_bytes(),
+                            &buffer_pool
+                        );
+                        let encoded = eof_frame.encode_with_pool(&buffer_pool);
+                        let _ = dc.send(encoded).await;
+                        eof_sent = true;
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    } else {
+                        break;
+                    }
+                    continue; 
+                }
+                _ => {
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        trace!( 
+                            "Channel({}): conn_no {}: setup_outbound_task POST-READ {} bytes from backend. EOF_sent: {}",
+                            channel_id_for_task, conn_no, n_read, eof_sent
+                        );
                     }
                     
-                    main_read_buffer.put_slice(&temp_buf_for_read[..n_read]);
                     eof_sent = false;
-                    let mut frames_to_send: Vec<Bytes> = Vec::new();
                     let mut close_conn_and_break = false;
 
                     if active_protocol == ActiveProtocol::Guacd {
+                        // **BOLD WARNING: GUACD PARSING HOT PATH**
+                        // **DO NOT CREATE STRINGS OR ALLOCATE OBJECTS UNNECESSARILY**
+                        // **USE is_error_opcode FLAG TO AVOID PARSING ERROR INSTRUCTIONS**
+                    
+                        
                         let mut consumed_offset = 0;
                         loop {
                             if consumed_offset >= main_read_buffer.len() {
@@ -216,29 +342,40 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                             }
                             let current_slice = &main_read_buffer[consumed_offset..main_read_buffer.len()];
                             
-                            match GuacdParser::peek_instruction(current_slice) {
-                                Ok(peeked_instr) => {
-                                    if peeked_instr.opcode == "error" {
-                                        let end_index = peeked_instr.total_length_in_buffer.saturating_sub(1);
-                                        // Ensure slice is valid before attempting to parse
-                                        if end_index < current_slice.len() && peeked_instr.total_length_in_buffer > 0 {
-                                            match GuacdParser::parse_instruction_content(&current_slice[..end_index]) {
-                                                Ok(parsed_error_instr) => {
-                                                    error!(
-                                                        "Channel({}): Conn {}: Guacd sent error: Opcode='{}', Args={:?}. Closing connection.",
-                                                        channel_id_for_task, conn_no, parsed_error_instr.opcode, parsed_error_instr.args
-                                                    );
-                                                },
-                                                Err(parse_err) => {
-                                                    error!(
-                                                        "Channel({}): Conn {}: Failed to parse Guacd 'error' instruction content after peeking: {}. Raw slice (approx): {:?}. Closing connection.",
-                                                        channel_id_for_task, conn_no, parse_err, &current_slice[..std::cmp::min(current_slice.len(), 100)] 
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                             error!("Channel({}): Conn {}: Slice bounds error for Guacd error parsing. Peeked: {:?}, SliceLen: {}", channel_id_for_task, conn_no, peeked_instr, current_slice.len());
+                            #[cfg(feature = "profiling")]
+                            let parse_start = std::time::Instant::now();
+                            
+                            // **ULTRA-FAST PATH: Only validate format and check for error**
+                            match GuacdParser::validate_and_check_error(current_slice) {
+                                Ok((instruction_len, is_error)) => {
+                                    #[cfg(feature = "profiling")]
+                                    {
+                                        let parse_duration = parse_start.elapsed();
+                                        if parse_duration.as_micros() > 100 {
+                                            warn!(
+                                                "Channel({}): Slow Guacd validate: {}μs",
+                                                channel_id_for_task, parse_duration.as_micros()
+                                            );
                                         }
+                                    }
+                                    
+                                    if is_error {
+                                        // Only parse the full instruction if it's an error
+                                        match GuacdParser::peek_instruction(current_slice) {
+                                            Ok(error_instr) => {
+                                                error!(
+                                                    "Channel({}): Conn {}: Guacd sent error opcode. Args: {:?}. Closing connection.",
+                                                    channel_id_for_task, conn_no, error_instr.args
+                                                );
+                                            }
+                                            Err(_) => {
+                                                error!(
+                                                    "Channel({}): Conn {}: Guacd sent error opcode but failed to parse args. Closing connection.",
+                                                    channel_id_for_task, conn_no
+                                                );
+                                            }
+                                        }
+                                        
                                         // Common error handling for Guacd "error" opcode
                                         let close_payload_bytes = conn_no.to_be_bytes();
                                         let mut temp_buf_for_control = buffer_pool.acquire();
@@ -259,26 +396,51 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                                         break; 
                                     }
 
-                                    encode_buffer.clear();
-                                    // Ensure slice for frame_content_slice is valid
-                                    let frame_content_slice = if current_slice.len() >= peeked_instr.total_length_in_buffer && peeked_instr.total_length_in_buffer > 0 {
-                                        &current_slice[..peeked_instr.total_length_in_buffer]
-                                    } else {
-                                        error!("Channel({}): conn_no {}: Slice bounds error for Guacd data frame. Peeked: {:?}, SliceLen: {}", channel_id_for_task, conn_no, peeked_instr, current_slice.len());
-                                        close_conn_and_break = true;
-                                        &[] // Placeholder, won't be used if loop breaks
-                                    };
-                                    if close_conn_and_break { break; }
+                                    // Batch Guacd instructions for efficiency
+                                    if let Some(ref mut batch_buffer) = guacd_batch_buffer {
+                                        let instruction_data = &current_slice[..instruction_len];
+                                        
+                                        if instruction_data.len() >= LARGE_INSTRUCTION_THRESHOLD {
+                                            // If large, first flush any existing batch
+                                            if !batch_buffer.is_empty() {
+                                                encode_buffer.clear();
+                                                let bytes_written = Frame::encode_data_frame_from_slice(
+                                                    &mut encode_buffer, conn_no, &batch_buffer[..]);
+                                                let batch_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+                                                if try_send_or_queue_frame(batch_frame_bytes, conn_no, &dc_clone_for_helper, &pending_messages_clone_for_helper, buffer_low_threshold, &channel_id_for_task, active_protocol, "(pre-large) batch").await.is_err() {
+                                                    close_conn_and_break = true;
+                                                }
+                                                batch_buffer.clear();
+                                                if close_conn_and_break { break; }
+                                            }
 
+                                            // Now send the large instruction directly
+                                            encode_buffer.clear();
+                                            let bytes_written = Frame::encode_data_frame_from_slice(
+                                                &mut encode_buffer, conn_no, instruction_data);
+                                            let large_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+                                            if try_send_or_queue_frame(large_frame_bytes, conn_no, &dc_clone_for_helper, &pending_messages_clone_for_helper, buffer_low_threshold, &channel_id_for_task, active_protocol, "large instruction").await.is_err() {
+                                                close_conn_and_break = true;
+                                            }
+                                            // No need to add to batch_buffer if sent directly
 
-                                    let bytes_written = Frame::encode_data_frame_from_slice(
-                                        &mut encode_buffer,
-                                        conn_no,
-                                        frame_content_slice, 
-                                    );
-                                    frames_to_send.push(encode_buffer.split_to(bytes_written).freeze());
-                                    
-                                    consumed_offset += peeked_instr.total_length_in_buffer;
+                                        } else { // Instruction is not large, proceed with normal batching
+                                            if batch_buffer.len() + instruction_data.len() > GUACD_BATCH_SIZE && !batch_buffer.is_empty() {
+                                                encode_buffer.clear();
+                                                let bytes_written = Frame::encode_data_frame_from_slice(
+                                                    &mut encode_buffer, conn_no, &batch_buffer[..]);
+                                                let batch_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+                                                if try_send_or_queue_frame(batch_frame_bytes, conn_no, &dc_clone_for_helper, &pending_messages_clone_for_helper, buffer_low_threshold, &channel_id_for_task, active_protocol, "batch").await.is_err() {
+                                                    close_conn_and_break = true;
+                                                }
+                                                batch_buffer.clear();
+                                                if close_conn_and_break { break; }
+                                            }
+                                            batch_buffer.extend_from_slice(instruction_data);
+                                        }
+                                        if close_conn_and_break { break; }
+                                    }
+                                    consumed_offset += instruction_len;
                                 }
                                 Err(PeekError::Incomplete) => {
                                     break; 
@@ -309,110 +471,101 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                             }
                         } // End of inner Guacd processing loop
                         
+                        // Flush any remaining batched Guacd data
+                        if let Some(ref mut batch_buffer) = guacd_batch_buffer {
+                            if !batch_buffer.is_empty() && !close_conn_and_break {
+                                encode_buffer.clear();
+                                let bytes_written = Frame::encode_data_frame_from_slice(
+                                    &mut encode_buffer,
+                                    conn_no,
+                                    &batch_buffer[..],
+                                );
+                                let final_batch_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+                                if try_send_or_queue_frame(final_batch_frame_bytes, conn_no, &dc_clone_for_helper, &pending_messages_clone_for_helper, buffer_low_threshold, &channel_id_for_task, active_protocol, "final batch").await.is_err() {
+                                    close_conn_and_break = true; // This will be checked after the Guacd block
+                                }
+                                batch_buffer.clear();
+                            }
+                        }
+                        
                         if close_conn_and_break { // If Guacd processing decided to close
                             main_read_buffer.clear(); 
-                            // current_buffer_len = 0; // Removed
                         } else if consumed_offset > 0 {
                             main_read_buffer.advance(consumed_offset);
-                            // current_buffer_len = main_read_buffer.len(); // Removed, direct use of main_read_buffer.len() is sufficient
                         }
 
                     } else { // Not Guacd protocol (e.g., PortForward, SOCKS5)
-                        if main_read_buffer.is_empty() { // Use is_empty() or check main_read_buffer.len() == 0
-                            trace!(
-                                "Channel({}): conn_no {}: PortForward/SOCKS5 - No data in main_read_buffer to process. Skipping encode.",
-                                channel_id_for_task, conn_no
-                            );
-                            continue; 
-                        }
-
-                        trace!(
-                            "Channel({}): conn_no {}: Entered PortForward/SOCKS5 data handling. main_read_buffer.len(): {}",
-                            channel_id_for_task, conn_no, main_read_buffer.len() // Use main_read_buffer.len()
-                        );
+                        // **BOLD WARNING: ZERO-COPY HOT PATH FOR PORT FORWARDING**
+                        // **ENCODE DIRECTLY FROM READ BUFFER - NO COPIES**
+                        // **SEND DIRECTLY - NO INTERMEDIATE VECTOR**
                         encode_buffer.clear();
-                        trace!(
-                            "Channel({}): conn_no {}: PortForward/SOCKS5 PRE-ENCODE. Buffer to slice: 0..{}",
-                            channel_id_for_task, conn_no, main_read_buffer.len() // Use main_read_buffer.len()
-                        );
+                        
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            trace!(
+                                "Channel({}): conn_no {}: PortForward/SOCKS5 zero-copy encode. Read {} bytes into temp_read_buffer",
+                                channel_id_for_task, conn_no, n_read
+                            );
+                        }
+                        
+                        // Encode directly from temp_read_buffer (which was filled by read_buf)
                         let bytes_written = Frame::encode_data_frame_from_slice(
                             &mut encode_buffer,
                             conn_no,
-                            &main_read_buffer[..main_read_buffer.len()], // Use main_read_buffer.len()
+                            &temp_read_buffer[..],
                         );
-                        trace!(
-                            "Channel({}): conn_no {}: PortForward/SOCKS5 POST-ENCODE. Bytes written to encode_buffer: {}",
-                            channel_id_for_task, conn_no, bytes_written
-                        );
-                        frames_to_send.push(encode_buffer.split_to(bytes_written).freeze());
-                        main_read_buffer.clear(); 
-                        // current_buffer_len = 0;   // Removed
-                    }
-
-                    trace!(
-                        "Channel({}): conn_no {}: PRE-SEND LOOP. Number of frames to send: {}",
-                        channel_id_for_task, conn_no, frames_to_send.len()
-                    );
-                    for encoded_frame_bytes in frames_to_send {
-                        if encoded_frame_bytes.is_empty() { 
+                        
+                        let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+                        
+                        if tracing::enabled!(tracing::Level::TRACE) {
                             trace!(
-                                "Channel({}): conn_no {}: Skipping empty frame.",
-                                channel_id_for_task, conn_no
+                                "Channel({}): conn_no {}: PortForward/SOCKS5 POST-ENCODE. Bytes written: {}",
+                                channel_id_for_task, conn_no, bytes_written
                             );
-                            continue; 
                         }
-                        trace!(
-                            "Channel({}): conn_no {}: Processing frame of size {}. PRE-GET dc.buffered_amount()",
-                            channel_id_for_task, conn_no, encoded_frame_bytes.len()
-                        );
+                        
+                        // **PERFORMANCE: Send directly without intermediate storage**
                         let buffered_amount = dc.buffered_amount().await;
-                        trace!(
-                            "Channel({}): conn_no {}: dc.buffered_amount() = {}. Threshold = {}",
-                            channel_id_for_task, conn_no, buffered_amount, buffer_low_threshold
-                        );
-
                         if buffered_amount >= buffer_low_threshold {
-                            debug!( 
-                                "Endpoint {}: Buffer amount high ({} bytes), QUEUEING message for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
-                                channel_id_for_task, buffered_amount, conn_no, channel_id_for_task, active_protocol, encoded_frame_bytes.len()
-                            );
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!( 
+                                    "Endpoint {}: Buffer amount high ({} bytes), QUEUEING message for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
+                                    channel_id_for_task, buffered_amount, conn_no, channel_id_for_task, active_protocol, encoded_frame_bytes.len()
+                                );
+                            }
                             let mut pending_guard = pending_messages.lock().await;
                             if let Some(queue) = pending_guard.get_mut(&conn_no) {
                                 queue.push_back(encoded_frame_bytes);
-                                if queue.len() % 100 == 0 {
-                                    debug!(
-                                        "Endpoint {}: Pending queue for connection {} has {} messages",
-                                        channel_id_for_task, conn_no, queue.len()
-                                    );
-                                }
                             }
                         } else {
-                            debug!( 
-                                "Endpoint {}: Buffer amount low ({} bytes), SENDING DIRECTLY message for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
-                                channel_id_for_task, buffered_amount, conn_no, channel_id_for_task, active_protocol, encoded_frame_bytes.len()
-                            );
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!( 
+                                    "Endpoint {}: Buffer amount low ({} bytes), SENDING DIRECTLY message for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
+                                    channel_id_for_task, buffered_amount, conn_no, channel_id_for_task, active_protocol, encoded_frame_bytes.len()
+                                );
+                            }
                             if let Err(e) = dc.send(encoded_frame_bytes).await {
                                 error!(
                                     "Endpoint {}: Failed to send data for connection {}: {}",
                                     channel_id_for_task, conn_no, e
                                 );
-                                close_conn_and_break = true; 
-                                break;
+                                close_conn_and_break = true;
                             }
                         }
                     }
+                    
                     if close_conn_and_break { break; }
-                }
-                
-                Err(e) => { 
-                    error!("Endpoint {}: Read error on connection {}: {}", channel_id_for_task, conn_no, e);
-                    break;
                 }
             }
         }
         debug!("Endpoint {}: Backend→WebRTC task for connection {} exited", channel_id_for_task, conn_no);
         buffer_pool.release(main_read_buffer);
         buffer_pool.release(encode_buffer);
+        buffer_pool.release(temp_read_buffer);
+        
+        // Release the batch buffer if it was used
+        if let Some(batch_buffer) = guacd_batch_buffer {
+            buffer_pool.release(batch_buffer);
+        }
         
         let mut pending_guard = pending_messages.lock().await;
         pending_guard.remove(&conn_no);
@@ -470,62 +623,80 @@ where
         SHelper: AsyncRead + Unpin + Send + ?Sized, 
     {
         loop {
-            match GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]) {
-                Ok(peeked_instr) => {
-                    let instruction_total_len = peeked_instr.total_length_in_buffer;
-                    if instruction_total_len == 0 || instruction_total_len > *current_buffer_len { 
-                        error!(
-                            target: "guac_protocol", channel_id=%channel_id, conn_no,
-                            "Invalid instruction length peeked ({}) vs buffer len ({}). Opcode: '{}'. Buffer (approx): {:?}",
-                            instruction_total_len, *current_buffer_len, peeked_instr.opcode, &handshake_buffer[..std::cmp::min(*current_buffer_len, 100)]
-                        );
-                        return Err(anyhow::anyhow!("Peeked instruction length is invalid or exceeds buffer."));
+            // Process peek result and extract what we need
+            let process_result = {
+                let peek_result = GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]);
+                
+                match peek_result {
+                    Ok(peeked_instr) => {
+                        let instruction_total_len = peeked_instr.total_length_in_buffer;
+                        if instruction_total_len == 0 || instruction_total_len > *current_buffer_len { 
+                            error!(
+                                target: "guac_protocol", channel_id=%channel_id, conn_no,
+                                "Invalid instruction length peeked ({}) vs buffer len ({}). Opcode: '{}'. Buffer (approx): {:?}",
+                                instruction_total_len, *current_buffer_len, peeked_instr.opcode, &handshake_buffer[..std::cmp::min(*current_buffer_len, 100)]
+                            );
+                            return Err(anyhow::anyhow!("Peeked instruction length is invalid or exceeds buffer."));
+                        }
+                        let content_slice = &handshake_buffer[..instruction_total_len - 1]; 
+                        
+                        let instruction = GuacdParser::parse_instruction_content(content_slice).map_err(|e| 
+                            anyhow::anyhow!("Handshake: Conn {}: Failed to parse peeked Guacd instruction (opcode: '{}'): {}. Content: {:?}", conn_no, peeked_instr.opcode, e, content_slice)
+                        )?;
+                        
+                        // Extract what we need from peeked_instr before it goes out of scope
+                        let expected_opcode_check = peeked_instr.opcode == expected_opcode;
+                        
+                        // Return the instruction and advance amount
+                        Some((instruction, instruction_total_len, expected_opcode_check))
                     }
-                    let content_slice = &handshake_buffer[..instruction_total_len - 1]; 
-                    
-                    let instruction = GuacdParser::parse_instruction_content(content_slice).map_err(|e| 
-                        anyhow::anyhow!("Handshake: Conn {}: Failed to parse peeked Guacd instruction (opcode: '{}'): {}. Content: {:?}", conn_no, peeked_instr.opcode, e, content_slice)
-                    )?;
-                    
-                    handshake_buffer.advance(instruction_total_len);
-                    *current_buffer_len -= instruction_total_len;
+                    Err(PeekError::Incomplete) => {
+                        // Need more data
+                        None
+                    }
+                    Err(err) => { 
+                        let err_msg = format!("Error peeking Guacd instruction while expecting '{}': {:?}. Buffer content (approx): {:?}", expected_opcode, err, &handshake_buffer[..std::cmp::min(*current_buffer_len, 100)]);
+                        error!(target: "guac_protocol", channel_id=%channel_id, conn_no, %err_msg);
+                        return Err(anyhow::anyhow!(err_msg));
+                    }
+                }
+            }; // peek_result is dropped here
+            
+            // Now we can safely mutate handshake_buffer
+            if let Some((instruction, advance_len, expected_opcode_check)) = process_result {
+                handshake_buffer.advance(advance_len);
+                *current_buffer_len -= advance_len;
 
-                    if instruction.opcode == "error" { 
-                        error!(target: "guac_protocol", channel_id=%channel_id, conn_no, error_opcode=%instruction.opcode, error_args=?instruction.args, expected_opcode=%expected_opcode, "Guacd sent error during handshake");
-                        return Err(anyhow::anyhow!("Guacd sent error '{}' ({:?}) during handshake (expected '{}')", instruction.opcode, instruction.args, expected_opcode));
-                    }
-                    return if instruction.opcode == expected_opcode {
-                        Ok(instruction)
-                    } else {
-                        error!(target: "guac_protocol", channel_id=%channel_id, conn_no, expected_opcode=%expected_opcode, received_opcode=%instruction.opcode, received_args=?instruction.args, "Unexpected Guacd opcode");
-                        Err(anyhow::anyhow!("Expected Guacd opcode '{}', got '{}' with args {:?}", expected_opcode, instruction.opcode, instruction.args))
-                    }
+                if instruction.opcode == "error" { 
+                    error!(target: "guac_protocol", channel_id=%channel_id, conn_no, error_opcode=%instruction.opcode, error_args=?instruction.args, expected_opcode=%expected_opcode, "Guacd sent error during handshake");
+                    return Err(anyhow::anyhow!("Guacd sent error '{}' ({:?}) during handshake (expected '{}')", instruction.opcode, instruction.args, expected_opcode));
                 }
-                Err(PeekError::Incomplete) => {
-                    let mut temp_read_buf = [0u8; 1024];
-                    match reader.read(&mut temp_read_buf).await {
-                        Ok(0) => {
-                            error!(target: "guac_protocol", channel_id=%channel_id, conn_no, expected_opcode=%expected_opcode, buffer_len = *current_buffer_len, "EOF during Guacd handshake");
-                            return Err(anyhow::anyhow!("EOF during Guacd handshake while waiting for '{}' (incomplete data in buffer)", expected_opcode));
-                        }
-                        Ok(n_read) => {
-                            if handshake_buffer.capacity() < *current_buffer_len + n_read {
-                                handshake_buffer.reserve(*current_buffer_len + n_read - handshake_buffer.capacity());
-                            }
-                            handshake_buffer.put_slice(&temp_read_buf[..n_read]);
-                            *current_buffer_len += n_read;
-                            trace!(target: "guac_protocol", channel_id=%channel_id, conn_no, bytes_read=n_read, new_buffer_len=*current_buffer_len, "Read more data for handshake, waiting for '{}'", expected_opcode);
-                        }
-                        Err(e) => {
-                            error!(target: "guac_protocol", channel_id=%channel_id, conn_no, expected_opcode=%expected_opcode, error=%e, "Read error waiting for Guacd instruction");
-                            return Err(e.into());
-                        }
-                    }
+                return if expected_opcode_check {
+                    Ok(instruction)
+                } else {
+                    error!(target: "guac_protocol", channel_id=%channel_id, conn_no, expected_opcode=%expected_opcode, received_opcode=%instruction.opcode, received_args=?instruction.args, "Unexpected Guacd opcode");
+                    Err(anyhow::anyhow!("Expected Guacd opcode '{}', got '{}' with args {:?}", expected_opcode, instruction.opcode, instruction.args))
                 }
-                Err(err) => { 
-                    let err_msg = format!("Error peeking Guacd instruction while expecting '{}': {:?}. Buffer content (approx): {:?}", expected_opcode, err, &handshake_buffer[..std::cmp::min(*current_buffer_len, 100)]);
-                    error!(target: "guac_protocol", channel_id=%channel_id, conn_no, %err_msg);
-                    return Err(anyhow::anyhow!(err_msg));
+            }
+            
+            // Handle the incomplete case - need to read more data
+            let mut temp_read_buf = [0u8; 1024];
+            match reader.read(&mut temp_read_buf).await {
+                Ok(0) => {
+                    error!(target: "guac_protocol", channel_id=%channel_id, conn_no, expected_opcode=%expected_opcode, buffer_len = *current_buffer_len, "EOF during Guacd handshake");
+                    return Err(anyhow::anyhow!("EOF during Guacd handshake while waiting for '{}' (incomplete data in buffer)", expected_opcode));
+                }
+                Ok(n_read) => {
+                    if handshake_buffer.capacity() < *current_buffer_len + n_read {
+                        handshake_buffer.reserve(*current_buffer_len + n_read - handshake_buffer.capacity());
+                    }
+                    handshake_buffer.put_slice(&temp_read_buf[..n_read]);
+                    *current_buffer_len += n_read;
+                    trace!(target: "guac_protocol", channel_id=%channel_id, conn_no, bytes_read=n_read, new_buffer_len=*current_buffer_len, "Read more data for handshake, waiting for '{}'", expected_opcode);
+                }
+                Err(e) => {
+                    error!(target: "guac_protocol", channel_id=%channel_id, conn_no, expected_opcode=%expected_opcode, error=%e, "Read error waiting for Guacd instruction");
+                    return Err(e.into());
                 }
             }
         }
@@ -632,7 +803,7 @@ where
             if mimetype_str.is_empty() { return Vec::new(); }
             serde_json::from_str::<Vec<String>>(mimetype_str)
                 .unwrap_or_else(|e| {
-                    warn!(target:"guac_protocol", channel_id=%channel_id, conn_no, error=%e, "Failed to parse mimetype string '{}' as JSON array, splitting by comma as fallback.", mimetype_str);
+                    debug!(target:"guac_protocol", channel_id=%channel_id, conn_no, error=%e, "Failed to parse mimetype string '{}' as JSON array, splitting by comma as fallback.", mimetype_str);
                     mimetype_str.split(',').map(String::from).filter(|s| !s.is_empty()).collect()
                 })
         };
@@ -688,14 +859,12 @@ where
     Ok(())
 }
 
-// The rest of the file (process_inbound_message, send_pending_messages)
-// relies on the overall Channel structure and Frame processing.
-// Adjustments for Guacd data wrapping have been made in setup_outbound_task,
-// which now uses the stateless GuacdParser and encodes Guacd instructions into Frames.
-// This approach appears compatible with process_inbound_message and send_pending_messages.
-
 // Process an inbound message (typically from WebRTC, to be sent to a backend connection)
 pub async fn process_inbound_message(channel: &mut Channel, frame: Frame) -> Result<()> {
+    // **BOLD WARNING: HOT PATH - WebRTC→BACKEND MESSAGE PROCESSING**
+    // **NO UNNECESSARY STRING/OBJECT ALLOCATIONS**
+    // **USE BUFFER POOLS AND BORROWED DATA**
+    
     let conn_no = frame.connection_no;
     
     if frame.connection_no == 0 { // Control message
@@ -733,21 +902,23 @@ pub async fn process_inbound_message(channel: &mut Channel, frame: Frame) -> Res
                                             if payload_cursor.remaining() >= MIN_CONNECT_AS_HEADER_LEN {
                                                 let connect_as_payload_len = payload_cursor.get_u16() as usize;
                                                 
-                                                let mut client_public_key_bytes = vec![0u8; CONNECT_AS_PUBLIC_KEY_BYTES];
-                                                payload_cursor.copy_to_slice(&mut client_public_key_bytes);
+                                                // **PERFORMANCE: Use buffer pool for crypto operations**
+                                                let mut crypto_buffer = channel.buffer_pool.acquire();
+                                                crypto_buffer.clear();
+                                                crypto_buffer.resize(CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES + connect_as_payload_len, 0);
                                                 
-                                                let mut nonce_bytes = vec![0u8; CONNECT_AS_NONCE_BYTES];
-                                                payload_cursor.copy_to_slice(&mut nonce_bytes);
+                                                payload_cursor.copy_to_slice(&mut crypto_buffer[..]);
+                                                
+                                                let client_public_key_bytes = &crypto_buffer[..CONNECT_AS_PUBLIC_KEY_BYTES];
+                                                let nonce_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES..CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES];
+                                                let encrypted_data_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES..];
 
                                                 if payload_cursor.remaining() >= connect_as_payload_len {
-                                                    let mut encrypted_data_bytes = vec![0u8; connect_as_payload_len];
-                                                    payload_cursor.copy_to_slice(&mut encrypted_data_bytes);
-
                                                     match decrypt_connect_as_payload(
                                                         channel.connect_as_settings.gateway_private_key.as_ref().unwrap(), // Safe due to is_some() check
-                                                        &client_public_key_bytes,
-                                                        &nonce_bytes,
-                                                        &encrypted_data_bytes,
+                                                        client_public_key_bytes,
+                                                        nonce_bytes,
+                                                        encrypted_data_bytes,
                                                     ) {
                                                         Ok(decrypted_payload) => {
                                                             info!("Channel({}): Successfully decrypted ConnectAs payload for target_conn_no {}", channel.channel_id, target_conn_no);
@@ -786,7 +957,9 @@ pub async fn process_inbound_message(channel: &mut Channel, frame: Frame) -> Res
                                                             return Err(anyhow::anyhow!("ConnectAs decryption/parsing failed: {}", e));
                                                         }
                                                     }
+                                                    channel.buffer_pool.release(crypto_buffer);
                                                 } else {
+                                                    channel.buffer_pool.release(crypto_buffer);
                                                     warn!("Channel({}): ConnectAs payload too short for encrypted data (expected {}, got {}) for target_conn_no {}",
                                                         channel.channel_id, connect_as_payload_len, payload_cursor.remaining(), target_conn_no);
                                                     return Err(anyhow::anyhow!("ConnectAs payload too short for encrypted data"));
@@ -1060,6 +1233,10 @@ pub async fn process_inbound_message(channel: &mut Channel, frame: Frame) -> Res
 
 // Send any pending messages for a given connection
 pub async fn send_pending_messages(channel: &mut Channel, conn_no: u32) -> Result<()> {
+    // **BOLD WARNING: HOT PATH - SENDING QUEUED MESSAGES**
+    // **NO STRING/OBJECT ALLOCATIONS IN THE LOOP**
+    // **MESSAGES ARE ALREADY ENCODED AS Bytes**
+    
     debug!("Channel({}): Attempting to send pending messages for conn_no {}", channel.channel_id, conn_no);
     let mut pending_guard = channel.pending_messages.lock().await;
     
@@ -1076,35 +1253,43 @@ pub async fn send_pending_messages(channel: &mut Channel, conn_no: u32) -> Resul
         // The WebRTCDataChannel already has set_buffered_amount_low_threshold and on_buffered_amount_low callback.
         // The check here is to proactively avoid over-sending if we are about to send a batch.
         
-        while let Some(message_bytes) = queue.front().cloned() { // Clone to avoid holding lock during await
-            if message_bytes.is_empty() {
-                queue.pop_front(); // Remove an empty message
-                continue;
+        // Strategy: Peek at message, clone for sending, pop only on successful send.
+        // This ensures messages aren't lost on transient send errors.
+        // Cloning Bytes is cheap (increments a ref count) but peeking first is crucial for error handling.
+        while let Some(message_bytes_ref) = queue.front() { // Peek at the front message
+            if message_bytes_ref.is_empty() {
+                queue.pop_front(); // Remove empty message
+                continue; // Skip empty messages
             }
 
+            // Clone here is necessary because we need to release the borrow on queue
+            // before .await, and we might put it back.
+            let message_bytes_cloned = message_bytes_ref.clone();
+
             let current_buffered_amount = channel.webrtc.buffered_amount().await;
-            // Assuming BUFFER_LOW_THRESHOLD is accessible or a similar check is made.
-            // A direct check against a high watermark like 16MB could also be used.
             if current_buffered_amount >= super::core::BUFFER_LOW_THRESHOLD { 
-                debug!(
-                    "Channel({}): Buffer amount {} for conn_no {} is high. Pausing sending of pending messages.",
-                    channel.channel_id, current_buffered_amount, conn_no
-                );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "Channel({}): Buffer amount {} for conn_no {} is high. Pausing sending of pending messages.",
+                        channel.channel_id, current_buffered_amount, conn_no
+                    );
+                }
+                // Message is still at the front, no need to push_front here.
                 break; // Stop sending if buffer is too full
             }
 
-            match channel.webrtc.send(message_bytes.clone()).await { // Send the cloned message
+            match channel.webrtc.send(message_bytes_cloned.clone()).await { // Send the cloned message
                 Ok(_) => {
                     messages_sent_count += 1;
-                    queue.pop_front(); // Remove a successfully sent message from the original queue
+                    queue.pop_front(); // Successfully sent, now remove from queue
                 }
                 Err(e) => {
                     error!(
-                        "Channel({}): Failed to send pending message for conn_no {}: {}. Message remains in queue.",
+                        "Channel({}): Failed to send pending message for conn_no {}: {}. Message remains at the front of the queue.",
                         channel.channel_id, conn_no, e
                     );
-                    // Depending on the error, may want to break or implement retry logic.
-                    // For now, stop processing this queue on error.
+                    // Message is still at the front of queue because we only peeked.
+                    // Stop processing this queue on error to avoid repeated attempts on a potentially problematic message or state.
                     break; 
                 }
             }

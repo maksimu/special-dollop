@@ -205,8 +205,8 @@ impl Channel {
         
         let network_checker = parse_network_rules_from_settings(&protocol_settings);
 
-        let mut determined_protocol = ActiveProtocol::PortForward; // Default
-        let mut initial_protocol_state = ProtocolLogicState::default();
+        let determined_protocol; // Declare without initial assignment
+        let initial_protocol_state; // Declare without initial assignment
 
         let mut guacd_host_setting: Option<String> = None;
         let mut guacd_port_setting: Option<u16> = None;
@@ -413,7 +413,9 @@ impl Channel {
             let ep_name_cb = channel_id_clone.clone();
             let trigger_tx = process_pending_trigger_tx_clone.clone();
             tokio::spawn(async move {
-               debug!(target: "channel_flow", channel_id = %ep_name_cb, "Buffer amount is now below threshold, signaling to process pending messages");
+               if tracing::enabled!(tracing::Level::DEBUG) {
+                   debug!(target: "channel_flow", channel_id = %ep_name_cb, "Buffer amount is now below threshold, signaling to process pending messages");
+               }
                if let Err(e) = trigger_tx.send(()) {
                     error!(target: "channel_flow", channel_id = %ep_name_cb, error = %e, "Failed to send pending process trigger");
                }
@@ -475,7 +477,9 @@ impl Channel {
         while !self.should_exit.load(std::sync::atomic::Ordering::Relaxed) {
             // Process any complete frames in the buffer
             while let Some(frame) = try_parse_frame(&mut buf) {
-                debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Received frame from WebRTC");
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Received frame from WebRTC");
+                }
                 
                 if let Err(e) = handle_incoming_frame(&mut self, frame).await {
                     error!(target: "channel_flow", channel_id = %self.channel_id, error = %e, "Error handling frame");
@@ -488,7 +492,9 @@ impl Channel {
                 biased;
                 maybe_conn = async { server_conn_rx.as_mut()?.recv().await }, if server_conn_rx.is_some() => {
                     if let Some((conn_no, writer, task)) = maybe_conn {
-                        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Registering connection from server");
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Registering connection from server");
+                        }
                             
                         // Create a stream half
                         let stream_half = StreamHalf {
@@ -515,14 +521,18 @@ impl Channel {
                 maybe_chunk = self.rx_from_dc.recv() => {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
-                            debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
-                            
-                            if chunk.len() > 0 {
-                                debug!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
+                                
+                                if chunk.len() > 0 {
+                                    debug!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
+                                }
                             }
                             
                             buf.extend_from_slice(&chunk);
-                            debug!(target: "channel_flow", channel_id = %self.channel_id, buffer_size = buf.len(), "Buffer size after adding chunk");
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!(target: "channel_flow", channel_id = %self.channel_id, buffer_size = buf.len(), "Buffer size after adding chunk");
+                            }
                             
                             // Process pending messages might be triggered by buffer low, 
                             // but also good to try after receiving new data if not recently triggered.
@@ -544,7 +554,9 @@ impl Channel {
                     guard.recv().await
                 } => {
                     if trigger.is_some() {
-                        debug!(target: "channel_flow", channel_id = %self.channel_id, "Trigger received to process pending messages.");
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(target: "channel_flow", channel_id = %self.channel_id, "Trigger received to process pending messages.");
+                        }
                         self.process_pending_messages().await?;
                     } else {
                         // Trigger channel closed, maybe log or break.
@@ -560,72 +572,95 @@ impl Channel {
     }
 
     // New method to process pending messages for all connections with better prioritization
+    // **BOLD WARNING: HOT PATH - PROCESSES QUEUED MESSAGES**
+    // **AVOID UNNECESSARY CLONES AND ALLOCATIONS**
     pub(crate) async fn process_pending_messages(&mut self) -> Result<()> {
         let mut pending_guard = self.pending_messages.lock().await;
         if pending_guard.iter().all(|(_, queue)| queue.is_empty()) {
-            debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages in any queue.");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages in any queue.");
+            }
             return Ok(());
         }
-        debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "process_pending_messages: Starting.");
-        
-        for (conn_no, queue) in pending_guard.iter() {
-            if !queue.is_empty() {
-                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, queue_size = queue.len(), "process_pending_messages: Connection has pending messages.");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "process_pending_messages: Starting.");
+            
+            for (conn_no, queue) in pending_guard.iter() {
+                if !queue.is_empty() {
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, queue_size = queue.len(), "process_pending_messages: Connection has pending messages.");
+                }
             }
         }
 
         let max_to_process = 100;
         let mut total_processed = 0;
         let total_messages: usize = pending_guard.values().map(|q| q.len()).sum();
-        if total_messages > 0 {
+        if total_messages > 0 && tracing::enabled!(tracing::Level::DEBUG) {
            debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "process_pending_messages: Total pending messages across all connections.");
         }
         let conn_nos: Vec<u32> = pending_guard.keys().filter(|&conn_no| !pending_guard[conn_no].is_empty()).copied().collect();
         let mut current_index = 0;
-        let encode_buffer = self.buffer_pool.acquire(); // Though encode_buffer is not used in this version of the loop. Consider removing if not needed.
         let buffer_threshold = BUFFER_LOW_THRESHOLD;
         
         while total_processed < max_to_process && !conn_nos.is_empty() {
             if conn_nos.is_empty() { 
-                debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: conn_nos became empty, breaking.");
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: conn_nos became empty, breaking.");
+                }
                 break; 
             }
             let conn_index = current_index % conn_nos.len();
             let conn_no = conn_nos[conn_index];
             
-            debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Attempting to process queue for connection.");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Attempting to process queue for connection.");
+            }
 
             if let Some(queue) = pending_guard.get_mut(&conn_no) {
                 if queue.is_empty() { 
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue is now empty for connection, skipping.");
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue is now empty for connection, skipping.");
+                    }
                     current_index += 1;
                     continue;
                 }
-                let message_to_send = if let Some(message) = queue.front() {
-                    message.clone()
-                } else {
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue front is None after checking not empty, skipping.");
-                    current_index += 1;
-                    continue;
+                
+                // **PERFORMANCE: Pop the message directly instead of cloning**
+                let message_to_send = match queue.pop_front() {
+                    Some(msg) => msg,
+                    None => {
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue was empty after checking, skipping.");
+                        }
+                        current_index += 1;
+                        continue;
+                    }
                 };
                 
                 let current_buffered_amount_before_send = self.webrtc.buffered_amount().await;
-                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, message_size = message_to_send.len(), buffered_amount_before_send = current_buffered_amount_before_send, "process_pending_messages: Sending message from queue.");
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, message_size = message_to_send.len(), buffered_amount_before_send = current_buffered_amount_before_send, "process_pending_messages: Sending message from queue.");
+                }
 
                 if let Err(e) = self.webrtc.send(message_to_send).await {
                     error!(target: "channel_flow", channel_id = %self.channel_id, conn_no, error = %e, "process_pending_messages: Failed to send queued message for connection. Breaking loop.");
                     break;
                 }
 
-                queue.pop_front();
                 total_processed += 1;
-                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, total_processed_in_loop = total_processed, remaining_in_queue = queue.len(), "process_pending_messages: Successfully sent message, popped from queue.");
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, total_processed_in_loop = total_processed, remaining_in_queue = queue.len(), "process_pending_messages: Successfully sent message, already popped from queue.");
+                }
                 
                 if total_processed % 10 == 0 {
                     let current_buffer_after_batch = self.webrtc.buffered_amount().await;
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, current_buffered_amount = current_buffer_after_batch, "process_pending_messages: Checking buffer threshold mid-batch.");
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, current_buffered_amount = current_buffer_after_batch, "process_pending_messages: Checking buffer threshold mid-batch.");
+                    }
                     if current_buffer_after_batch >= buffer_threshold {
-                        debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, "process_pending_messages: Buffer threshold reached during processing, pausing.");
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, "process_pending_messages: Buffer threshold reached during processing, pausing.");
+                        }
                         break;
                     }
 
@@ -636,11 +671,14 @@ impl Channel {
             current_index += 1;
         }
         
-        self.buffer_pool.release(encode_buffer);
         if total_processed > 0 {
-           debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
+           if tracing::enabled!(tracing::Level::DEBUG) {
+               debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
+           }
         } else {
-           debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
+           if tracing::enabled!(tracing::Level::DEBUG) {
+               debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
+           }
         }
         Ok(())
     }
@@ -668,17 +706,21 @@ impl Channel {
                 if ping_conn_no == 0 {
                     let mut sent_time = self.channel_ping_sent_time.lock().await;
                     *sent_time = Some(crate::tube_protocol::now_ms());
-                    debug!("Channel({}): Sent channel PING (conn_no=0), recorded send time.", self.channel_id);
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!("Channel({}): Sent channel PING (conn_no=0), recorded send time.", self.channel_id);
+                    }
                 }
             } else if data.is_empty() { // Convention: empty data for Ping implies channel ping
                  let mut sent_time = self.channel_ping_sent_time.lock().await;
                  *sent_time = Some(crate::tube_protocol::now_ms());
-                 debug!("Channel({}): Sent channel PING (conn_no=0, empty payload convention), recorded send time.", self.channel_id);
+                 if tracing::enabled!(tracing::Level::DEBUG) {
+                     debug!("Channel({}): Sent channel PING (conn_no=0, empty payload convention), recorded send time.", self.channel_id);
+                 }
             }
         }
 
         let buffered_amount = self.webrtc.buffered_amount().await;
-        if buffered_amount >= BUFFER_LOW_THRESHOLD {
+        if buffered_amount >= BUFFER_LOW_THRESHOLD && tracing::enabled!(tracing::Level::DEBUG) {
            debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");
         }
         self.webrtc.send(encoded).await.map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -716,20 +758,60 @@ impl Channel {
         
         self.send_control_message(ControlMessage::CloseConnection, &msg_data).await?;
 
+        // For control connections or explicit cleanup, remove immediately
+        let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
-        if let Some(mut conn) = self.conns.lock().await.remove(&conn_no) {
-            let _ = crate::models::AsyncReadWrite::shutdown(&mut conn.backend).await;
-            conn.to_webrtc.abort();
-            match tokio::time::timeout(self.timeouts.close_connection, conn.to_webrtc).await {
-                Ok(_) => debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed backend task for connection"),
-                Err(_) => warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Timeout waiting for backend task to close for connection"),
+        if !should_delay_removal {
+            // Immediate removal
+            if let Some(mut conn) = self.conns.lock().await.remove(&conn_no) {
+                let _ = crate::models::AsyncReadWrite::shutdown(&mut conn.backend).await;
+                conn.to_webrtc.abort();
+                match tokio::time::timeout(self.timeouts.close_connection, conn.to_webrtc).await {
+                    Ok(_) => debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed backend task for connection"),
+                    Err(_) => warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Timeout waiting for backend task to close for connection"),
+                }
             }
-        }
 
-        // Correctly remove from pending_messages
-        {
-            let mut pending_guard = self.pending_messages.lock().await;
-            pending_guard.remove(&conn_no);
+            // Correctly remove from pending_messages
+            {
+                let mut pending_guard = self.pending_messages.lock().await;
+                pending_guard.remove(&conn_no);
+            }
+        } else {
+            // Delayed removal - shutdown the connection but keep it in the map briefly
+            {
+                let mut conns_guard = self.conns.lock().await;
+                if let Some(conn) = conns_guard.get_mut(&conn_no) {
+                    // Shutdown the backend connection
+                    let _ = crate::models::AsyncReadWrite::shutdown(&mut conn.backend).await;
+                    // Abort the to_webrtc task
+                    conn.to_webrtc.abort();
+                }
+            }
+
+            // Schedule delayed cleanup
+            let conns_arc = Arc::clone(&self.conns);
+            let pending_messages_arc = Arc::clone(&self.pending_messages);
+            let channel_id_clone = self.channel_id.clone();
+            let close_timeout = self.timeouts.close_connection;
+            
+            // Spawn a task to remove the connection after a grace period
+            tokio::spawn(async move {
+                // Wait a bit to allow in-flight messages to be processed
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                
+                debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
+                
+                // Now remove from both maps
+                if let Some(conn) = conns_arc.lock().await.remove(&conn_no) {
+                    // Wait for the task to finish
+                    match tokio::time::timeout(close_timeout, conn.to_webrtc).await {
+                        Ok(_) => debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed backend task after grace period"),
+                        Err(_) => warn!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Timeout waiting for backend task after grace period"),
+                    }
+                }
+                pending_messages_arc.lock().await.remove(&conn_no);
+            });
         }
 
         if conn_no == 0 {

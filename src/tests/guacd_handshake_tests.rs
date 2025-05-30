@@ -73,55 +73,64 @@ async fn recv_and_get_instruction(
         }
         // println! (SERVER_RECV_FN_PEEK_ATTEMPT): Attempting to peek. Buffer len: {}. Content (trunc 64): {:?}
         //local_buffer.len(), &local_buffer[..std::cmp::min(local_buffer.len(), 64)]
-        match GuacdParser::peek_instruction(&local_buffer) {
-            Ok(peeked_instr) => {
-                // println! (SERVER_RECV_FN_PEEK_OK): Peek OK. Opcode: '{}', Total len in buffer: {}.
-                //peeked_instr.opcode, peeked_instr.total_length_in_buffer
-                let content_slice = &local_buffer[..peeked_instr.total_length_in_buffer - 1];
-                let instr = GuacdParser::parse_instruction_content(content_slice)
-                    .map_err(|e| format!("Server: Failed to fully parse peeked instruction: {}. Content: {:?}", e, content_slice))?;
-                // println! (SERVER_RECV_FN_PARSE_OK): Parse OK. Instruction: {{opcode: '{}', args: {:?}}}.
-                //instr.opcode, instr.args
-                local_buffer.advance(peeked_instr.total_length_in_buffer);
-                return Ok(instr);
-            }
-            Err(PeekError::Incomplete) => {
-                // println! (SERVER_RECV_FN_PEEK_INCOMPLETE): Peek Incomplete. Current buffer len: {}.
-                //local_buffer.len()
-                if local_buffer.capacity() == 0 { 
-                    local_buffer.reserve(1024);
+        
+        // Extract what we need from peek result before any buffer mutations
+        let process_result = {
+            let peek_result = GuacdParser::peek_instruction(&local_buffer);
+            match peek_result {
+                Ok(peeked_instr) => {
+                    let total_length = peeked_instr.total_length_in_buffer;
+                    let content_slice = &local_buffer[..total_length - 1];
+                    let instr = GuacdParser::parse_instruction_content(content_slice)
+                        .map_err(|e| format!("Server: Failed to fully parse peeked instruction: {}. Content: {:?}", e, content_slice))?;
+                    
+                    // Return the instruction and advance amount
+                    Some((instr, total_length))
                 }
-                let mut temp_read_buf = [0u8; 512]; 
-                // println! (SERVER_RECV_FN_AWAIT_READ): About to await stream.read().
-                match stream.read(&mut temp_read_buf).await {
-                    Ok(0) => {
-                        // println! (SERVER_RECV_FN_READ_EOF): Read EOF.
-                        return Err("Server: EOF while waiting for a complete instruction".to_string());
-                    }
-                    Ok(n) => {
-                        // println! (SERVER_RECV_FN_READ_OK): Read {} bytes. Data (trunc 64): {:?}
-                        //n, &temp_read_buf[..std::cmp::min(n, 64)]
-                        if local_buffer.capacity() < local_buffer.len() + n {
-                            local_buffer.reserve(local_buffer.len() + n - local_buffer.capacity());
-                        }
-                        local_buffer.extend_from_slice(&temp_read_buf[..n]);
-                    }
-                    Err(e) => {
-                        // println! (SERVER_RECV_FN_READ_ERR): Read error: {}.
-                        //e
-                        return Err(format!("Server: Read error from stream: {}", e));
-                    }
+                Err(PeekError::Incomplete) => {
+                    // Handle incomplete case
+                    None
+                }
+                Err(PeekError::InvalidFormat(e)) => {
+                    return Err(format!("Server: Invalid Guacd format in received data: {}", e));
+                }
+                Err(PeekError::Utf8Error(e)) => {
+                    return Err(format!("Server: UTF-8 error in received Guacd data: {}", e));
                 }
             }
-            Err(PeekError::InvalidFormat(e)) => {
-                // println! (SERVER_RECV_FN_PEEK_INVALID): Peek InvalidFormat: {}.
-                //e
-                return Err(format!("Server: Invalid Guacd format in received data: {}", e));
+        }; // peek_result is dropped here
+        
+        // Now we can safely mutate local_buffer
+        if let Some((instr, advance_len)) = process_result {
+            local_buffer.advance(advance_len);
+            return Ok(instr);
+        }
+        
+        // Handle the incomplete case after the match to avoid borrow issues
+        // println! (SERVER_RECV_FN_PEEK_INCOMPLETE): Peek Incomplete. Current buffer len: {}.
+        //local_buffer.len()
+        if local_buffer.capacity() == 0 { 
+            local_buffer.reserve(1024);
+        }
+        let mut temp_read_buf = [0u8; 512]; 
+        // println! (SERVER_RECV_FN_AWAIT_READ): About to await stream.read().
+        match stream.read(&mut temp_read_buf).await {
+            Ok(0) => {
+                // println! (SERVER_RECV_FN_READ_EOF): Read EOF.
+                return Err("Server: EOF while waiting for a complete instruction".to_string());
             }
-            Err(PeekError::Utf8Error(e)) => {
-                // println! (SERVER_RECV_FN_PEEK_UTF8): Peek Utf8Error: {}.
+            Ok(n) => {
+                // println! (SERVER_RECV_FN_READ_OK): Read {} bytes. Data (trunc 64): {:?}
+                //n, &temp_read_buf[..std::cmp::min(n, 64)]
+                if local_buffer.capacity() < local_buffer.len() + n {
+                    local_buffer.reserve(local_buffer.len() + n - local_buffer.capacity());
+                }
+                local_buffer.extend_from_slice(&temp_read_buf[..n]);
+            }
+            Err(e) => {
+                // println! (SERVER_RECV_FN_READ_ERR): Read error: {}.
                 //e
-                return Err(format!("Server: UTF-8 error in received Guacd data: {}", e));
+                return Err(format!("Server: Read error from stream: {}", e));
             }
         }
         read_attempts += 1;
@@ -189,35 +198,45 @@ async fn test_guacd_handshake_successful_new_connection() {
                     
                     let mut temp_parse_buffer = diagnostic_buffer.clone();
                     loop {
-                        match GuacdParser::peek_instruction(&temp_parse_buffer) {
-                            Ok(peeked) => {
-                                let content_slice = &temp_parse_buffer[..peeked.total_length_in_buffer -1];
-                                match GuacdParser::parse_instruction_content(content_slice) {
-                                    Ok(instr) => {
-                                        println!("Server (success_new): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
-                                        if instr.opcode == "size" {
-                                            assert_eq!(instr.args, vec!["1024", "768", "96"]);
-                                        } else if instr.opcode == "audio" || instr.opcode == "video" || instr.opcode == "image" {
-                                            assert!(instr.args.is_empty());
-                                        } else if instr.opcode == "connect" {
-                                            assert_eq!(instr.args, vec!["VERSION_1_5_0", "testserver", "3389", "", "", ""]);
-                                            connect_received = true;
-                                            println!("Server (success_new): V2: 'connect' received and validated.");
+                        let advance_amount = {
+                            let peek_result = GuacdParser::peek_instruction(&temp_parse_buffer);
+                            match peek_result {
+                                Ok(peeked) => {
+                                    let total_length = peeked.total_length_in_buffer;
+                                    let content_slice = &temp_parse_buffer[..total_length -1];
+                                    match GuacdParser::parse_instruction_content(content_slice) {
+                                        Ok(instr) => {
+                                            println!("Server (success_new): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
+                                            if instr.opcode == "size" {
+                                                assert_eq!(instr.args, vec!["1024", "768", "96"]);
+                                            } else if instr.opcode == "audio" || instr.opcode == "video" || instr.opcode == "image" {
+                                                assert!(instr.args.is_empty());
+                                            } else if instr.opcode == "connect" {
+                                                assert_eq!(instr.args, vec!["VERSION_1_5_0", "testserver", "3389", "", "", ""]);
+                                                connect_received = true;
+                                                println!("Server (success_new): V2: 'connect' received and validated.");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("Server (success_new): V2: Parse error for peeked data: {}. Content: {:?}",e, content_slice);
+                                            break; // break inner parse loop, try to get more stream data
                                         }
                                     }
-                                    Err(e) => {
-                                        println!("Server (success_new): V2: Parse error for peeked data: {}. Content: {:?}",e, content_slice);
-                                        break; // break inner parse loop, try to get more stream data
-                                    }
+                                    Some(total_length) // Return the amount to advance
                                 }
-                                temp_parse_buffer.advance(peeked.total_length_in_buffer);
-                                if temp_parse_buffer.is_empty() { break; }
+                                Err(PeekError::Incomplete) => None, // Need more data from stream
+                                Err(e) => {
+                                    println!("Server (success_new): V2: Peek Error: {:?}", e);
+                                    None
+                                }
                             }
-                            Err(PeekError::Incomplete) => break, // Need more data from stream
-                            Err(e) => {
-                                println!("Server (success_new): V2: Peek Error: {:?}", e);
-                                break; 
-                            }
+                        };
+                        
+                        if let Some(advance) = advance_amount {
+                            temp_parse_buffer.advance(advance);
+                            if temp_parse_buffer.is_empty() { break; }
+                        } else {
+                            break;
                         }
                     }
                     if connect_received { break; } // Exit outer read loop if connect is processed
@@ -512,38 +531,46 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
                     // Try to parse connect from the accumulated buffer
                     let mut temp_parse_buffer = diagnostic_buffer.clone(); // Clone for parsing attempts
                     loop {
-                        match GuacdParser::peek_instruction(&temp_parse_buffer) {
-                            Ok(peeked) => {
-                                if peeked.opcode == "connect" {
-                                    let content_slice = &temp_parse_buffer[..peeked.total_length_in_buffer -1];
-                                    match GuacdParser::parse_instruction_content(content_slice) {
-                                        Ok(connect_instr) => {
-                                            println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' successfully parsed: {:?}. Proceeding to send 'goodbye_cruel_world'.", connect_instr.args);
-                                            let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
-                                            server_stream.write_all(&unexpected_response).await.expect("Server (fail_ready): Failed to send unexpected_opcode");
-                                            println!("Server (fail_ready): Sent goodbye_cruel_world");
-                                            server_stream.shutdown().await.ok();
-                                            return; // End server task
+                        let advance_amount = {
+                            let peek_result = GuacdParser::peek_instruction(&temp_parse_buffer);
+                            match peek_result {
+                                Ok(peeked) => {
+                                    if peeked.opcode == "connect" {
+                                        let total_length = peeked.total_length_in_buffer;
+                                        let content_slice = &temp_parse_buffer[..total_length -1];
+                                        match GuacdParser::parse_instruction_content(content_slice) {
+                                            Ok(connect_instr) => {
+                                                println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' successfully parsed: {:?}. Proceeding to send 'goodbye_cruel_world'.", connect_instr.args);
+                                                let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
+                                                server_stream.write_all(&unexpected_response).await.expect("Server (fail_ready): Failed to send unexpected_opcode");
+                                                println!("Server (fail_ready): Sent goodbye_cruel_world");
+                                                server_stream.shutdown().await.ok();
+                                                return; // End server task
+                                            }
+                                            Err(e) => {
+                                                println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' peeked in final parse attempt, but failed to parse fully: {}. Content: {:?}", e, content_slice);
+                                                None
+                                            }
                                         }
-                                        Err(e) => {
-                                            println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' peeked, but failed to parse fully: {}. Content: {:?}", e, content_slice);
-                                            // Don't advance if parse failed, maybe more data needed for this specific instruction
-                                            break; // Break inner parse loop, try to read more from stream
-                                        }
+                                    } else {
+                                        // Not a connect instruction, advance anyway for debugging
+                                        println!("Server (fail_ready): DIAGNOSTIC V2: Final parse found: opcode='{}', args={:?}", peeked.opcode, peeked.args);
+                                        Some(peeked.total_length_in_buffer)
                                     }
                                 }
-                                // Successfully peeked something, advance buffer for next peek attempt in this inner loop
-                                temp_parse_buffer.advance(peeked.total_length_in_buffer);
-                                if temp_parse_buffer.is_empty() { break; } // Parsed all currently available
+                                Err(PeekError::Incomplete) => None,
+                                Err(e) => {
+                                    println!("Server (fail_ready): DIAGNOSTIC V2: Final parse Peek Error: {:?}. Stopping.", e);
+                                    None
+                                }
                             }
-                            Err(PeekError::Incomplete) => {
-                                // println!("Server (fail_ready): DIAGNOSTIC V2: Peek Incomplete with {} bytes in temp_parse_buffer.", temp_parse_buffer.len());
-                                break; // Need more data from stream
-                            }
-                            Err(e) => {
-                                println!("Server (fail_ready): DIAGNOSTIC V2: Peek Error: {:?}. Bytes in temp_parse_buffer: {}. Stopping parse attempt.", e, temp_parse_buffer.len());
-                                break; // Error during peek, stop trying to parse this buffer content
-                            }
+                        };
+                        
+                        if let Some(advance) = advance_amount {
+                            temp_parse_buffer.advance(advance);
+                            if temp_parse_buffer.is_empty() { break; }
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -559,28 +586,48 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
                         // Re-attempt parse on timeout, similar to above
                         let mut final_parse_buffer = diagnostic_buffer.clone();
                         loop {
-                             match GuacdParser::peek_instruction(&final_parse_buffer) {
-                                Ok(peeked) => {
-                                    if peeked.opcode == "connect" {
-                                        let content_slice = &final_parse_buffer[..peeked.total_length_in_buffer -1];
-                                        if GuacdParser::parse_instruction_content(content_slice).is_ok() {
-                                            println!("Server (fail_ready): DIAGNOSTIC V2 (timeout check): 'connect' successfully parsed. Proceeding.");
-                                            let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
-                                            server_stream.write_all(&unexpected_response).await.expect("Server (fail_ready): Failed to send unexpected_opcode");
-                                            println!("Server (fail_ready): Sent goodbye_cruel_world");
-                                            server_stream.shutdown().await.ok();
-                                            return;
+                            let advance_amount = {
+                                let peek_result = GuacdParser::peek_instruction(&final_parse_buffer);
+                                match peek_result {
+                                    Ok(peeked) => {
+                                        if peeked.opcode == "connect" {
+                                            let total_length = peeked.total_length_in_buffer;
+                                            let content_slice = &final_parse_buffer[..total_length -1];
+                                            match GuacdParser::parse_instruction_content(content_slice) {
+                                                Ok(connect_instr) => {
+                                                    println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' successfully parsed: {:?}. Proceeding to send 'goodbye_cruel_world'.", connect_instr.args);
+                                                    let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
+                                                    server_stream.write_all(&unexpected_response).await.expect("Server (fail_ready): Failed to send unexpected_opcode");
+                                                    println!("Server (fail_ready): Sent goodbye_cruel_world");
+                                                    server_stream.shutdown().await.ok();
+                                                    return;
+                                                }
+                                                Err(e) => {
+                                                    println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' peeked in final parse attempt, but failed to parse fully: {}. Content: {:?}", e, content_slice);
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            // Not a connect instruction, advance anyway for debugging
+                                            println!("Server (fail_ready): DIAGNOSTIC V2: Final parse found: opcode='{}', args={:?}", peeked.opcode, peeked.args);
+                                            Some(peeked.total_length_in_buffer)
                                         }
                                     }
-                                    final_parse_buffer.advance(peeked.total_length_in_buffer);
-                                    if final_parse_buffer.is_empty() { break; }
+                                    Err(PeekError::Incomplete) => None,
+                                    Err(e) => {
+                                        println!("Server (fail_ready): DIAGNOSTIC V2: Final parse Peek Error: {:?}. Stopping.", e);
+                                        None
+                                    }
                                 }
-                                Err(_) => break, 
+                            };
+                            
+                            if let Some(advance) = advance_amount {
+                                final_parse_buffer.advance(advance);
+                                if final_parse_buffer.is_empty() { break; }
+                            } else {
+                                break;
                             }
                         }
-                    }
-                    if i == 19 { // Last attempt also timed out
-                        println!("Server (fail_ready): DIAGNOSTIC V2: Max read attempts reached with timeouts. Dumping buffer.");
                     }
                 }
             }
@@ -742,42 +789,50 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
                     
                     let mut temp_parse_buffer = diagnostic_buffer.clone();
                     loop {
-                        match GuacdParser::peek_instruction(&temp_parse_buffer) {
-                            Ok(peeked) => {
-                                let content_slice = &temp_parse_buffer[..peeked.total_length_in_buffer -1];
-                                match GuacdParser::parse_instruction_content(content_slice) {
-                                    Ok(instr) => {
-                                        println!("Server (timeout_ready): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
-                                        if instr.opcode == "size" {
-                                            assert_eq!(instr.args, vec!["1024", "768", "96"]);
-                                        } else if instr.opcode == "audio" || instr.opcode == "video" || instr.opcode == "image" {
-                                            assert!(instr.args.is_empty());
-                                        } else if instr.opcode == "connect" {
-                                            // For this test, client sends: VERSION_1_5_0, hostname, port
-                                            // guacd_params has: "hostname":"testserver_timeout_ready", "port":"3389"
-                                            // args sent by server: VERSION_1_5_0, hostname, port
-                                            // Expected connect args based on perform_guacd_handshake: VERSION_1_5_0, value_for_hostname, value_for_port
-                                            assert_eq!(instr.args, vec!["VERSION_1_5_0".to_string(), "testserver_timeout_ready".to_string(), "3389".to_string()]);
-                                            connect_instr_received_and_validated = true;
-                                            println!("Server (timeout_ready): V2: 'connect' received and validated.");
+                        let advance_amount = {
+                            let peek_result = GuacdParser::peek_instruction(&temp_parse_buffer);
+                            match peek_result {
+                                Ok(peeked) => {
+                                    let content_slice = &temp_parse_buffer[..peeked.total_length_in_buffer -1];
+                                    match GuacdParser::parse_instruction_content(content_slice) {
+                                        Ok(instr) => {
+                                            println!("Server (timeout_ready): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
+                                            if instr.opcode == "size" {
+                                                assert_eq!(instr.args, vec!["1024", "768", "96"]);
+                                            } else if instr.opcode == "audio" || instr.opcode == "video" || instr.opcode == "image" {
+                                                assert!(instr.args.is_empty());
+                                            } else if instr.opcode == "connect" {
+                                                // For this test, client sends: VERSION_1_5_0, hostname, port
+                                                // guacd_params has: "hostname":"testserver_timeout_ready", "port":"3389"
+                                                // args sent by server: VERSION_1_5_0, hostname, port
+                                                // Expected connect args based on perform_guacd_handshake: VERSION_1_5_0, value_for_hostname, value_for_port
+                                                assert_eq!(instr.args, vec!["VERSION_1_5_0".to_string(), "testserver_timeout_ready".to_string(), "3389".to_string()]);
+                                                connect_instr_received_and_validated = true;
+                                                println!("Server (timeout_ready): V2: 'connect' received and validated.");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("Server (timeout_ready): V2: Parse error for peeked data: {}. Content: {:?}",e, content_slice);
+                                            break; 
                                         }
                                     }
-                                    Err(e) => {
-                                        println!("Server (timeout_ready): V2: Parse error for peeked data: {}. Content: {:?}",e, content_slice);
-                                        break; 
-                                    }
+                                    Some(peeked.total_length_in_buffer) // Return the amount to advance
                                 }
-                                temp_parse_buffer.advance(peeked.total_length_in_buffer);
-                                if temp_parse_buffer.is_empty() { break; }
-                                if connect_instr_received_and_validated { break; } //Optimization: if connect is found, exit inner loop.
+                                Err(PeekError::Incomplete) => None, 
+                                Err(e) => {
+                                    println!("Server (timeout_ready): V2: Peek Error: {:?}", e);
+                                    None
+                                }
                             }
-                            Err(PeekError::Incomplete) => break, 
-                            Err(e) => {
-                                println!("Server (timeout_ready): V2: Peek Error: {:?}", e);
-                                break; 
-                            }
+                        };
+                        
+                        if let Some(advance) = advance_amount {
+                            temp_parse_buffer.advance(advance);
+                            if temp_parse_buffer.is_empty() { break; }
+                            if connect_instr_received_and_validated { break; } //Optimization: if connect is found, exit inner loop.
+                        } else {
+                            break;
                         }
-                        if connect_instr_received_and_validated { break; }
                     }
                     if connect_instr_received_and_validated { break; } // Exit outer read loop if connect is processed
                 }

@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [features]
 default = ["python"]
 python = ["pyo3", "pyo3-log"]
+profiling = []
 
 [dependencies]
 bytes = "1.10.1"
@@ -39,6 +40,7 @@ sha2 = "0.10.8"
 hkdf = "0.12.4"
 aes-gcm = "0.10.3"
 log = "0.4.27"
+smallvec = "1.13.2"
 
 [package.metadata.maturin]
 name = "keeper_pam_webrtc_rs"

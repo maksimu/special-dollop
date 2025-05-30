@@ -36,7 +36,7 @@ fn test_peek_and_parse_single_instruction() {
     match GuacdParser::peek_instruction(data) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["value"]);
+            assert_eq!(peeked.args.as_slice(), &["value"]);
             assert_eq!(peeked.total_length_in_buffer, data.len());
 
             let content_slice = &data[..peeked.total_length_in_buffer - 1];
@@ -72,7 +72,7 @@ fn test_peek_and_parse_multi_arg_instruction() {
     match GuacdParser::peek_instruction(data) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["hellohello", "worldworldworld"]);
+            assert_eq!(peeked.args.as_slice(), &["hellohello", "worldworldworld"]);
             assert_eq!(peeked.total_length_in_buffer, data.len());
 
             let content_slice = &data[..peeked.total_length_in_buffer - 1];
@@ -101,7 +101,7 @@ fn test_peek_split_packets_simulation() {
     match GuacdParser::peek_instruction(&buffer) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["instruction"]);
+            assert_eq!(peeked.args.as_slice(), &["instruction"]);
             assert_eq!(peeked.total_length_in_buffer, buffer.len());
             
             let content_slice = &buffer[..peeked.total_length_in_buffer - 1];
@@ -110,7 +110,7 @@ fn test_peek_split_packets_simulation() {
             assert_eq!(instruction.args, vec!["instruction".to_string()]);
         }
         Err(e) => panic!("Peek failed after completing instruction: {:?}", e),
-    }
+    };
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn test_peek_multiple_instructions_sequentially() {
     match GuacdParser::peek_instruction(current_slice) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["instruction"]);
+            assert_eq!(peeked.args.as_slice(), &["instruction"]);
             let content_slice = &current_slice[..peeked.total_length_in_buffer - 1];
             let instruction = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instruction.opcode, "test");
@@ -136,7 +136,7 @@ fn test_peek_multiple_instructions_sequentially() {
     match GuacdParser::peek_instruction(current_slice) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "another");
-            assert_eq!(peeked.args, vec!["instr2"]);
+            assert_eq!(peeked.args.as_slice(), &["instr2"]);
             let content_slice = &current_slice[..peeked.total_length_in_buffer - 1];
             let instruction = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instruction.opcode, "another");
@@ -150,7 +150,7 @@ fn test_peek_multiple_instructions_sequentially() {
     match GuacdParser::peek_instruction(current_slice) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "last");
-            assert_eq!(peeked.args, vec!["instr3"]);
+            assert_eq!(peeked.args.as_slice(), &["instr3"]);
             let content_slice = &current_slice[..peeked.total_length_in_buffer - 1];
             let instruction = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instruction.opcode, "last");
@@ -211,7 +211,7 @@ fn test_peek_large_instruction_simulation() {
             assert!(instruction.args.is_empty());
         }
         Err(e) => panic!("Peek failed for large instruction: {:?}", e),
-    }
+    };
 }
 
 #[test]
@@ -244,7 +244,7 @@ fn test_peek_small_instructions() {
      match GuacdParser::peek_instruction(data) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "x");
-            assert_eq!(peeked.args, vec!["", "y"]);
+            assert_eq!(peeked.args.as_slice(), &["", "y"]);
 
             let content_slice = &data[..peeked.total_length_in_buffer-1];
             let instruction = GuacdParser::parse_instruction_content(content_slice).unwrap();
@@ -397,7 +397,7 @@ fn test_parse_simple_instruction() { // Already refactored, keeping to avoid del
     match GuacdParser::peek_instruction(data) {
         Ok(peeked_instr) => {
             assert_eq!(peeked_instr.opcode, "test");
-            assert_eq!(peeked_instr.args, vec!["param1", "param2"]);
+            assert_eq!(peeked_instr.args.as_slice(), &["param1", "param2"]);
             let content_slice = &data[..peeked_instr.total_length_in_buffer - 1];
             let instruction = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instruction.opcode, "test");
@@ -417,10 +417,10 @@ fn test_partial_instruction() { // Renamed test_peek_partial_then_complete
     match GuacdParser::peek_instruction(&buffer) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["param1"]);
+            assert_eq!(peeked.args.as_slice(), &["param1"]);
         }
         Err(e) => panic!("Peek failed after completing instruction: {:?}", e),
-    }
+    };
 }
 
 
@@ -451,7 +451,7 @@ fn test_large_instructions() { // Renamed from test_guacd_parser_large_instructi
             assert_eq!(instruction.args[0], large_str);
         }
         Err(e) => panic!("Peek failed for large instruction: {:?}", e),
-    }
+    };
 }
 
 
@@ -583,7 +583,7 @@ fn test_parse_multiple_instructions_with_peek() { // Renamed from test_parse_mul
     // Instruction 1
     match GuacdParser::peek_instruction(remaining_slice) {
         Ok(peeked) if peeked.opcode == "cmd1" => {
-            assert_eq!(peeked.args, vec!["arg1"]); // Check args directly from peeked
+            assert_eq!(peeked.args.as_slice(), &["arg1"]); // Check args directly from peeked
             let content_slice = &remaining_slice[..peeked.total_length_in_buffer-1];
             let instr = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instr.opcode, "cmd1");
@@ -595,7 +595,7 @@ fn test_parse_multiple_instructions_with_peek() { // Renamed from test_parse_mul
     // Instruction 2
     match GuacdParser::peek_instruction(remaining_slice) {
         Ok(peeked) if peeked.opcode == "cmd2a" => {
-            assert_eq!(peeked.args, vec!["argX", "argY"]); // Check args
+            assert_eq!(peeked.args.as_slice(), &["argX", "argY"]); // Check args
             let content_slice = &remaining_slice[..peeked.total_length_in_buffer-1];
             let instr = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instr.opcode, "cmd2a");
@@ -656,14 +656,14 @@ fn test_guacd_protocol_compliance_various_valid_instructions_peek() { // Renamed
         (b"6.select,3.rdp;".as_slice(), "select", vec!["rdp"]),
         (b"4.size,4.1024,3.768,2.96;".as_slice(), "size", vec!["1024", "768", "96"]),
         (b"5.audio,20.audio/L16;rate=44100;".as_slice(), "audio", vec!["audio/L16;rate=44100"]),
-        (b"0.;".as_slice(), "", Vec::<&str>::new()), // Empty instruction
+        (b"0.;".as_slice(), "", vec![]), // Empty instruction
     ];
 
     for (data, expected_opcode, expected_args_slices) in test_cases {
         match GuacdParser::peek_instruction(data) {
             Ok(peeked) => {
                 assert_eq!(peeked.opcode, expected_opcode, "Opcode mismatch for data: {:?}", data);
-                assert_eq!(peeked.args, expected_args_slices, "Args mismatch for data: {:?}", data);
+                assert_eq!(peeked.args.as_slice(), expected_args_slices.as_slice(), "Args mismatch for data: {:?}", data);
                 // Optionally, fully parse to double-check
                 let content_slice = &data[..peeked.total_length_in_buffer - 1];
                 let instruction = GuacdParser::parse_instruction_content(content_slice).unwrap();
@@ -685,7 +685,7 @@ fn test_peek_then_simulate_consume() { // Renamed from test_peek_then_consume_ra
     match GuacdParser::peek_instruction(data1) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["value"]);
+            assert_eq!(peeked.args.as_slice(), &["value"]);
             assert_eq!(peeked.total_length_in_buffer, data1.len());
         }
         Err(e) => panic!("Peek failed for first instruction: {:?}. Slice: '{}'", e, String::from_utf8_lossy(data1)),
@@ -695,7 +695,7 @@ fn test_peek_then_simulate_consume() { // Renamed from test_peek_then_consume_ra
     match GuacdParser::peek_instruction(data2_slice) {
          Ok(peeked) => {
             assert_eq!(peeked.opcode, "next");
-            assert_eq!(peeked.args, vec!["X"]);
+            assert_eq!(peeked.args.as_slice(), &["X"]);
             assert_eq!(peeked.total_length_in_buffer, data2_slice.len());
         }
         Err(e) => panic!("Peek failed for second instruction (isolated): {:?}. Slice: '{}'", e, String::from_utf8_lossy(data2_slice)),
@@ -710,7 +710,7 @@ fn test_peek_then_simulate_consume() { // Renamed from test_peek_then_consume_ra
     match GuacdParser::peek_instruction(current_slice) {
         Ok(peeked) => {
            assert_eq!(peeked.opcode, "next");
-           assert_eq!(peeked.args, vec!["X"]);
+           assert_eq!(peeked.args.as_slice(), &["X"]);
            assert_eq!(peeked.total_length_in_buffer, "4.next,1.X;".len()); // Corrected expected length
        }
        Err(e) => panic!("Peek failed for second instruction (sequential): {:?}. Slice: '{}'", e, String::from_utf8_lossy(current_slice)),
@@ -733,7 +733,7 @@ fn test_parser_handles_data_chunks_correctly_with_peek() { // Renamed
     let mut current_view = &buffer[..];
     match GuacdParser::peek_instruction(current_view) {
         Ok(peeked) if peeked.opcode == "cmd1" => {
-            assert_eq!(peeked.args, vec!["arg1"]);
+            assert_eq!(peeked.args.as_slice(), &["arg1"]);
             let content_slice = &current_view[..peeked.total_length_in_buffer-1];
             let instr = GuacdParser::parse_instruction_content(content_slice).unwrap();
             assert_eq!(instr.opcode, "cmd1");
@@ -764,7 +764,7 @@ fn test_parser_handles_data_chunks_correctly_with_peek() { // Renamed
             assert_eq!(GuacdParser::peek_instruction(remaining_after_cmd2a), Err(PeekError::Incomplete));
         }
         other => panic!("Expected cmd2a after chunk3, got {:?}", other),
-    }
+    };
 }
 
 #[test]
@@ -866,7 +866,7 @@ fn test_very_long_instruction_peek() { // Renamed
             assert_eq!(instr.args[0], long_arg_val);
         }
         other => panic!("Long instruction test failed, got {:?}", other),
-    }
+    };
 }
 
 #[test]
@@ -879,7 +879,7 @@ fn test_partial_instruction_then_complete_peek() { // Renamed
     
     match GuacdParser::peek_instruction(&buffer) {
         Ok(peeked) if peeked.opcode == "sync" => {
-            assert_eq!(peeked.args, vec!["123", "hello"]); 
+            assert_eq!(peeked.args.as_slice(), &["123", "hello"]); 
             // Full parse check
             let content_slice = &buffer[..peeked.total_length_in_buffer-1];
             let instr = GuacdParser::parse_instruction_content(content_slice).unwrap();
@@ -891,7 +891,7 @@ fn test_partial_instruction_then_complete_peek() { // Renamed
             assert_eq!(GuacdParser::peek_instruction(remaining), Err(PeekError::Incomplete));
         }
         other => panic!("Expected sync after completion, got {:?}", other),
-    }
+    };
 }
 
 #[test]
@@ -993,7 +993,13 @@ fn test_peek_instruction_malformed_opcode_no_len_delim() {
 #[test]
 fn test_peek_instruction_opcode_len_not_utf8() {
     let data: &[u8] = &[0xFF, b'.', b'o', b'p', b';']; // Invalid UTF-8 for length
-    assert!(matches!(GuacdParser::peek_instruction(data), Err(PeekError::Utf8Error(_))));
+    // Our fast integer parser returns InvalidFormat, not Utf8Error
+    match GuacdParser::peek_instruction(data) {
+        Err(PeekError::InvalidFormat(msg)) => {
+            assert!(msg.contains("Opcode length not an integer"));
+        }
+        other => panic!("Expected InvalidFormat for non-UTF8 length, got {:?}", other),
+    }
 }
 
 // Added test: Opcode value goes beyond content
@@ -1011,7 +1017,13 @@ fn test_peek_instruction_opcode_val_overflow() {
 #[test]
 fn test_peek_instruction_arg_len_not_utf8() {
     let data: &[u8] = &[b'2',b'.',b'o',b'p',b',', 0xFF, b'.', b'a',b'r',b'g',b';'];
-    assert!(matches!(GuacdParser::peek_instruction(data), Err(PeekError::Utf8Error(_))));
+    // Our fast integer parser returns InvalidFormat, not Utf8Error
+    match GuacdParser::peek_instruction(data) {
+        Err(PeekError::InvalidFormat(msg)) => {
+            assert!(msg.contains("Argument length not an integer"));
+        }
+        other => panic!("Expected InvalidFormat for non-UTF8 arg length, got {:?}", other),
+    }
 }
 
 // Added test: Arg value goes beyond content
@@ -1065,7 +1077,7 @@ fn test_peek_instruction_multiple_empty_args() {
     match GuacdParser::peek_instruction(data) {
         Ok(peeked) => {
             assert_eq!(peeked.opcode, "test");
-            assert_eq!(peeked.args, vec!["", "", ""]);
+            assert_eq!(peeked.args.as_slice(), &["", "", ""]);
         }
         Err(e) => panic!("Peek failed for multiple empty args: {:?}", e),
     }

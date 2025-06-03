@@ -28,7 +28,7 @@ fn test_tube_creation() {
     let runtime = get_runtime();
     runtime.block_on(async {
         // Create a tube
-        let tube = Tube::new(false).expect("Failed to create tube");
+        let tube = Tube::new(false, None).expect("Failed to create tube");
         let tube_id = tube.id();
         println!("Created tube with ID: {}", tube_id);
 
@@ -118,7 +118,7 @@ fn test_tube_channel_creation() {
     println!("Starting test_tube_channel_creation");
     let runtime = get_runtime();
     runtime.block_on(async {
-        let tube = Tube::new(false).expect("Failed to create tube");
+        let tube = Tube::new(false, None).expect("Failed to create tube");
         let tube_id = tube.id();
         let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
         let mut settings = HashMap::new();
@@ -147,7 +147,9 @@ fn test_tube_channel_creation() {
             "test",
             &data_channel,
             Some(5.0),
-            settings
+            settings,
+            Some("TEST_CALLBACK_TOKEN_1".to_string()),
+            Some("TEST_MODE_KSM_CONFIG_1".to_string())
         ).await.expect("Call to create_channel itself failed");
 
         // Verify channel shutdown signal exists
@@ -177,7 +179,7 @@ fn test_tube_channel_creation() {
 
 #[tokio::test]
 async fn test_tube_create_with_pc() {
-    let tube = Tube::new(false).expect("Failed to create tube");
+    let tube = Tube::new(false, None).expect("Failed to create tube");
     
     // Create a signaling channel
     let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
@@ -200,7 +202,7 @@ async fn test_tube_create_with_pc() {
 
 #[tokio::test]
 async fn test_tube_webrtc_connection() {
-    let tube = Tube::new(false).expect("Failed to create tube");
+    let tube = Tube::new(false, None).expect("Failed to create tube");
     
     // Create a signaling channel
     let (signal_tx, _) = mpsc::unbounded_channel();
@@ -225,7 +227,7 @@ async fn test_tube_webrtc_connection() {
 
 #[tokio::test]
 async fn test_tube_create_channel() {
-    let tube = Tube::new(false).expect("Failed to create tube");
+    let tube = Tube::new(false, None).expect("Failed to create tube");
     let (signal_tx, _) = mpsc::unbounded_channel();
     let mut settings = HashMap::new();
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
@@ -246,7 +248,9 @@ async fn test_tube_create_channel() {
         "test", 
         &data_channel, 
         Some(5.0),
-        settings 
+        settings,
+        Some("token_val".to_string()),
+        Some("ksm_config_val".to_string())
     ).await.expect("Failed to create channel instance");
 
     // Assert that the channel shutdown signal exists in the tube's map
@@ -427,8 +431,8 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
 
     info!("[E2E_TEST] Starting test_tube_p2p_data_transfer_end_to_end");
 
-    let tube1 = Tube::new(false)?;
-    let tube2 = Tube::new(false)?;
+    let tube1 = Tube::new(false, None)?;
+    let tube2 = Tube::new(false, None)?;
     info!("[E2E_TEST] Tube1 ID: {}, Tube2 ID: {}", tube1.id(), tube2.id());
 
     let ksm_config_t1 = "TEST_MODE_KSM_CONFIG_T1_E2E".to_string();

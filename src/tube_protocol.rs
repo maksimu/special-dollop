@@ -44,7 +44,7 @@ impl std::fmt::Display for ControlMessage {
 
 impl TryFrom<u16> for ControlMessage {
     type Error = anyhow::Error;
-    fn try_from(raw: u16) -> anyhow::Result<Self, Self::Error> {
+    fn try_from(raw: u16) -> anyhow::Result<Self> {
         use ControlMessage::*;
         match raw {
             1 => Ok(Ping),
@@ -62,15 +62,25 @@ impl TryFrom<u16> for ControlMessage {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CloseConnectionReason {
     Normal = 0,
-    ConnectionFailed = 1,
-    ConnectionLost = 2,
-    Timeout = 3,
-    AIClosed = 4,
-    AddressResolutionFailed = 5,
-    DecryptionFailed = 6,
-    ConfigurationError = 7,
-    ProtocolError = 8,
-    Unknown = 0xFFFF,
+    Error = 1,
+    Timeout = 2,
+    ServerRefuse = 4,
+    Client = 5,
+    Unknown = 6,
+    InvalidInstruction = 7,
+    GuacdRefuse = 8,
+    ConnectionLost = 9,
+    ConnectionFailed = 10,
+    TunnelClosed = 11,
+    AdminClosed = 12,
+    ErrorRecording = 13,
+    GuacdError = 14,
+    AIClosed = 15,
+    AddressResolutionFailed = 16,
+    DecryptionFailed = 17,
+    ConfigurationError = 18,
+    ProtocolError = 19,
+    UpstreamClosed = 20,
 }
 
 // Helper for CloseConnectionReason (assuming it might be defined elsewhere, adding a basic version)
@@ -79,14 +89,25 @@ impl CloseConnectionReason {
     pub fn from_code(code: u16) -> Self {
         match code {
             0 => CloseConnectionReason::Normal,
-            1 => CloseConnectionReason::ConnectionFailed,
-            2 => CloseConnectionReason::ConnectionLost,
-            3 => CloseConnectionReason::Timeout,
-            4 => CloseConnectionReason::AIClosed,
-            5 => CloseConnectionReason::AddressResolutionFailed,
-            6 => CloseConnectionReason::DecryptionFailed,
-            7 => CloseConnectionReason::ConfigurationError,
-            8 => CloseConnectionReason::ProtocolError,
+            1 => CloseConnectionReason::Error,
+            2 => CloseConnectionReason::Timeout,
+            4 => CloseConnectionReason::ServerRefuse,
+            5 => CloseConnectionReason::Client,
+            6 => CloseConnectionReason::Unknown,
+            7 => CloseConnectionReason::InvalidInstruction,
+            8 => CloseConnectionReason::GuacdRefuse,
+            9 => CloseConnectionReason::ConnectionLost,
+            10 => CloseConnectionReason::ConnectionFailed,
+            11 => CloseConnectionReason::TunnelClosed,
+            12 => CloseConnectionReason::AdminClosed,
+            13 => CloseConnectionReason::ErrorRecording,
+            14 => CloseConnectionReason::GuacdError,
+            15 => CloseConnectionReason::AIClosed,
+            16 => CloseConnectionReason::AddressResolutionFailed,
+            17 => CloseConnectionReason::DecryptionFailed,
+            18 => CloseConnectionReason::ConfigurationError,
+            19 => CloseConnectionReason::ProtocolError,
+            20 => CloseConnectionReason::UpstreamClosed,
             _ => CloseConnectionReason::Unknown,
         }
     }
@@ -95,17 +116,28 @@ impl CloseConnectionReason {
 impl TryFrom<u16> for CloseConnectionReason {
     type Error = anyhow::Error; // Or a more specific error type
 
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
+    fn try_from(value: u16) -> anyhow::Result<Self> {
         match value {
             0 => Ok(CloseConnectionReason::Normal),
-            1 => Ok(CloseConnectionReason::ConnectionFailed),
-            2 => Ok(CloseConnectionReason::ConnectionLost),
-            3 => Ok(CloseConnectionReason::Timeout),
-            4 => Ok(CloseConnectionReason::AIClosed),
-            5 => Ok(CloseConnectionReason::AddressResolutionFailed),
-            6 => Ok(CloseConnectionReason::DecryptionFailed),
-            7 => Ok(CloseConnectionReason::ConfigurationError),
-            8 => Ok(CloseConnectionReason::ProtocolError),
+            1 => Ok(CloseConnectionReason::Error),
+            2 => Ok(CloseConnectionReason::Timeout),
+            4 => Ok(CloseConnectionReason::ServerRefuse),
+            5 => Ok(CloseConnectionReason::Client),
+            6 => Ok(CloseConnectionReason::Unknown),
+            7 => Ok(CloseConnectionReason::InvalidInstruction),
+            8 => Ok(CloseConnectionReason::GuacdRefuse),
+            9 => Ok(CloseConnectionReason::ConnectionLost),
+            10 => Ok(CloseConnectionReason::ConnectionFailed),
+            11 => Ok(CloseConnectionReason::TunnelClosed),
+            12 => Ok(CloseConnectionReason::AdminClosed),
+            13 => Ok(CloseConnectionReason::ErrorRecording),
+            14 => Ok(CloseConnectionReason::GuacdError),
+            15 => Ok(CloseConnectionReason::AIClosed),
+            16 => Ok(CloseConnectionReason::AddressResolutionFailed),
+            17 => Ok(CloseConnectionReason::DecryptionFailed),
+            18 => Ok(CloseConnectionReason::ConfigurationError),
+            19 => Ok(CloseConnectionReason::ProtocolError),
+            20 => Ok(CloseConnectionReason::UpstreamClosed),
             0xFFFF => Ok(CloseConnectionReason::Unknown),
             _ => Err(anyhow::anyhow!("Invalid u16 value for CloseConnectionReason: {}", value)),
         }
@@ -174,7 +206,7 @@ impl Frame {
         payload_slice: &[u8],
         // pool: &BufferPool, // Pool is not directly used here; target_buf should be from a pool
     ) -> usize {
-        target_buf.clear(); // Ensure buffer is ready for new frame
+        target_buf.clear(); // Ensure the buffer is ready for a new frame
         let timestamp_ms = now_ms();
         let payload_len = payload_slice.len();
 
@@ -186,7 +218,7 @@ impl Frame {
         target_buf.put_u32(conn_no);
         target_buf.put_u64(timestamp_ms);
         target_buf.put_u32(payload_len as u32);
-        target_buf.extend_from_slice(payload_slice); // Payload copied directly from source slice
+        target_buf.extend_from_slice(payload_slice); // Payload copied directly from the source slice
         target_buf.extend_from_slice(TERMINATOR);
         
         needed_capacity // Return total bytes written for this frame

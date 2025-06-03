@@ -3,7 +3,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 use crate::Tube;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn, error, trace};
 use anyhow::{Result, anyhow, Context};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -175,11 +175,13 @@ impl TubeRegistry {
     }
     
     /// get all conversations from a tube id
+    #[allow(dead_code)]
     pub(crate) fn tube_id_from_conversation_id(&self, conversation_id: &str) -> Option<&String> {
         self.conversation_mappings.get(conversation_id)
     }
     
     /// get all conversation ids by tube id 
+    #[allow(dead_code)]
     pub(crate) fn conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<&String> {
         let mut results = Vec::new();
         // Search in conversation IDs
@@ -214,7 +216,7 @@ impl TubeRegistry {
 
         let is_server_mode = initial_offer_sdp_decoded.is_none();
 
-        let tube_arc = Tube::new(is_server_mode)?;
+        let tube_arc = Tube::new(is_server_mode, Some(conversation_id.to_string()))?;
         let tube_id = tube_arc.id();
 
         self.add_tube(Arc::clone(&tube_arc));
@@ -222,7 +224,8 @@ impl TubeRegistry {
         self.set_server_mode(is_server_mode);
         self.signal_channels.insert(tube_id.clone(), signal_sender.clone());
 
-        info!(target: "ice_config", tube_id = %tube_id, ksm_config = %ksm_config, "Received ksm_config for ICE server setup");
+        info!(target: "ice_config", tube_id = %tube_id, "Received ksm_config for ICE server setup");
+        trace!(target: "ice_config", ksm_config = %ksm_config, "Received ksm_config for ICE server setup");
 
         let mut ice_servers = Vec::new();
         let mut turn_only_for_config = settings.get("turn_only").map_or(false, |v| v.as_bool().unwrap_or(false));
@@ -277,8 +280,6 @@ impl TubeRegistry {
                                     info!(target: "ice_config", tube_id = %tube_id, turn_url = %turn_url_udp, "Added TURN server (UDP)");
                                 } else {
                                     warn!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Failed to add TURN servers: Usable TURN credentials (empty username/password) not obtained.");
-                                    // Potentially return an error or handle as a configuration issue
-                                    // For now, just log and continue without these specific TURN servers
                                 }
                             },
                             Err(e) => {
@@ -292,8 +293,6 @@ impl TubeRegistry {
                 }
             }
         }
-
-        // Log all configured ICE server URLs before creating RTCConfiguration
         let all_configured_urls: Vec<String> = ice_servers.iter().flat_map(|s| s.urls.clone()).collect();
         info!(target: "ice_config", tube_id = %tube_id, configured_ice_urls = ?all_configured_urls, "Final list of ICE server URLs to be used");
 
@@ -320,14 +319,14 @@ impl TubeRegistry {
             signal_sender.clone(),
         ).await?;
 
-        let mut listening_port_option: Option<u16> = None; // Initialize outside the if
+        let mut listening_port_option: Option<u16> = None; // Initialize outside if
 
-        // Conditionally create channels only if in server mode (no initial offer from client)
+        // Conditionally create channels only if in server mode (no initial offer from the client)
         if is_server_mode {
             info!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: Proactively creating control and main data channels.");
             if let Err(e) = tube_arc.create_control_channel(ksm_config.to_string(), callback_token.to_string()).await {
                 warn!("Failed to create control channel for tube {}: {}", tube_id, e);
-                // Decide if this is a fatal error for server mode. For now, just warning.
+                // Decide if this is a fatal error for server mode. For now, just a warning.
             }
 
             // Create the main data channel, using conversation_id as its label.
@@ -335,7 +334,7 @@ impl TubeRegistry {
             match tube_arc.create_data_channel(conversation_id, ksm_config.to_string(), callback_token.to_string()).await {
                 Ok(data_channel_arc) => {
                     // Assign to listening_port_option here
-                    match tube_arc.create_channel(conversation_id, &data_channel_arc, None, settings.clone()).await {
+                    match tube_arc.create_channel(conversation_id, &data_channel_arc, None, settings.clone(), Some(callback_token.to_string()), Some(ksm_config.to_string())).await {
                         Ok(port_opt) => listening_port_option = port_opt,
                         Err(e) => {
                             warn!(target: "tube_lifecycle", tube_id = %tube_id, channel_id = %conversation_id, "Server mode: Failed to create logical channel for main data channel: {}", e);
@@ -344,19 +343,14 @@ impl TubeRegistry {
                 }
                 Err(e) => {
                     warn!(target: "tube_lifecycle", tube_id = %tube_id, channel_id = %conversation_id, "Server mode: Failed to create main data channel: {}", e);
-                    // Decide if this is fatal.
                 }
             }
         } else {
             info!(target: "tube_lifecycle", tube_id = %tube_id, "Client mode: Expecting client to create data channels via its offer.");
-            // In client mode (offer provided), we rely on the on_data_channel callback
-            // in Tube::create_peer_connection to handle incoming channels defined by the client.
         }
 
         let mut result_map = HashMap::new();
         result_map.insert("tube_id".to_string(), tube_id.clone());
-
-        // Conditionally add actual_local_listen_addr if in server mode AND a port was obtained
         if is_server_mode {
             if let Some(port) = listening_port_option {
                 result_map.insert("actual_local_listen_addr".to_string(), format!("127.0.0.1:{}", port));
@@ -380,7 +374,7 @@ impl TubeRegistry {
             target: "tube_lifecycle", 
             tube_id = %tube_id, 
             conversation_id = %conversation_id, 
-            mode = if is_server_mode {"Server"} else {"Client"}, 
+            mode = if is_server_mode {"Server"} else {"Client"},
             result_keys = ?result_map.keys(), 
             settings_keys = ?settings.keys(),
             "Tube processing complete."
@@ -418,6 +412,7 @@ impl TubeRegistry {
     }
     
     /// Get connection state
+    #[allow(dead_code)]
     pub(crate) async fn get_connection_state(&self, tube_id: &str) -> Result<String> {
         let tube = self.get_by_tube_id(tube_id)
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
@@ -460,6 +455,7 @@ impl TubeRegistry {
     
     /// Register a channel and set up a data channel on an EXISTING tube.
     /// This function assumes the tube and its peer connection are already established.
+    #[allow(dead_code)]
     pub(crate) async fn register_channel(
         &mut self,
         channel_id: &str,
@@ -481,12 +477,13 @@ impl TubeRegistry {
         let data_channel = tube.create_data_channel(channel_id, ksm_config.clone(), callback_token.clone()).await?;
         
         // Create the logical channel handler
-        tube.create_channel(channel_id, &data_channel, None, settings.clone()).await?; 
+        tube.create_channel(channel_id, &data_channel, None, settings.clone(), Some(callback_token), Some(ksm_config)).await?; 
         
         Ok(())
     }
 
     /// Create a new connection, either using an existing tube or creating a new one
+    #[allow(dead_code)]
     pub(crate) async fn new_connection(
         &mut self,
         tube_id: Option<&str>,
@@ -556,6 +553,7 @@ impl TubeRegistry {
     }
 
     /// Add an ICE candidate received from the external source
+    #[allow(dead_code)]
     pub(crate) async fn add_external_ice_candidate(&self, tube_id: &str, candidate: &str) -> Result<()> {
         let tube = self.get_by_tube_id(tube_id)
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;

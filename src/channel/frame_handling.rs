@@ -6,6 +6,7 @@ use tracing::{debug, error, warn};
 use super::core::Channel;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
+use crate::channel::protocol::now_ms;
 
 // Central dispatcher for incoming frames
 // **BOLD WARNING: HOT PATH - CALLED FOR EVERY INCOMING FRAME**
@@ -36,7 +37,7 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
                 debug!("Channel({}): Routing frame to protocol handler for connection {}", 
                          channel.channel_id, conn_no);
             }
-            forward_to_protocol(channel, conn_no, frame.payload).await?;
+            forward_to_protocol(channel, conn_no, frame.payload, frame.timestamp_ms).await?;
         }
     }
     
@@ -79,10 +80,10 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
 // **BOLD WARNING: HOT PATH - CALLED FOR EVERY DATA FRAME**
 // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
 // **WARNING: LOCK ACQUISITION ON EVERY CALL - CONSIDER LOCK-FREE ALTERNATIVES**
-async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes) -> Result<()> {
+async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes, frame_timestamp_ms: u64) -> Result<()> {
     if tracing::enabled!(tracing::Level::DEBUG) {
-        debug!("Channel({}): Forwarding {} bytes for connection {} directly to backend TCP", 
-               channel.channel_id, payload.len(), conn_no);
+        debug!("Channel({}): Forwarding {} bytes for connection {} directly to backend TCP (timestamp: {})", 
+               channel.channel_id, payload.len(), conn_no, frame_timestamp_ms);
         
         if payload.len() > 0 {
             if payload.len() <= 100 {
@@ -93,6 +94,9 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
             }
         }
     }
+
+    // Call update_stats first. It will acquire its own lock on channel.conns.
+    update_stats(channel, conn_no, payload.len(), frame_timestamp_ms).await;
 
     let mut conns_guard = channel.conns.lock().await;
     if let Some(conn) = conns_guard.get_mut(&conn_no) {
@@ -120,4 +124,44 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     }
     
     Ok(())
+}
+
+/// Update connection statistics based on received data
+// **BOLD WARNING: HOT PATH - CALLED FOR EVERY DATA FRAME**
+// **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
+// **WARNING: MULTIPLE LOCK ACQUISITIONS - CONSIDER LOCK-FREE STATISTICS**
+async fn update_stats(channel: &mut Channel, connection_no: u32, bytes: usize, timestamp: u64) {
+    // Get current time
+    let now = now_ms();
+
+    // Calculate receive latency (how long it took for the message to arrive)
+    let receive_latency = now.saturating_sub(timestamp);
+
+    // Update connection stats
+    // **PERFORMANCE WARNING: Lock acquisition in a hot path**
+    let mut conns_guard = channel.conns.lock().await;
+    if let Some(conn) = conns_guard.get_mut(&connection_no) {
+        // Update bytes received
+        conn.stats.receive_size += bytes;
+
+        // Update message counter (used for ACK tracking)
+        conn.stats.message_counter += 1;
+
+        // Update receive latency
+        conn.stats.receive_latency_sum += receive_latency;
+        conn.stats.receive_latency_count += 1;
+
+        // Log stats periodically (every 1000 messages)
+        if conn.stats.message_counter % 1000 == 0 && tracing::enabled!(tracing::Level::DEBUG) {
+            let avg_latency = if conn.stats.receive_latency_count > 0 {
+                conn.stats.receive_latency_sum / conn.stats.receive_latency_count
+            } else {
+                0
+            };
+            debug!(target: "protocol_event", channel_id=%channel.channel_id, "Endpoint Stats for connection {}: {} bytes received, avg latency {} ms", connection_no, conn.stats.receive_size, avg_latency);
+        }
+    } else if connection_no != 0 && tracing::enabled!(tracing::Level::DEBUG) {
+        // Only log for non-control connections
+        debug!(target: "protocol_event", channel_id=%channel.channel_id, "Endpoint No connection found for stats update: {}", connection_no);
+    }
 }

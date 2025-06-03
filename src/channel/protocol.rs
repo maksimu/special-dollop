@@ -1,21 +1,24 @@
 use crate::runtime::get_runtime;
 use anyhow::{anyhow, Result};
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::net::ToSocketAddrs;
 use tracing::{debug, error, info, warn, trace};
 use tokio::io::{AsyncWriteExt};
 
-use super::core::Channel;
+use super::core::{Channel, BUFFER_LOW_THRESHOLD};
 use crate::tube_protocol::{ControlMessage, CloseConnectionReason, CONN_NO_LEN};
 
 // Import from the new connect_as module
 use super::connect_as::decrypt_connect_as_payload;
 
-// Placeholder constants - ensure these are defined correctly in your project scope
-// or move them to a more appropriate central location (e.g., types.rs or a consts.rs)
-pub(crate) const PUBLIC_KEY_LENGTH: usize = 65; 
-pub(crate) const NONCE_LENGTH: usize = 12;
+// Constants for ConnectAs, similar to those in connections.rs
+const CONNECT_AS_DETAILS_LEN_FIELD_BYTES: usize = 4;
+const CONNECT_AS_PUBLIC_KEY_BYTES: usize = 65; // As per Python: 65-byte public key
+const CONNECT_AS_NONCE_BYTES: usize = 12;    // As per Python: 12 byte nonce
+
+use p256::SecretKey as P256SecretKey;
+use p256::pkcs8::DecodePrivateKey; // Trait for from_pkcs8_pem
+use hex;
 
 /// Get the current time in milliseconds since epoch
 pub fn now_ms() -> u64 {
@@ -171,300 +174,296 @@ impl Channel {
         }
 
         let mut cursor = std::io::Cursor::new(data);
-        let target_connection_no = cursor.get_u32();
+        let target_connection_no = cursor.get_u32(); // Consumes first 4 bytes
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = target_connection_no, payload_len = cursor.remaining(), server_mode = self.server_mode, active_protocol = ?self.active_protocol, "Endpoint Received OpenConnection request");
         }
-
-        // Prepare data for the detailed trace log BEFORE the trace! macro
-        let guacd_host_clone = self.guacd_host.clone();
-        let guacd_port_clone = self.guacd_port; // Option<u16> is Copy
-        let connect_as_settings_clone = self.connect_as_settings.clone();
         
-        // Lock and prepare the guacd_params for logging
+        // Initialize effective host/port with channel defaults
+        let mut effective_guacd_host = self.guacd_host.clone();
+        let mut effective_guacd_port = self.guacd_port;
+
+        // --- ConnectAs Logic (integrated from connections.rs) ---
+        if self.active_protocol == super::types::ActiveProtocol::Guacd &&
+           (self.connect_as_settings.allow_supply_user || self.connect_as_settings.allow_supply_host) &&
+           self.connect_as_settings.gateway_private_key.is_some() {
+            
+            debug!("Channel({}): Attempting ConnectAs for Guacd target_conn_no {}", self.channel_id, target_connection_no);
+
+            if cursor.remaining() >= CONNECT_AS_DETAILS_LEN_FIELD_BYTES {
+                let connect_as_payload_len = cursor.get_u32() as usize; // Consumes 4 bytes
+                let required_crypto_block_len = CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES + connect_as_payload_len;
+
+                if cursor.remaining() >= required_crypto_block_len {
+                    let mut crypto_buffer = self.buffer_pool.acquire();
+                    crypto_buffer.clear();
+                    crypto_buffer.resize(required_crypto_block_len, 0);
+                    
+                    cursor.copy_to_slice(&mut crypto_buffer[..]); // Consumes required_crypto_block_len bytes
+                    
+                    let client_public_key_bytes = &crypto_buffer[..CONNECT_AS_PUBLIC_KEY_BYTES];
+                    let nonce_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES..CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES];
+                    let encrypted_data_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES..];
+
+                    let gateway_private_key_pem = self.connect_as_settings.gateway_private_key.as_ref().unwrap();
+
+                    // 1. Parse PKCS#8 PEM to P256SecretKey
+                    let p256_secret_key = P256SecretKey::from_pkcs8_pem(gateway_private_key_pem)
+                        .map_err(|e| {
+                            error!("Channel({}): Failed to parse gateway private key PKCS#8 PEM: {}. PEM was: '{}'", self.channel_id, e, gateway_private_key_pem);
+                            anyhow!("Failed to parse gateway private key PKCS#8 PEM: {}", e)
+                        })?;
+
+                    // 2. Get the raw scalar bytes of the P256SecretKey
+                    let secret_key_scalar_bytes = p256_secret_key.to_bytes(); // This returns FieldBytes<NistP256>
+
+                    // 3. Convert raw scalar bytes to hex string
+                    // FieldBytes<C> (which is GenericArray<u8, C::FieldSize>) implements AsRef<[u8]>,
+                    // so it can be passed directly to hex::encode.
+                    let gateway_private_key_hex = hex::encode(secret_key_scalar_bytes);
+
+                    match decrypt_connect_as_payload(
+                        &gateway_private_key_hex, // Use the hex string of raw scalar bytes
+                        client_public_key_bytes,
+                        nonce_bytes,
+                        encrypted_data_bytes,
+                    ) {
+                        Ok(decrypted_payload) => {
+                            info!("Channel({}): Successfully decrypted ConnectAs payload for target_conn_no {}", self.channel_id, target_connection_no);
+                            let mut guacd_params_locked = self.guacd_params.lock().await;
+
+                            // Apply user credentials if EITHER allow_supply_user OR allow_supply_host is true (matches Python logic)
+                            if self.connect_as_settings.allow_supply_user || self.connect_as_settings.allow_supply_host {
+                                if let Some(user_details) = decrypted_payload.user {
+                                    debug!("Channel({}): Applying ConnectAs user details", self.channel_id);
+                                    
+                                    if let Some(val) = user_details.username { 
+                                        guacd_params_locked.insert("username".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.password { 
+                                        guacd_params_locked.insert("password".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.private_key { 
+                                        guacd_params_locked.insert("privatekey".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.private_key_passphrase { 
+                                        guacd_params_locked.insert("privatekeypassphrase".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.passphrase { 
+                                        guacd_params_locked.insert("passphrase".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.domain { 
+                                        guacd_params_locked.insert("domain".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.connect_database { 
+                                        guacd_params_locked.insert("connectdatabase".to_string(), val); 
+                                    }
+                                    if let Some(val) = user_details.distinguished_name { 
+                                        guacd_params_locked.insert("distinguishedname".to_string(), val); 
+                                    }
+                                }
+                            }
+                            if self.connect_as_settings.allow_supply_host {
+                                if let Some(host) = decrypted_payload.host {
+                                    debug!("Channel({}): ConnectAs supplied host: {}", self.channel_id, host);
+                                    effective_guacd_host = Some(host);
+                                }
+                                if let Some(port) = decrypted_payload.port {
+                                    debug!("Channel({}): ConnectAs supplied port: {}", self.channel_id, port);
+                                    effective_guacd_port = Some(port);
+                                }
+                            }
+                            // Guacd params are updated, effective_guacd_host/port is set.
+                        }
+                        Err(e) => {
+                            error!("Channel({}): Failed to decrypt or parse ConnectAs payload for target_conn_no {}: {}", self.channel_id, target_connection_no, e);
+                            self.buffer_pool.release(crypto_buffer);
+                            // Unlike original connections.rs, we might not want to immediately return Err here.
+                            // Consider if connection should proceed with default Guacd params if ConnectAs fails.
+                            // For now, maintaining strict behavior: if ConnectAs is attempted and fails, the connection attempt fails.
+                            return Err(anyhow!("ConnectAs decryption/parsing failed: {}", e));
+                        }
+                    }
+                    self.buffer_pool.release(crypto_buffer);
+                } else {
+                    warn!("Channel({}): ConnectAs payload too short for PK, Nonce, and encrypted data (expected {}, got {}) for target_conn_no {}",
+                          self.channel_id, required_crypto_block_len, cursor.remaining(), target_connection_no);
+                    return Err(anyhow!("ConnectAs payload too short for PK, Nonce, and encrypted data"));
+                }
+            } else {
+                warn!("Channel({}): ConnectAs payload too short for connect_as_payload_len field (expected {} bytes, got {}) for target_conn_no {}",
+                      self.channel_id, CONNECT_AS_DETAILS_LEN_FIELD_BYTES, cursor.remaining(), target_connection_no);
+                // If ConnectAs was expected but the payload is too short even for its length, it's an error.
+                // If ConnectAs was optional and this path is reached, it implies no ConnectAs data was provided.
+                // The original connections.rs returned Err. Here, we might just log and proceed if ConnectAs is not mandatory.
+                // For now, assuming if ConnectAs is configured, its presence is expected if data follows conn_no.
+                // However, the cursor.remaining() might be 0 if only conn_no was sent.
+                // This needs careful consideration of whether ConnectAs data is mandatory or optional if settings allow it.
+                // The original logic in connections.rs would bail out. Let's stick to that for now if ConnectAs settings are enabled.
+                 if cursor.remaining() > 0 { // If there was some data beyond conn_no but not enough for ConnectAs header
+                    return Err(anyhow!("ConnectAs payload present but too short for its own length field"));
+                 }
+                 // If cursor.remaining() is 0, it means no ConnectAs payload was sent, proceed without it.
+                 debug!("Channel({}): No additional payload for ConnectAs provided after target_conn_no {}.", self.channel_id, target_connection_no);
+            }
+        }
+        // --- End of ConnectAs Logic ---
+
+
+        // Prepare data for the detailed trace log AFTER ConnectAs might have modified params
         let guacd_params_locked = self.guacd_params.lock().await;
         let guacd_params_for_log = format!("{:?}", *guacd_params_locked);
-        drop(guacd_params_locked); // Release the lock as soon as possible
+        drop(guacd_params_locked);
 
         trace!(target: "protocol_event",
             channel_id = %self.channel_id,
             conn_no = target_connection_no,
-            guacd_host = ?guacd_host_clone,
-            guacd_port = ?guacd_port_clone,
-            connect_as_settings = ?connect_as_settings_clone,
-            guacd_params_map = %guacd_params_for_log, // Log the prepared string
-            "Channel state at OpenConnection for Guacd target determination"
+            effective_guacd_host = ?effective_guacd_host,
+            effective_guacd_port = ?effective_guacd_port,
+            connect_as_settings = ?self.connect_as_settings,
+            guacd_params_map = %guacd_params_for_log,
+            "Channel state for OpenConnection (after potential ConnectAs)"
         );
 
-        // If this channel is a server-mode PortForwarder, it originates connections locally.
-        // An incoming OpenConnection for a specific conn_no is an ack/part of handshake from the client-side of the tunnel.
-        // The server should already have (or be in the process of setting up) this conn_no from a local TCP acceptance.
-        // It should not try to establish a new outbound connection based on this message.
         if self.server_mode && self.active_protocol == super::types::ActiveProtocol::PortForward {
             debug!(target: "protocol_event", channel_id=%self.channel_id, "Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened.", target_connection_no);
-            // The connection should be in self.conns, or it will be shortly. Via the local TCP accept path.
-            // Sending ConnectionOpened confirms to the client that this conn_no is active on the server side.
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
             return Ok(());
         }
 
-        // Existing check: if connection already processed and in conns map (e.g., client mode, or SOCKS5 server after target resolution)
         if self.conns.lock().await.contains_key(&target_connection_no) {
             debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened.", target_connection_no);
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
             return Ok(());
         }
-
-        let mut host_to_connect: String;
-        let mut port_to_connect: u16;
-
-        // Scenario 1: SOCKS5 - Python SOCKS5Server sends conn_no, host_len, host, port
-        // Scenario 2: Guacd with connect_as - Python TunnelEntrance (acting on behalf of GuacdExit's request)
-        //             might send conn_no, then an encrypted blob. The other Python end (GuacdExit) decrypts this.
-        //             The Rust channel's role here is primarily to establish the TCP link to the guacd server.
-        //             The *final* guacd host/port might be fixed, come from channel config, or be derivable
-        //             if the Rust channel itself were to decrypt a part of the connect_as blob (less likely).
-        // Scenario 3: Simple Port Forward / Guacd (no connect_as in payload) - Python TunnelEntrance sends just conn_no.
-        //             Rust channel uses its pre-configured target.
-
-        if cursor.has_remaining() { 
-            if self.network_checker.is_some() && cursor.remaining() >= 4 { // 4 for host_len u32
-                let pos_before_socks_parse = cursor.position();
-                let host_len = cursor.get_u32() as usize;
-                if cursor.remaining() >= host_len + 2 { 
-                    // **PERFORMANCE: Use buffer pool for host bytes**
-                    let mut host_buffer = self.buffer_pool.acquire();
-                    host_buffer.clear();
-                    host_buffer.resize(host_len, 0);
-                    cursor.copy_to_slice(&mut host_buffer[..]);
-                    let parsed_host = std::str::from_utf8(&host_buffer[..host_len])
-                        .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?
-                        .to_string();
-                    self.buffer_pool.release(host_buffer);
-                    
-                    let parsed_port = cursor.get_u16();
-
-                    if let Some(ref checker) = self.network_checker {
-                        if !checker.is_host_allowed(&parsed_host) {
-                            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target host {} not allowed.", parsed_host);
-                            return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 host not allowed").await;
+        
+        // --- Actual Connection Opening Logic ---
+        let open_result = match self.active_protocol {
+            super::types::ActiveProtocol::Guacd => {
+                if let (Some(host), Some(port)) = (effective_guacd_host.as_deref(), effective_guacd_port) {
+                    match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                        Ok(mut addrs) => {
+                            if let Some(socket_addr) = addrs.next() {
+                                debug!("Channel({}): Guacd OpenConnection for target_conn_no {} to {}:{} (resolved to {}).", 
+                                    self.channel_id, target_connection_no, host, port, socket_addr);
+                                // Use super::connections to call open_backend
+                                super::connections::open_backend(self, target_connection_no, socket_addr, super::types::ActiveProtocol::Guacd).await
+                            } else {
+                                Err(anyhow!("Could not resolve Guacd host {}:{} to any SocketAddr", host, port))
+                            }
                         }
-                        if !checker.is_port_allowed(parsed_port) {
-                            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target port {} not allowed.", parsed_port);
-                            return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 port not allowed").await;
-                        }
+                        Err(e) => Err(anyhow!("DNS lookup failed for Guacd host {}:{}: {}", host, port, e)),
                     }
-                    host_to_connect = parsed_host;
-                    port_to_connect = parsed_port;
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Parsed SOCKS5 target from OpenConnection: {}:{} for conn_no {}", host_to_connect, port_to_connect, target_connection_no);
-                    return self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await;
                 } else {
-                    // Not enough data for SOCKS5 host/port, rewind cursor for other parsing logic.
-                    cursor.set_position(pos_before_socks_parse);
-                    warn!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint OpenConnection payload looked like SOCKS5 but was too short. Rewinding for other parsing.");
+                    Err(anyhow!("Guacd host/port not configured or supplied via ConnectAs for OpenConnection"))
                 }
             }
-
-            // If not SOCKS5 or SOCKS5 parsing failed to consume, the payload might be for other protocols (e.g., connect_as for Guacd)
-            // For Guacd with 'connect_as'; the other side sends the OpenConnection with this payload.
-            // The Rust channel's job is to connect to the guacd server.
-            // The Rust channel here might need to know the Guacd server's host/port from its own config, especially if 'connect_as' doesn't change it.
-            if self.active_protocol == super::types::ActiveProtocol::Guacd {
-                let remaining_at_connect_as_check = cursor.remaining();
-
-                // Using self.connect_as_settings directly
-                return if (self.connect_as_settings.allow_supply_user || self.connect_as_settings.allow_supply_host) &&
-                    remaining_at_connect_as_check >= (4 /*len field*/ + PUBLIC_KEY_LENGTH + NONCE_LENGTH) {
-                    let connect_as_declared_len = cursor.get_u32() as usize;
-
-                    if cursor.remaining() >= (PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len) {
-                        // **PERFORMANCE: Use buffer pool for crypto buffers**
-                        let mut crypto_buffer = self.buffer_pool.acquire();
-                        crypto_buffer.clear();
-                        crypto_buffer.resize(PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len, 0);
-                        
-                        cursor.copy_to_slice(&mut crypto_buffer[..PUBLIC_KEY_LENGTH + NONCE_LENGTH + connect_as_declared_len]);
-                        
-                        let client_public_key = &crypto_buffer[..PUBLIC_KEY_LENGTH];
-                        let client_nonce = &crypto_buffer[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH + NONCE_LENGTH];
-                        let encrypted_connect_as_data = &crypto_buffer[PUBLIC_KEY_LENGTH + NONCE_LENGTH..];
-
-                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Extracted Guacd 'connect_as' fields for conn_no {}. Encrypted payload length: {}.", target_connection_no, connect_as_declared_len);
-                        // Using self.connect_as_settings directly
-                        if let Some(private_key_hex) = &self.connect_as_settings.gateway_private_key {
-                            let result = match decrypt_connect_as_payload(
-                                private_key_hex,
-                                client_public_key,
-                                client_nonce,
-                                encrypted_connect_as_data,
-                            ) {
-                                Ok(decrypted_payload) => {
-                                    info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully decrypted 'connect_as' payload for conn_no {}: {:?}", target_connection_no, decrypted_payload);
-
-                                    // Use self.guacd_host and self.guacd_port as defaults
-                                    host_to_connect = self.guacd_host.clone().unwrap_or_else(|| "localhost".to_string());
-                                    port_to_connect = self.guacd_port.unwrap_or(4822);
-
-                                    if self.connect_as_settings.allow_supply_host {
-                                        if let Some(supplied_host) = decrypted_payload.host {
-                                            host_to_connect = supplied_host;
-                                            info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Using host '{}' from 'connect_as' payload for conn_no {}.", host_to_connect, target_connection_no);
-                                        }
-                                        if let Some(supplied_port) = decrypted_payload.port {
-                                            port_to_connect = supplied_port;
-                                            info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Using port {} from 'connect_as' payload for conn_no {}.", port_to_connect, target_connection_no);
-                                        }
-                                    }
-
-                                    if self.connect_as_settings.allow_supply_user {
-                                        if let Some(user_info) = decrypted_payload.user {
-                                            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint User details from 'connect_as' for conn_no {}: {:?}", target_connection_no, user_info);
-
-                                            let mut params_guard = self.guacd_params.lock().await;
-                                            // Clear specific connect_as params before adding new ones for this connection? Or augment?
-                                            // For now, augmenting. If params are strictly per-connection and not additive to base, clearing might be needed.
-                                            if let Some(username) = user_info.username {
-                                                params_guard.insert("username".to_string(), username);
-                                            }
-                                            if let Some(password) = user_info.password {
-                                                params_guard.insert("password".to_string(), password);
-                                            }
-                                            if let Some(domain) = user_info.domain {
-                                                params_guard.insert("domain".to_string(), domain);
-                                            }
-                                            if let Some(private_key) = user_info.private_key {
-                                                params_guard.insert("private-key".to_string(), private_key);
-                                            }
-                                            if let Some(pk_pass) = user_info.private_key_passphrase {
-                                                params_guard.insert("private_key_passphrase".to_string(), pk_pass);
-                                            }
-                                            if let Some(connect_db) = user_info.connect_database {
-                                                params_guard.insert("connect_database".to_string(), connect_db);
-                                            }
-                                            if let Some(d_name) = user_info.distinguished_name {
-                                                params_guard.insert("distinguished_name".to_string(), d_name);
-                                            }
-                                            drop(params_guard);
-                                            warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %target_connection_no, "Updated self.guacd_params with connect_as user details. TODO: Ensure params are correctly passed to Guacd connection logic.");
-                                        }
-                                    }
-                                    self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await
-                                },
-                                Err(e) => {
-                                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to decrypt/process 'connect_as' payload for conn_no {}: {}. Check key configuration and payload structure.", target_connection_no, e);
-                                    self.close_backend_and_notify(target_connection_no, CloseConnectionReason::DecryptionFailed, "Connect As decryption/processing failed").await
+            super::types::ActiveProtocol::PortForward => {
+                // This logic is mostly for client mode PortForward. Server mode is handled above.
+                if let super::core::ProtocolLogicState::PortForward(pf_state) = &self.protocol_state {
+                    if let (Some(host), Some(port)) = (pf_state.target_host.as_deref(), pf_state.target_port) {
+                        match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                            Ok(mut addrs) => {
+                                if let Some(socket_addr) = addrs.next() {
+                                    debug!("Channel({}): PortForward OpenConnection for target_conn_no {} to {}:{} (resolved to {}).", 
+                                        self.channel_id, target_connection_no, host, port, socket_addr);
+                                    super::connections::open_backend(self, target_connection_no, socket_addr, super::types::ActiveProtocol::PortForward).await
+                                } else {
+                                    Err(anyhow!("Could not resolve PortForward host {}:{} to any SocketAddr", host, port))
                                 }
-                            };
-                            self.buffer_pool.release(crypto_buffer);
-                            result
-                        } else {
-                            self.buffer_pool.release(crypto_buffer);
-                            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Gateway private key for 'connect_as' not configured (self.connect_as_settings). Cannot decrypt payload for conn_no {}.", target_connection_no);
-                            self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConfigurationError, "Connect As private key missing").await
+                            }
+                            Err(e) => Err(anyhow!("DNS lookup failed for PortForward host {}:{}: {}", host, port, e)),
                         }
                     } else {
-                        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Invalid Guacd 'connect_as' data for conn_no {}: not enough bytes for key, nonce, and declared payload length {}. Declared: {}, cursor remaining: {}, key+nonce needed: {}.", target_connection_no, connect_as_declared_len, connect_as_declared_len, cursor.remaining(), PUBLIC_KEY_LENGTH + NONCE_LENGTH);
-                        self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ProtocolError, "Invalid Connect As data structure (length mismatch)").await
+                        Err(anyhow!("PortForward target host/port not configured in channel protocol state"))
                     }
                 } else {
-                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint OpenConnection for Guacd conn_no {} does not match 'connect_as' structure (min length for header+key+nonce: {}, remaining: {}) or 'connect_as' is not allowed/configured (self.connect_as_settings). Using configured Guacd target.", target_connection_no, 4 + PUBLIC_KEY_LENGTH + NONCE_LENGTH, remaining_at_connect_as_check);
-                    self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ProtocolError, "Invalid Connect As data structure (length mismatch)").await
+                     Err(anyhow!("Channel is in PortForward mode, but protocol state is not PortForward"))
                 }
-            }
-        }
- 
-        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint OpenConnection for conn_no {} has no (or unparsed) specific target payload. Using pre-configured target.", target_connection_no);
-        match self.active_protocol {
-            super::types::ActiveProtocol::PortForward => {
-                if let super::core::ProtocolLogicState::PortForward(ref pf_state) = self.protocol_state {
-                    host_to_connect = pf_state.target_host.clone().ok_or_else(|| anyhow!("PortForward target host not set for conn_no {}", target_connection_no))?;
-                    port_to_connect = pf_state.target_port.ok_or_else(|| anyhow!("PortForward target port not set for conn_no {}", target_connection_no))?;
-                } else {
-                    return Err(anyhow!("Invalid state for PortForward OpenConnection for conn_no {}", target_connection_no));
-                }
-            }
-            super::types::ActiveProtocol::Guacd => {
-                // Use self.guacd_host and self.guacd_port
-                host_to_connect = self.guacd_host.clone().unwrap_or_else(|| "localhost".to_string());
-                port_to_connect = self.guacd_port.unwrap_or(4822);
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Guacd OpenConnection (no specific payload) for conn_no {}. Connecting to configured Guacd server {}:{}.", target_connection_no, host_to_connect, port_to_connect);
             }
             super::types::ActiveProtocol::Socks5 => {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 mode, but OpenConnection for conn_no {} did not contain a valid SOCKS5 target payload.", target_connection_no);
-                return self.close_backend_and_notify(target_connection_no, CloseConnectionReason::ConnectionFailed, "SOCKS5 target missing in OpenConnection").await;
-            }
-        }
-        self.establish_backend_connection(target_connection_no, &host_to_connect, port_to_connect).await
-    }
+                // SOCKS5 connection opening is more complex and typically driven by client requests *after* initial tunnel setup.
+                // An OpenConnection here might be an acknowledgment or part of a specific sub-protocol.
+                // The original connections.rs deferred SOCKS5 OpenConnection payload parsing.
+                // The current protocol.rs has some SOCKS5 host/port parsing if network_checker is present.
+                // This section needs to be harmonized based on the exact SOCKS5 flow.
+                // For now, let's assume SOCKS5 target details are parsed from `cursor` if present.
+                if cursor.has_remaining() && self.network_checker.is_some() && cursor.remaining() >= 4 { // Heuristic: if data remains, it might be SOCKS target
+                    // Assuming SOCKS5 target is host_len (u32), then host, then port (u16)
+                    // Note: SOCKS addresses can be domain (length prefixed) or IP. This is simplified.
+                    // This parsing logic is partially duplicated from below, needs cleanup.
+                    let host_len_u32 = cursor.get_u32(); // Read u32 for host_len
+                    let host_len = host_len_u32 as usize;
 
-    /// Helper to close the backend and potentially send a CloseConnection control message.
-    async fn close_backend_and_notify(&mut self, conn_no: u32, reason: CloseConnectionReason, log_message: &str) -> Result<()> {
-        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint {} for conn_no {}. Closing backend.", log_message, conn_no);
-        // The close_backend method should handle removing the connection from self.conns
-        // and cleaning up its resources. It might also send a CloseConnection control message.
-        // If close_backend doesn't always send a notification, we might need to send one here.
-        self.close_backend(conn_no, reason).await
-        // Optionally, ensure a CloseConnection is sent if not handled by close_backend:
-        // let mut payload = Vec::new();
-        // payload.extend_from_slice(&conn_no.to_be_bytes());
-        // payload.extend_from_slice(&(reason as u16).to_be_bytes());
-        // self.send_control_message(ControlMessage::CloseConnection, &payload).await?;
-        // Ok(()) returning Ok because the OpenConnection *message itself* was processed, even if the outcome was failure.
-    }
 
-    /// Helper function to establish backend connection and send ConnectionOpened
-    async fn establish_backend_connection(&mut self, conn_no: u32, host: &str, port: u16) -> Result<()> {
-        let target_str = format!("{}:{}", host, port);
-        info!(target: "protocol_connect", channel_id = %self.channel_id, conn_no, target_address = %target_str, active_protocol = ?self.active_protocol, "Attempting to establish backend connection to target.");
+                    if cursor.remaining() >= host_len + 2 { // host_bytes + port_bytes
+                        let mut host_buffer = self.buffer_pool.acquire();
+                        host_buffer.clear();
+                        host_buffer.resize(host_len, 0);
+                        cursor.copy_to_slice(&mut host_buffer[..host_len]);
+                        let parsed_host = String::from_utf8(host_buffer.to_vec())
+                            .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?;
+                        self.buffer_pool.release(host_buffer);
+                        
+                        let parsed_port = cursor.get_u16();
 
-        // Check network access rules if configured (primarily for client-side initiated from OpenConnection)
-        if let Some(ref checker) = self.network_checker {
-            if !checker.is_host_allowed(host) {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Target host {} not allowed by network rules for conn_no {}.", host, conn_no);
-                self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
-                // We might want to send a CloseConnection control message back to origin if not already handled by close_backend.
-                return Ok(()); // Return Ok to signify a message handled, even if the connection failed rules.
-            }
-            if !checker.is_port_allowed(port) {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Target port {} not allowed by network rules for conn_no {}.", port, conn_no);
-                self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
-                return Ok(());
-            }
-        }
-
-        let addrs = match target_str.to_socket_addrs() {
-            Ok(iter) => iter.collect::<Vec<_>>(),
-            Err(e) => {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to resolve address {}: {} for conn_no {}.", target_str, e, conn_no);
-                self.close_backend(conn_no, CloseConnectionReason::AddressResolutionFailed).await?;
-                return Ok(());
+                        if let Some(ref checker) = self.network_checker {
+                            if !checker.is_host_allowed(&parsed_host) {
+                                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target host {} not allowed.", parsed_host);
+                                return Err(anyhow!("SOCKS5 target host {} not allowed", parsed_host));
+                            }
+                            if !checker.is_port_allowed(parsed_port) {
+                                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target port {} not allowed.", parsed_port);
+                                return Err(anyhow!("SOCKS5 target port {} not allowed", parsed_port));
+                            }
+                        }
+                        debug!("Channel({}): SOCKS5 OpenConnection for target_conn_no {} to {}:{}.", 
+                                self.channel_id, target_connection_no, parsed_host, parsed_port);
+                        
+                        // Convert String host to &str for lookup_host
+                        match tokio::net::lookup_host(format!("{}:{}", parsed_host, parsed_port)).await {
+                            Ok(mut addrs) => {
+                                if let Some(socket_addr) = addrs.next() {
+                                    super::connections::open_backend(self, target_connection_no, socket_addr, super::types::ActiveProtocol::Socks5).await
+                                } else {
+                                    Err(anyhow!("Could not resolve SOCKS5 host {}:{} to any SocketAddr", parsed_host, parsed_port))
+                                }
+                            }
+                            Err(e) => Err(anyhow!("DNS lookup failed for SOCKS5 host {}:{}: {}", parsed_host, parsed_port, e)),
+                        }
+                    } else {
+                        warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no=target_connection_no, "SOCKS5 OpenConnection for conn_no {} received, but payload for host/port is incomplete or missing. Remaining: {}", target_connection_no, cursor.remaining());
+                        Err(anyhow!("SOCKS5 OpenConnection payload incomplete for host/port"))
+                    }
+                } else {
+                     warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no=target_connection_no, "SOCKS5 OpenConnection for conn_no {} received without host/port payload, or network_checker not configured. Cannot open backend.", target_connection_no);
+                     Err(anyhow!("SOCKS5 OpenConnection missing target details or checker"))
+                }
             }
         };
 
-        if addrs.is_empty() {
-            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Could not resolve address: {} for conn_no {}.", target_str, conn_no);
-            self.close_backend(conn_no, CloseConnectionReason::AddressResolutionFailed).await?;
-            return Ok(());
-        }
+        // --- Post OpenConnection Attempt ---
+        let mut temp_payload_buffer = self.buffer_pool.acquire(); // Used for ConnectionOpened/CloseConnection
+        temp_payload_buffer.clear();
 
-        match tokio::time::timeout(
-            self.timeouts.open_connection,
-            super::connections::open_backend(self, conn_no, addrs[0], self.active_protocol)
-        ).await {
-            Ok(Ok(_)) => {
-                self.send_control_message(ControlMessage::ConnectionOpened, &conn_no.to_be_bytes()).await?;
-                info!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully opened backend connection {} to {}:{}. Sent ConnectionOpened.", conn_no, host, port);
+        if let Err(e) = open_result {
+            error!("Channel({}): Failed to process OpenConnection for target_conn_no {}: {}. Sending CloseConnection back.", 
+                self.channel_id, target_connection_no, e);
+            temp_payload_buffer.put_u32(target_connection_no); 
+            temp_payload_buffer.put_u16(CloseConnectionReason::ConnectionFailed as u16);
+            // Use self.send_control_message for sending
+            if let Err(send_err) = self.send_control_message(ControlMessage::CloseConnection, &temp_payload_buffer).await {
+                error!("Channel({}): Failed to send CloseConnection for failed OpenConnection {}: {}", self.channel_id, target_connection_no, send_err);
             }
-            Ok(Err(e)) => {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to open backend connection {} to {}:{}: {}", conn_no, host, port, e);
-                self.close_backend(conn_no, CloseConnectionReason::ConnectionFailed).await?;
-            }
-            Err(_) => {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Backend connection {} to {}:{} timed out.", conn_no, host, port);
-                self.close_backend(conn_no, CloseConnectionReason::Timeout).await?;
+        } else {
+            info!("Channel({}): Successfully processed OpenConnection for target_conn_no {}, sending ConnectionOpened.", self.channel_id, target_connection_no);
+            temp_payload_buffer.put_u32(target_connection_no);
+            if let Err(e) = self.send_control_message(ControlMessage::ConnectionOpened, &temp_payload_buffer).await {
+                error!("Channel({}): Error sending ConnectionOpened for conn_no {}: {}", self.channel_id, target_connection_no, e);
             }
         }
+        self.buffer_pool.release(temp_payload_buffer);
         Ok(())
     }
 
@@ -485,7 +484,7 @@ impl Channel {
         // Extract connection number
         let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         
-        // Connection 0 is a special control connection that doesn't need to exist in the conns map
+        // Connection 0 is a special control connection that doesn't need to exist in the conn's map
         if conn_no != 0 {
             // Check if the non-control connection exists
             if !self.conns.lock().await.contains_key(&conn_no) {
@@ -689,116 +688,76 @@ impl Channel {
         info!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "Connection fully opened and ready.");
         
         drop(conns_guard);
+
+        // Attempt to send any pending messages for this newly opened connection
+        if let Err(e) = self.send_pending_messages(connection_no).await {
+            error!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, error = %e, "Error sending pending messages after ConnectionOpened");
+            // Depending on desired strictness, you might not want to return an error from handle_connection_opened itself here,
+            // as the connection is open, but sending pending messages failed.
+        }
+
         Ok(())
     }
-    // 
-    // /// Send data to a target connection
-    // async fn send_data_to_target(&mut self, connection_no: u32, data: &[u8]) -> Result<()> {
-    //     // Get the connection
-    //     let mut conns_guard = self.conns.lock().await;
-    //     let conn = match conns_guard.get_mut(&connection_no) {
-    //         Some(c) => c,
-    //         None => {
-    //             drop(conns_guard);
-    //             return Err(anyhow!("Connection {} not found for send_data_to_target", connection_no));
-    //         }
-    //     };
-    //     
-    //     let backend = conn.backend.as_mut();
-    //     
-    //     // Write to backend
-    //     match backend.write_all(data).await {
-    //         Ok(_) => {
-    //             // Also flush the writer to ensure data is sent
-    //             match backend.flush().await {
-    //                 Ok(_) => Ok(()),
-    //                 Err(e) => {
-    //                     drop(conns_guard);
-    //                     Err(anyhow!("Failed to flush backend for send_data_to_target: {}", e))
-    //                 }
-    //             }
-    //         },
-    //         Err(e) => {
-    //             drop(conns_guard);
-    //             Err(anyhow!("Failed to write to backend for send_data_to_target: {}", e))
-    //         }
-    //     }
-    // }
 
-    // /// Parse target host and port from the data in an OpenConnection message
-    // async fn parse_target_info(&mut self, data: &[u8], connection_no: u32) -> Result<(String, u16)> {
-    //     if data.len() < 4 {
-    //         return Err(anyhow!("Target info data too short"));
-    //     }
-    //     
-    //     let mut cursor = std::io::Cursor::new(data);
-    //     
-    //     // Read host length (4 bytes)
-    //     let mut host_len_bytes = [0u8; 4];
-    //     std::io::Read::read_exact(&mut cursor, &mut host_len_bytes)
-    //         .map_err(|e| anyhow!("Failed to read host length: {}", e))?;
-    //     let host_len = u32::from_be_bytes(host_len_bytes) as usize;
-    //     
-    //     if host_len > 256 {
-    //         return Err(anyhow!("Host length too large: {}", host_len));
-    //     }
-    //     
-    //     // Read host
-    //     let mut host_bytes = vec![0u8; host_len];
-    //     std::io::Read::read_exact(&mut cursor, &mut host_bytes)
-    //         .map_err(|e| anyhow!("Failed to read host: {}", e))?;
-    //     let host = String::from_utf8(host_bytes)
-    //         .map_err(|e| anyhow!("Invalid UTF-8 in host: {}", e))?;
-    //     
-    //     // Read port (2 bytes)
-    //     let mut port_bytes = [0u8; 2];
-    //     std::io::Read::read_exact(&mut cursor, &mut port_bytes)
-    //         .map_err(|e| anyhow!("Failed to read port: {}", e))?;
-    //     let port = u16::from_be_bytes(port_bytes);
-    //     
-    //     debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Parsed target for connection {}: {}:{}", connection_no, host, port);
-    //     
-    //     Ok((host, port))
-    // }
-
-    /// Update connection statistics based on received data
-    // **BOLD WARNING: HOT PATH - CALLED FOR EVERY DATA FRAME**
-    // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
-    // **WARNING: MULTIPLE LOCK ACQUISITIONS - CONSIDER LOCK-FREE STATISTICS**
-    async fn update_stats(&mut self, connection_no: u32, bytes: usize, timestamp: u64) {
-        // Get current time
-        let now = now_ms();
+    // Send any pending messages for a given connection
+    async fn send_pending_messages(&mut self, conn_no: u32) -> Result<()> {
+        // **BOLD WARNING: HOT PATH - SENDING QUEUED MESSAGES**
+        // **NO STRING/OBJECT ALLOCATIONS IN THE LOOP**
+        // **MESSAGES ARE ALREADY ENCODED AS Bytes**
         
-        // Calculate receive latency (how long it took for the message to arrive)
-        let receive_latency = now.saturating_sub(timestamp);
+        debug!("Channel({}): Attempting to send pending messages for conn_no {}", self.channel_id, conn_no);
+        let mut pending_guard = self.pending_messages.lock().await;
         
-        // Update connection stats
-        // **PERFORMANCE WARNING: Lock acquisition in a hot path**
-        let mut conns_guard = self.conns.lock().await;
-        if let Some(conn) = conns_guard.get_mut(&connection_no) {
-            // Update bytes received
-            conn.stats.receive_size += bytes;
-            
-            // Update message counter (used for ACK tracking)
-            conn.stats.message_counter += 1;
-            
-            // Update receive latency
-            conn.stats.receive_latency_sum += receive_latency;
-            conn.stats.receive_latency_count += 1;
-            
-            // Log stats periodically (every 1000 messages)
-            if conn.stats.message_counter % 1000 == 0 && tracing::enabled!(tracing::Level::DEBUG) {
-                let avg_latency = if conn.stats.receive_latency_count > 0 {
-                    conn.stats.receive_latency_sum / conn.stats.receive_latency_count
-                } else {
-                    0
-                };
-                
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Stats for connection {}: {} bytes received, avg latency {} ms", connection_no, conn.stats.receive_size, avg_latency);
+        if let Some(queue) = pending_guard.get_mut(&conn_no) {
+            if queue.is_empty() {
+                debug!("Channel({}): No pending messages for conn_no {}.", self.channel_id, conn_no);
+                return Ok(());
             }
-        } else if connection_no != 0 && tracing::enabled!(tracing::Level::DEBUG) {
-            // Only log for non-control connections
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint No connection found for stats update: {}", connection_no);
+            
+            let mut messages_sent_count = 0;
+            // The WebRTCDataChannel already has set_buffered_amount_low_threshold and on_buffered_amount_low callback.
+            // The check here is to proactively avoid over-sending if we are about to send a batch.
+            while let Some(message_bytes_ref) = queue.front() { // Peek at the front message
+                if message_bytes_ref.is_empty() {
+                    queue.pop_front(); // Remove an empty message
+                    continue; // Skip empty messages
+                }
+
+                let message_bytes_cloned = message_bytes_ref.clone();
+
+                let current_buffered_amount = self.webrtc.buffered_amount().await;
+                if current_buffered_amount >= BUFFER_LOW_THRESHOLD { 
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(
+                            "Channel({}): Buffer amount {} for conn_no {} is high. Pausing sending of pending messages.",
+                            self.channel_id, current_buffered_amount, conn_no
+                        );
+                    }
+                    break; // Stop sending if the buffer is too full
+                }
+
+                match self.webrtc.send(message_bytes_cloned.clone()).await { // Send the cloned message
+                    Ok(_) => {
+                        messages_sent_count += 1;
+                        queue.pop_front(); // Successfully sent, now remove from the queue
+                    }
+                    Err(e) => {
+                        error!(
+                            "Channel({}): Failed to send pending message for conn_no {}: {}. Message remains at the front of the queue.",
+                            self.channel_id, conn_no, e
+                        );
+                        break; 
+                    }
+                }
+            }
+            if messages_sent_count > 0 {
+                debug!("Channel({}): Sent {} pending messages for conn_no {}. Remaining in queue: {}", 
+                    self.channel_id, messages_sent_count, conn_no, queue.len());
+            }
+        } else {
+            debug!("Channel({}): No pending message queue found for conn_no {}.", self.channel_id, conn_no);
         }
+        
+        Ok(())
     }
 }

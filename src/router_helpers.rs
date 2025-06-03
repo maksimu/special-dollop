@@ -8,7 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::error::Error;
 use std::time::Duration;
 use anyhow::anyhow;
-use tracing::debug;
+use tracing::{debug, error, trace};
 use log::warn;
 
 // Custom error type to replace KRouterException
@@ -136,8 +136,8 @@ mod challenge_response {
                 Err(e) => {
                     let mut error_detail_parts: Vec<String> = Vec::new();
                     error_detail_parts.push(format!("Main error: {:?}", e));
-                    let mut current_err: Option<&dyn std::error::Error> = Some(&e);
-                    while let Some(source) = current_err.and_then(std::error::Error::source) {
+                    let mut current_err: Option<&dyn Error> = Some(&e);
+                    while let Some(source) = current_err.and_then(Error::source) {
                         error_detail_parts.push(format!("Caused by: {:?}", source));
                         current_err = Some(source);
                     }
@@ -325,7 +325,7 @@ fn http_router_url_from_ksm_config(ksm_config_str: &str) -> Result<String, Box<d
         // Convert ws:// to http://
         Ok(router_host.replacen("ws://", "http://", 1))
     } else if router_host.starts_with("http://") || router_host.starts_with("https://") {
-        // Already a full HTTP/S URL, return as is
+        // Already a full HTTP/S URL return as is
         Ok(router_host)
     } else {
         // Assume it's a hostname and prepend https:// (since VERIFY_SSL is typically true)
@@ -352,7 +352,7 @@ async fn router_request(
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
-    debug!(
+    trace!(
         target: "router_communication", 
         method = %http_method, 
         path = %url_path, 
@@ -460,14 +460,27 @@ pub async fn post_connection_state(
     is_terminated: Option<bool>,
 ) -> Result<(), Box<dyn Error>> {
     // Special handling for test mode
-    if ksm_config == "TEST_MODE_KSM_CONFIG" {
+    if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
         // Just return OK for tests without making an actual request
         debug!(
             target: "router_communication", 
             connection_state = %connection_state, 
+            ksm_config_prefix = %ksm_config.split('_').next().unwrap_or("TEST_MODE_KSM_CONFIG"),
             "TEST MODE: Skipping post_connection_state"
         );
         return Ok(());
+    }
+
+    // If not in test mode, a valid ksm_config is required.
+    if ksm_config.is_empty() {
+        error!(
+            target: "router_communication",
+            connection_state = %connection_state,
+            "post_connection_state called with empty ksm_config in non-test mode. This is not allowed."
+        );
+        return Err(Box::new(KRouterError(
+            "KSM config is empty and not in test mode. Cannot post connection state.".to_string()
+        )));
     }
 
     let body = match token {
@@ -507,22 +520,31 @@ pub async fn post_connection_state(
         }
     };
 
-    // For test environments, allow skipping actual HTTP post
-    if std::env::var("TEST_MODE_SKIP_POST_CONNECTION_STATE").is_ok() {
+    // For test environments, allow skipping actual HTTP post via environment variable
+    // This is different from TEST_MODE_KSM_CONFIG as it might be used for integration tests
+    // that use real KSM configs but want to avoid network calls.
+    if env::var("TEST_MODE_SKIP_POST_CONNECTION_STATE").is_ok() {
         debug!(
             target: "router_communication",
             connection_state = %body.connection_type,
-            "TEST MODE: Skipping post_connection_state"
+            "ENV VAR TEST_MODE: Skipping post_connection_state due to TEST_MODE_SKIP_POST_CONNECTION_STATE env var"
         );
         return Ok(());
     }
+
+    let request_body = serde_json::to_value(body)?;
+    trace!(
+        target: "router_communication",
+        request_body = %serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "failed to serialize".to_string()),
+        "Sending connection state to router"
+    );
 
     router_request(
         ksm_config,
         "POST",
         "api/device/connect_state",
         None,
-        Some(serde_json::to_value(body)?),
+        Some(request_body),
     ).await?;
 
     Ok(())

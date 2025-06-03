@@ -22,8 +22,6 @@ pub(crate) struct ConnectionStats {
     pub(crate) transfer_latency_count: u64,
     pub(crate) ping_time: Option<u64>,
     pub(crate) message_counter: u32,
-    pub(crate) received_eof: bool,
-    pub(crate) remote_connected: bool,
 }
 
 impl ConnectionStats {
@@ -129,8 +127,6 @@ pub(crate) struct Conn {
 #[derive(Debug, Clone)]
 pub struct TunnelTimeouts {
     pub read: Duration,
-    pub ping_timeout: Duration,
-    pub open_connection: Duration,
     pub close_connection: Duration,
     pub guacd_handshake: Duration,
 }
@@ -139,8 +135,6 @@ impl Default for TunnelTimeouts {
     fn default() -> Self {
         Self {
             read: Duration::from_secs(15),
-            ping_timeout: Duration::from_secs(5),
-            open_connection: Duration::from_secs(10),
             close_connection: Duration::from_secs(5),
             guacd_handshake: Duration::from_secs(10),
         }

@@ -31,9 +31,8 @@ pub(crate) const BUFFER_LOW_THRESHOLD: u64 = 14 * 1024 * 1024; // 14MB for respo
 // --- Protocol-specific state definitions ---
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ChannelSocks5State {
-    pub handshake_complete: bool,
-    pub target_addr: Option<String>, 
-    // Add other SOCKS5 specific fields, e.g., current handshake step
+    // SOCKS5 handshake and target address are handled directly in server.rs
+    // without persistent state storage
 }
 
 #[derive(Debug, Default, Clone)]
@@ -72,8 +71,6 @@ pub struct ConnectAsSettings {
     pub allow_supply_host: bool,
     #[serde(alias = "gateway_private_key")]
     pub gateway_private_key: Option<String>,
-    #[serde(default)]
-    pub nonce: Option<String>, // Added nonce
 }
 // --- End ConnectAs Settings Definition ---
 
@@ -91,9 +88,6 @@ pub struct Channel {
     pub(crate) is_connected: bool,
     pub(crate) should_exit: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) server_mode: bool,
-    // Client-side fields
-    pub(crate) cleanup_started: Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) connection_tx: Option<mpsc::Sender<(u32, StreamHalf, JoinHandle<()>)>>,
     // Server-related fields
     pub(crate) local_listen_addr: Option<String>,
     pub(crate) actual_listen_addr: Option<std::net::SocketAddr>,
@@ -120,17 +114,29 @@ pub struct Channel {
     frame_input_tx: mpsc::UnboundedSender<Frame>,
     frame_input_rx: Arc<Mutex<mpsc::UnboundedReceiver<Frame>>>,
     // Trigger for processing pending messages when the buffer is low
-    pub(crate) process_pending_trigger_tx: mpsc::UnboundedSender<()>, 
     pub(crate) process_pending_trigger_rx: Arc<Mutex<mpsc::UnboundedReceiver<()>>>,
     // Timestamp for the last channel-level ping sent (conn_no=0)
     pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
+
+    // For signaling connection task closures to the main Channel run loop
+    pub(crate) conn_closed_tx: mpsc::UnboundedSender<(u32, String)>, // (conn_no, channel_id)
+    conn_closed_rx: Option<mpsc::UnboundedReceiver<(u32, String)>>,
+    // Stores the conn_no of the primary Guacd data connection
+    pub(crate) primary_guacd_conn_no: Arc<Mutex<Option<u32>>>,
+    // Callback token for router communication  
+    pub(crate) callback_token: Option<String>,
+    // KSM config for router communication
+    pub(crate) ksm_config: Option<String>,
 }
 
 // Implement Clone for Channel
 impl Clone for Channel {
     fn clone(&self) -> Self {
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
-        let (pending_trigger_tx, pending_trigger_rx) = mpsc::unbounded_channel::<()>();
+        let (_, pending_trigger_rx) = mpsc::unbounded_channel::<()>();
+        // For cloned Channel instances, conn_closed_tx can be a new sender,
+        // but conn_closed_rx should be None as run() consumes the original.
+        let cloned_conn_closed_tx = mpsc::unbounded_channel::<(u32, String)>().0;
         
         Self {
             webrtc: self.webrtc.clone(),
@@ -167,11 +173,13 @@ impl Clone for Channel {
             buffer_pool: self.buffer_pool.clone(),
             frame_input_tx: self.frame_input_tx.clone(),
             frame_input_rx: Arc::clone(&self.frame_input_rx),
-            process_pending_trigger_tx: pending_trigger_tx,
             process_pending_trigger_rx: Arc::new(Mutex::new(pending_trigger_rx)),
-            cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            connection_tx: None,
             channel_ping_sent_time: Mutex::new(None), // Initialize for clone
+            conn_closed_tx: cloned_conn_closed_tx, // Cloned instance gets a new sender (though likely unused if the clone isn't run)
+            conn_closed_rx: None, // Cloned instance does not get the original receiver
+            primary_guacd_conn_no: Arc::new(Mutex::new(None)), // Cloned channels start fresh for primary Guacd conn
+            callback_token: self.callback_token.clone(),
+            ksm_config: self.ksm_config.clone(),
         }
     }
 }
@@ -184,6 +192,8 @@ impl Channel {
         timeouts: Option<TunnelTimeouts>,
         protocol_settings: HashMap<String, JsonValue>, // Using JsonValue alias
         server_mode: bool,
+        callback_token: Option<String>,
+        ksm_config: Option<String>,
     ) -> Result<Self> {
         info!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
         trace!(target: "channel_setup", channel_id = %channel_id, ?protocol_settings, "Initial protocol_settings received by Channel::new");
@@ -191,6 +201,7 @@ impl Channel {
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
         let (f_input_tx, f_input_rx) = mpsc::unbounded_channel::<Frame>();
         let (pending_tx, pending_rx) = mpsc::unbounded_channel::<()>();
+        let (conn_closed_tx, conn_closed_rx) = mpsc::unbounded_channel::<(u32, String)>();
         
         webrtc.set_buffered_amount_low_threshold(BUFFER_LOW_THRESHOLD);
         
@@ -261,7 +272,7 @@ impl Channel {
                                             }
                                             JsonValue::Null => None, // Omit null values by not adding them
                                             // For JsonValue::Object, stringify the nested object.
-                                            // This matches behavior if a struct field was Option<JsonValue> and then stringified.
+                                            // This matches the behavior if a struct field was Option<JsonValue> and then stringified.
                                             JsonValue::Object(obj_map) => serde_json::to_string(obj_map).ok().map(|s_val| (k.clone(), s_val)),
                                         }
                                     }).collect();
@@ -286,7 +297,7 @@ impl Channel {
                                         if server_mode {
                                             initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState::default());
                                         } else {
-                                            // Try to get target host/port from either target_host/target_port or guacd field
+                                            // Try to get the target host / port from either target_host/target_port or guacd field
                                             let mut dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
                                             let mut dest_port = protocol_settings.get("target_port")
                                                 .and_then(|v| {
@@ -453,11 +464,13 @@ impl Channel {
             buffer_pool,
             frame_input_tx: f_input_tx,
             frame_input_rx: Arc::new(Mutex::new(f_input_rx)),
-            process_pending_trigger_tx: pending_tx,
             process_pending_trigger_rx: Arc::new(Mutex::new(pending_rx)),
-            cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            connection_tx: None,
             channel_ping_sent_time: Mutex::new(None),
+            conn_closed_tx,
+            conn_closed_rx: Some(conn_closed_rx),
+            primary_guacd_conn_no: Arc::new(Mutex::new(None)),
+            callback_token,
+            ksm_config,
         };
         
         info!(target: "channel_lifecycle", channel_id = %new_channel.channel_id, server_mode = new_channel.server_mode, "Channel initialized");
@@ -472,6 +485,12 @@ impl Channel {
 
         // Take the receiver channel for server connections
         let mut server_conn_rx = self.local_client_server_conn_rx.take();
+        
+        // Take ownership of conn_closed_rx for the select loop
+        let mut local_conn_closed_rx = self.conn_closed_rx.take().ok_or_else(|| {
+            error!(target: "channel_lifecycle", channel_id = %self.channel_id, "conn_closed_rx was already taken or None. Channel cannot monitor connection closures.");
+            ChannelError::Internal("conn_closed_rx missing at start of run".to_string())
+        })?;
 
         // Main processing loop - reads from WebRTC and dispatches frames
         while !self.should_exit.load(std::sync::atomic::Ordering::Relaxed) {
@@ -562,6 +581,49 @@ impl Channel {
                         // Trigger channel closed, maybe log or break.
                         info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Process pending trigger channel closed.");
                         // Depending on desired behavior, you might want to break the loop.
+                    }
+                }
+
+                // Listen for connection closure signals
+                maybe_closed_conn_info = local_conn_closed_rx.recv() => {
+                    if let Some((closed_conn_no, closed_channel_id)) = maybe_closed_conn_info {
+                        info!(target: "connection_lifecycle", channel_id = %closed_channel_id, conn_no = closed_conn_no, "Connection task reported exit to Channel run loop.");
+
+                        let mut is_critical_closure = false;
+                        if self.active_protocol == ActiveProtocol::Guacd {
+                            let primary_opt = self.primary_guacd_conn_no.lock().await;
+                            if let Some(primary_conn_no) = *primary_opt {
+                                if primary_conn_no == closed_conn_no {
+                                    warn!(target: "channel_lifecycle", channel_id = %self.channel_id, conn_no = closed_conn_no, "Critical Guacd data connection has closed. Initiating channel shutdown.");
+                                    is_critical_closure = true;
+                                }
+                            }
+                        }
+
+                        if is_critical_closure {
+                            self.should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Attempt to gracefully close the control connection (conn_no 0) as well, if not already closing.
+                            // This sends a CloseConnection message to the client for the channel itself.
+                            if closed_conn_no != 0 { // Avoid self-triggering if conn_no 0 was what closed to signal this.
+                                info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Shutting down control connection (0) due to critical upstream closure.");
+                                if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed).await {
+                                    error!(target: "channel_lifecycle", channel_id = %self.channel_id, error = %e, "Error explicitly closing control connection (0) during critical shutdown.");
+                                }
+                            }
+                            // Instead of just breaking, return the specific error to indicate why the channel is stopping.
+                            // The main loop will break due to should_exit, but this provides the reason to the caller of run().
+                            // However, the run loop continues until should_exit is polled again.
+                            // For immediate exit and propagation: directly return.
+                            return Err(ChannelError::CriticalUpstreamClosed(self.channel_id.clone()));
+                        }
+                        // Optional: Remove from self.conns and self.pending_messages if desired immediately.
+                        // However, cleanup_all_connections will handle it upon loop exit.
+
+                    } else {
+                        // Conn_closed_tx was dropped, meaning all senders are gone.
+                        // This might happen if the channel is already shutting down and tasks are aborting.
+                        info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Connection closure signal channel (conn_closed_rx) closed.");
+                        // If this is unexpected, it might warrant setting should_exit to true.
                     }
                 }
             }
@@ -684,6 +746,13 @@ impl Channel {
     }
 
     pub(crate) async fn cleanup_all_connections(&mut self) -> Result<()> {
+        // Stop the server if it's running
+        if self.server_mode && self.local_client_server_task.is_some() {
+            if let Err(e) = self.stop_server().await {
+                warn!(target: "channel_lifecycle", channel_id = %self.channel_id, error = %e, "Failed to stop server during cleanup");
+            }
+        }
+
         let conn_keys: Vec<u32> = self.conns.lock().await.keys().copied().collect();
         for conn_no in conn_keys {
             if conn_no != 0 {

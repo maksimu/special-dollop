@@ -166,7 +166,9 @@ async fn test_guacd_handshake_successful_new_connection() {
         "test_channel_id".to_string(),
         Some(TunnelTimeouts::default()),
         protocol_settings, 
-        false, 
+        false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel");
     let conn_no = 1u32;
     
@@ -314,6 +316,8 @@ async fn test_guacd_handshake_join_existing_connection_readonly() {
         Some(TunnelTimeouts::default()),
         protocol_settings,
         false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel for join test");
     let conn_no = 2u32;
     let server_task = tokio::spawn(async move {
@@ -377,6 +381,8 @@ async fn test_guacd_handshake_join_existing_connection_not_readonly() {
         Some(TunnelTimeouts::default()),
         protocol_settings,
         false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel for join_not_readonly test");
     let conn_no = 3u32;
     let server_task = tokio::spawn(async move {
@@ -438,6 +444,8 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_args() {
         Some(TunnelTimeouts::default()),
         protocol_settings,
         false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel for fail_args test");
     let conn_no = 4u32;
     let server_task = tokio::spawn(async move {
@@ -501,6 +509,8 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
         Some(TunnelTimeouts::default()),
         protocol_settings,
         false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel for fail_ready test");
     let conn_no = 5u32;
     let server_task = tokio::spawn(async move {
@@ -695,6 +705,8 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
         Some(timeouts),
         protocol_settings,
         false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel for timeout_args test");
     let conn_no = 6u32;
     let server_task = tokio::spawn(async move {
@@ -759,6 +771,8 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
         Some(timeouts),
         protocol_settings,
         false,
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await.expect("Failed to create channel for timeout_ready test");
     let conn_no = 7u32;
     

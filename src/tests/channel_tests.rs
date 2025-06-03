@@ -80,6 +80,8 @@ async fn test_server_mode_data_flow() -> Result<()> {
         None, // default timeouts
         settings, // protocol_settings
         true, // server_mode=true
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await?;
 
     // Start server listening on localhost with a random port
@@ -223,6 +225,8 @@ async fn test_client_mode_data_flow() -> Result<()> {
         None, // default timeouts
         settings, // protocol_settings
         false, // server_mode=false
+        Some("test_callback_token".to_string()),
+        Some("test_ksm_config".to_string()),
     ).await?;
 
     // Start the channel running in a separate task

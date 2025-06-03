@@ -99,7 +99,7 @@ pub struct WebRTCPeerConnection {
     ksm_config: String,
     answer_sent: Arc<AtomicBool>,
     pending_ice_candidates: Arc<Mutex<Vec<String>>>,
-    signal_sender: Option<UnboundedSender<SignalMessage>>,
+    pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
     pub tube_id: String,
 }
 

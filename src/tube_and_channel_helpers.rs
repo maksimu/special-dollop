@@ -4,10 +4,11 @@ use tokio::sync::mpsc;
 use crate::channel::Channel;
 use crate::models::{NetworkAccessChecker, TunnelTimeouts};
 use crate::webrtc_data_channel::WebRTCDataChannel;
+use crate::tube::Tube;
 use tracing::{debug, error, trace};
 
 // Tube Status
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TubeStatus {
     New,
     Initializing, // Tube is being set up by PyTubeRegistry::create_tube
@@ -17,6 +18,7 @@ pub enum TubeStatus {
     Failed,
     Closing,      // Close has been initiated
     Closed,
+    Disconnected,
 }
 
 impl std::fmt::Display for TubeStatus {
@@ -30,6 +32,7 @@ impl std::fmt::Display for TubeStatus {
             TubeStatus::Failed => write!(f, "failed"),
             TubeStatus::Closing => write!(f, "closing"),
             TubeStatus::Closed => write!(f, "closed"),
+            TubeStatus::Disconnected => write!(f, "disconnected"),       
         }
     }
 }
@@ -41,6 +44,9 @@ pub(crate) async fn setup_channel_for_data_channel(
     timeouts: Option<TunnelTimeouts>,
     protocol_settings: HashMap<String, serde_json::Value>,
     server_mode: bool,
+    callback_token: Option<String>,
+    ksm_config: Option<String>,
+    tube: Option<Arc<Tube>>,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -53,14 +59,22 @@ pub(crate) async fn setup_channel_for_data_channel(
         timeouts,
         protocol_settings,
         server_mode,
+        callback_token,
+        ksm_config,
     ).await?;
+    
+    // Register the channel with the tube if provided
+    if let Some(tube_arc) = tube {
+        tube_arc.register_channel(label.clone(), channel_instance.clone()).await?;
+        debug!(target: "channel_setup", channel_name = %label, tube_id = %tube_arc.id, "Channel registered with tube");
+    }
     
     // Set up a message handler for the data channel using zero-copy buffers
     let data_channel_ref = &data_channel.data_channel;
     
     let buffer_pool = Arc::new(crate::buffer_pool::BufferPool::default());
     
-    // tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
+    // Tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
     data_channel_ref.on_message(Box::new(move |msg| {
         trace!( target: "on_message", message_size = msg.data.len(), "Channel got message");
         let tx_clone = tx.clone(); // Clone tx for the async block

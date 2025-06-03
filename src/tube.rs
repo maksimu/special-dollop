@@ -14,7 +14,9 @@ use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use crate::tube_registry::SignalMessage;
 use std::sync::atomic::AtomicBool;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use crate::router_helpers::post_connection_state;
+use crate::channel::Channel;
 
 // A single tube holding a WebRTC peer connection and channels
 #[derive(Clone)]
@@ -29,17 +31,21 @@ pub struct Tube {
     pub(crate) control_channel: Arc<TokioRwLock<Option<WebRTCDataChannel>>>,
     // Map of channel names to their shutdown signals
     pub channel_shutdown_signals: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
+    // Active channels registered with this tube
+    pub(crate) active_channels: Arc<TokioRwLock<HashMap<String, Arc<TokioMutex<Channel>>>>>,
     // Indicates if this tube was created in a server or client context by its registry
     pub(crate) is_server_mode_context: bool,
     // Current status
     pub(crate) status: Arc<TokioRwLock<TubeStatus>>,
     // Runtime
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
+    // Original conversation ID that created this tube (for control channel mapping)
+    pub(crate) original_conversation_id: Option<String>,
 }
 
 impl Tube {
     // Create a new tube with the optional peer connection
-    pub fn new(is_server_mode_context: bool) -> Result<Arc<Self>> {
+    pub fn new(is_server_mode_context: bool, original_conversation_id: Option<String>) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
         let runtime = get_runtime();
 
@@ -49,9 +55,11 @@ impl Tube {
             data_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             control_channel: Arc::new(TokioRwLock::new(None)),
             channel_shutdown_signals: Arc::new(TokioRwLock::new(HashMap::new())),
+            active_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             is_server_mode_context,
             status: Arc::new(TokioRwLock::new(TubeStatus::Initializing)),
             runtime,
+            original_conversation_id,
         });
 
         Ok(tube)
@@ -84,27 +92,63 @@ impl Tube {
         
         let status = self.status.clone();
         
+        let tube_arc_for_pc_state = self.clone();
+        
         info!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
         connection_arc.setup_ice_candidate_handler();
         
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
+            let tube_clone_for_closure = tube_arc_for_pc_state.clone();
+
             Box::pin(async move {
+                let tube_id_log = tube_clone_for_closure.id.clone();
                 match state {
-                    webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected => {
+                    RTCPeerConnectionState::Connected => {
                         *status_clone.write().await = TubeStatus::Active;
-                        info!("Tube connection state changed to Active");
+                        info!(tube_id = %tube_id_log, "Tube connection state changed to Active");
                     },
-                    webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                        *status_clone.write().await = TubeStatus::Failed;
-                        info!("Tube connection state changed to Failed");
-                    },
-                    webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed => {
-                        *status_clone.write().await = TubeStatus::Closed;
-                        info!("Tube connection state changed to Closed");
+                    RTCPeerConnectionState::Failed |
+                    RTCPeerConnectionState::Closed |
+                    RTCPeerConnectionState::Disconnected => {
+                        
+                        let current_status = *status_clone.read().await;
+                        let new_status = match state {
+                            RTCPeerConnectionState::Failed => TubeStatus::Failed,
+                            RTCPeerConnectionState::Closed => TubeStatus::Closed,
+                            RTCPeerConnectionState::Disconnected => TubeStatus::Disconnected,
+                            _ => current_status, // Should not happen due to outer match
+                        };
+
+                        if current_status != TubeStatus::Closing && 
+                           current_status != TubeStatus::Closed &&
+                           current_status != TubeStatus::Failed &&
+                           current_status != TubeStatus::Disconnected {
+
+                            warn!(tube_id = %tube_id_log, old_status = ?current_status, new_state = ?state, "WebRTC peer connection state indicates closure/failure. Initiating Tube close.");
+                            *status_clone.write().await = new_status;
+
+                            // Get the global runtime to spawn the close task
+                            let runtime = get_runtime(); // Ensure get_runtime() is accessible
+                            runtime.spawn(async move {
+                                debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection state change.");
+                                let mut registry = crate::tube_registry::REGISTRY.write().await;
+                                if let Err(e) = registry.close_tube(&tube_id_log).await {
+                                     error!(tube_id = %tube_id_log, "Error trying to close tube via registry after peer connection failed/closed: {}", e);
+                                } else {
+                                     info!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry after peer connection state change.");
+                                }
+                            });
+                        } else {
+                            debug!(tube_id = %tube_id_log, current_status = ?current_status, new_state = ?state, "Peer connection reached terminal state, but tube status indicates it's already closing or closed. No new action taken.");
+                            // Ensure the status is updated if it wasn't already the final one
+                            if *status_clone.read().await != new_status {
+                                *status_clone.write().await = new_status;
+                            }
+                        }
                     },
                     _ => {
-                        debug!("Connection state changed to: {:?}", state);
+                        debug!(tube_id = %tube_id_log, "Connection state changed to: {:?}", state);
                     }
                 }
             })
@@ -113,10 +157,14 @@ impl Tube {
         // Set up a handler for incoming data channels
         let tube_clone = self.clone();
         let protocol_settings_clone_for_on_data_channel = protocol_settings.clone(); // Clone for the outer closure
+        let callback_token_for_on_data_channel = callback_token.clone(); // Clone for on_data_channel
+        let ksm_config_for_on_data_channel = ksm_config.clone(); // Clone for on_data_channel
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
+            let callback_token_for_channel = callback_token_for_on_data_channel.clone();
+            let ksm_config_for_channel = ksm_config_for_on_data_channel.clone();
             let rtc_data_channel_label = rtc_data_channel.label().to_string(); // Get the label once for logging
             let rtc_data_channel_id = rtc_data_channel.id();
 
@@ -150,7 +198,10 @@ impl Tube {
                     rtc_data_channel_label.clone(), 
                     None, 
                     protocol_settings_for_channel_setup, 
-                    current_server_mode
+                    current_server_mode,
+                    Some(callback_token_for_channel), // Use callback_token from tube creation
+                    Some(ksm_config_for_channel), // Use ksm_config from tube creation
+                    Some(Arc::new(tube.clone())), // Pass tube reference for registration
                 ).await;
 
                 let mut owned_channel = match channel_result {
@@ -200,13 +251,72 @@ impl Tube {
                 let label_clone_for_run = rtc_data_channel_label.clone();
                 let runtime_for_run = get_runtime(); 
                 let tube_id_for_log = tube.id.clone();
+                // Clone the tube and peer_connection Arc to move into the spawned task
+                let tube_for_callbacks = Arc::new(tube.clone());
+                let peer_connection_for_signal = Arc::clone(&tube.peer_connection);
 
                 info!(tube_id = %tube.id, channel_label = %label_clone_for_run, "on_data_channel: Spawning channel.run() task.");
                 runtime_for_run.spawn(async move {
                     debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task started.");
-                    if let Err(e) = owned_channel.run().await {
-                        error!("Tube {}: Endpoint (from on_data_channel) {}: Error running channel: {}", tube_id_for_log, label_clone_for_run, e);
+                    
+                    // Send connection_open callback when channel starts running
+                    if let Err(e) = tube_for_callbacks.send_connection_open_callback(&label_clone_for_run).await {
+                        warn!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send connection_open callback: {}", e);
                     }
+                    
+                    let run_result = owned_channel.run().await;
+                    let outcome_details: String;
+
+                    match &run_result {
+                        Ok(()) => {
+                            info!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Channel '{}' (from on_data_channel) ran and exited normally. Signaling Python.", label_clone_for_run);
+                            outcome_details = "normal_exit".to_string();
+                        }
+                        Err(crate::error::ChannelError::CriticalUpstreamClosed(closed_channel_id_from_err)) => {
+                            warn!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, channel_id_in_err = %closed_channel_id_from_err, "Channel '{}' (from on_data_channel) exited due to critical upstream closure. Signaling Python.", label_clone_for_run);
+                            outcome_details = format!("critical_upstream_closed: {}", closed_channel_id_from_err);
+                        }
+                        Err(e) => {
+                            error!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Channel '{}' (from on_data_channel) encountered an error in run(): {}. Signaling Python.", label_clone_for_run, e);
+                            outcome_details = format!("error: {}", e);
+                        }
+                    }
+                    
+                    // Send connection_close callback when channel finishes
+                    if let Err(e) = tube_for_callbacks.send_connection_close_callback(&label_clone_for_run).await {
+                        warn!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send connection_close callback: {}", e);
+                    }
+                    
+                    // Deregister the channel from the tube
+                    tube_for_callbacks.deregister_channel(&label_clone_for_run).await;
+                    
+                    // Always send a signal when channel.run() finishes, regardless of reason.
+                    let pc_guard = peer_connection_for_signal.lock().await;
+                    if let Some(pc_instance_arc) = &*pc_guard {
+                        if let Some(sender) = &pc_instance_arc.signal_sender {
+                            let signal_data = serde_json::json!({
+                                "channel_id": label_clone_for_run, // The label of the channel from on_data_channel
+                                "outcome": outcome_details
+                            }).to_string();
+
+                            let signal_msg = SignalMessage {
+                                tube_id: tube_id_for_log.clone(),
+                                kind: "channel_closed".to_string(),
+                                data: signal_data,
+                                conversation_id: label_clone_for_run.clone(), 
+                            };
+                            if let Err(e) = sender.send(signal_msg) {
+                                error!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send channel_closed signal (from on_data_channel) to Python: {}", e);
+                            } else {
+                                debug!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Successfully sent channel_closed signal (from on_data_channel) to Python.");
+                            }
+                        } else {
+                            warn!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "No signal_sender on peer_connection for channel_closed signal (from on_data_channel).");
+                        }
+                    } else {
+                        warn!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Peer_connection was None, cannot send channel_closed signal (from on_data_channel).");
+                    }
+
                     debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task finished.");
                     // Optionally, after the run finishes, remove its shutdown signal from the map.
                     // Requires cloning tube.channel_shutdown_signals Arc into the task.
@@ -235,6 +345,40 @@ impl Tube {
     // Get tube ID
     pub fn id(&self) -> String {
         self.id.clone()
+    }
+
+    // Get callback tokens from all active channels (for refresh_connections)
+    // Channels report their own tokens, tube just aggregates them
+    pub async fn get_callback_tokens(&self) -> Vec<String> {
+        let channels_guard = self.active_channels.read().await;
+        let mut tokens = Vec::new();
+        
+        for (_channel_name, channel_arc) in channels_guard.iter() {
+            let channel_guard = channel_arc.lock().await;
+            if let Some(ref token) = channel_guard.callback_token {
+                tokens.push(token.clone());
+            }
+        }
+        
+        debug!(tube_id = %self.id, token_count = tokens.len(), "Collected callback tokens from {} active channels", channels_guard.len());
+        tokens
+    }
+
+    // Get KSM config from active channels
+    pub async fn get_ksm_config_from_channels(&self) -> Option<String> {
+        let channels_guard = self.active_channels.read().await;
+        
+        // Get ksm_config from the first channel that has one
+        for (_channel_name, channel_arc) in channels_guard.iter() {
+            let channel_guard = channel_arc.lock().await;
+            if let Some(ref config) = channel_guard.ksm_config {
+                debug!(tube_id = %self.id, "Found KSM config from active channel");
+                return Some(config.clone());
+            }
+        }
+        
+        debug!(tube_id = %self.id, "No KSM config found in any active channel");
+        None
     }
     
     // Get reference to peer connection
@@ -393,6 +537,8 @@ impl Tube {
         data_channel: &WebRTCDataChannel,
         timeout_seconds: Option<f64>,
         protocol_settings: HashMap<String, serde_json::Value>,
+        callback_token: Option<String>,
+        ksm_config: Option<String>,
     ) -> Result<Option<u16>> {
         info!(tube_id = %self.id, channel_name = %name, "create_channel: Called.");
         trace!(tube_id = %self.id, channel_name = %name, ?timeout_seconds, ?protocol_settings, "create_channel: Initial parameters.");
@@ -400,8 +546,6 @@ impl Tube {
         let timeouts = if let Some(timeout) = timeout_seconds {
             Some(TunnelTimeouts {
                 read: std::time::Duration::from_secs_f64(timeout),
-                ping_timeout: std::time::Duration::from_secs_f64(timeout / 3.0),
-                open_connection: std::time::Duration::from_secs_f64(timeout),
                 close_connection: std::time::Duration::from_secs_f64(timeout / 2.0),
                 guacd_handshake: std::time::Duration::from_secs_f64(timeout / 1.5),
             })
@@ -416,7 +560,10 @@ impl Tube {
             name.to_string(), 
             timeouts,
             protocol_settings.clone(), // protocol_settings is already cloned if needed by the caller or passed as value
-            self.is_server_mode_context
+            self.is_server_mode_context,
+            callback_token,
+            ksm_config,
+            Some(Arc::new(self.clone())), // Pass tube reference for registration
         ).await;
 
         let mut owned_channel = match setup_result {
@@ -469,16 +616,72 @@ impl Tube {
         let name_clone = name.to_string();
         let runtime_clone = Arc::clone(&self.runtime);
         let tube_id_for_spawn = self.id.clone(); // Clone self.id here to make it 'static
+        let peer_connection_for_spawn = Arc::clone(&self.peer_connection); // Clone peer_connection
 
         info!(tube_id = %self.id, channel_name = %name_clone, "create_channel: Spawning channel.run() task.");
+        let tube_for_callbacks = Arc::new(self.clone());
         runtime_clone.spawn(async move {
             // Use the cloned tube_id_for_spawn which is 'static
             debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task started.");
-            if let Err(e) = owned_channel.run().await {
-                // Update the error log to also use the 'static tube_id_for_spawn
-                error!("Channel '{}' (tube_id: {}) encountered an error in run(): {}", name_clone, tube_id_for_spawn, e);
+            
+            // Send connection_open callback when channel starts running
+            if let Err(e) = tube_for_callbacks.send_connection_open_callback(&name_clone).await {
+                warn!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send connection_open callback: {}", e);
             }
-            // Use the cloned tube_id_for_spawn
+            
+            let run_result = owned_channel.run().await;
+            let outcome_details: String;
+
+            match &run_result {
+                Ok(()) => {
+                    info!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Channel '{}' ran and exited normally. Signaling Python.", name_clone);
+                    outcome_details = "normal_exit".to_string();
+                }
+                Err(crate::error::ChannelError::CriticalUpstreamClosed(closed_channel_id_from_err)) => {
+                    warn!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, channel_id_in_err = %closed_channel_id_from_err, "Channel '{}' exited due to critical upstream closure. Signaling Python.", name_clone);
+                    outcome_details = format!("critical_upstream_closed: {}", closed_channel_id_from_err);
+                }
+                Err(e) => {
+                    error!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Channel '{}' encountered an error in run(): {}. Signaling Python.", name_clone, e);
+                    outcome_details = format!("error: {}", e);
+                }
+            }
+            
+            // Send connection_close callback when channel finishes
+            if let Err(e) = tube_for_callbacks.send_connection_close_callback(&name_clone).await {
+                warn!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send connection_close callback: {}", e);
+            }
+            
+            // Deregister the channel from the tube
+            tube_for_callbacks.deregister_channel(&name_clone).await;
+            
+            // Always send a signal when channel.run() finishes, regardless of reason.
+            let pc_guard = peer_connection_for_spawn.lock().await;
+            if let Some(pc_instance_arc) = &*pc_guard {
+                if let Some(sender) = &pc_instance_arc.signal_sender {
+                    let signal_data = serde_json::json!({
+                        "channel_id": name_clone, // This is the label of the channel that finished
+                        "outcome": outcome_details
+                    }).to_string();
+
+                    let signal_msg = SignalMessage {
+                        tube_id: tube_id_for_spawn.clone(),
+                        kind: "channel_closed".to_string(), // Generic kind for any channel closure
+                        data: signal_data,
+                        conversation_id: name_clone.clone(), // Use the channel's label/name as conversation_id for this signal
+                    };
+                    if let Err(e) = sender.send(signal_msg) {
+                        error!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send channel_closed signal to Python: {}", e);
+                    } else {
+                        debug!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Successfully sent channel_closed signal to Python.");
+                    }
+                } else {
+                    warn!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "No signal_sender found on peer_connection to send channel_closed signal.");
+                }
+            } else {
+                warn!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Peer_connection was None, cannot send channel_closed signal.");
+            }
+            
             debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task finished.");
             // TODO: after run finishes (normally or due to error), remove its shutdown signal from the map
             //  This requires Tube to be passed or its shutdown_signals map Arc to be cloned into the task.
@@ -595,8 +798,72 @@ impl Tube {
         *self.status.write().await = TubeStatus::Closed;
         info!("Set tube status to Closed");
 
+        // Send connection_close callbacks for all active channels
+        let channel_names: Vec<String> = {
+            let channels_guard = self.active_channels.read().await;
+            channels_guard.keys().cloned().collect()
+        };
+
+        for channel_name in &channel_names {
+            if let Err(e) = self.send_connection_close_callback(channel_name).await {
+                warn!(tube_id = %self.id, channel_name = %channel_name, "Failed to send connection_close callback during tube closure: {}", e);
+            }
+        }
+
+        // Send "channel_closed" signals to Python for all channels before closing them
+        let signal_sender_opt = {
+            let pc_guard = self.peer_connection.lock().await;
+            if let Some(pc_instance_arc) = &*pc_guard {
+                pc_instance_arc.signal_sender.clone()
+            } else {
+                None
+            }
+        };
+
+        if let Some(signal_sender) = signal_sender_opt {
+            let data_channels_snapshot = self.data_channels.read().await.clone();
+            for (_channel_label, data_channel) in data_channels_snapshot.iter() {
+                let channel_label_str = data_channel.data_channel.label(); // Use the label which contains the original conversation_id from Python
+                
+                // For the control channel, use the original conversation ID if available
+                let conversation_id = if channel_label_str == "control" {
+                    if let Some(ref original_id) = self.original_conversation_id {
+                        original_id.clone()
+                    } else {
+                        debug!(target: "python_bindings", tube_id = %self.id, "Skipping channel_closed signal for control channel - no original_conversation_id stored");
+                        continue;
+                    }
+                } else {
+                    channel_label_str.to_string()
+                };
+                
+                let signal_data = serde_json::json!({
+                    "channel_id": conversation_id,
+                    "outcome": "tube_closed"
+                }).to_string();
+
+                let signal_msg = SignalMessage {
+                    tube_id: self.id.clone(),
+                    kind: "channel_closed".to_string(),
+                    data: signal_data,
+                    conversation_id: conversation_id.clone(),
+                };
+
+                if let Err(e) = signal_sender.send(signal_msg) {
+                    error!(target: "python_bindings", tube_id = %self.id, channel_label = %channel_label_str, conversation_id = %conversation_id, "Failed to send channel_closed signal for tube closure: {}", e);
+                } else {
+                    debug!(target: "python_bindings", tube_id = %self.id, channel_label = %channel_label_str, conversation_id = %conversation_id, "Sent channel_closed signal due to tube closure");
+                }
+            }
+        } else {
+            warn!(target: "python_bindings", tube_id = %self.id, "No signal sender available to notify Python of channel closures during tube close");
+        }
+
         // Clear all channel shutdown signals
         self.channel_shutdown_signals.write().await.clear();
+
+        // Clear all active channels
+        self.active_channels.write().await.clear();
 
         // Close all data channels
         for (_, dc) in self.data_channels.write().await.drain() {
@@ -633,6 +900,96 @@ impl Tube {
     // Get status
     pub async fn status(&self) -> TubeStatus {
         self.status.read().await.clone()
+    }
+
+    // Register a channel with this tube
+    pub async fn register_channel(&self, channel_name: String, channel: Channel) -> Result<()> {
+        let channel_arc = Arc::new(TokioMutex::new(channel));
+        let mut channels_guard = self.active_channels.write().await;
+        channels_guard.insert(channel_name.clone(), channel_arc);
+        info!(tube_id = %self.id, channel_name = %channel_name, "Registered channel with tube");
+        Ok(())
+    }
+
+    // Deregister a channel from this tube
+    pub async fn deregister_channel(&self, channel_name: &str) {
+        let mut channels_guard = self.active_channels.write().await;
+        if channels_guard.remove(channel_name).is_some() {
+            info!(tube_id = %self.id, channel_name = %channel_name, "Deregistered channel from tube");
+        } else {
+            warn!(tube_id = %self.id, channel_name = %channel_name, "Attempted to deregister channel that wasn't registered");
+        }
+    }
+
+    // Send connection_open callback for a specific channel
+    pub async fn send_connection_open_callback(&self, channel_name: &str) -> Result<()> {
+        let channels_guard = self.active_channels.read().await;
+        if let Some(channel_arc) = channels_guard.get(channel_name) {
+            let channel_guard = channel_arc.lock().await;
+            
+            if let (Some(ref ksm_config), Some(ref callback_token)) = (&channel_guard.ksm_config, &channel_guard.callback_token) {
+                // Skip if in test mode
+                if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
+                    debug!(tube_id = %self.id, channel_name = %channel_name, "TEST MODE: Skipping connection_open callback");
+                    return Ok(());
+                }
+                
+                debug!(tube_id = %self.id, channel_name = %channel_name, "Sending connection_open callback to router");
+                let token_value = serde_json::Value::String(callback_token.clone());
+
+                match post_connection_state(ksm_config, "connection_open", &token_value, None).await {
+                    Ok(_) => {
+                        debug!(tube_id = %self.id, channel_name = %channel_name, "Connection open callback sent successfully");
+                        Ok(())
+                    },
+                    Err(e) => {
+                        error!(tube_id = %self.id, channel_name = %channel_name, "Error sending connection open callback: {}", e);
+                        Err(anyhow!("Failed to send connection open callback: {}", e))
+                    }
+                }
+            } else {
+                warn!(tube_id = %self.id, channel_name = %channel_name, "Channel missing ksm_config or callback_token for connection_open callback");
+                Ok(())
+            }
+        } else {
+            Err(anyhow!("Channel {} not found in tube {}", channel_name, self.id))
+        }
+    }
+
+    // Send connection_close callback for a specific channel
+    pub async fn send_connection_close_callback(&self, channel_name: &str) -> Result<()> {
+        let channels_guard = self.active_channels.read().await;
+        if let Some(channel_arc) = channels_guard.get(channel_name) {
+            let channel_guard = channel_arc.lock().await;
+            
+            if let (Some(ref ksm_config), Some(ref callback_token)) = (&channel_guard.ksm_config, &channel_guard.callback_token) {
+                // Skip if in test mode
+                if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
+                    debug!(tube_id = %self.id, channel_name = %channel_name, "TEST MODE: Skipping connection_close callback");
+                    return Ok(());
+                }
+                
+                debug!(tube_id = %self.id, channel_name = %channel_name, "Sending connection_close callback to router");
+                let token_value = serde_json::Value::String(callback_token.clone());
+
+                match post_connection_state(ksm_config, "connection_close", &token_value, Some(true)).await {
+                    Ok(_) => {
+                        debug!(tube_id = %self.id, channel_name = %channel_name, "Connection close callback sent successfully");
+                        Ok(())
+                    },
+                    Err(e) => {
+                        error!(tube_id = %self.id, channel_name = %channel_name, "Error sending connection close callback: {}", e);
+                        Err(anyhow!("Failed to send connection close callback: {}", e))
+                    }
+                }
+            } else {
+                warn!(tube_id = %self.id, channel_name = %channel_name, "Channel missing ksm_config or callback_token for connection_close callback");
+                Ok(())
+            }
+        } else {
+            warn!(tube_id = %self.id, channel_name = %channel_name, "Channel not found when trying to send connection_close callback");
+            Ok(())
+        }
     }
 }
 

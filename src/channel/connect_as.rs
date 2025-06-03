@@ -6,8 +6,6 @@ use p256::{
     PublicKey as P256PublicKey,
     SecretKey as P256SecretKey,
 };
-use p256::elliptic_curve::sec1::FromEncodedPoint;
-use p256::EncodedPoint;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce as AesNonce};
@@ -21,6 +19,7 @@ pub(crate) struct ConnectAsUser {
     pub(crate) password: Option<String>,
     pub(crate) private_key: Option<String>,
     pub(crate) private_key_passphrase: Option<String>,
+    pub(crate) passphrase: Option<String>,
     pub(crate) domain: Option<String>,
     pub connect_database: Option<String>,
     pub distinguished_name: Option<String>
@@ -47,23 +46,8 @@ pub(crate) fn decrypt_connect_as_payload(
         .map_err(|e| anyhow!("Failed to create P256SecretKey from bytes: {}", e))?;
 
     // 2. Parse client's public key (bytes to P256PublicKey)
-    // Change the problematic code section:
-    let client_public_key = match P256PublicKey::from_sec1_bytes(client_public_key_bytes) {
-        Ok(key) => key,
-        Err(e) => {
-            let point = EncodedPoint::from_bytes(client_public_key_bytes)
-                .map_err(|e_point| anyhow!("Failed to create EncodedPoint from client public key bytes ({}). Original error: {}", e_point, e))?;
-
-            // Use is_some().into() to convert Choice to bool and unwrap_or_else for error handling
-            let public_key_option = P256PublicKey::from_encoded_point(&point);
-            if bool::from(public_key_option.is_some()) {
-                // Safe to unwrap since we've checked is_some()
-                public_key_option.unwrap()
-            } else {
-                return Err(anyhow!("Failed to convert EncodedPoint to P256PublicKey. Original error: {}", e));
-            }
-        }
-    };
+    let client_public_key = P256PublicKey::from_sec1_bytes(client_public_key_bytes)
+        .map_err(|e| anyhow!("Failed to parse client public key using from_sec1_bytes. Input len: {}. Error: {}", client_public_key_bytes.len(), e))?;
 
     // 3. Perform ECDH to get shared secret
     let shared_secret = diffie_hellman(
@@ -72,9 +56,9 @@ pub(crate) fn decrypt_connect_as_payload(
     );
 
     // 4. Use HKDF (SHA256) to derive a 32-byte symmetric key for AES-256-GCM
-    let hk = Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes().as_ref());
+    let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_ref());
     let mut symmetric_key_bytes = [0u8; 32];
-    hk.expand(b"pam-rustwebrtc-connect-as-key-v1", &mut symmetric_key_bytes)
+    hk.expand(b"KEEPER_CONNECT_AS_ECIES_SECP256R1_HKDF_SHA256", &mut symmetric_key_bytes)
         .map_err(|e| anyhow!("HKDF expand error: {}", e))?;
 
     // 5. Decrypt using AES-256-GCM

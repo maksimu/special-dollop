@@ -35,10 +35,6 @@ pub enum GuacdParserError {
     InvalidFormat(String),
     #[error("UTF-8 error in instruction content: {0}")]
     Utf8Error(#[from] str::Utf8Error),
-    // Anyhow might be used if complex error propagation is needed from deeper parsing,
-    // but try to use specific variants.
-    #[error("Generic parsing error: {0}")]
-    Generic(String),
 }
 
 /// Information about a Guacamole instruction peeked from a buffer, using borrowed slices.
@@ -54,35 +50,9 @@ pub struct PeekedInstruction<'a> {
     pub is_error_opcode: bool,
 }
 
-impl<'a> PeekedInstruction<'a> {
-    /// Fast check for common opcodes without string allocation
-    #[inline]
-    pub fn is_opcode(&self, opcode: &str) -> bool {
-        self.opcode == opcode
-    }
-    
-    /// Fast check using byte comparison (even faster for ASCII opcodes)
-    #[inline]
-    pub fn is_opcode_bytes(&self, opcode_bytes: &[u8]) -> bool {
-        self.opcode.as_bytes() == opcode_bytes
-    }
-}
-
 // Common opcode constants for fast comparison
 pub const ERROR_OPCODE: &str = "error";
 pub const ERROR_OPCODE_BYTES: &[u8] = b"error";
-
-// **PERFORMANCE: Pre-computed common opcodes for fast comparison**
-pub const SYNC_OPCODE_BYTES: &[u8] = b"sync";
-pub const IMG_OPCODE_BYTES: &[u8] = b"img";
-pub const BLOB_OPCODE_BYTES: &[u8] = b"blob";
-pub const CURSOR_OPCODE_BYTES: &[u8] = b"cursor";
-pub const COPY_OPCODE_BYTES: &[u8] = b"copy";
-pub const RECT_OPCODE_BYTES: &[u8] = b"rect";
-pub const CFILL_OPCODE_BYTES: &[u8] = b"cfill";
-pub const MOVE_OPCODE_BYTES: &[u8] = b"move";
-pub const SHADE_OPCODE_BYTES: &[u8] = b"shade";
-pub const SIZE_OPCODE_BYTES: &[u8] = b"size";
 
 /// Error type for the peeking operation.
 #[derive(Debug, PartialEq, Clone)]
@@ -112,7 +82,7 @@ impl GuacdParser {
     #[inline(always)]
     fn find_delimiter(slice: &[u8], delimiter: u8) -> Option<usize> {
         // For small slices, use the standard iterator
-        // For larger slices, memchr crate would be faster but we'll use the standard approach
+        // For larger slices, memchr crate would be faster, but we'll use the standard approach
         slice.iter().position(|&b| b == delimiter)
     }
     
@@ -124,7 +94,7 @@ impl GuacdParser {
             return Err(());
         }
         
-        // Handle single digit optimizations
+        // Handle single-digit optimizations
         if slice.len() == 1 {
             let b = slice[0];
             if b >= b'0' && b <= b'9' {
@@ -201,9 +171,9 @@ impl GuacdParser {
                 }
             })?;
         
-        // Ensure buffer is long enough for length string itself
+        // Ensure the buffer is long enough for the length string itself
         if initial_pos_for_opcode_len + length_end_op_rel >= buffer_slice.len() {
-            return Err(PeekError::Incomplete); // Not enough for "L." part
+            return Err(PeekError::Incomplete); // Not enough for the "L." part
         }
 
         let opcode_len_slice = &buffer_slice[initial_pos_for_opcode_len .. initial_pos_for_opcode_len + length_end_op_rel];
@@ -216,7 +186,7 @@ impl GuacdParser {
 
         pos = initial_pos_for_opcode_len + length_end_op_rel + 1; // Move past length and ELEM_SEP
 
-        // Ensure buffer is long enough for opcode value
+        // Ensure the buffer is long enough for opcode value
         if pos + length_op > buffer_slice.len() {
             return Err(PeekError::Incomplete); // Not enough for opcode value
         }
@@ -255,7 +225,7 @@ impl GuacdParser {
                 })?;
 
             if initial_pos_for_arg_len + length_end_arg_rel >= buffer_slice.len() {
-                return Err(PeekError::Incomplete); // Not enough for "L." part of arg
+                return Err(PeekError::Incomplete); // Not enough for the "L." part of arg
             }
             
             let arg_len_slice = &buffer_slice[initial_pos_for_arg_len .. initial_pos_for_arg_len + length_end_arg_rel];
@@ -285,7 +255,7 @@ impl GuacdParser {
         // We have at least one more character at buffer_slice[pos]
         if buffer_slice[pos] == INST_TERM {
             // Correctly terminated instruction
-            // Handle "0.;" specifically to ensure opcode is empty and args are empty
+            // Handles "0.;" specifically to ensure opcode is empty and args are empty
             if length_op == 0 && opcode_value_slice.is_empty() && arg_slices_vec.is_empty() {
                  return Ok(PeekedInstruction {
                     opcode: "", 
@@ -319,7 +289,7 @@ impl GuacdParser {
         let mut args_owned = Vec::new();
         let mut pos = 0;
 
-        if content_slice.is_empty() { // Corresponds to "0.;" if terminator was removed
+        if content_slice.is_empty() { // Corresponds to "0.;" if the terminator was removed
             return Ok(GuacdInstruction::new("".to_string(), vec![]));
         }
          // "0." is the content of "0.;"
@@ -409,7 +379,7 @@ impl GuacdParser {
         Self::parse_instruction_content(data_without_terminator)
     }
 
-    /// **ULTRA-FAST PATH: Validate Guacd format and check for error opcode only**
+    /// **ULTRA-FAST PATH: Validate the Guacd format and check for error opcode only**
     /// Returns (total_bytes, is_error) without any string parsing except for errors
     #[inline(always)]
     pub fn validate_and_check_error(buffer_slice: &[u8]) -> Result<(usize, bool), PeekError> {
@@ -478,16 +448,13 @@ impl GuacdParser {
         
         // Check for terminator
         if pos >= buffer_slice.len() || buffer_slice[pos] != INST_TERM {
-            if pos >= buffer_slice.len() {
-                return Err(PeekError::Incomplete);
+            return if pos >= buffer_slice.len() {
+                Err(PeekError::Incomplete)
             } else {
-                return Err(PeekError::InvalidFormat("Missing terminator".to_string()));
+                Err(PeekError::InvalidFormat("Missing terminator".to_string()))
             }
         }
         
         Ok((pos + 1, is_error))
     }
 }
-
-// Drop implementation is not needed for a stateless unit struct like GuacdParser.
-// If GuacdParser were to hold resources, Drop would be relevant.

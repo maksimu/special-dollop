@@ -6,6 +6,7 @@ use pyo3::exceptions::PyRuntimeError;
 use tracing::{debug, info, trace, warn, error};
 use crate::runtime::get_runtime;
 use crate::tube_registry::REGISTRY;
+use crate::router_helpers::post_connection_state;
 use std::sync::Arc;
 
 /// Python bindings for the Rust TubeRegistry.
@@ -309,7 +310,7 @@ impl PyTubeRegistry {
             .ok_or_else(|| PyRuntimeError::new_err("Tube ID missing from create_tube response"))?
             .clone();
 
-        // Setup Python signal handler if a callback was provided
+        // Set up Python signal handler if a callback was provided
         if let Some(cb) = signal_callback {
             setup_signal_handler(final_tube_id.clone(), signal_receiver_py, master_runtime.clone(), cb);
         }
@@ -569,6 +570,42 @@ impl PyTubeRegistry {
                 } else {
                     Err(PyRuntimeError::new_err(format!("No tube found for conversation: {}", conversation_id_owned)))
                 }
+            })
+        })
+    }
+
+    /// Refresh connections on router - collect all callback tokens and send to router
+    fn refresh_connections(&self, py: Python<'_>, ksm_config_from_python: String) -> PyResult<()> {
+        let master_runtime = get_runtime();
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+                
+                // Collect all callback tokens from active tubes
+                let mut callback_tokens = Vec::new();
+                
+                for tube_arc in registry.tubes_by_id.values() {
+                    // Get callback tokens from all channels in this tube
+                    let tube_channel_tokens = tube_arc.get_callback_tokens().await;
+                    callback_tokens.extend(tube_channel_tokens);
+                }
+                // The post_connection_state function handles TEST_MODE_KSM_CONFIG internally.
+                // It will also error out if ksm_config_from_python is empty and not a test string.
+                debug!(
+                    target: "python_bindings",
+                    token_count = callback_tokens.len(),
+                    ksm_source = "python_direct_arg",
+                    "Preparing to send refresh_connections (open_connections) callback with KSM config from Python."
+                );
+
+                let tokens_json = serde_json::Value::Array(
+                    callback_tokens.into_iter()
+                        .map(serde_json::Value::String)
+                        .collect()
+                );
+                
+                post_connection_state(&ksm_config_from_python, "open_connections", &tokens_json, None).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to refresh connections on router: {}", e)))
             })
         })
     }

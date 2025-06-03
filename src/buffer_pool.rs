@@ -19,7 +19,7 @@ impl Default for BufferPoolConfig {
         Self {
             buffer_size: 8 * 1024,  // 8KB default buffer size (matches MAX_READ_SIZE)
             max_pooled: 32,         // Keep up to 32 buffers in the pool
-            resize_on_return: true, // Resize buffers when returning to pool
+            resize_on_return: true, // Resize buffers when returning to the pool
         }
     }
 }
@@ -48,12 +48,12 @@ impl BufferPool {
         }
     }
 
-    /// Create a new buffer pool with default configuration
+    /// Create a new buffer pool with the default configuration
     pub fn default() -> Self {
         Self::new(BufferPoolConfig::default())
     }
 
-    /// Get a buffer from the pool, or create a new one if none available
+    /// Get a buffer from the pool or create a new one if none available
     pub fn acquire(&self) -> BytesMut {
         let mut inner = self.inner.lock().unwrap();
         match inner.buffers.pop_front() {
@@ -116,6 +116,7 @@ impl BufferPool {
     }
 
     /// Get the number of buffers currently in the pool
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.buffers.len()
@@ -137,7 +138,7 @@ mod tests {
         buf1.extend_from_slice(b"test data");
         assert_eq!(buf1.len(), 9);
         
-        // Clear and return to pool
+        // Clear and return to the pool
         buf1.clear();
         assert_eq!(buf1.len(), 0);
         pool.release(buf1);

@@ -6,7 +6,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
 use crate::models::{Conn, ConnectionStats, StreamHalf};
-use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason};
+use crate::tube_protocol::{Frame, ControlMessage};
 use crate::channel::types::ActiveProtocol;
 use crate::channel::guacd_parser::{GuacdInstruction, GuacdParser, PeekError};
 use tracing::{debug, error, info, warn, trace};
@@ -16,28 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use bytes::{Buf, BufMut, BytesMut};
-use crate::channel::core::ProtocolLogicState;
-use crate::channel::connect_as::decrypt_connect_as_payload;
 
 use super::core::Channel;
-
-const CONNECT_AS_DETAILS_LEN_FIELD_BYTES: usize = 2;
-const CONNECT_AS_PUBLIC_KEY_BYTES: usize = 65; // As per Python: 65-byte public key
-const CONNECT_AS_NONCE_BYTES: usize = 12;    // As per Python: 12 byte nonce
-
-// Helper function to convert camelCase to kebab-case
-fn camel_to_kebab(s: &str) -> String {
-    let mut result = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            result.push('-');
-            result.push(ch.to_lowercase().next().unwrap());
-        } else {
-            result.push(ch.to_lowercase().next().unwrap_or(ch));
-        }
-    }
-    result
-}
 
 // Open a backend connection to a given address
 pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr, active_protocol: ActiveProtocol) -> Result<()> {
@@ -50,6 +30,19 @@ pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr,
     if channel.conns.lock().await.contains_key(&conn_no) {
         warn!("Endpoint {}: Connection {} already exists", channel.channel_id, conn_no);
         return Ok(());
+    }
+
+    // If this is a Guacd connection, try to set it as the primary one if not already set.
+    if active_protocol == ActiveProtocol::Guacd {
+        let mut primary_conn_no_guard = channel.primary_guacd_conn_no.lock().await;
+        if primary_conn_no_guard.is_none() {
+            *primary_conn_no_guard = Some(conn_no);
+            info!(target: "connection_lifecycle", channel_id = %channel.channel_id, conn_no, "Marked as primary Guacd data connection.");
+        } else if *primary_conn_no_guard != Some(conn_no) {
+            // This case would be unusual - opening a new Guacd connection when one (potentially different conn_no) is already primary.
+            // For now, log it. Depending on design, there might be an error or a secondary stream.
+            debug!(target: "connection_lifecycle", channel_id = %channel.channel_id, conn_no, existing_primary = ?*primary_conn_no_guard, "Opening additional Guacd connection; primary already set.");
+        }
     }
 
     // Connect to the backend
@@ -69,6 +62,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
 
     let dc = channel.webrtc.clone();
     let channel_id_for_task = channel.channel_id.clone(); 
+    let conn_closed_tx_for_task = channel.conn_closed_tx.clone(); // Clone the sender for the task
     let pending_messages = channel.pending_messages.clone();
     let buffer_pool = channel.buffer_pool.clone(); 
     let buffer_low_threshold = super::core::BUFFER_LOW_THRESHOLD;
@@ -112,7 +106,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     &mut temp_control_payload_buf
                 );
                 buffer_pool.release(temp_control_payload_buf);
-                let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use task's dc and buffer_pool
+                let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use the task's dc and buffer_pool
                 return Err(e);
             }
             Err(_) => { 
@@ -126,7 +120,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     &mut temp_control_payload_buf
                 );
                 buffer_pool.release(temp_control_payload_buf);
-                let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use task's dc and buffer_pool
+                let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use the task's dc and buffer_pool
                 return Err(anyhow::anyhow!("Guacd handshake timed out"));
             }
         }
@@ -277,7 +271,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                 if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE {
                     main_read_buffer.reserve(MAX_READ_SIZE); 
                 }
-                match reader.read_buf(&mut main_read_buffer).await { // Read appends to main_read_buffer
+                match reader.read_buf(&mut main_read_buffer).await { // Read then append to main_read_buffer
                     Ok(n) => n,
                     Err(e) => {
                         error!("Endpoint {}: Read error on connection {} (Guacd path): {}", channel_id_for_task, conn_no, e);
@@ -345,7 +339,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                             #[cfg(feature = "profiling")]
                             let parse_start = std::time::Instant::now();
                             
-                            // **ULTRA-FAST PATH: Only validate format and check for error**
+                            // **ULTRA-FAST PATH: Only validate a format and check for error**
                             match GuacdParser::validate_and_check_error(current_slice) {
                                 Ok((instruction_len, is_error)) => {
                                     #[cfg(feature = "profiling")]
@@ -569,6 +563,15 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         
         let mut pending_guard = pending_messages.lock().await;
         pending_guard.remove(&conn_no);
+
+        // Signal that this connection task has exited
+        if let Err(e) = conn_closed_tx_for_task.send((conn_no, channel_id_for_task.clone())) {
+            // If sending fails, it likely means the Channel's run loop (receiver) has already terminated.
+            // This is not necessarily an error in this context, so a warning or trace might be appropriate.
+            warn!(target: "connection_lifecycle", channel_id = %channel_id_for_task, conn_no, error = %e, "Failed to send connection closure signal; channel might be shutting down.");
+        } else {
+            debug!(target: "connection_lifecycle", channel_id = %channel_id_for_task, conn_no, "Sent connection closure signal to Channel run loop.");
+        }
     });
 
     trace!( 
@@ -623,7 +626,7 @@ where
         SHelper: AsyncRead + Unpin + Send + ?Sized, 
     {
         loop {
-            // Process peek result and extract what we need
+            // Process a peek result and extract what we need
             let process_result = {
                 let peek_result = GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]);
                 
@@ -828,17 +831,23 @@ where
         writer.write_all(&GuacdParser::guacd_encode_instruction(&GuacdInstruction::new("image".to_string(), image_mimetypes))).await?;
         writer.flush().await?;
         
+        // Pre-normalize config keys once for efficient lookup
+        let normalized_config_map: HashMap<String, String> = connect_params_for_new_conn.iter()
+            .map(|(key, value)| {
+                let normalized_key = key.replace(&['-', '_'][..], "").to_ascii_lowercase();
+                (normalized_key, value.clone())
+            })
+            .collect();
+            
         for arg_name_from_guacd in args_instruction.args.iter().skip(1) { 
-            let param_value = connect_params_for_new_conn.get(arg_name_from_guacd.replace('_', "-").as_str()) 
-                                .or_else(|| connect_params_for_new_conn.get(arg_name_from_guacd.as_str()))
-                                .or_else(|| {
-                                    // Try to find the camelCase version of the parameter
-                                    connect_params_for_new_conn.keys()
-                                        .find(|k| camel_to_kebab(k) == *arg_name_from_guacd)
-                                        .and_then(|k| connect_params_for_new_conn.get(k))
-                                })
-                                .cloned()
-                                .unwrap_or_else(String::new);
+            // Normalize the guacd parameter name by removing hyphens/underscores and converting to lowercase
+            let normalized_guacd_param = arg_name_from_guacd.replace(&['-', '_'][..], "").to_ascii_lowercase();
+            
+            // Look up the parameter value using the normalized key
+            let param_value = normalized_config_map.get(&normalized_guacd_param)
+                .cloned()
+                .unwrap_or_else(String::new);
+            
             connect_args.push(param_value);
         }
     }
@@ -856,452 +865,5 @@ where
         info!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd handshake completed. No client ID received with 'ready'.");
     }
     buffer_pool.release(handshake_buffer); 
-    Ok(())
-}
-
-// Process an inbound message (typically from WebRTC, to be sent to a backend connection)
-pub async fn process_inbound_message(channel: &mut Channel, frame: Frame) -> Result<()> {
-    // **BOLD WARNING: HOT PATH - WebRTC→BACKEND MESSAGE PROCESSING**
-    // **NO UNNECESSARY STRING/OBJECT ALLOCATIONS**
-    // **USE BUFFER POOLS AND BORROWED DATA**
-    
-    let conn_no = frame.connection_no;
-    
-    if frame.connection_no == 0 { // Control message
-        // Buffer for operations that might need it (like Pong payload)
-        let mut temp_payload_buffer = channel.buffer_pool.acquire();
-
-        if frame.payload.len() >= crate::tube_protocol::CTRL_NO_LEN { 
-            let mut payload_cursor = std::io::Cursor::new(&frame.payload);
-            let control_code = payload_cursor.get_u16();
-            match ControlMessage::try_from(control_code) {
-                Ok(ctrl_msg) => {
-                    debug!("Channel({}): Received control message: {:?} (frame.conn_no=0, target identified in payload if applicable)", channel.channel_id, ctrl_msg);
-                    match ctrl_msg {
-                        ControlMessage::OpenConnection => {
-                            // Payload format: target_conn_no (u32), then protocol-specific data
-                            if payload_cursor.remaining() >= 4 { // Minimum for target_conn_no
-                                let target_conn_no = payload_cursor.get_u32();
-                                info!("Channel({}): Received OpenConnection request for target_conn_no {}", channel.channel_id, target_conn_no);
-
-                                let open_result = match channel.active_protocol {
-                                    ActiveProtocol::Guacd => {
-                                        let mut effective_guacd_host = channel.guacd_host.clone();
-                                        let mut effective_guacd_port = channel.guacd_port;
-
-                                        // ConnectAs logic
-                                        if (channel.connect_as_settings.allow_supply_user || channel.connect_as_settings.allow_supply_host) &&
-                                           channel.connect_as_settings.gateway_private_key.is_some() {
-                                            
-                                            debug!("Channel({}): Attempting ConnectAs for Guacd target_conn_no {}", channel.channel_id, target_conn_no);
-
-                                            // Check if enough data for connect_as fields
-                                            // connect_as_payload_len (u16) + public_key (65) + nonce (12)
-                                            const MIN_CONNECT_AS_HEADER_LEN: usize = CONNECT_AS_DETAILS_LEN_FIELD_BYTES + CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES;
-                                            
-                                            if payload_cursor.remaining() >= MIN_CONNECT_AS_HEADER_LEN {
-                                                let connect_as_payload_len = payload_cursor.get_u16() as usize;
-                                                
-                                                // **PERFORMANCE: Use buffer pool for crypto operations**
-                                                let mut crypto_buffer = channel.buffer_pool.acquire();
-                                                crypto_buffer.clear();
-                                                crypto_buffer.resize(CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES + connect_as_payload_len, 0);
-                                                
-                                                payload_cursor.copy_to_slice(&mut crypto_buffer[..]);
-                                                
-                                                let client_public_key_bytes = &crypto_buffer[..CONNECT_AS_PUBLIC_KEY_BYTES];
-                                                let nonce_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES..CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES];
-                                                let encrypted_data_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES..];
-
-                                                if payload_cursor.remaining() >= connect_as_payload_len {
-                                                    match decrypt_connect_as_payload(
-                                                        channel.connect_as_settings.gateway_private_key.as_ref().unwrap(), // Safe due to is_some() check
-                                                        client_public_key_bytes,
-                                                        nonce_bytes,
-                                                        encrypted_data_bytes,
-                                                    ) {
-                                                        Ok(decrypted_payload) => {
-                                                            info!("Channel({}): Successfully decrypted ConnectAs payload for target_conn_no {}", channel.channel_id, target_conn_no);
-                                                            let mut guacd_params_locked = channel.guacd_params.lock().await;
-
-                                                            if channel.connect_as_settings.allow_supply_user {
-                                                                if let Some(user_details) = decrypted_payload.user {
-                                                                    debug!("Channel({}): Applying ConnectAs user details: {:?}", channel.channel_id, user_details);
-                                                                    if let Some(val) = user_details.username { guacd_params_locked.insert("username".to_string(), val); }
-                                                                    if let Some(val) = user_details.password { guacd_params_locked.insert("password".to_string(), val); }
-                                                                    if let Some(val) = user_details.private_key { guacd_params_locked.insert("private-key".to_string(), val); } // Guacamole uses 'private-key'
-                                                                    if let Some(val) = user_details.private_key_passphrase { guacd_params_locked.insert("passphrase".to_string(), val); } // Guacamole uses 'passphrase'
-                                                                    if let Some(val) = user_details.domain { guacd_params_locked.insert("domain".to_string(), val); }
-                                                                    if let Some(val) = user_details.connect_database { guacd_params_locked.insert("database".to_string(), val); } // Common for SQL
-                                                                    if let Some(val) = user_details.distinguished_name { guacd_params_locked.insert("user-dn".to_string(), val); } // Example for LDAP/X.500
-                                                                }
-                                                            }
-
-                                                            if channel.connect_as_settings.allow_supply_host {
-                                                                if let Some(host) = decrypted_payload.host {
-                                                                    debug!("Channel({}): ConnectAs supplied host: {}", channel.channel_id, host);
-                                                                    effective_guacd_host = Some(host);
-                                                                }
-                                                                if let Some(port) = decrypted_payload.port {
-                                                                    debug!("Channel({}): ConnectAs supplied port: {}", channel.channel_id, port);
-                                                                    effective_guacd_port = Some(port);
-                                                                }
-                                                            }
-                                                            // Guacd params are updated, next steps will use them
-                                                        }
-                                                        Err(e) => {
-                                                            error!("Channel({}): Failed to decrypt or parse ConnectAs payload for target_conn_no {}: {}", channel.channel_id, target_conn_no, e);
-                                                            // Fall through to use default guacd_host/port or error if not configured
-                                                            // Or explicitly return error here if ConnectAs was mandatory.
-                                                            // For now, let's make it an error that prevents connection.
-                                                            return Err(anyhow::anyhow!("ConnectAs decryption/parsing failed: {}", e));
-                                                        }
-                                                    }
-                                                    channel.buffer_pool.release(crypto_buffer);
-                                                } else {
-                                                    channel.buffer_pool.release(crypto_buffer);
-                                                    warn!("Channel({}): ConnectAs payload too short for encrypted data (expected {}, got {}) for target_conn_no {}",
-                                                        channel.channel_id, connect_as_payload_len, payload_cursor.remaining(), target_conn_no);
-                                                    return Err(anyhow::anyhow!("ConnectAs payload too short for encrypted data"));
-                                                }
-                                            } else {
-                                                 warn!("Channel({}): ConnectAs payload too short for headers (key, nonce) for target_conn_no {}", channel.channel_id, target_conn_no);
-                                                 return Err(anyhow::anyhow!("ConnectAs payload too short for headers"));
-                                            }
-                                        } // End of ConnectAs logic block
-
-                                        // Proceed with effective host/port
-                                        if let (Some(host), Some(port)) = (effective_guacd_host.as_deref(), effective_guacd_port) {
-                                            match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
-                                                Ok(mut addrs) => {
-                                                    if let Some(socket_addr) = addrs.next() {
-                                                        debug!("Channel({}): Guacd OpenConnection for target_conn_no {} to pre-configured {}:{} (resolved to {}).", 
-                                                            channel.channel_id, target_conn_no, host, port, socket_addr);
-                                                        open_backend(channel, target_conn_no, socket_addr, ActiveProtocol::Guacd).await
-                                                    } else {
-                                                        Err(anyhow::anyhow!("Could not resolve pre-configured Guacd host {}:{} to any SocketAddr", host, port))
-                                                    }
-                                                }
-                                                Err(e) => Err(anyhow::anyhow!("DNS lookup failed for pre-configured Guacd host {}:{}: {}", host, port, e)),
-                                            }
-                                        } else {
-                                            Err(anyhow::anyhow!("Guacd host/port not configured on channel for OpenConnection"))
-                                        }
-                                    }
-                                    ActiveProtocol::PortForward => {
-                                        if let ProtocolLogicState::PortForward(pf_state) = &channel.protocol_state {
-                                            if let (Some(host), Some(port)) = (pf_state.target_host.as_deref(), pf_state.target_port) {
-                                                match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
-                                                    Ok(mut addrs) => {
-                                                        if let Some(socket_addr) = addrs.next() {
-                                                            debug!("Channel({}): PortForward OpenConnection for target_conn_no {} to pre-configured {}:{} (resolved to {}).", 
-                                                                channel.channel_id, target_conn_no, host, port, socket_addr);
-                                                            open_backend(channel, target_conn_no, socket_addr, ActiveProtocol::PortForward).await
-                                                        } else {
-                                                            Err(anyhow::anyhow!("Could not resolve pre-configured PortForward host {}:{} to any SocketAddr", host, port))
-                                                        }
-                                                    }
-                                                    Err(e) => Err(anyhow::anyhow!("DNS lookup failed for pre-configured PortForward host {}:{}: {}", host, port, e)),
-                                                }
-                                            } else {
-                                                Err(anyhow::anyhow!("PortForward target host/port not configured in channel protocol state"))
-                                            }
-                                        } else {
-                                            Err(anyhow::anyhow!("Channel is in PortForward mode, but protocol state is not PortForward")) // Should not happen
-                                        }
-                                    }
-                                    ActiveProtocol::Socks5 => {
-                                        // Payload: host_len (u16), host (String), port (u16)
-                                        // We are deferring SOCKS5 specific payload parsing for now.
-                                        // This branch will effectively fail or use placeholder logic.
-                                        warn!("Channel({}): SOCKS5 OpenConnection payload parsing is not fully implemented for target_conn_no {}. Deferring detailed parsing.", channel.channel_id, target_conn_no);
-                                        // For now, let's return an error to indicate it's not supported in this path yet,
-                                        // rather than trying to connect to a default/unspecified SOCKS5 target.
-                                        Err(anyhow::anyhow!("SOCKS5 OpenConnection payload parsing deferred"))
-                                    }
-                                };
-
-                                if let Err(e) = open_result {
-                                    error!("Channel({}): Failed to process OpenConnection for target_conn_no {}: {}. Sending CloseConnection back.", 
-                                        channel.channel_id, target_conn_no, e);
-                                    temp_payload_buffer.clear(); 
-                                    temp_payload_buffer.put_u32(target_conn_no); // The conn_no that failed
-                                    temp_payload_buffer.put_u16(CloseConnectionReason::ConnectionFailed as u16);
-                                    if let Err(send_err) = channel.send_control_message(ControlMessage::CloseConnection, &temp_payload_buffer).await {
-                                        error!("Channel({}): Failed to send CloseConnection for failed OpenConnection {}: {}", channel.channel_id, target_conn_no, send_err);
-                                    }
-                                } else {
-                                    // If open_backend succeeded, send ConnectionOpened
-                                    info!("Channel({}): Successfully processed OpenConnection for target_conn_no {}, sending ConnectionOpened.", channel.channel_id, target_conn_no);
-                                    temp_payload_buffer.clear();
-                                    temp_payload_buffer.put_u32(target_conn_no);
-                                    if let Err(e) = channel.send_control_message(ControlMessage::ConnectionOpened, &temp_payload_buffer).await {
-                                        error!("Channel({}): Error sending ConnectionOpened for conn_no {}: {}", channel.channel_id, target_conn_no, e);
-                                    }
-                                }
-                            } else {
-                                warn!("Channel({}): OpenConnection payload too short (min 4 bytes for target_conn_no required). Actual: {}", channel.channel_id, payload_cursor.remaining());
-                            }
-                        }
-                        ControlMessage::CloseConnection => {
-                            if payload_cursor.remaining() >= 4 { // Need at least 4 bytes for target_conn_no
-                                let target_conn_no = payload_cursor.get_u32();
-                                let reason = if payload_cursor.remaining() >= 2 {
-                                    match CloseConnectionReason::try_from(payload_cursor.get_u16()) {
-                                        Ok(r) => r,
-                                        Err(_) => {
-                                            warn!("Channel({}): Invalid CloseConnectionReason code in payload for conn_no {}. Defaulting to Normal.", channel.channel_id, target_conn_no);
-                                            CloseConnectionReason::Normal
-                                        }
-                                    }
-                                } else {
-                                    CloseConnectionReason::Normal
-                                };
-                                // Drop conns_map before calling channel.close_backend
-                                // Explicitly drop for clarity, though scope ending would also work if structured differently
-                                // let mut conns_map = channel.conns.lock().await; // This was the original problematic line
-                                // drop(conns_map); // Ensure lock is released
-
-                                info!("Channel({}): Received CloseConnection control message for target_conn_no {} with reason {:?}", channel.channel_id, target_conn_no, reason);
-                                if let Err(e) = channel.close_backend(target_conn_no, reason).await {
-                                    error!("Channel({}): Error closing backend connection {}: {}", channel.channel_id, target_conn_no, e);
-                                }
-                            } else {
-                                warn!("Channel({}): CloseConnection payload too short to contain target_conn_no.", channel.channel_id);
-                            }
-                        }
-                        ControlMessage::SendEOF => {
-                            if payload_cursor.remaining() >= 4 { // Need at least 4 bytes for target_conn_no
-                                let target_conn_no = payload_cursor.get_u32();
-                                info!("Channel({}): Received SendEOF control message for target_conn_no {}", channel.channel_id, target_conn_no);
-                                
-                                // Lock needed here to access specific connection
-                                let mut conns_map_guard = channel.conns.lock().await;
-                                if let Some(conn_to_eof) = conns_map_guard.get_mut(&target_conn_no) {
-                                    if let Err(e) = crate::models::AsyncReadWrite::shutdown(&mut conn_to_eof.backend).await {
-                                        error!("Channel({}): Error sending EOF to backend for conn_no {}: {}", channel.channel_id, target_conn_no, e);
-                                    } else {
-                                        debug!("Channel({}): Successfully sent EOF/shutdown to backend for conn_no {}", channel.channel_id, target_conn_no);
-                                    }
-                                } else {
-                                    warn!("Channel({}): SendEOF for unknown connection {}", channel.channel_id, target_conn_no);
-                                }
-                                // conns_map_guard is dropped here
-                            } else {
-                                warn!("Channel({}): SendEOF payload too short to contain target_conn_no.", channel.channel_id);
-                            }
-                        }
-                        ControlMessage::ConnectionOpened => {
-                            if payload_cursor.remaining() >= 4 { // conn_no
-                                let target_conn_no_opened = payload_cursor.get_u32();
-                                info!("Channel({}): Received ConnectionOpened for conn_no {}", channel.channel_id, target_conn_no_opened);
-                                
-                                {
-                                    let mut conns_map = channel.conns.lock().await;
-                                    if let Some(conn) = conns_map.get_mut(&target_conn_no_opened) {
-                                        conn.stats.remote_connected = true; // Mark as fully connected
-                                        debug!("Channel({}): Marked conn_no {} stats.remote_connected = true.", channel.channel_id, target_conn_no_opened);
-                                    } else {
-                                        warn!("Channel({}): Received ConnectionOpened for unknown conn_no {}", channel.channel_id, target_conn_no_opened);
-                                        // If conn not found, no point trying to send pending messages for it.
-                                        // Release buffer and return from this control message case.
-                                        channel.buffer_pool.release(temp_payload_buffer);
-                                        return Ok(()); 
-                                    }
-                                } // conns_map lock is dropped here
-                                
-                                // Now that the lock on conns_map is released, we can call send_pending_messages.
-                                debug!("Channel({}): Triggering send_pending_messages for newly opened conn_no {}.", channel.channel_id, target_conn_no_opened);
-                                if let Err(e) = send_pending_messages(channel, target_conn_no_opened).await {
-                                    error!("Channel({}): Error in send_pending_messages for conn_no {}: {}", channel.channel_id, target_conn_no_opened, e);
-                                }
-                            } else {
-                                warn!("Channel({}): ConnectionOpened payload too short for conn_no.", channel.channel_id);
-                            }
-                        }
-                        ControlMessage::Ping => {
-                            temp_payload_buffer.clear();
-                            if payload_cursor.remaining() > 0 {
-                                let position = payload_cursor.position() as usize;
-                                temp_payload_buffer.extend_from_slice(&frame.payload[position..]);
-                            }
-                            // Drop conns_map before calling channel.send_control_message
-                            // let mut conns_map = channel.conns.lock().await; // Original problematic line
-                            // drop(conns_map); // Ensure lock is released
-
-                            debug!("Channel({}): Received Ping, sending Pong. Pong payload len: {}", channel.channel_id, temp_payload_buffer.len());
-                            if let Err(e) = channel.send_control_message(ControlMessage::Pong, &temp_payload_buffer).await {
-                                error!("Channel({}): Error sending Pong: {}", channel.channel_id, e);
-                            }
-                        }
-                        ControlMessage::Pong => {
-                            if payload_cursor.remaining() >= 4 { // conn_no
-                                let conn_no_pong = payload_cursor.get_u32();
-                                
-                                if conn_no_pong == 0 {
-                                    // Handle channel-level Pong (conn_no = 0)
-                                    let mut channel_ping_time = channel.channel_ping_sent_time.lock().await;
-                                    if let Some(ping_sent_time_ms) = channel_ping_time.take() { // .take() resets to None
-                                        let current_time_ms = crate::tube_protocol::now_ms();
-                                        if current_time_ms >= ping_sent_time_ms {
-                                            let rtt = current_time_ms - ping_sent_time_ms;
-                                            let mut rtt_vec = channel.round_trip_latency.lock().await;
-                                            rtt_vec.push(rtt);
-                                            if rtt_vec.len() > 100 { // Keep a sliding window
-                                                rtt_vec.remove(0);
-                                            }
-                                            debug!("Channel({}): Channel PONG received. RTT: {}ms. Channel ping time reset.", channel.channel_id, rtt);
-                                        } else {
-                                            warn!("Channel({}): Channel PONG received with current_time < ping_sent_time. Clock skew?", channel.channel_id);
-                                        }
-                                    } else {
-                                        debug!("Channel({}): Channel PONG received, but no channel_ping_sent_time was set. Ignoring RTT.", channel.channel_id);
-                                    }
-                                } else {
-                                    // Handle data connection Pong (conn_no > 0)
-                                    let mut locked_conns = channel.conns.lock().await;
-                                    if let Some(conn_stats) = locked_conns.get_mut(&conn_no_pong).map(|c| &mut c.stats) {
-                                        conn_stats.message_counter = 0; // Reset message counter
-                                        if let Some(ping_sent_time_ms) = conn_stats.ping_time.take() { // .take() resets it to None
-                                            let current_time_ms = crate::tube_protocol::now_ms();
-                                            if current_time_ms >= ping_sent_time_ms {
-                                                let rtt = current_time_ms - ping_sent_time_ms;
-                                                // Store individual connection RTT if needed, or just log
-                                                // For now, primary RTT tracking is via channel.round_trip_latency for overall health
-                                                debug!("Channel({}): Pong for conn_no {} received. RTT: {}ms. Ping time reset.", channel.channel_id, conn_no_pong, rtt);
-
-                                                // Simplified transfer latency update
-                                                if conn_stats.receive_latency_count > 0 {
-                                                    let receive_avg = conn_stats.receive_latency_avg();
-                                                    if rtt >= receive_avg {
-                                                        conn_stats.transfer_latency_sum += rtt - receive_avg;
-                                                        conn_stats.transfer_latency_count += 1;
-                                                    }
-                                                }
-                                            } else {
-                                                warn!("Channel({}): Pong for conn_no {} received with current_time < ping_sent_time. Clock skew?", channel.channel_id, conn_no_pong);
-                                            }
-                                        } else {
-                                            debug!("Channel({}): Pong for conn_no {} received, but no ping_time was set. Ignoring RTT.", channel.channel_id, conn_no_pong);
-                                        }
-                                    } else {
-                                        warn!("Channel({}): Pong for unknown data connection_no {}", channel.channel_id, conn_no_pong);
-                                    }
-                                }
-                            } else {
-                                warn!("Channel({}): Pong payload too short to contain conn_no.", channel.channel_id);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    warn!("Channel({}): Unknown control message code: {} (frame.conn_no=0)", channel.channel_id, control_code);
-                }
-            }
-        } else {
-            warn!("Channel({}): Control message payload too short ({} bytes) to contain code (frame.conn_no=0)", channel.channel_id, frame.payload.len());
-        }
-        channel.buffer_pool.release(temp_payload_buffer); // Release buffer used for pong or other ops
-    } else { // Data message for connection_no > 0
-        let mut conns_map = channel.conns.lock().await;
-        if let Some(conn) = conns_map.get_mut(&conn_no) {
-            if frame.payload.is_empty() {
-                debug!("Channel({}): Received empty data payload for conn_no {}", channel.channel_id, conn_no);
-            } else {
-                debug!("Channel({}): Forwarding data for conn_no {}. Payload size: {}", channel.channel_id, conn_no, frame.payload.len());
-                // TODO: Consider if there are scenarios where this write should be non-blocking or handled in a separate task. A potential future performance tuning if needed
-                // For now, direct await is simplest.
-                if let Err(e) = conn.backend.write_all(&frame.payload).await {
-                    error!("Channel({}): Failed to write to backend for conn_no {}: {}", channel.channel_id, conn_no, e);
-                    // Optionally, close connection or send error back via WebRTC
-                    // For now, just logging. This error will propagate up.
-                    return Err(e.into());
-                }
-                // Flush might be important depending on the backend's expectations
-                if let Err(e) = conn.backend.flush().await {
-                     error!("Channel({}): Failed to flush backend writer for conn_no {}: {}", channel.channel_id, conn_no, e);
-                     return Err(e.into());
-                }
-            }
-        } else {
-            warn!("Channel({}): Message for unknown connection {} in process_inbound_message", channel.channel_id, conn_no);
-        }
-    }
-    Ok(())
-}
-
-
-// Send any pending messages for a given connection
-pub async fn send_pending_messages(channel: &mut Channel, conn_no: u32) -> Result<()> {
-    // **BOLD WARNING: HOT PATH - SENDING QUEUED MESSAGES**
-    // **NO STRING/OBJECT ALLOCATIONS IN THE LOOP**
-    // **MESSAGES ARE ALREADY ENCODED AS Bytes**
-    
-    debug!("Channel({}): Attempting to send pending messages for conn_no {}", channel.channel_id, conn_no);
-    let mut pending_guard = channel.pending_messages.lock().await;
-    
-    if let Some(queue) = pending_guard.get_mut(&conn_no) {
-        if queue.is_empty() {
-            debug!("Channel({}): No pending messages for conn_no {}.", channel.channel_id, conn_no);
-            return Ok(());
-        }
-        
-        let mut messages_sent_count = 0;
-        // Check the buffer amount before starting, and periodically inside the loop if sending many messages.
-        // BUFFER_LOW_THRESHOLD is defined in core.rs, consider making it accessible or passing it.
-        // For now, using a local constant or assuming Channel.webrtc has the threshold knowledge.
-        // The WebRTCDataChannel already has set_buffered_amount_low_threshold and on_buffered_amount_low callback.
-        // The check here is to proactively avoid over-sending if we are about to send a batch.
-        
-        // Strategy: Peek at message, clone for sending, pop only on successful send.
-        // This ensures messages aren't lost on transient send errors.
-        // Cloning Bytes is cheap (increments a ref count) but peeking first is crucial for error handling.
-        while let Some(message_bytes_ref) = queue.front() { // Peek at the front message
-            if message_bytes_ref.is_empty() {
-                queue.pop_front(); // Remove empty message
-                continue; // Skip empty messages
-            }
-
-            // Clone here is necessary because we need to release the borrow on queue
-            // before .await, and we might put it back.
-            let message_bytes_cloned = message_bytes_ref.clone();
-
-            let current_buffered_amount = channel.webrtc.buffered_amount().await;
-            if current_buffered_amount >= super::core::BUFFER_LOW_THRESHOLD { 
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(
-                        "Channel({}): Buffer amount {} for conn_no {} is high. Pausing sending of pending messages.",
-                        channel.channel_id, current_buffered_amount, conn_no
-                    );
-                }
-                // Message is still at the front, no need to push_front here.
-                break; // Stop sending if buffer is too full
-            }
-
-            match channel.webrtc.send(message_bytes_cloned.clone()).await { // Send the cloned message
-                Ok(_) => {
-                    messages_sent_count += 1;
-                    queue.pop_front(); // Successfully sent, now remove from queue
-                }
-                Err(e) => {
-                    error!(
-                        "Channel({}): Failed to send pending message for conn_no {}: {}. Message remains at the front of the queue.",
-                        channel.channel_id, conn_no, e
-                    );
-                    // Message is still at the front of queue because we only peeked.
-                    // Stop processing this queue on error to avoid repeated attempts on a potentially problematic message or state.
-                    break; 
-                }
-            }
-            // Optional: Add a small yield or limit the number of messages sent in one go if this loop becomes too tight.
-        }
-        if messages_sent_count > 0 {
-            debug!("Channel({}): Sent {} pending messages for conn_no {}. Remaining in queue: {}", 
-                channel.channel_id, messages_sent_count, conn_no, queue.len());
-        }
-    } else {
-        debug!("Channel({}): No pending message queue found for conn_no {}.", channel.channel_id, conn_no);
-    }
-    
     Ok(())
 }

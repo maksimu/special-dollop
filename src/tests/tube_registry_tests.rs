@@ -26,9 +26,11 @@ fn new_test_tube_without_registry_add() -> Result<Arc<Tube>> {
         data_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         control_channel: Arc::new(tokio::sync::RwLock::new(None)),
         channel_shutdown_signals: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        active_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         is_server_mode_context: false, // Default to client context for this helper
         status: Arc::new(tokio::sync::RwLock::new(crate::tube_and_channel_helpers::TubeStatus::New)),
         runtime,
+        original_conversation_id: None,
     }))
 }
 
@@ -253,7 +255,7 @@ async fn perform_tube_signaling(
     let client_tube = client_registry.get_by_tube_id(client_tube_id)
         .ok_or_else(|| format!("Client tube {} not found in registry", client_tube_id))?;
 
-    // Use server_registry to set remote description, which handles base64 decoding
+    // Use server_registry to set a remote description, which handles base64 decoding
     server_registry.set_remote_description(server_tube_id, &client_answer_sdp, true).await
         .map_err(|e| format!("ServerTube ({}) set_remote_description (answer) error via registry: {}", server_tube.id(), e))?
         .map_or(Ok(()), |_| Err(format!("ServerTube ({}) set_remote_description (answer) via registry returned unexpected Some(answer)", server_tube.id())))?;

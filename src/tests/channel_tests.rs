@@ -79,16 +79,16 @@ async fn test_server_mode_data_flow() -> Result<()> {
     let mut settings = HashMap::new();
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
-    let mut channel = Channel::new(
-        webrtc.clone(),
+    let mut channel = Channel::new(crate::channel::core::ChannelParams {
+        webrtc: webrtc.clone(),
         rx_from_dc,
-        "test_server_mode".to_string(),
-        None,     // default timeouts
-        settings, // protocol_settings
-        true,     // server_mode=true
-        Some("test_callback_token".to_string()),
-        Some("test_ksm_config".to_string()),
-    )
+        channel_id: "test_server_mode".to_string(),
+        timeouts: None,              // default timeouts
+        protocol_settings: settings, // protocol_settings
+        server_mode: true,           // server_mode=true
+        callback_token: Some("test_callback_token".to_string()),
+        ksm_config: Some("test_ksm_config".to_string()),
+    })
     .await?;
 
     // Start server listening on localhost with a random port
@@ -260,16 +260,16 @@ async fn test_client_mode_data_flow() -> Result<()> {
     );
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
-    let channel = Channel::new(
-        webrtc.clone(),
+    let channel = Channel::new(crate::channel::core::ChannelParams {
+        webrtc: webrtc.clone(),
         rx_from_dc,
-        "test_client_mode".to_string(),
-        None,     // default timeouts
-        settings, // protocol_settings
-        false,    // server_mode=false
-        Some("test_callback_token".to_string()),
-        Some("test_ksm_config".to_string()),
-    )
+        channel_id: "test_client_mode".to_string(),
+        timeouts: None,              // default timeouts
+        protocol_settings: settings, // protocol_settings
+        server_mode: false,          // server_mode=false
+        callback_token: Some("test_callback_token".to_string()),
+        ksm_config: Some("test_ksm_config".to_string()),
+    })
     .await?;
 
     // Start the channel running in a separate task

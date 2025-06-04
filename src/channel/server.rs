@@ -31,7 +31,7 @@ impl Channel {
     /// Start a server listening on the given address for the given protocol
     /// Returns the actual SocketAddr it bound to.
     pub async fn start_server(&mut self, addr_str: &str) -> Result<SocketAddr, anyhow::Error> {
-        if self.server_mode == false {
+        if !self.server_mode {
             return Err(anyhow!("Cannot start server in client mode"));
         }
 
@@ -92,7 +92,7 @@ impl Channel {
 
                                 // Read the initial greeting to determine the SOCKS version
                                 let mut buf = [0u8; 2];
-                                if let Ok(_) = reader.read_exact(&mut buf).await {
+                                if (reader.read_exact(&mut buf).await).is_ok() {
                                     // Send connection didn't allow response
                                     let version = buf[0];
                                     if version == SOCKS5_VERSION {

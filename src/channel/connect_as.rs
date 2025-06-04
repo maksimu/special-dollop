@@ -1,11 +1,9 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce as AesNonce};
 use anyhow::{anyhow, Result};
-use hex;
 use hkdf::Hkdf;
 use p256::{ecdh::diffie_hellman, PublicKey as P256PublicKey, SecretKey as P256SecretKey};
 use serde::Deserialize;
-use serde_json;
 use sha2::Sha256;
 
 // Structs for deserializing connect_as JSON payload
@@ -36,7 +34,7 @@ pub(crate) fn decrypt_connect_as_payload(
     encrypted_data: &[u8],
 ) -> Result<ConnectAsPayload, anyhow::Error> {
     // 1. Parse gateway's private key (hex to bytes, then to P256SecretKey)
-    let private_key_bytes = hex::decode(gateway_private_key_hex)
+    let private_key_bytes = ::hex::decode(gateway_private_key_hex)
         .map_err(|e| anyhow!("Failed to decode gateway private key hex: {}", e))?;
     let gateway_secret_key = P256SecretKey::from_slice(&private_key_bytes)
         .map_err(|e| anyhow!("Failed to create P256SecretKey from bytes: {}", e))?;
@@ -76,7 +74,7 @@ pub(crate) fn decrypt_connect_as_payload(
         .map_err(|e| anyhow!("AES-GCM decryption error: {}", e))?;
 
     // 6. Parse decrypted bytes as JSON into ConnectAsPayload struct
-    let payload: ConnectAsPayload = serde_json::from_slice(&decrypted_bytes)
+    let payload: ConnectAsPayload = ::serde_json::from_slice(&decrypted_bytes)
         .map_err(|e| anyhow!("Failed to deserialize decrypted JSON payload: {}", e))?;
 
     Ok(payload)

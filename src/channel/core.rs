@@ -188,17 +188,29 @@ impl Clone for Channel {
     }
 }
 
+pub struct ChannelParams {
+    pub webrtc: WebRTCDataChannel,
+    pub rx_from_dc: mpsc::UnboundedReceiver<Bytes>,
+    pub channel_id: String,
+    pub timeouts: Option<TunnelTimeouts>,
+    pub protocol_settings: HashMap<String, JsonValue>,
+    pub server_mode: bool,
+    pub callback_token: Option<String>,
+    pub ksm_config: Option<String>,
+}
+
 impl Channel {
-    pub async fn new(
-        webrtc: WebRTCDataChannel,
-        rx_from_dc: mpsc::UnboundedReceiver<Bytes>, // This receiver is from the WebRTC data channel
-        channel_id: String,
-        timeouts: Option<TunnelTimeouts>,
-        protocol_settings: HashMap<String, JsonValue>, // Using JsonValue alias
-        server_mode: bool,
-        callback_token: Option<String>,
-        ksm_config: Option<String>,
-    ) -> Result<Self> {
+    pub async fn new(params: ChannelParams) -> Result<Self> {
+        let ChannelParams {
+            webrtc,
+            rx_from_dc,
+            channel_id,
+            timeouts,
+            protocol_settings,
+            server_mode,
+            callback_token,
+            ksm_config,
+        } = params;
         info!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
         trace!(target: "channel_setup", channel_id = %channel_id, ?protocol_settings, "Initial protocol_settings received by Channel::new");
 
@@ -592,7 +604,7 @@ impl Channel {
                             if tracing::enabled!(tracing::Level::DEBUG) {
                                 debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
 
-                                if chunk.len() > 0 {
+                                if !chunk.is_empty() {
                                     debug!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
                                 }
                             }
@@ -792,10 +804,8 @@ impl Channel {
             if tracing::enabled!(tracing::Level::DEBUG) {
                 debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
             }
-        } else {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
-            }
+        } else if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
         }
         Ok(())
     }
@@ -966,12 +976,11 @@ impl Channel {
                     reason,
                     CloseConnectionReason::UpstreamClosed | CloseConnectionReason::Error
                 ))
+            && self.local_client_server_task.is_some()
         {
-            if self.local_client_server_task.is_some() {
-                debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Stopping server due to critical connection closure");
-                if let Err(e) = self.stop_server().await {
-                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, error = %e, "Failed to stop server during connection close");
-                }
+            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Stopping server due to critical connection closure");
+            if let Err(e) = self.stop_server().await {
+                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, error = %e, "Failed to stop server during connection close");
             }
         }
 

@@ -14,8 +14,6 @@ use super::connect_as::decrypt_connect_as_payload;
 const CONNECT_AS_DETAILS_LEN_FIELD_BYTES: usize = 4;
 const CONNECT_AS_PUBLIC_KEY_BYTES: usize = 65; // As per Python: 65-byte public key
 const CONNECT_AS_NONCE_BYTES: usize = 12; // As per Python: 12 byte nonce
-
-use hex;
 use p256::pkcs8::DecodePrivateKey; // Trait for from_pkcs8_pem
 use p256::SecretKey as P256SecretKey;
 
@@ -632,10 +630,8 @@ impl Channel {
             if tracing::enabled!(tracing::Level::DEBUG) {
                 debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request with timing data for {}", conn_no);
             }
-        } else {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request for {}", conn_no);
-            }
+        } else if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request for {}", conn_no);
         }
 
         // Send response - using buffer pool data
@@ -665,15 +661,11 @@ impl Channel {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong");
                 }
-            } else {
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
-                }
+            } else if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
             }
-        } else {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong for unknown connection {}", conn_no);
-            }
+        } else if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong for unknown connection {}", conn_no);
         }
 
         // Reset ping attempt counter

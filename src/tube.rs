@@ -68,6 +68,7 @@ impl Tube {
         Ok(tube)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_peer_connection(
         &self,
         config: Option<RTCConfiguration>,
@@ -88,7 +89,6 @@ impl Tube {
             config,
             trickle_ice,
             turn_only,
-            ksm_config.clone(),
             Some(signal_sender),
             self.id.clone(), // Pass tube_id
         )
@@ -272,22 +272,21 @@ impl Tube {
                     }
 
                     let run_result = owned_channel.run().await;
-                    let outcome_details: String;
 
-                    match &run_result {
+                    let outcome_details: String = match &run_result {
                         Ok(()) => {
                             info!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Channel '{}' (from on_data_channel) ran and exited normally. Signaling Python.", label_clone_for_run);
-                            outcome_details = "normal_exit".to_string();
+                            "normal_exit".to_string()
                         }
                         Err(crate::error::ChannelError::CriticalUpstreamClosed(closed_channel_id_from_err)) => {
                             warn!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, channel_id_in_err = %closed_channel_id_from_err, "Channel '{}' (from on_data_channel) exited due to critical upstream closure. Signaling Python.", label_clone_for_run);
-                            outcome_details = format!("critical_upstream_closed: {}", closed_channel_id_from_err);
+                            format!("critical_upstream_closed: {}", closed_channel_id_from_err)
                         }
                         Err(e) => {
                             error!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Channel '{}' (from on_data_channel) encountered an error in run(): {}. Signaling Python.", label_clone_for_run, e);
-                            outcome_details = format!("error: {}", e);
+                            format!("error: {}", e)
                         }
-                    }
+                    };
 
                     // Send connection_close callback when channel finishes
                     if let Err(e) = tube_arc.send_connection_close_callback(&label_clone_for_run).await {
@@ -448,7 +447,7 @@ impl Tube {
 
             Ok(data_channel_clone)
         } else {
-            Err(anyhow!("No peer connection available").into())
+            Err(anyhow!("No peer connection available"))
         }
     }
 
@@ -522,7 +521,7 @@ impl Tube {
         debug!("Sending connection open callback to router");
         let token_value = serde_json::Value::String(callback_token);
 
-        match post_connection_state(&*ksm_config, "connection_open", &token_value, None).await {
+        match post_connection_state(&ksm_config, "connection_open", &token_value, None).await {
             Ok(_) => {
                 debug!("Connection open callback sent successfully");
                 Ok(())
@@ -552,7 +551,7 @@ impl Tube {
 
         // Fall back to direct API call
         match post_connection_state(
-            &*ksm_config,
+            &ksm_config,
             "connection_close",
             &token_value,
             Some(true), // Assuming terminated=true as default for simplicity
@@ -583,15 +582,11 @@ impl Tube {
         info!(tube_id = %self.id, channel_name = %name, "create_channel: Called.");
         trace!(tube_id = %self.id, channel_name = %name, ?timeout_seconds, ?protocol_settings, "create_channel: Initial parameters.");
 
-        let timeouts = if let Some(timeout) = timeout_seconds {
-            Some(TunnelTimeouts {
-                read: std::time::Duration::from_secs_f64(timeout),
-                close_connection: std::time::Duration::from_secs_f64(timeout / 2.0),
-                guacd_handshake: std::time::Duration::from_secs_f64(timeout / 1.5),
-            })
-        } else {
-            None
-        };
+        let timeouts = timeout_seconds.map(|timeout| TunnelTimeouts {
+            read: std::time::Duration::from_secs_f64(timeout),
+            close_connection: std::time::Duration::from_secs_f64(timeout / 2.0),
+            guacd_handshake: std::time::Duration::from_secs_f64(timeout / 1.5),
+        });
         trace!(tube_id = %self.id, channel_name = %name, ?timeouts, "create_channel: Timeouts configured.");
 
         info!(tube_id = %self.id, channel_name = %name, "create_channel: About to call setup_channel_for_data_channel.");
@@ -614,7 +609,7 @@ impl Tube {
             }
             Err(e) => {
                 error!(tube_id = %self.id, channel_name = %name, "create_channel: setup_channel_for_data_channel failed: {}", e);
-                return Err(e.into()); // Propagate the error from setup_channel_for_data_channel
+                return Err(e); // Propagate the error from setup_channel_for_data_channel
             }
         };
         trace!(tube_id = %self.id, channel_name = %name, ?owned_channel.active_protocol, ?owned_channel.local_listen_addr, server_mode = owned_channel.server_mode, "create_channel: Channel details after setup.");
@@ -683,22 +678,21 @@ impl Tube {
             }
 
             let run_result = owned_channel.run().await;
-            let outcome_details: String;
 
-            match &run_result {
+            let outcome_details: String = match &run_result {
                 Ok(()) => {
                     info!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Channel '{}' ran and exited normally. Signaling Python.", name_clone);
-                    outcome_details = "normal_exit".to_string();
+                    "normal_exit".to_string()
                 }
                 Err(crate::error::ChannelError::CriticalUpstreamClosed(closed_channel_id_from_err)) => {
                     warn!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, channel_id_in_err = %closed_channel_id_from_err, "Channel '{}' exited due to critical upstream closure. Signaling Python.", name_clone);
-                    outcome_details = format!("critical_upstream_closed: {}", closed_channel_id_from_err);
+                    format!("critical_upstream_closed: {}", closed_channel_id_from_err)
                 }
                 Err(e) => {
                     error!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Channel '{}' encountered an error in run(): {}. Signaling Python.", name_clone, e);
-                    outcome_details = format!("error: {}", e);
+                    format!("error: {}", e)
                 }
-            }
+            };
 
             // Send connection_close callback when channel finishes
             if let Err(e) = tube_arc.send_connection_close_callback(&name_clone).await {
@@ -975,7 +969,7 @@ impl Tube {
 
     // Get status
     pub async fn status(&self) -> TubeStatus {
-        self.status.read().await.clone()
+        *self.status.read().await
     }
 
     // Register a channel with this tube

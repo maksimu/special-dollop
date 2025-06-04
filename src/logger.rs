@@ -5,8 +5,6 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[cfg(feature = "python")]
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
-#[cfg(feature = "python")]
-use pyo3_log;
 
 // Custom error type for logger initialization
 #[derive(Debug)]

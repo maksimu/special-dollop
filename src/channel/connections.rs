@@ -190,6 +190,7 @@ pub async fn setup_outbound_task(
         // Define an async helper function for sending or queueing a frame
         // It returns Ok(()) if the operation was successful (sent or queued),
         // and Err(()) if a direct send failed, indicating the connection should be closed.
+        #[allow(clippy::too_many_arguments)]
         async fn try_send_or_queue_frame(
             frame_to_send: bytes::Bytes,
             conn_no_local: u32,
@@ -973,7 +974,7 @@ where
     debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, received_args=?args_instruction.args, "Guacd Handshake: Received 'args' from Guacd server");
 
     const EXPECTED_GUACD_VERSION: &str = "VERSION_1_5_0";
-    let connect_version_arg = args_instruction.args.get(0).cloned().unwrap_or_else(|| {
+    let connect_version_arg = args_instruction.args.first().cloned().unwrap_or_else(|| {
         warn!(target: "guac_protocol", channel_id=%channel_id, conn_no, "'args' instruction missing version, defaulting to {}", EXPECTED_GUACD_VERSION);
         EXPECTED_GUACD_VERSION.to_string()
     });
@@ -1118,7 +1119,7 @@ where
         "ready",
     )
     .await?;
-    if let Some(client_id_from_ready) = ready_instruction.args.get(0) {
+    if let Some(client_id_from_ready) = ready_instruction.args.first() {
         info!(target: "guac_protocol", channel_id=%channel_id, conn_no, guacd_client_id=%client_id_from_ready, "Guacd handshake completed.");
     } else {
         info!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd handshake completed. No client ID received with 'ready'.");

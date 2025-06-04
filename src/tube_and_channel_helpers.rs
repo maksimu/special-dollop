@@ -39,6 +39,7 @@ impl std::fmt::Display for TubeStatus {
 }
 
 // Helper method to set up a data channel message handler and create a Channel
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn setup_channel_for_data_channel(
     data_channel: &WebRTCDataChannel,
     label: String,
@@ -53,16 +54,16 @@ pub(crate) async fn setup_channel_for_data_channel(
     let (tx, rx) = mpsc::unbounded_channel();
 
     // Create the channel
-    let channel_instance = Channel::new(
-        data_channel.clone(),
-        rx,
-        label.clone(),
+    let channel_instance = Channel::new(crate::channel::core::ChannelParams {
+        webrtc: data_channel.clone(),
+        rx_from_dc: rx,
+        channel_id: label.clone(),
         timeouts,
         protocol_settings,
         server_mode,
         callback_token,
         ksm_config,
-    )
+    })
     .await?;
 
     // Register the channel with the tube if provided

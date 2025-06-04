@@ -44,7 +44,6 @@ use tracing::{debug, error, info, trace, warn};
 ///     signal_callback=on_signal
 /// )
 /// ```
-
 // Helper function to convert any PyAny to serde_json::Value
 fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value> {
     if py_obj.is_instance_of::<PyDict>() {
@@ -269,6 +268,7 @@ impl PyTubeRegistry {
         offer = None,
         signal_callback = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn create_tube(
         &self,
         py: Python<'_>,
@@ -458,6 +458,7 @@ impl PyTubeRegistry {
         trickle_ice = false,
         signal_callback = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new_connection(
         &self,
         py: Python<'_>,

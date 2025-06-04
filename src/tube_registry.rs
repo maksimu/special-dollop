@@ -172,7 +172,7 @@ impl TubeRegistry {
         let mut results = Vec::new();
 
         // Search in tube IDs
-        for (id, _tube) in &self.tubes_by_id {
+        for id in self.tubes_by_id.keys() {
             if id.contains(search_term) {
                 results.push(id.clone());
             }
@@ -216,6 +216,7 @@ impl TubeRegistry {
     }
 
     /// Create a tube with WebRTC connection and ICE configuration
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_tube(
         &mut self,
         conversation_id: &str,
@@ -255,7 +256,7 @@ impl TubeRegistry {
         let mut ice_servers = Vec::new();
         let mut turn_only_for_config = settings
             .get("turn_only")
-            .map_or(false, |v| v.as_bool().unwrap_or(false));
+            .is_some_and(|v| v.as_bool().unwrap_or(false));
         info!(target: "ice_config", tube_id = %tube_id, turn_only_setting = turn_only_for_config, "Initial 'turn_only' setting from input");
 
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
@@ -289,7 +290,7 @@ impl TubeRegistry {
 
                     let use_turn_for_config_from_settings = settings
                         .get("use_turn")
-                        .map_or(true, |v| v.as_bool().unwrap_or(true));
+                        .is_none_or(|v| v.as_bool().unwrap_or(true));
                     info!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
 
                     if use_turn_for_config_from_settings {
@@ -514,7 +515,7 @@ impl TubeRegistry {
                 anyhow!("Tube not found: {}", tube_id)
             })?;
 
-        let current_status = tube_arc.status.read().await.clone();
+        let current_status = *tube_arc.status.read().await;
         info!(target: "registry", tube_id = %tube_id, status = %current_status, "close_tube: Attempting to close tube.");
 
         match current_status {

@@ -347,14 +347,12 @@ async fn test_turn_only_mode() {
     let config = Some(RTCConfiguration::default());
     let trickle_ice = true;
     let turn_only = true;
-    let ksm_config_1 = "TEST_MODE_KSM_CONFIG_1".to_string();
 
     // Create the connection
     let conn = crate::WebRTCPeerConnection::new(
         config.clone(),
         trickle_ice,
         turn_only,
-        ksm_config_1,
         None,
         "test_tube_id".to_string(),
     )
@@ -375,12 +373,10 @@ async fn test_turn_only_mode() {
 
     // Create another connection with turn_only set to false
     let turn_only = false;
-    let ksm_config_2 = "TEST_MODE_KSM_CONFIG_2".to_string();
     let conn_regular = crate::WebRTCPeerConnection::new(
         config,
         trickle_ice,
         turn_only,
-        ksm_config_2,
         None,
         "test_tube_id_regular".to_string(),
     )

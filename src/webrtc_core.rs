@@ -90,11 +90,11 @@ pub async fn create_data_channel(
 }
 
 // Async-first wrapper for core WebRTC operations
+#[derive(Clone)]
 pub struct WebRTCPeerConnection {
     pub peer_connection: Arc<RTCPeerConnection>,
     pub(crate) trickle_ice: bool,
     is_closing: Arc<AtomicBool>,
-    ksm_config: String,
     answer_sent: Arc<AtomicBool>,
     pending_ice_candidates: Arc<Mutex<Vec<String>>>,
     pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
@@ -169,7 +169,6 @@ impl WebRTCPeerConnection {
         config: Option<RTCConfiguration>,
         trickle_ice: bool,
         turn_only: bool,
-        ksm_config: String,
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         tube_id: String,
     ) -> Result<Self, String> {
@@ -223,7 +222,6 @@ impl WebRTCPeerConnection {
             peer_connection: pc_arc,
             trickle_ice,
             is_closing,
-            ksm_config,
             answer_sent: Arc::new(AtomicBool::new(false)),
             pending_ice_candidates,
             signal_sender,
@@ -349,20 +347,6 @@ impl WebRTCPeerConnection {
         }
     }
 
-    // Clone implementation for WebRTCPeerConnection
-    pub fn clone(&self) -> Self {
-        Self {
-            peer_connection: Arc::clone(&self.peer_connection),
-            trickle_ice: self.trickle_ice,
-            is_closing: Arc::clone(&self.is_closing),
-            ksm_config: self.ksm_config.clone(),
-            answer_sent: Arc::clone(&self.answer_sent),
-            pending_ice_candidates: Arc::clone(&self.pending_ice_candidates),
-            signal_sender: self.signal_sender.clone(),
-            tube_id: self.tube_id.clone(),
-        }
-    }
-
     pub(crate) async fn create_description_with_checks(
         &self,
         is_offer: bool,
@@ -377,24 +361,24 @@ impl WebRTCPeerConnection {
 
         if is_offer {
             // Offer-specific signaling state validation
-            match current_state {
-                webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer => {
-                    return if !self.trickle_ice {
-                        if let Some(desc) = self.peer_connection.local_description().await {
-                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Already have local offer and non-trickle, returning existing SDP");
-                            Ok(desc.sdp)
-                        } else {
-                            Err("Cannot create offer: already have local offer but failed to retrieve it (non-trickle)".to_string())
-                        }
+            if current_state
+                == webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer
+            {
+                return if !self.trickle_ice {
+                    if let Some(desc) = self.peer_connection.local_description().await {
+                        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Already have local offer and non-trickle, returning existing SDP");
+                        Ok(desc.sdp)
                     } else {
-                        Err(
-                            "Cannot create offer when already have local offer (trickle ICE)"
-                                .to_string(),
-                        )
+                        Err("Cannot create offer: already have local offer but failed to retrieve it (non-trickle)".to_string())
                     }
-                }
-                _ => {} // Other states are generally fine for creating an offer
+                } else {
+                    Err(
+                        "Cannot create offer when already have local offer (trickle ICE)"
+                            .to_string(),
+                    )
+                };
             }
+            // Other states are generally fine for creating an offer
         } else {
             // Answer-specific signaling state validation
             match current_state {

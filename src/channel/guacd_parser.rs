@@ -94,7 +94,7 @@ impl GuacdParser {
         // Handle single-digit optimizations
         if slice.len() == 1 {
             let b = slice[0];
-            if b >= b'0' && b <= b'9' {
+            if b.is_ascii_digit() {
                 return Ok((b - b'0') as usize);
             }
             return Err(());
@@ -102,7 +102,7 @@ impl GuacdParser {
 
         let mut result = 0usize;
         for &b in slice {
-            if b < b'0' || b > b'9' {
+            if !b.is_ascii_digit() {
                 return Err(());
             }
             result = result * 10 + (b - b'0') as usize;
@@ -128,8 +128,8 @@ impl GuacdParser {
     ///   to form a valid instruction structure before a potential terminator.
     /// * `Err(PeekError::InvalidFormat)`: If the instruction structure is malformed.
     /// * `Err(PeekError::Utf8Error)`: If string parts are not valid UTF-8.
-    /// Returns borrowed data that references the input buffer
-    /// Returns Ok with instruction details and total length, or Err if incomplete/invalid
+    ///   Returns borrowed data that references the input buffer
+    ///   Returns Ok with instruction details and total length, or Err if incomplete/invalid
     #[inline(always)]
     pub fn peek_instruction(buffer_slice: &[u8]) -> Result<PeekedInstruction, PeekError> {
         // **BOLD WARNING: HOT PATH - CALLED FOR EVERY GUACD INSTRUCTION**

@@ -7,13 +7,15 @@ use std::time::Duration;
 use tracing::{debug, warn};
 use webrtc::data_channel::RTCDataChannel;
 
+// Type alias for complex callback type
+type BufferedAmountLowCallback = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>;
+
 // Async-first wrapper for data channel functionality
 pub struct WebRTCDataChannel {
     pub data_channel: Arc<RTCDataChannel>,
     pub(crate) is_closing: Arc<AtomicBool>,
     pub(crate) buffered_amount_low_threshold: Arc<Mutex<u64>>,
-    pub(crate) on_buffered_amount_low_callback:
-        Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>,
+    pub(crate) on_buffered_amount_low_callback: BufferedAmountLowCallback,
     pub(crate) threshold_monitor: Arc<AtomicBool>,
 
     #[cfg(test)]

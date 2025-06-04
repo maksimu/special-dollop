@@ -38,7 +38,7 @@ pub(crate) async fn handle_ping_timeout(channel: &mut Channel) -> Result<(), Cha
         combined.extend_from_slice(&timestamp_bytes);
         // Build ping payload
         let frame =
-            Frame::new_control_with_pool(ControlMessage::Ping, &*combined, &channel.buffer_pool);
+            Frame::new_control_with_pool(ControlMessage::Ping, &combined, &channel.buffer_pool);
         let encoded = frame.encode_with_pool(&channel.buffer_pool);
         channel
             .webrtc

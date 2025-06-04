@@ -1,22 +1,24 @@
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use bytes::Bytes;
 #[cfg(test)]
 use futures::future::BoxFuture;
-use webrtc::data_channel::RTCDataChannel;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{debug, warn};
+use webrtc::data_channel::RTCDataChannel;
 
 // Async-first wrapper for data channel functionality
 pub struct WebRTCDataChannel {
     pub data_channel: Arc<RTCDataChannel>,
     pub(crate) is_closing: Arc<AtomicBool>,
     pub(crate) buffered_amount_low_threshold: Arc<Mutex<u64>>,
-    pub(crate) on_buffered_amount_low_callback: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>,
+    pub(crate) on_buffered_amount_low_callback:
+        Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>,
     pub(crate) threshold_monitor: Arc<AtomicBool>,
 
     #[cfg(test)]
-    pub(crate) test_send_hook: Arc<Mutex<Option<Box<dyn Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static>>>>,
+    pub(crate) test_send_hook:
+        Arc<Mutex<Option<Box<dyn Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static>>>>,
 }
 
 impl Clone for WebRTCDataChannel {
@@ -42,7 +44,7 @@ impl WebRTCDataChannel {
             buffered_amount_low_threshold: Arc::new(Mutex::new(0)),
             on_buffered_amount_low_callback: Arc::new(Mutex::new(None)),
             threshold_monitor: Arc::new(AtomicBool::new(false)),
-            
+
             #[cfg(test)]
             test_send_hook: Arc::new(Mutex::new(None)),
         }
@@ -60,31 +62,39 @@ impl WebRTCDataChannel {
         if threshold > 0 {
             let dc = self.clone();
             let threshold_clone = threshold;
-            
+
             // Spawn a task to set the threshold and register the callback on the native data channel
             tokio::spawn(async move {
                 // Set the native threshold - convert u64 to usize
                 let threshold_usize = threshold_clone.try_into().unwrap_or(usize::MAX);
-                dc.data_channel.set_buffered_amount_low_threshold(threshold_usize).await;
-                
+                dc.data_channel
+                    .set_buffered_amount_low_threshold(threshold_usize)
+                    .await;
+
                 // Make a separate clone for the callback
                 let callback_dc = dc.clone();
-                
+
                 // Register the onBufferedAmountLow callback
-                dc.data_channel.on_buffered_amount_low(Box::new(move || {
-                    let callback_dc = callback_dc.clone();
-                    let threshold_value = threshold_clone;
-                    
-                    Box::pin(async move {
-                        debug!("Native bufferedAmountLow event triggered (buffer below {})", threshold_value);
-                        
-                        // Get and call our callback
-                        let callback_guard = callback_dc.on_buffered_amount_low_callback.lock().unwrap();
-                        if let Some(ref callback) = *callback_guard {
-                            callback();
-                        }
-                    })
-                })).await;
+                dc.data_channel
+                    .on_buffered_amount_low(Box::new(move || {
+                        let callback_dc = callback_dc.clone();
+                        let threshold_value = threshold_clone;
+
+                        Box::pin(async move {
+                            debug!(
+                                "Native bufferedAmountLow event triggered (buffer below {})",
+                                threshold_value
+                            );
+
+                            // Get and call our callback
+                            let callback_guard =
+                                callback_dc.on_buffered_amount_low_callback.lock().unwrap();
+                            if let Some(ref callback) = *callback_guard {
+                                callback();
+                            }
+                        })
+                    }))
+                    .await;
             });
         }
     }
@@ -116,7 +126,7 @@ impl WebRTCDataChannel {
         if self.is_closing.load(Ordering::Acquire) {
             return Err("Channel is closing".to_string());
         }
-        
+
         // For testing: call the test hook if set
         #[cfg(test)]
         {
@@ -132,9 +142,10 @@ impl WebRTCDataChannel {
                 tokio::spawn(hook_future);
             }
         }
-        
+
         // Send data with detailed error handling
-        let result = self.data_channel
+        let result = self
+            .data_channel
             .send(&data)
             .await
             .map(|_| ())
@@ -158,40 +169,42 @@ impl WebRTCDataChannel {
     #[cfg(test)]
     pub async fn wait_for_channel_open(&self, timeout: Option<Duration>) -> Result<bool, String> {
         let timeout_duration = timeout.unwrap_or(Duration::from_secs(10));
-        
+
         // Use oneshot channel for event-driven notification
         let (tx, rx) = tokio::sync::oneshot::channel();
-        
+
         // Wrap sender in Arc<Mutex<Option<>>> so we can safely consume it from either callback
         let sender = Arc::new(Mutex::new(Some(tx)));
-        
+
         // Create shared flags for state
         let is_open = Arc::new(AtomicBool::new(false));
         let is_open_for_close = Arc::clone(&is_open);
-        
+
         // We don't need this variable anymore
         let is_closing = self.is_closing.clone();
-        
+
         // Set up onOpen callback if not already open
-        if self.data_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+        if self.data_channel.ready_state()
+            != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        {
             let sender_clone = Arc::clone(&sender);
-            
+
             self.data_channel.on_open(Box::new(move || {
                 // Set the is_open flag
                 is_open.store(true, Ordering::Release);
-                
+
                 // Send the notification, consuming the sender
                 if let Some(tx) = sender_clone.lock().unwrap().take() {
                     let _ = tx.send(true);
                 }
-                
+
                 Box::pin(async {})
             }));
         }
-        
+
         // Set up onClose callback
         let sender_for_close = Arc::clone(&sender);
-        
+
         self.data_channel.on_close(Box::new(move || {
             // If opened and then closed during this wait, send it false
             if is_open_for_close.load(Ordering::Acquire) {
@@ -200,30 +213,33 @@ impl WebRTCDataChannel {
                     let _ = tx.send(false);
                 }
             }
-            
+
             Box::pin(async {})
         }));
-        
+
         // Check if already closed first (fast path)
         if is_closing.load(Ordering::Acquire) {
             return Err("Data channel is closing".to_string());
         }
-        
+
         // Check if already open the second (fast path)
-        if self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+        if self.data_channel.ready_state()
+            == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        {
             return Ok(true);
         }
-        
+
         // Wait for the event or timeout
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(state)) => Ok(state),
             Ok(Err(_)) => {
                 // Channel closed without sending a value
                 Ok(false)
-            },
+            }
             Err(_) => {
                 // Timeout occurred
-                Ok(self.data_channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open)
+                Ok(self.data_channel.ready_state()
+                    == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open)
             }
         }
     }

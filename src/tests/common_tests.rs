@@ -4,15 +4,15 @@ use crate::webrtc_core::format_ice_candidate;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::time::Duration;
+use tracing::debug;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::RTCPeerConnection;
-use tokio::sync::oneshot;
-use tracing::debug;
 
 // Helper function to create a test WebRTC data channel
 pub async fn create_test_webrtc_data_channel() -> WebRTCDataChannel {
@@ -99,7 +99,7 @@ async fn setup_connected_data_channel_pair() -> anyhow::Result<WebRTCDataChannel
             }
         })
     }));
-    
+
     let (dc1_open_tx, dc1_open_rx) = oneshot::channel::<Arc<RTCDataChannel>>();
     let dc1_open_tx = Arc::new(StdMutex::new(Some(dc1_open_tx)));
 
@@ -108,9 +108,13 @@ async fn setup_connected_data_channel_pair() -> anyhow::Result<WebRTCDataChannel
     let dc1_for_on_open_label = dc1.clone(); // Clone for label
     let dc1_for_on_open_send = dc1.clone(); // Clone for sending
     dc1.on_open(Box::new(move || {
-        debug!("PC1: DataChannel '{}' opened", dc1_for_on_open_label.label());
+        debug!(
+            "PC1: DataChannel '{}' opened",
+            dc1_for_on_open_label.label()
+        );
         if let Some(tx) = dc1_open_tx.lock().unwrap().take() {
-            if tx.send(dc1_for_on_open_send).is_err() { // Send the cloned dc
+            if tx.send(dc1_for_on_open_send).is_err() {
+                // Send the cloned dc
                 debug!("PC1: DataChannel open signal receiver dropped");
             }
         }
@@ -122,16 +126,17 @@ async fn setup_connected_data_channel_pair() -> anyhow::Result<WebRTCDataChannel
 
     pc2.on_data_channel(Box::new(move |dc2| {
         let dc2_label_clone = dc2.clone(); // Clone for label
-        let dc2_send_clone = dc2.clone();   // Clone for sending
+        let dc2_send_clone = dc2.clone(); // Clone for sending
         let dc2_open_tx_clone_for_closure = dc2_open_tx_arc.clone(); // Clone Arc for the on_open closure
 
         debug!("PC2: Received DataChannel '{}'", dc2_label_clone.label());
-        
+
         dc2.on_open(Box::new(move || {
             debug!("PC2: DataChannel '{}' opened", dc2_label_clone.label()); // Use cloned dc2 for a label
             if let Some(tx) = dc2_open_tx_clone_for_closure.lock().unwrap().take() {
-                if tx.send(dc2_send_clone).is_err() { // Send the other cloned dc2
-                     debug!("PC2: DataChannel open signal receiver dropped");
+                if tx.send(dc2_send_clone).is_err() {
+                    // Send the other cloned dc2
+                    debug!("PC2: DataChannel open signal receiver dropped");
                 }
             }
             Box::pin(async {})
@@ -176,7 +181,7 @@ async fn setup_connected_data_channel_pair() -> anyhow::Result<WebRTCDataChannel
             }
         }
     };
-    
+
     let overall_timeout = Duration::from_secs(10);
 
     tokio::select! {
@@ -186,17 +191,17 @@ async fn setup_connected_data_channel_pair() -> anyhow::Result<WebRTCDataChannel
             let opened_dc1 = res1.map_err(|e| anyhow::anyhow!("DC1 open signal failed: {}", e))?;
             let _opened_dc2 = res2.map_err(|e| anyhow::anyhow!("DC2 open signal failed: {}", e))?;
             debug!("Both data channels reported open.");
-            
+
             // These are the original senders from the outer scope, now safe to drop.
-            drop(pc1_ice_candidate_tx); 
+            drop(pc1_ice_candidate_tx);
             drop(pc2_ice_candidate_tx);
 
             Ok(WebRTCDataChannel::new(opened_dc1))
         }
         _ice_drain_outcome = async { tokio::join!(pc1_drain_ice, pc2_drain_ice) } => {
             debug!("ICE draining tasks completed before data channels opened. This might be okay if DCs open shortly.");
-            futures::future::pending::<()>().await; 
-            anyhow::bail!("ICE drained but DC did not open (should be caught by timeout or DC open arm)"); 
+            futures::future::pending::<()>().await;
+            anyhow::bail!("ICE drained but DC did not open (should be caught by timeout or DC open arm)");
         }
         _ = tokio::time::sleep(overall_timeout) => {
             anyhow::bail!("Timeout waiting for data channel to open and ICE to complete")

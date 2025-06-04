@@ -5,16 +5,16 @@ use std::str::FromStr;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::{debug_hot_path, warn_hot_path};
+use anyhow::Result;
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 use tokio::sync::mpsc;
-use anyhow::Result;
-use bytes::Bytes;
-use tracing::{debug, info, warn};
-use crate::{debug_hot_path, warn_hot_path}; // Import centralized hot path macros
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn}; // Import centralized hot path macros
 
 // Connection message types for channel communication
 #[derive(Debug)]
@@ -24,7 +24,9 @@ pub(crate) enum ConnectionMessage {
 }
 
 // Trait for async read/write operations
-pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static {
+pub(crate) trait AsyncReadWrite:
+    AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static
+{
     fn shutdown(&mut self) -> BoxFuture<'_, io::Result<()>>;
 }
 
@@ -67,17 +69,11 @@ impl AsyncWrite for StreamHalf {
         Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().writer).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
     }
 }
@@ -110,7 +106,7 @@ impl Conn {
         channel_id: String,
     ) -> Self {
         let (data_tx, data_rx) = mpsc::unbounded_channel::<ConnectionMessage>();
-        
+
         // Create backend task that handles the actual backend I/O
         let backend_task = tokio::spawn(backend_task_runner(
             backend,
@@ -118,39 +114,39 @@ impl Conn {
             conn_no,
             channel_id.clone(),
         ));
-        
+
         // Create placeholder for the to_webrtc task (would handle Backend → WebRTC in full implementation)
         let to_webrtc = tokio::spawn(async move {
             // Placeholder: In full implementation, this would read from backend and send to WebRTC
-            debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, 
+            debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
                    "to_webrtc task started (placeholder)");
         });
-        
+
         Self {
             data_tx,
             backend_task,
             to_webrtc,
         }
     }
-    
+
     /// Shutdown the connection gracefully
     pub async fn shutdown(self) -> Result<()> {
         // Close the data channel
         drop(self.data_tx);
-        
+
         // Wait for tasks to complete
         if let Err(e) = self.backend_task.await {
             if !e.is_cancelled() {
                 warn!(target: "connection_lifecycle", error=%e, "Backend task ended with error during shutdown");
             }
         }
-        
+
         if let Err(e) = self.to_webrtc.await {
             if !e.is_cancelled() {
                 warn!(target: "connection_lifecycle", error=%e, "to_webrtc task ended with error during shutdown");
             }
         }
-        
+
         Ok(())
     }
 }
@@ -162,9 +158,9 @@ async fn backend_task_runner(
     conn_no: u32,
     channel_id: String,
 ) {
-    debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, 
+    debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
            "Backend task started");
-    
+
     while let Some(message) = data_rx.recv().await {
         match message {
             ConnectionMessage::Data(payload) => {
@@ -180,7 +176,7 @@ async fn backend_task_runner(
                             );
                             break; // Exit the task on flush error
                         }
-                        
+
                         debug_hot_path!(
                             channel_id = %channel_id,
                             conn_no = conn_no,
@@ -202,24 +198,24 @@ async fn backend_task_runner(
             ConnectionMessage::Eof => {
                 // Handle EOF - call real TCP shutdown
                 if let Err(e) = AsyncReadWrite::shutdown(&mut backend).await {
-                    warn!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, error=%e, 
+                    warn!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, error=%e,
                           "Failed to shutdown backend on EOF");
                 } else {
-                    info!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, 
+                    info!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
                           "Backend shutdown on EOF (connection remains alive for RDP patterns)");
                 }
                 // Note: We don't break here - connection stays alive after EOF for RDP
             }
         }
     }
-    
+
     // Shutdown backend on task exit
     if let Err(e) = AsyncReadWrite::shutdown(&mut backend).await {
-        debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, error=%e, 
+        debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, error=%e,
                "Error shutting down backend in task cleanup");
     }
-    
-    debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, 
+
+    debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
            "Backend task exited");
 }
 
@@ -250,7 +246,10 @@ pub struct NetworkAccessChecker {
 
 impl NetworkAccessChecker {
     pub fn new(allowed_hosts: Vec<String>, allowed_ports: Vec<u16>) -> Self {
-        Self { allowed_hosts, allowed_ports }
+        Self {
+            allowed_hosts,
+            allowed_ports,
+        }
     }
 
     pub fn is_host_allowed(&self, host: &str) -> bool {

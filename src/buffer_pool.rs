@@ -1,8 +1,8 @@
 // Buffer pool implementation for efficient buffer reuse
 
-use bytes::{BytesMut, Bytes, BufMut};
-use std::sync::{Arc, Mutex};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for buffer pool
 pub struct BufferPoolConfig {
@@ -65,25 +65,25 @@ impl BufferPool {
     /// Return a buffer to the pool if it doesn't exceed the maximum pool size
     pub fn release(&self, mut buf: BytesMut) {
         let mut inner = self.inner.lock().unwrap();
-        
+
         // Don't pool if we already have enough buffers
         if inner.buffers.len() >= inner.config.max_pooled {
             return;
         }
-        
+
         // Clear the buffer contents
         buf.clear();
-        
+
         // Resize capacity if configured to do so
         if inner.config.resize_on_return && buf.capacity() > inner.config.buffer_size * 2 {
             // If the buffer has grown too large, don't reuse it
             return;
         }
-        
+
         // Add to pool
         inner.buffers.push_back(buf);
     }
-    
+
     /// Create a new Bytes object from a slice, using a pooled buffer
     pub fn create_bytes(&self, data: &[u8]) -> Bytes {
         if data.is_empty() {
@@ -99,17 +99,17 @@ impl BufferPool {
             // This might involve a reallocation if the pooled buffer was smaller.
             buf.reserve(data.len() - buf.capacity());
         }
-        
+
         buf.put_slice(data); // Copy data into buf. buf.len() is now data.len().
 
         // Split off the part of the buffer that contains the data.
         // `result_data_buf` will have length == capacity == data.len().
         let result_data_buf = buf.split_to(data.len());
-        
+
         // The original `buf` is now empty (or contains data after what was split).
         // In this case, since we split up to data.len() which was its full content, `buf` is empty.
         // Release the (now empty) original buffer back to the pool.
-        self.release(buf); 
+        self.release(buf);
 
         // Freeze the exact-sized buffer. This is a cheap O(1) operation.
         result_data_buf.freeze()
@@ -126,31 +126,31 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_buffer_pool_reuse() {
         let pool = BufferPool::default();
-        
+
         // Acquire a buffer
         let mut buf1 = pool.acquire();
-        
+
         // Add some data
         buf1.extend_from_slice(b"test data");
         assert_eq!(buf1.len(), 9);
-        
+
         // Clear and return to the pool
         buf1.clear();
         assert_eq!(buf1.len(), 0);
         pool.release(buf1);
-        
+
         // Check that a buffer is available
         assert_eq!(pool.count(), 1);
-        
+
         // Acquire another buffer (should be the same one)
         let buf2 = pool.acquire();
         assert_eq!(buf2.len(), 0);
-        
+
         // No buffers should be left in the pool
         assert_eq!(pool.count(), 0);
     }
-} 
+}

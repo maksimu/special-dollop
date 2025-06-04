@@ -1,15 +1,18 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, engine::general_purpose::URL_SAFE as URL_SAFE_BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::STANDARD as BASE64,
+    engine::general_purpose::URL_SAFE as URL_SAFE_BASE64, Engine as _,
+};
 
+use anyhow::anyhow;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use log::warn;
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
 use std::env;
-use p256::ecdsa::{SigningKey, Signature, signature::Signer};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::error::Error;
 use std::time::Duration;
-use anyhow::anyhow;
 use tracing::{debug, error, trace};
-use log::warn;
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -49,7 +52,7 @@ struct ConnectionStateBody {
 const VERIFY_SSL: bool = true;
 
 // Uses the name and version from Cargo.toml at compile time
-const KEEPER_CLIENT: &str = concat!(env!("CARGO_PKG_NAME"), ":", env!("CARGO_PKG_VERSION")); 
+const KEEPER_CLIENT: &str = concat!(env!("CARGO_PKG_NAME"), ":", env!("CARGO_PKG_VERSION"));
 
 const KEY_PRIVATE_KEY: &str = "privateKey";
 const KEY_CLIENT_ID: &str = "clientId";
@@ -57,11 +60,11 @@ const KEY_CLIENT_ID: &str = "clientId";
 // Challenge response module - implements caching logic
 mod challenge_response {
     use super::*;
+    use anyhow::Result;
     use lazy_static::lazy_static;
+    use p256::pkcs8::DecodePrivateKey;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use p256::pkcs8::DecodePrivateKey;
-    use anyhow::Result;
     use tracing::{debug, error};
 
     const CHALLENGE_RESPONSE_TIMEOUT_SEC: u64 = 10; // Set to 10 seconds
@@ -79,7 +82,6 @@ mod challenge_response {
         challenge_seconds: f64,
         challenge: String,
         signature: String,
-        
     }
 
     pub struct ChallengeResponse;
@@ -98,7 +100,8 @@ mod challenge_response {
 
                 if latest_challenge_seconds < CHALLENGE_RESPONSE_TIMEOUT_SEC as f64
                     && !data.challenge.is_empty()
-                    && !data.signature.is_empty() {
+                    && !data.signature.is_empty()
+                {
                     debug!(
                         target: "challenge_response",
                         age_seconds = latest_challenge_seconds as u64,
@@ -175,17 +178,27 @@ mod challenge_response {
         let ksm_config_dict: serde_json::Value = serde_json::from_str(ksm_config)?;
 
         let private_key_der_str = match ksm_config_dict.get(KEY_PRIVATE_KEY) {
-            Some(val) => val.as_str().ok_or("Private key not found or not a string")?,
-            None => return Err(Box::new(KRouterError("Private key not found in config".into()))),
+            Some(val) => val
+                .as_str()
+                .ok_or("Private key not found or not a string")?,
+            None => {
+                return Err(Box::new(KRouterError(
+                    "Private key not found in config".into(),
+                )))
+            }
         };
 
         let client_id_str = match ksm_config_dict.get(KEY_CLIENT_ID) {
             Some(val) => val.as_str().ok_or("Client ID not found or not a string")?,
-            None => return Err(Box::new(KRouterError("Client ID not found in config".into()))),
+            None => {
+                return Err(Box::new(KRouterError(
+                    "Client ID not found in config".into(),
+                )))
+            }
         };
 
         debug!(target: "challenge_response", "Decoding client_id and private key");
-        
+
         let private_key_der_bytes = match url_safe_str_to_bytes(private_key_der_str) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -193,7 +206,7 @@ mod challenge_response {
                 return Err(e);
             }
         };
-        
+
         let mut client_id_bytes = match url_safe_str_to_bytes(client_id_str) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -203,7 +216,7 @@ mod challenge_response {
         };
 
         debug!(target: "challenge_response", "Adding challenge to the signature before connecting to the router");
-        
+
         let challenge_bytes = match url_safe_str_to_bytes(challenge) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -211,7 +224,7 @@ mod challenge_response {
                 return Err(e);
             }
         };
-        
+
         client_id_bytes.extend_from_slice(&challenge_bytes);
 
         let signature = sign_data(&private_key_der_bytes, &client_id_bytes)?;
@@ -228,7 +241,7 @@ mod challenge_response {
             let padding = "=".repeat(4 - s.len() % 4);
             format!("{}{}", s, padding)
         };
-        
+
         // Try URL safe first, then fall back to the standard
         let bytes = match URL_SAFE_BASE64.decode(padded.as_bytes()) {
             Ok(result) => result,
@@ -240,7 +253,7 @@ mod challenge_response {
                 }
             }
         };
-        
+
         Ok(bytes)
     }
 
@@ -275,10 +288,10 @@ pub(crate) fn router_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result
     // Check if config is base64 encoded
     let ksm_config_str = if is_base64(ksm_config_str) {
         // Decode base64 string
-        let decoded = BASE64.decode(ksm_config_str)
+        let decoded = BASE64
+            .decode(ksm_config_str)
             .map_err(|e| anyhow!("Failed to decode base64: {}", e))?;
-        String::from_utf8(decoded)
-            .map_err(|e| anyhow!("Failed to convert to UTF-8: {}", e))?
+        String::from_utf8(decoded).map_err(|e| anyhow!("Failed to convert to UTF-8: {}", e))?
     } else {
         ksm_config_str.to_string()
     };
@@ -302,16 +315,15 @@ fn is_base64(s: &str) -> bool {
     // Check if the string could be base64 encoded (standard or URL-safe)
     // Standard base64 uses A-Z, a-z, 0-9, +, /, and = for padding
     // URL-safe base64 uses A-Z, a-z, 0-9, -, _, and = for padding
-    
+
     // Only check if the length is valid for base64 (multiple of 4 if padding is used)
     if s.len() % 4 != 0 && !s.ends_with('=') {
         return false;
     }
-    
+
     // Check if characters are valid for either standard or URL-safe base64
-    s.chars().all(|c| {
-        c.is_alphanumeric() || c == '+' || c == '/' || c == '-' || c == '_' || c == '='
-    })
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '-' || c == '_' || c == '=')
 }
 
 // Function to get HTTP router URL
@@ -340,7 +352,10 @@ pub(crate) fn krealy_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result
         return Ok(router_host.replace("connect", "krelay"));
     }
     warn!("Router host is not what was is expected: {}", router_host);
-    Ok(Err(Box::new(KRouterError(format!("Invalid router host: {}", router_host))))?)
+    Ok(Err(Box::new(KRouterError(format!(
+        "Invalid router host: {}",
+        router_host
+    ))))?)
 }
 
 // Main router request function
@@ -353,20 +368,21 @@ async fn router_request(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
     trace!(
-        target: "router_communication", 
-        method = %http_method, 
-        path = %url_path, 
+        target: "router_communication",
+        method = %http_method,
+        path = %url_path,
         ?ksm_config,
         "Router request"
     );
-    
+
     let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
     let ksm_config_parsed: KsmConfig = serde_json::from_str(ksm_config)?;
     let client_id = &ksm_config_parsed.client_id;
 
     let url = format!("{}/{}", router_http_host, url_path);
 
-    let (challenge_str, signature) = challenge_response::ChallengeResponse::fetch(ksm_config).await?;
+    let (challenge_str, signature) =
+        challenge_response::ChallengeResponse::fetch(ksm_config).await?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -379,7 +395,12 @@ async fn router_request(
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
         "DELETE" => client.delete(&url),
-        _ => return Err(Box::new(KRouterError(format!("Unsupported HTTP method: {}", http_method)))),
+        _ => {
+            return Err(Box::new(KRouterError(format!(
+                "Unsupported HTTP method: {}",
+                http_method
+            ))))
+        }
     };
 
     // Add headers
@@ -449,7 +470,8 @@ pub async fn get_relay_access_creds(
         "api/device/relay_access_creds",
         Some(query_params),
         None,
-    ).await
+    )
+    .await
 }
 
 // Function to post connection state
@@ -463,8 +485,8 @@ pub async fn post_connection_state(
     if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
         // Just return OK for tests without making an actual request
         debug!(
-            target: "router_communication", 
-            connection_state = %connection_state, 
+            target: "router_communication",
+            connection_state = %connection_state,
             ksm_config_prefix = %ksm_config.split('_').next().unwrap_or("TEST_MODE_KSM_CONFIG"),
             "TEST MODE: Skipping post_connection_state"
         );
@@ -479,18 +501,16 @@ pub async fn post_connection_state(
             "post_connection_state called with empty ksm_config in non-test mode. This is not allowed."
         );
         return Err(Box::new(KRouterError(
-            "KSM config is empty and not in test mode. Cannot post connection state.".to_string()
+            "KSM config is empty and not in test mode. Cannot post connection state.".to_string(),
         )));
     }
 
     let body = match token {
-        serde_json::Value::String(token_str) => {
-            ConnectionStateBody {
-                connection_type: connection_state.to_string(),
-                token: Some(token_str.clone()),
-                tokens: None,
-                terminated: is_terminated,
-            }
+        serde_json::Value::String(token_str) => ConnectionStateBody {
+            connection_type: connection_state.to_string(),
+            token: Some(token_str.clone()),
+            tokens: None,
+            terminated: is_terminated,
         },
         serde_json::Value::Array(token_list) => {
             // Convert the array of values to strings
@@ -511,7 +531,7 @@ pub async fn post_connection_state(
                 tokens: Some(tokens),
                 terminated: is_terminated,
             }
-        },
+        }
         _ => {
             return Err(Box::new(KRouterError(format!(
                 "Invalid token type: {:?}",
@@ -545,7 +565,8 @@ pub async fn post_connection_state(
         "api/device/connect_state",
         None,
         Some(request_body),
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }

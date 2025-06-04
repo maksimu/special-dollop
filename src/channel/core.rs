@@ -1,26 +1,28 @@
 // Core Channel implementation
 
+use super::types::ActiveProtocol;
+use crate::buffer_pool::{BufferPool, BufferPoolConfig};
+pub(crate) use crate::error::ChannelError;
+use crate::models::{
+    is_guacd_session, Conn, ConversationType, NetworkAccessChecker, StreamHalf, TunnelTimeouts,
+};
+use crate::runtime::get_runtime;
+use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
+use crate::tube_protocol::{try_parse_frame, CloseConnectionReason, ControlMessage, Frame};
+use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
-use bytes::{Buf, BytesMut};
 use bytes::Bytes;
+use bytes::{Buf, BytesMut};
+use dashmap::DashMap;
+use serde::Deserialize;
+use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use dashmap::DashMap;
-pub(crate) use crate::error::ChannelError;
-use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason, try_parse_frame};
-use crate::models::{Conn, TunnelTimeouts, NetworkAccessChecker, StreamHalf, is_guacd_session, ConversationType};
-use crate::runtime::get_runtime;
-use crate::webrtc_data_channel::WebRTCDataChannel;
-use crate::buffer_pool::{BufferPool, BufferPoolConfig};
-use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
-use super::types::ActiveProtocol;
-use tracing::{debug, error, info, trace, warn};
-use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
-use serde::Deserialize; // Add this
+use tracing::{debug, error, info, trace, warn}; // Add this
 
 // Import from sibling modules
 use super::frame_handling::handle_incoming_frame;
@@ -47,7 +49,6 @@ pub(crate) struct ChannelPortForwardState {
     pub target_host: Option<String>,
     pub target_port: Option<u16>,
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProtocolLogicState {
@@ -94,9 +95,11 @@ pub struct Channel {
     pub(crate) actual_listen_addr: Option<std::net::SocketAddr>,
     pub(crate) local_client_server: Option<Arc<TcpListener>>,
     pub(crate) local_client_server_task: Option<JoinHandle<()>>,
-    pub(crate) local_client_server_conn_tx: Option<mpsc::Sender<(u32, OwnedWriteHalf, JoinHandle<()>)>>,
-    pub(crate) local_client_server_conn_rx: Option<mpsc::Receiver<(u32, OwnedWriteHalf, JoinHandle<()>)>>,
-    
+    pub(crate) local_client_server_conn_tx:
+        Option<mpsc::Sender<(u32, OwnedWriteHalf, JoinHandle<()>)>>,
+    pub(crate) local_client_server_conn_rx:
+        Option<mpsc::Receiver<(u32, OwnedWriteHalf, JoinHandle<()>)>>,
+
     // Protocol handling integrated into Channel
     pub(crate) active_protocol: ActiveProtocol,
     pub(crate) protocol_state: ProtocolLogicState,
@@ -124,7 +127,7 @@ pub struct Channel {
     conn_closed_rx: Option<mpsc::UnboundedReceiver<(u32, String)>>,
     // Stores the conn_no of the primary Guacd data connection
     pub(crate) primary_guacd_conn_no: Arc<Mutex<Option<u32>>>,
-    // Callback token for router communication  
+    // Callback token for router communication
     pub(crate) callback_token: Option<String>,
     // KSM config for router communication
     pub(crate) ksm_config: Option<String>,
@@ -138,7 +141,7 @@ impl Clone for Channel {
         // For cloned Channel instances, conn_closed_tx can be a new sender,
         // but conn_closed_rx should be None as run() consumes the original.
         let cloned_conn_closed_tx = mpsc::unbounded_channel::<(u32, String)>().0;
-        
+
         Self {
             webrtc: self.webrtc.clone(),
             conns: Arc::new(DashMap::new()), // New empty DashMap for clone
@@ -146,7 +149,7 @@ impl Clone for Channel {
             // Each clone gets a new rx_from_dc; this is problematic if the original is consumed.
             // Channel instances are typically Arc<Mutex<Channel>>, and cloning that Arc is preferred.
             // If direct Channel cloning is essential, rx_from_dc handling needs careful thought.
-            rx_from_dc: mpsc::unbounded_channel().1, 
+            rx_from_dc: mpsc::unbounded_channel().1,
             channel_id: format!("{}_clone", self.channel_id),
             timeouts: self.timeouts.clone(),
             network_checker: self.network_checker.clone(),
@@ -163,7 +166,7 @@ impl Clone for Channel {
             local_client_server_conn_rx: Some(server_conn_rx),
             active_protocol: self.active_protocol, // Clone
             protocol_state: self.protocol_state.clone(), // Clone
-            
+
             // Clone new fields
             guacd_host: self.guacd_host.clone(),
             guacd_port: self.guacd_port,
@@ -203,18 +206,19 @@ impl Channel {
         let (f_input_tx, f_input_rx) = mpsc::unbounded_channel::<Frame>();
         let (pending_tx, pending_rx) = mpsc::unbounded_channel::<()>();
         let (conn_closed_tx, conn_closed_rx) = mpsc::unbounded_channel::<(u32, String)>();
-        
+
         webrtc.set_buffered_amount_low_threshold(BUFFER_LOW_THRESHOLD);
-        
+
         let buffer_pool_config = BufferPoolConfig {
             buffer_size: 32 * 1024,
             max_pooled: 64,
             resize_on_return: true,
         };
         let buffer_pool = BufferPool::new(buffer_pool_config);
-        
-        let pending_messages: Arc<Mutex<HashMap<u32, VecDeque<Bytes>>>> = Arc::new(Mutex::new(HashMap::new()));
-        
+
+        let pending_messages: Arc<Mutex<HashMap<u32, VecDeque<Bytes>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         let network_checker = parse_network_rules_from_settings(&protocol_settings);
 
         let determined_protocol; // Declare without initial assignment
@@ -223,7 +227,7 @@ impl Channel {
         let mut guacd_host_setting: Option<String> = None;
         let mut guacd_port_setting: Option<u16> = None;
         let mut temp_initial_guacd_params_map = HashMap::new();
-        
+
         let mut local_listen_addr_setting: Option<String> = None;
 
         if let Some(protocol_name_val) = protocol_settings.get("conversationType") {
@@ -233,50 +237,78 @@ impl Channel {
                         if is_guacd_session(&parsed_conversation_type) {
                             debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for GuacD protocol");
                             determined_protocol = ActiveProtocol::Guacd;
-                            initial_protocol_state = ProtocolLogicState::Guacd(ChannelGuacdState::default());
+                            initial_protocol_state =
+                                ProtocolLogicState::Guacd(ChannelGuacdState::default());
 
-                            if let Some(guacd_dedicated_settings_val) = protocol_settings.get("guacd") {
+                            if let Some(guacd_dedicated_settings_val) =
+                                protocol_settings.get("guacd")
+                            {
                                 trace!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd' block in protocol_settings: {:?}", guacd_dedicated_settings_val);
                                 if let JsonValue::Object(guacd_map) = guacd_dedicated_settings_val {
-                                    guacd_host_setting = guacd_map.get("guacd_host").and_then(|v| v.as_str()).map(String::from);
-                                    guacd_port_setting = guacd_map.get("guacd_port").and_then(|v| v.as_u64()).map(|p| p as u16);
+                                    guacd_host_setting = guacd_map
+                                        .get("guacd_host")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                    guacd_port_setting = guacd_map
+                                        .get("guacd_port")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|p| p as u16);
                                     info!(target: "channel_setup", channel_id = %channel_id, ?guacd_host_setting, ?guacd_port_setting, "Parsed from dedicated 'guacd' settings block.");
                                 } else {
                                     warn!(target: "channel_setup", channel_id = %channel_id, "'guacd' block was not a JSON Object.");
                                 }
                             } else {
-                                 trace!(target: "channel_setup", channel_id = %channel_id, "No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults.");
+                                trace!(target: "channel_setup", channel_id = %channel_id, "No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults.");
                             }
 
-                            if let Some(guacd_params_json_val) = protocol_settings.get("guacd_params") {
+                            if let Some(guacd_params_json_val) =
+                                protocol_settings.get("guacd_params")
+                            {
                                 info!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd_params' in protocol_settings.");
                                 trace!(target: "channel_setup", channel_id = %channel_id, guacd_params_value = ?guacd_params_json_val, "Raw guacd_params value for direct processing.");
 
                                 if let JsonValue::Object(map) = guacd_params_json_val {
-                                    temp_initial_guacd_params_map = map.iter().filter_map(|(k, v)| {
-                                        match v {
-                                            JsonValue::String(s) => Some((k.clone(), s.clone())),
-                                            JsonValue::Bool(b) => Some((k.clone(), b.to_string())),
-                                            JsonValue::Number(n) => Some((k.clone(), n.to_string())),
-                                            JsonValue::Array(arr) => {
-                                                let str_arr: Vec<String> = arr.iter()
-                                                    .filter_map(|val| val.as_str().map(String::from))
-                                                    .collect();
-                                                if !str_arr.is_empty() {
-                                                    Some((k.clone(), str_arr.join(",")))
-                                                } else {
-                                                    // For arrays not of strings, or empty string arrays, produce empty string or skip.
-                                                    // Guacamole usually expects comma-separated for multiple values like image/audio mimetypes.
-                                                    // If it's an array of other things, stringifying the whole array might be an option.
-                                                    Some((k.clone(), "".to_string())) // Or None to skip
+                                    temp_initial_guacd_params_map = map
+                                        .iter()
+                                        .filter_map(|(k, v)| {
+                                            match v {
+                                                JsonValue::String(s) => {
+                                                    Some((k.clone(), s.clone()))
+                                                }
+                                                JsonValue::Bool(b) => {
+                                                    Some((k.clone(), b.to_string()))
+                                                }
+                                                JsonValue::Number(n) => {
+                                                    Some((k.clone(), n.to_string()))
+                                                }
+                                                JsonValue::Array(arr) => {
+                                                    let str_arr: Vec<String> = arr
+                                                        .iter()
+                                                        .filter_map(|val| {
+                                                            val.as_str().map(String::from)
+                                                        })
+                                                        .collect();
+                                                    if !str_arr.is_empty() {
+                                                        Some((k.clone(), str_arr.join(",")))
+                                                    } else {
+                                                        // For arrays not of strings, or empty string arrays, produce empty string or skip.
+                                                        // Guacamole usually expects comma-separated for multiple values like image/audio mimetypes.
+                                                        // If it's an array of other things, stringifying the whole array might be an option.
+                                                        Some((k.clone(), "".to_string()))
+                                                        // Or None to skip
+                                                    }
+                                                }
+                                                JsonValue::Null => None, // Omit null values by not adding them
+                                                // For JsonValue::Object, stringify the nested object.
+                                                // This matches the behavior if a struct field was Option<JsonValue> and then stringified.
+                                                JsonValue::Object(obj_map) => {
+                                                    serde_json::to_string(obj_map)
+                                                        .ok()
+                                                        .map(|s_val| (k.clone(), s_val))
                                                 }
                                             }
-                                            JsonValue::Null => None, // Omit null values by not adding them
-                                            // For JsonValue::Object, stringify the nested object.
-                                            // This matches the behavior if a struct field was Option<JsonValue> and then stringified.
-                                            JsonValue::Object(obj_map) => serde_json::to_string(obj_map).ok().map(|s_val| (k.clone(), s_val)),
-                                        }
-                                    }).collect();
+                                        })
+                                        .collect();
                                     debug!(target: "channel_setup", channel_id = %channel_id, ?temp_initial_guacd_params_map, "Populated guacd_params map directly from JSON Value.");
                                 } else {
                                     error!(target: "channel_setup", channel_id = %channel_id, "guacd_params was not a JSON object. Value: {:?}", guacd_params_json_val);
@@ -291,16 +323,25 @@ impl Channel {
                                     if network_checker.is_some() && server_mode {
                                         debug!(target:"channel_setup", channel_id = %channel_id, "Configuring for SOCKS5 protocol (Tunnel type with network rules)");
                                         determined_protocol = ActiveProtocol::Socks5;
-                                        initial_protocol_state = ProtocolLogicState::Socks5(ChannelSocks5State::default());
+                                        initial_protocol_state = ProtocolLogicState::Socks5(
+                                            ChannelSocks5State::default(),
+                                        );
                                     } else {
                                         debug!(target:"channel_setup", channel_id = %channel_id, server_mode, "Configuring for PortForward protocol (Tunnel type)");
                                         determined_protocol = ActiveProtocol::PortForward;
                                         if server_mode {
-                                            initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState::default());
+                                            initial_protocol_state =
+                                                ProtocolLogicState::PortForward(
+                                                    ChannelPortForwardState::default(),
+                                                );
                                         } else {
                                             // Try to get the target host / port from either target_host/target_port or guacd field
-                                            let mut dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
-                                            let mut dest_port = protocol_settings.get("target_port")
+                                            let mut dest_host = protocol_settings
+                                                .get("target_host")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
+                                            let mut dest_port = protocol_settings
+                                                .get("target_port")
                                                 .and_then(|v| {
                                                     // First, try to get it as an u64 directly
                                                     if let Some(num) = v.as_u64() {
@@ -315,59 +356,93 @@ impl Channel {
                                                         None
                                                     }
                                                 });
-                                            
+
                                             // If not found, check the guacd field for tunnel connections
-                                            (dest_host, dest_port) = Self::extract_host_port_from_guacd(
-                                                &protocol_settings, dest_host, dest_port, &channel_id, "tunnel connections"
-                                            );
-                                            
-                                            initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState {
-                                                target_host: dest_host,
-                                                target_port: dest_port,
-                                            });
+                                            (dest_host, dest_port) =
+                                                Self::extract_host_port_from_guacd(
+                                                    &protocol_settings,
+                                                    dest_host,
+                                                    dest_port,
+                                                    &channel_id,
+                                                    "tunnel connections",
+                                                );
+
+                                            initial_protocol_state =
+                                                ProtocolLogicState::PortForward(
+                                                    ChannelPortForwardState {
+                                                        target_host: dest_host,
+                                                        target_port: dest_port,
+                                                    },
+                                                );
                                         }
                                     }
-                                    if server_mode { // For PortForward server, we need a listen address
-                                        local_listen_addr_setting = protocol_settings.get("local_listen_addr").and_then(|v| v.as_str()).map(String::from);
+                                    if server_mode {
+                                        // For PortForward server, we need a listen address
+                                        local_listen_addr_setting = protocol_settings
+                                            .get("local_listen_addr")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
                                     }
                                 }
-                                _ => { // Other non-Guacd types
+                                _ => {
+                                    // Other non-Guacd types
                                     if network_checker.is_some() {
                                         debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for SOCKS5 protocol (network rules present)");
                                         determined_protocol = ActiveProtocol::Socks5;
-                                        initial_protocol_state = ProtocolLogicState::Socks5(ChannelSocks5State::default());
+                                        initial_protocol_state = ProtocolLogicState::Socks5(
+                                            ChannelSocks5State::default(),
+                                        );
                                     } else {
                                         debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for PortForward protocol (defaulting)");
                                         determined_protocol = ActiveProtocol::PortForward;
-                                        let mut dest_host = protocol_settings.get("target_host").and_then(|v| v.as_str()).map(String::from);
-                                        let mut dest_port = protocol_settings.get("target_port").and_then(|v| v.as_u64()).map(|p| p as u16);
-                                        
+                                        let mut dest_host = protocol_settings
+                                            .get("target_host")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        let mut dest_port = protocol_settings
+                                            .get("target_port")
+                                            .and_then(|v| v.as_u64())
+                                            .map(|p| p as u16);
+
                                         // If not found, check the guacd field
                                         (dest_host, dest_port) = Self::extract_host_port_from_guacd(
-                                            &protocol_settings, dest_host, dest_port, &channel_id, "default case"
+                                            &protocol_settings,
+                                            dest_host,
+                                            dest_port,
+                                            &channel_id,
+                                            "default case",
                                         );
-                                        
-                                        initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState {
-                                            target_host: dest_host,
-                                            target_port: dest_port,
-                                        });
+
+                                        initial_protocol_state = ProtocolLogicState::PortForward(
+                                            ChannelPortForwardState {
+                                                target_host: dest_host,
+                                                target_port: dest_port,
+                                            },
+                                        );
                                     }
                                 }
                             }
                         }
                     }
                     Err(_) => {
-                         error!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Invalid conversationType string. Erroring out.");
-                         return Err(anyhow::anyhow!("Invalid conversationType string: {}", protocol_name_str));
+                        error!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Invalid conversationType string. Erroring out.");
+                        return Err(anyhow::anyhow!(
+                            "Invalid conversationType string: {}",
+                            protocol_name_str
+                        ));
                     }
                 }
-            } else { // protocol_name_val is not a string
+            } else {
+                // protocol_name_val is not a string
                 error!(target:"channel_setup", channel_id = %channel_id, "conversationType is not a string. Erroring out.");
                 return Err(anyhow::anyhow!("conversationType is not a string"));
             }
-        } else { // "conversationType" not found
+        } else {
+            // "conversationType" not found
             error!(target:"channel_setup", channel_id = %channel_id, "No specific protocol defined (conversationType missing). Erroring out.");
-            return Err(anyhow::anyhow!("No specific protocol defined (conversationType missing)"));
+            return Err(anyhow::anyhow!(
+                "No specific protocol defined (conversationType missing)"
+            ));
         }
 
         let mut final_connect_as_settings = ConnectAsSettings::default();
@@ -389,7 +464,7 @@ impl Channel {
         } else {
             warn!(target: "channel_setup", channel_id = %channel_id, "'connect_as_settings' key not found in protocol_settings. Using default.");
         }
-        
+
         let channel_id_clone = channel_id.clone();
         let process_pending_trigger_tx_clone = pending_tx.clone();
 
@@ -405,7 +480,7 @@ impl Channel {
                }
             });
         })));
-        
+
         let new_channel = Self {
             webrtc,
             conns: Arc::new(DashMap::new()),
@@ -427,7 +502,7 @@ impl Channel {
             local_client_server_conn_rx: Some(server_conn_rx),
             active_protocol: determined_protocol,
             protocol_state: initial_protocol_state,
-            
+
             guacd_host: guacd_host_setting,
             guacd_port: guacd_port_setting,
             connect_as_settings: final_connect_as_settings,
@@ -445,9 +520,9 @@ impl Channel {
             callback_token,
             ksm_config,
         };
-        
+
         info!(target: "channel_lifecycle", channel_id = %new_channel.channel_id, server_mode = new_channel.server_mode, "Channel initialized");
-        
+
         Ok(new_channel)
     }
 
@@ -458,7 +533,7 @@ impl Channel {
 
         // Take the receiver channel for server connections
         let mut server_conn_rx = self.local_client_server_conn_rx.take();
-        
+
         // Take ownership of conn_closed_rx for the select loop
         let mut local_conn_closed_rx = self.conn_closed_rx.take().ok_or_else(|| {
             error!(target: "channel_lifecycle", channel_id = %self.channel_id, "conn_closed_rx was already taken or None. Channel cannot monitor connection closures.");
@@ -472,7 +547,7 @@ impl Channel {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Received frame from WebRTC");
                 }
-                
+
                 if let Err(e) = handle_incoming_frame(&mut self, frame).await {
                     error!(target: "channel_flow", channel_id = %self.channel_id, error = %e, "Error handling frame");
                 }
@@ -487,13 +562,13 @@ impl Channel {
                         if tracing::enabled!(tracing::Level::DEBUG) {
                             debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Registering connection from server");
                         }
-                            
+
                         // Create a stream half
                         let stream_half = StreamHalf {
                             reader: None,
                             writer,
                         };
-                            
+
                         // Create a lock-free connection with a dedicated backend task
                         let conn = Conn::new_with_backend(
                             Box::new(stream_half),
@@ -501,7 +576,7 @@ impl Channel {
                             conn_no,
                             self.channel_id.clone(),
                         ).await;
-                            
+
                         // Store in our lock-free registry
                         self.conns.insert(conn_no, conn);
                     } else {
@@ -516,24 +591,24 @@ impl Channel {
                         Ok(Some(chunk)) => {
                             if tracing::enabled!(tracing::Level::DEBUG) {
                                 debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
-                                
+
                                 if chunk.len() > 0 {
                                     debug!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
                                 }
                             }
-                            
+
                             buf.extend_from_slice(&chunk);
                             if tracing::enabled!(tracing::Level::DEBUG) {
                                 debug!(target: "channel_flow", channel_id = %self.channel_id, buffer_size = buf.len(), "Buffer size after adding chunk");
                             }
-                            
-                            // Process pending messages might be triggered by buffer low, 
+
+                            // Process pending messages might be triggered by buffer low,
                             // but also good to try after receiving new data if not recently triggered.
                             self.process_pending_messages().await?;
                         }
                         Ok(None) => {
                             info!(target: "channel_lifecycle", channel_id = %self.channel_id, "WebRTC data channel closed or sender dropped.");
-                            break; 
+                            break;
                         }
                         Err(_) => { // Timeout on rx_from_dc.recv()
                             handle_ping_timeout(&mut self).await?;
@@ -605,7 +680,7 @@ impl Channel {
 
         // Log final stats before cleanup
         self.log_final_stats().await;
-        
+
         self.cleanup_all_connections().await?;
         Ok(())
     }
@@ -623,7 +698,7 @@ impl Channel {
         }
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "process_pending_messages: Starting.");
-            
+
             for (conn_no, queue) in pending_guard.iter() {
                 if !queue.is_empty() {
                     debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, queue_size = queue.len(), "process_pending_messages: Connection has pending messages.");
@@ -635,35 +710,39 @@ impl Channel {
         let mut total_processed = 0;
         let total_messages: usize = pending_guard.values().map(|q| q.len()).sum();
         if total_messages > 0 && tracing::enabled!(tracing::Level::DEBUG) {
-           debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "process_pending_messages: Total pending messages across all connections.");
+            debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "process_pending_messages: Total pending messages across all connections.");
         }
-        let conn_nos: Vec<u32> = pending_guard.keys().filter(|&conn_no| !pending_guard[conn_no].is_empty()).copied().collect();
+        let conn_nos: Vec<u32> = pending_guard
+            .keys()
+            .filter(|&conn_no| !pending_guard[conn_no].is_empty())
+            .copied()
+            .collect();
         let mut current_index = 0;
         let buffer_threshold = BUFFER_LOW_THRESHOLD;
-        
+
         while total_processed < max_to_process && !conn_nos.is_empty() {
-            if conn_nos.is_empty() { 
+            if conn_nos.is_empty() {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: conn_nos became empty, breaking.");
                 }
-                break; 
+                break;
             }
             let conn_index = current_index % conn_nos.len();
             let conn_no = conn_nos[conn_index];
-            
+
             if tracing::enabled!(tracing::Level::DEBUG) {
                 debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Attempting to process queue for connection.");
             }
 
             if let Some(queue) = pending_guard.get_mut(&conn_no) {
-                if queue.is_empty() { 
+                if queue.is_empty() {
                     if tracing::enabled!(tracing::Level::DEBUG) {
                         debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue is now empty for connection, skipping.");
                     }
                     current_index += 1;
                     continue;
                 }
-                
+
                 // **PERFORMANCE: Pop the message directly instead of cloning**
                 let message_to_send = match queue.pop_front() {
                     Some(msg) => msg,
@@ -675,7 +754,7 @@ impl Channel {
                         continue;
                     }
                 };
-                
+
                 let current_buffered_amount_before_send = self.webrtc.buffered_amount().await;
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, message_size = message_to_send.len(), buffered_amount_before_send = current_buffered_amount_before_send, "process_pending_messages: Sending message from queue.");
@@ -690,7 +769,7 @@ impl Channel {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, total_processed_in_loop = total_processed, remaining_in_queue = queue.len(), "process_pending_messages: Successfully sent message, already popped from queue.");
                 }
-                
+
                 if total_processed % 10 == 0 {
                     let current_buffer_after_batch = self.webrtc.buffered_amount().await;
                     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -702,22 +781,21 @@ impl Channel {
                         }
                         break;
                     }
-
                 }
             } else {
-                 warn!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Connection not found in pending_messages during processing. This should not happen.");
+                warn!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Connection not found in pending_messages during processing. This should not happen.");
             }
             current_index += 1;
         }
-        
+
         if total_processed > 0 {
-           if tracing::enabled!(tracing::Level::DEBUG) {
-               debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
-           }
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
+            }
         } else {
-           if tracing::enabled!(tracing::Level::DEBUG) {
-               debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
-           }
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
+            }
         }
         Ok(())
     }
@@ -734,13 +812,18 @@ impl Channel {
         let conn_keys = self.get_connection_ids();
         for conn_no in conn_keys {
             if conn_no != 0 {
-                self.close_backend(conn_no, CloseConnectionReason::Normal).await?;
+                self.close_backend(conn_no, CloseConnectionReason::Normal)
+                    .await?;
             }
         }
         Ok(())
     }
 
-    pub(crate) async fn send_control_message(&mut self, message: ControlMessage, data: &[u8]) -> Result<()> {
+    pub(crate) async fn send_control_message(
+        &mut self,
+        message: ControlMessage,
+        data: &[u8],
+    ) -> Result<()> {
         let frame = Frame::new_control_with_pool(message, data, &self.buffer_pool);
         let encoded = frame.encode_with_pool(&self.buffer_pool);
 
@@ -754,33 +837,44 @@ impl Channel {
                     let mut sent_time = self.channel_ping_sent_time.lock().await;
                     *sent_time = Some(crate::tube_protocol::now_ms());
                     if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!("Channel({}): Sent channel PING (conn_no=0), recorded send time.", self.channel_id);
+                        debug!(
+                            "Channel({}): Sent channel PING (conn_no=0), recorded send time.",
+                            self.channel_id
+                        );
                     }
                 }
-            } else if data.is_empty() { // Convention: empty data for Ping implies channel ping
-                 let mut sent_time = self.channel_ping_sent_time.lock().await;
-                 *sent_time = Some(crate::tube_protocol::now_ms());
-                 if tracing::enabled!(tracing::Level::DEBUG) {
-                     debug!("Channel({}): Sent channel PING (conn_no=0, empty payload convention), recorded send time.", self.channel_id);
-                 }
+            } else if data.is_empty() {
+                // Convention: empty data for Ping implies channel ping
+                let mut sent_time = self.channel_ping_sent_time.lock().await;
+                *sent_time = Some(crate::tube_protocol::now_ms());
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!("Channel({}): Sent channel PING (conn_no=0, empty payload convention), recorded send time.", self.channel_id);
+                }
             }
         }
 
         let buffered_amount = self.webrtc.buffered_amount().await;
         if buffered_amount >= BUFFER_LOW_THRESHOLD && tracing::enabled!(tracing::Level::DEBUG) {
-           debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");
+            debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");
         }
-        self.webrtc.send(encoded).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.webrtc
+            .send(encoded)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
 
-    pub(crate) async fn close_backend(&mut self, conn_no: u32, reason: CloseConnectionReason) -> Result<()> {
+    pub(crate) async fn close_backend(
+        &mut self,
+        conn_no: u32,
+        reason: CloseConnectionReason,
+    ) -> Result<()> {
         let total_connections = self.conns.len();
         let remaining_connections = self.get_connection_ids_except(conn_no);
         let pending_msg_count = self.get_pending_message_count().await;
-        
-        info!(target: "connection_lifecycle", 
-              channel_id = %self.channel_id, conn_no, ?reason, 
+
+        info!(target: "connection_lifecycle",
+              channel_id = %self.channel_id, conn_no, ?reason,
               total_connections, pending_msg_count, ?remaining_connections,
               "Closing connection - Connection summary");
 
@@ -790,9 +884,11 @@ impl Channel {
         buffer.extend_from_slice(&(reason as u16).to_be_bytes());
         let msg_data = buffer.freeze();
 
-        self.internal_handle_connection_close(conn_no, reason).await?;
-        
-        self.send_control_message(ControlMessage::CloseConnection, &msg_data).await?;
+        self.internal_handle_connection_close(conn_no, reason)
+            .await?;
+
+        self.send_control_message(ControlMessage::CloseConnection, &msg_data)
+            .await?;
 
         // For control connections or explicit cleanup, remove immediately
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
@@ -827,14 +923,14 @@ impl Channel {
             let conns_arc = Arc::clone(&self.conns);
             let pending_messages_arc = Arc::clone(&self.pending_messages);
             let channel_id_clone = self.channel_id.clone();
-            
+
             // Spawn a task to remove the connection after a grace period
             tokio::spawn(async move {
                 // Wait a bit to allow in-flight messages to be processed
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                
+
                 debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
-                
+
                 // Now remove from both maps
                 if let Some((_, conn)) = conns_arc.remove(&conn_no) {
                     // Shutdown the connection gracefully
@@ -849,17 +945,28 @@ impl Channel {
         }
 
         if conn_no == 0 {
-            self.should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.should_exit
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
 
-    pub(crate) async fn internal_handle_connection_close(&mut self, conn_no: u32, reason: CloseConnectionReason) -> Result<()> {
+    pub(crate) async fn internal_handle_connection_close(
+        &mut self,
+        conn_no: u32,
+        reason: CloseConnectionReason,
+    ) -> Result<()> {
         debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, ?reason, "internal_handle_connection_close");
-        
+
         // If this is the control connection (conn_no 0) or we're shutting down due to an error,
         // and we're in server mode, stop the server to prevent new connections
-        if self.server_mode && (conn_no == 0 || matches!(reason, CloseConnectionReason::UpstreamClosed | CloseConnectionReason::Error)) {
+        if self.server_mode
+            && (conn_no == 0
+                || matches!(
+                    reason,
+                    CloseConnectionReason::UpstreamClosed | CloseConnectionReason::Error
+                ))
+        {
             if self.local_client_server_task.is_some() {
                 debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Stopping server due to critical connection closure");
                 if let Err(e) = self.stop_server().await {
@@ -885,7 +992,7 @@ impl Channel {
                 // Port forwarding connections are just TCP streams, no special cleanup needed
             }
         }
-        
+
         Ok(())
     }
 
@@ -902,7 +1009,8 @@ impl Channel {
 
     /// Get a list of all active connection IDs except the specified one
     pub(crate) fn get_connection_ids_except(&self, exclude_conn_no: u32) -> Vec<u32> {
-        self.conns.iter()
+        self.conns
+            .iter()
             .map(|entry| *entry.key())
             .filter(|&id| id != exclude_conn_no)
             .collect()
@@ -924,17 +1032,19 @@ impl Channel {
         if dest_host.is_none() || dest_port.is_none() {
             if let Some(guacd_obj) = protocol_settings.get("guacd").and_then(|v| v.as_object()) {
                 if dest_host.is_none() {
-                    dest_host = guacd_obj.get("guacd_host")
+                    dest_host = guacd_obj
+                        .get("guacd_host")
                         .and_then(|v| v.as_str())
                         .map(|s| s.trim().to_string()); // Trim whitespace
                 }
                 if dest_port.is_none() {
-                    dest_port = guacd_obj.get("guacd_port")
+                    dest_port = guacd_obj
+                        .get("guacd_port")
                         .and_then(|v| v.as_u64())
                         .map(|p| p as u16);
                 }
-                debug!(target:"channel_setup", channel_id = %channel_id, 
-                       "Extracted target from guacd field ({}): host={:?}, port={:?}", 
+                debug!(target:"channel_setup", channel_id = %channel_id,
+                       "Extracted target from guacd field ({}): host={:?}, port={:?}",
                        context, dest_host, dest_port);
             }
         }
@@ -948,16 +1058,16 @@ impl Channel {
         let connection_ids = self.get_connection_ids();
         let pending_msg_count = self.get_pending_message_count().await;
         let buffered_amount = self.webrtc.buffered_amount().await;
-        
-        info!(target: "channel_summary", 
-              channel_id=%self.channel_id, total_connections, ?connection_ids, 
-              server_mode=self.server_mode, pending_msg_count, buffered_amount, 
+
+        info!(target: "channel_summary",
+              channel_id=%self.channel_id, total_connections, ?connection_ids,
+              server_mode=self.server_mode, pending_msg_count, buffered_amount,
               ?self.active_protocol,
-              "Channel '{}' closing - Final stats: {} connections: {:?}, {} pending messages, {} bytes buffered", 
+              "Channel '{}' closing - Final stats: {} connections: {:?}, {} pending messages, {} bytes buffered",
               self.channel_id, total_connections, connection_ids, pending_msg_count, buffered_amount);
-              
-        // Note: Full WebRTC native stats (bytes sent/received, round-trip time, 
-        // packet loss, bandwidth usage, connection quality, etc.) are available 
+
+        // Note: Full WebRTC native stats (bytes sent/received, round-trip time,
+        // packet loss, bandwidth usage, connection quality, etc.) are available
         // via peer_connection.get_stats() API in browser context.
         // These provide much more detailed metrics than our previous custom tracking.
     }
@@ -966,7 +1076,8 @@ impl Channel {
 // Ensure all resources are properly cleaned up
 impl Drop for Channel {
     fn drop(&mut self) {
-        self.should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.should_exit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(task) = &self.local_client_server_task {
             task.abort();
         }
@@ -982,20 +1093,20 @@ impl Drop for Channel {
             let conn_keys = Self::extract_connection_ids(&conns_clone);
             for conn_no in conn_keys {
                 if conn_no == 0 { continue; }
-                
+
                 // Send close frame to remote peer
                 let mut close_buffer = buffer_pool_clone.acquire();
                 close_buffer.clear();
                 close_buffer.extend_from_slice(&conn_no.to_be_bytes());
                 close_buffer.extend_from_slice(&(CloseConnectionReason::Normal as u16).to_be_bytes());
-                
+
                 let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut close_buffer);
                 let encoded = close_frame.encode_with_pool(&buffer_pool_clone);
                 if let Err(e) = webrtc.send(encoded).await {
                     warn!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error sending close frame in drop for connection");
                 }
                 buffer_pool_clone.release(close_buffer);
-                
+
                 // Shutdown the connection gracefully
                 if let Some((_, conn)) = conns_clone.remove(&conn_no) {
                     if let Err(e) = conn.shutdown().await {

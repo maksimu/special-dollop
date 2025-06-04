@@ -49,7 +49,7 @@ fn test_p2p_connection() {
             }],
             ..Default::default()
         };
-        
+
         let peer1 = Arc::new(create_peer_connection(config.clone()).await.unwrap());
         let peer2 = Arc::new(create_peer_connection(config).await.unwrap());
 
@@ -126,7 +126,9 @@ fn test_p2p_connection() {
             let state2 = peer2.connection_state();
             println!("Connection states: peer1={}, peer2={}", state1, state2);
 
-            if state1 == RTCPeerConnectionState::Connected && state2 == RTCPeerConnectionState::Connected {
+            if state1 == RTCPeerConnectionState::Connected
+                && state2 == RTCPeerConnectionState::Connected
+            {
                 break;
             }
 
@@ -301,7 +303,9 @@ fn test_p2p_connection_non_trickle() {
             let state2 = peer2.connection_state();
             println!("Connection states: peer1={}, peer2={}", state1, state2);
 
-            if state1 == RTCPeerConnectionState::Connected && state2 == RTCPeerConnectionState::Connected {
+            if state1 == RTCPeerConnectionState::Connected
+                && state2 == RTCPeerConnectionState::Connected
+            {
                 connected = true;
                 break;
             }
@@ -347,16 +351,22 @@ async fn test_turn_only_mode() {
 
     // Create the connection
     let conn = crate::WebRTCPeerConnection::new(
-        config.clone(), 
-        trickle_ice, 
-        turn_only, 
-        ksm_config_1, 
+        config.clone(),
+        trickle_ice,
+        turn_only,
+        ksm_config_1,
         None,
         "test_tube_id".to_string(),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     // Use reflection to check that the ICE transport policy was set to Relay
-    let ice_transport_policy = conn.peer_connection.get_configuration().await.ice_transport_policy;
+    let ice_transport_policy = conn
+        .peer_connection
+        .get_configuration()
+        .await
+        .ice_transport_policy;
     assert_eq!(
         ice_transport_policy,
         webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::Relay,
@@ -367,16 +377,22 @@ async fn test_turn_only_mode() {
     let turn_only = false;
     let ksm_config_2 = "TEST_MODE_KSM_CONFIG_2".to_string();
     let conn_regular = crate::WebRTCPeerConnection::new(
-        config, 
-        trickle_ice, 
-        turn_only, 
-        ksm_config_2, 
+        config,
+        trickle_ice,
+        turn_only,
+        ksm_config_2,
         None,
         "test_tube_id_regular".to_string(),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     // Check that ICE transport policy is set to All for regular mode
-    let ice_transport_policy = conn_regular.peer_connection.get_configuration().await.ice_transport_policy;
+    let ice_transport_policy = conn_regular
+        .peer_connection
+        .get_configuration()
+        .await
+        .ice_transport_policy;
     assert_eq!(
         ice_transport_policy,
         webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,

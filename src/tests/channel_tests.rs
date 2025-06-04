@@ -1,21 +1,21 @@
 // Tests for the Channel module
 #![cfg(test)]
-use std::collections::HashMap;
-use std::time::Duration;
+use crate::buffer_pool::{BufferPool, BufferPoolConfig};
+use crate::channel::Channel;
+use crate::tube_protocol::{ControlMessage, Frame};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use crate::buffer_pool::{BufferPool, BufferPoolConfig};
-use crate::channel::Channel;
-use crate::tube_protocol::{ControlMessage, Frame};
 
 #[tokio::test]
 async fn test_buffer_pool_usage() {
     // This test verifies that the buffer pool is used efficiently
-    
+
     // Create a custom buffer pool for testing
     let buffer_pool_config = BufferPoolConfig {
         buffer_size: 8 * 1024, // 8KB buffer size
@@ -23,24 +23,27 @@ async fn test_buffer_pool_usage() {
         resize_on_return: true,
     };
     let buffer_pool = BufferPool::new(buffer_pool_config);
-    
+
     // Verify initial buffer pool state
     assert_eq!(buffer_pool.count(), 0, "Buffer pool should start empty");
-    
+
     // Create a frame using the pool
     let test_data = b"test data for buffer pool";
     let frame = Frame::new_data_with_pool(1, test_data, &buffer_pool);
-    
+
     // Encode it and manually return the buffer to the pool
     {
         let mut buffer = BytesMut::with_capacity(64);
         frame.encode_into(&mut buffer);
         buffer_pool.release(buffer);
     }
-    
+
     // Verify pool usage
-    assert!(buffer_pool.count() > 0, "Buffer pool should have buffers after use");
-    
+    assert!(
+        buffer_pool.count() > 0,
+        "Buffer pool should have buffers after use"
+    );
+
     // Create another frame and encode, then release
     {
         let frame2 = Frame::new_data_with_pool(2, b"more test data", &buffer_pool);
@@ -48,9 +51,12 @@ async fn test_buffer_pool_usage() {
         frame2.encode_into(&mut buffer);
         buffer_pool.release(buffer);
     }
-    
+
     // The buffer pool count should not exceed max_pooled
-    assert!(buffer_pool.count() <= 5, "Buffer pool should not exceed max_pooled");
+    assert!(
+        buffer_pool.count() <= 5,
+        "Buffer pool should not exceed max_pooled"
+    );
 }
 
 /// Test to verify data flow in server mode (local TCP -> Channel -> WebRTC)
@@ -77,12 +83,13 @@ async fn test_server_mode_data_flow() -> Result<()> {
         webrtc.clone(),
         rx_from_dc,
         "test_server_mode".to_string(),
-        None, // default timeouts
+        None,     // default timeouts
         settings, // protocol_settings
-        true, // server_mode=true
+        true,     // server_mode=true
         Some("test_callback_token".to_string()),
         Some("test_ksm_config".to_string()),
-    ).await?;
+    )
+    .await?;
 
     // Start server listening on localhost with a random port
     let server_addr = "127.0.0.1:0"; // Let OS assign a port
@@ -114,32 +121,51 @@ async fn test_server_mode_data_flow() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // First, capture and verify the OpenConnection control frame
-    let control_frame_data = receive_with_timeout(&mut frame_rx, Duration::from_millis(500)).await?;
+    let control_frame_data =
+        receive_with_timeout(&mut frame_rx, Duration::from_millis(500)).await?;
     let control_frame = extract_frame_from_bytes(&control_frame_data)?;
 
-    println!("Captured control frame: conn_no={}, payload.len={}",
-             control_frame.connection_no, control_frame.payload.len());
+    println!(
+        "Captured control frame: conn_no={}, payload.len={}",
+        control_frame.connection_no,
+        control_frame.payload.len()
+    );
 
     // The control frame should have connection number 0 (for control messages)
-    assert_eq!(control_frame.connection_no, 0, "Control frame should have connection number 0");
+    assert_eq!(
+        control_frame.connection_no, 0,
+        "Control frame should have connection number 0"
+    );
 
     // Verify this is an OpenConnection control message
     // Payload structure for OpenConnection: [u16: control_code][u32: assigned_connection_no]
-    assert!(control_frame.payload.len() >= 6, "OpenConnection payload is too short. Expected at least 6 bytes.");
-    
+    assert!(
+        control_frame.payload.len() >= 6,
+        "OpenConnection payload is too short. Expected at least 6 bytes."
+    );
+
     let control_code_val = u16::from_be_bytes([control_frame.payload[0], control_frame.payload[1]]);
-    assert_eq!(control_code_val, ControlMessage::OpenConnection as u16, "Control frame should be an OpenConnection message");
+    assert_eq!(
+        control_code_val,
+        ControlMessage::OpenConnection as u16,
+        "Control frame should be an OpenConnection message"
+    );
 
     let conn_bytes = [
         control_frame.payload[2],
         control_frame.payload[3],
         control_frame.payload[4],
-        control_frame.payload[5]
+        control_frame.payload[5],
     ];
     let assigned_conn_no = u32::from_be_bytes(conn_bytes);
-    println!("OpenConnection assigned connection number: {}", assigned_conn_no);
-    assert!(assigned_conn_no > 0, "Assigned connection number should be greater than 0");
-
+    println!(
+        "OpenConnection assigned connection number: {}",
+        assigned_conn_no
+    );
+    assert!(
+        assigned_conn_no > 0,
+        "Assigned connection number should be greater than 0"
+    );
 
     // Now send test data from client to server
     let test_data = b"Hello from TCP client!";
@@ -154,11 +180,17 @@ async fn test_server_mode_data_flow() -> Result<()> {
     let data_frame = extract_frame_from_bytes(&data_frame_bytes)?;
 
     // Print info about the captured data frame
-    println!("Captured data frame: conn_no={}, payload.len={}",
-             data_frame.connection_no, data_frame.payload.len());
+    println!(
+        "Captured data frame: conn_no={}, payload.len={}",
+        data_frame.connection_no,
+        data_frame.payload.len()
+    );
 
     // Verify the data frame - the connection number should match the one assigned in OpenConnection
-    assert_eq!(data_frame.connection_no, assigned_conn_no, "Data frame connection number should match the assigned one from OpenConnection");
+    assert_eq!(
+        data_frame.connection_no, assigned_conn_no,
+        "Data frame connection number should match the assigned one from OpenConnection"
+    );
 
     // Check that the payload matches our test data
     assert_eq!(
@@ -187,7 +219,10 @@ async fn test_client_mode_data_flow() -> Result<()> {
 
     // Spawn a task to handle connections to our mock server
     let server_handle = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("Failed to accept connection");
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("Failed to accept connection");
         println!("Connection accepted from: {}", socket.peer_addr().unwrap());
 
         let mut buf = [0u8; 1024];
@@ -196,7 +231,10 @@ async fn test_client_mode_data_flow() -> Result<()> {
                 Ok(0) => break, // Connection closed
                 Ok(n) => {
                     println!("TCP server received {} bytes", n);
-                    tcp_data_tx.send(buf[..n].to_vec()).await.expect("Failed to send to channel");
+                    tcp_data_tx
+                        .send(buf[..n].to_vec())
+                        .await
+                        .expect("Failed to send to channel");
                 }
                 Err(e) => {
                     eprintln!("TCP server read error: {}", e);
@@ -212,22 +250,27 @@ async fn test_client_mode_data_flow() -> Result<()> {
 
     // Configure the channel to connect to our mock TCP server
     let mut settings = HashMap::new();
-    settings.insert("target_host".to_string(),
-                    serde_json::json!(server_addr.ip().to_string()));
-    settings.insert("target_port".to_string(),
-                    serde_json::json!(server_addr.port()));
+    settings.insert(
+        "target_host".to_string(),
+        serde_json::json!(server_addr.ip().to_string()),
+    );
+    settings.insert(
+        "target_port".to_string(),
+        serde_json::json!(server_addr.port()),
+    );
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
     let channel = Channel::new(
         webrtc.clone(),
         rx_from_dc,
         "test_client_mode".to_string(),
-        None, // default timeouts
+        None,     // default timeouts
         settings, // protocol_settings
-        false, // server_mode=false
+        false,    // server_mode=false
         Some("test_callback_token".to_string()),
         Some("test_ksm_config".to_string()),
-    ).await?;
+    )
+    .await?;
 
     // Start the channel running in a separate task
     let channel_handle = tokio::spawn(async move {
@@ -249,13 +292,12 @@ async fn test_client_mode_data_flow() -> Result<()> {
     let buffer_pool = BufferPool::default();
 
     // Send the OpenConnection control message using new_control_with_pool
-    let open_frame = Frame::new_control_with_pool(
-        ControlMessage::OpenConnection,
-        &open_data,
-        &buffer_pool
-    );
+    let open_frame =
+        Frame::new_control_with_pool(ControlMessage::OpenConnection, &open_data, &buffer_pool);
     let encoded_open = open_frame.encode_with_pool(&buffer_pool);
-    tx_to_channel.send(encoded_open).expect("Failed to send OpenConnection");
+    tx_to_channel
+        .send(encoded_open)
+        .expect("Failed to send OpenConnection");
 
     // Give time for the connection to be established
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -264,7 +306,9 @@ async fn test_client_mode_data_flow() -> Result<()> {
     let test_data = b"Hello from WebRTC!";
     let data_frame = Frame::new_data_with_pool(conn_no, test_data, &buffer_pool);
     let encoded_data = data_frame.encode_with_pool(&buffer_pool);
-    tx_to_channel.send(encoded_data).expect("Failed to send data frame");
+    tx_to_channel
+        .send(encoded_data)
+        .expect("Failed to send data frame");
 
     // Give time for data to be processed
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -273,7 +317,10 @@ async fn test_client_mode_data_flow() -> Result<()> {
     let received_data = receive_with_timeout(&mut tcp_data_rx, Duration::from_millis(500)).await?;
 
     println!("TCP server received data: {:?}", received_data);
-    assert_eq!(received_data, test_data, "TCP server should receive the test data");
+    assert_eq!(
+        received_data, test_data,
+        "TCP server should receive the test data"
+    );
 
     // Clean up
     channel_handle.abort();
@@ -297,7 +344,7 @@ fn extract_frame_from_bytes(data: &Bytes) -> Result<Frame> {
 // Helper to receive with timeout
 async fn receive_with_timeout<T>(
     receiver: &mut mpsc::Receiver<T>,
-    timeout_duration: Duration
+    timeout_duration: Duration,
 ) -> Result<T> {
     match timeout(timeout_duration, receiver.recv()).await {
         Ok(Some(data)) => Ok(data),

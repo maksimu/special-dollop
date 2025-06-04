@@ -1,8 +1,8 @@
 use anyhow::Result;
-use bytes::{Bytes, BytesMut, BufMut};
-use tracing::error;
-use std::str;
+use bytes::{BufMut, Bytes, BytesMut};
 use smallvec::SmallVec;
+use std::str;
+use tracing::error;
 
 // Guacamole protocol constants
 pub const INST_TERM: u8 = b';';
@@ -20,10 +20,7 @@ pub struct GuacdInstruction {
 
 impl GuacdInstruction {
     pub fn new(opcode: String, args: Vec<String>) -> Self {
-        Self {
-            opcode,
-            args,
-        }
+        Self { opcode, args }
     }
 }
 
@@ -85,7 +82,7 @@ impl GuacdParser {
         // For larger slices, memchr crate would be faster, but we'll use the standard approach
         slice.iter().position(|&b| b == delimiter)
     }
-    
+
     /// Fast integer parsing for small numbers (optimized for lengths)
     /// Most Guacd instruction lengths are < 100
     #[inline(always)]
@@ -93,7 +90,7 @@ impl GuacdParser {
         if slice.is_empty() {
             return Err(());
         }
-        
+
         // Handle single-digit optimizations
         if slice.len() == 1 {
             let b = slice[0];
@@ -102,7 +99,7 @@ impl GuacdParser {
             }
             return Err(());
         }
-        
+
         let mut result = 0usize;
         for &b in slice {
             if b < b'0' || b > b'9' {
@@ -139,7 +136,7 @@ impl GuacdParser {
         // **NO STRING ALLOCATIONS, NO HEAP ALLOCATIONS**
         // **RETURN ONLY BORROWED SLICES FROM INPUT BUFFER**
         // **USE SmallVec TO AVOID HEAP ALLOCATION FOR ARGS**
-        
+
         if buffer_slice.is_empty() {
             return Err(PeekError::Incomplete);
         }
@@ -161,28 +158,37 @@ impl GuacdParser {
         // Parse opcode
         let initial_pos_for_opcode_len = pos;
         // Check for opcode length delimiter '.'
-        let length_end_op_rel = Self::find_delimiter(&buffer_slice[initial_pos_for_opcode_len..], ELEM_SEP)
-            .ok_or_else(|| {
-                // If no '.', it's incomplete unless a ';' is found immediately (malformed)
-                if Self::find_delimiter(&buffer_slice[initial_pos_for_opcode_len..], INST_TERM).is_some() {
-                    PeekError::InvalidFormat("Malformed opcode: no length delimiter before instruction end.".to_string())
-                } else {
-                    PeekError::Incomplete
-                }
-            })?;
-        
+        let length_end_op_rel =
+            Self::find_delimiter(&buffer_slice[initial_pos_for_opcode_len..], ELEM_SEP)
+                .ok_or_else(|| {
+                    // If no '.', it's incomplete unless a ';' is found immediately (malformed)
+                    if Self::find_delimiter(&buffer_slice[initial_pos_for_opcode_len..], INST_TERM)
+                        .is_some()
+                    {
+                        PeekError::InvalidFormat(
+                            "Malformed opcode: no length delimiter before instruction end."
+                                .to_string(),
+                        )
+                    } else {
+                        PeekError::Incomplete
+                    }
+                })?;
+
         // Ensure the buffer is long enough for the length string itself
         if initial_pos_for_opcode_len + length_end_op_rel >= buffer_slice.len() {
             return Err(PeekError::Incomplete); // Not enough for the "L." part
         }
 
-        let opcode_len_slice = &buffer_slice[initial_pos_for_opcode_len .. initial_pos_for_opcode_len + length_end_op_rel];
-        
+        let opcode_len_slice = &buffer_slice
+            [initial_pos_for_opcode_len..initial_pos_for_opcode_len + length_end_op_rel];
+
         // **PERFORMANCE: Use fast integer parsing**
-        let length_op: usize = Self::parse_length(opcode_len_slice)
-            .map_err(|_| PeekError::InvalidFormat(format!("Opcode length not an integer: '{}'", 
+        let length_op: usize = Self::parse_length(opcode_len_slice).map_err(|_| {
+            PeekError::InvalidFormat(format!(
+                "Opcode length not an integer: '{}'",
                 str::from_utf8(opcode_len_slice).unwrap_or("<invalid>")
-            )))?;
+            ))
+        })?;
 
         pos = initial_pos_for_opcode_len + length_end_op_rel + 1; // Move past length and ELEM_SEP
 
@@ -190,7 +196,7 @@ impl GuacdParser {
         if pos + length_op > buffer_slice.len() {
             return Err(PeekError::Incomplete); // Not enough for opcode value
         }
-        let opcode_value_slice = &buffer_slice[pos .. pos + length_op];
+        let opcode_value_slice = &buffer_slice[pos..pos + length_op];
         // Special case for "0.;" - opcode is empty string
         // Check if length_op is 0.
         // The opcode_value_slice will be empty in this case.
@@ -211,55 +217,65 @@ impl GuacdParser {
                 // Dangling comma implies incomplete if no further terminator,
                 // or malformed if terminator is next.
                 // If we only have a dangling comma and then end of buffer_slice, it's incomplete.
-                return Err(PeekError::Incomplete); 
+                return Err(PeekError::Incomplete);
             }
 
             let initial_pos_for_arg_len = pos;
-            let length_end_arg_rel = Self::find_delimiter(&buffer_slice[initial_pos_for_arg_len..], ELEM_SEP)
-                .ok_or_else(|| {
-                     if Self::find_delimiter(&buffer_slice[initial_pos_for_arg_len..], INST_TERM).is_some() {
-                         PeekError::InvalidFormat("Malformed argument: no length delimiter before instruction end.".to_string())
-                     } else {
-                         PeekError::Incomplete
-                     }
-                })?;
+            let length_end_arg_rel =
+                Self::find_delimiter(&buffer_slice[initial_pos_for_arg_len..], ELEM_SEP)
+                    .ok_or_else(|| {
+                        if Self::find_delimiter(&buffer_slice[initial_pos_for_arg_len..], INST_TERM)
+                            .is_some()
+                        {
+                            PeekError::InvalidFormat(
+                                "Malformed argument: no length delimiter before instruction end."
+                                    .to_string(),
+                            )
+                        } else {
+                            PeekError::Incomplete
+                        }
+                    })?;
 
             if initial_pos_for_arg_len + length_end_arg_rel >= buffer_slice.len() {
                 return Err(PeekError::Incomplete); // Not enough for the "L." part of arg
             }
-            
-            let arg_len_slice = &buffer_slice[initial_pos_for_arg_len .. initial_pos_for_arg_len + length_end_arg_rel];
-            
+
+            let arg_len_slice = &buffer_slice
+                [initial_pos_for_arg_len..initial_pos_for_arg_len + length_end_arg_rel];
+
             // **PERFORMANCE: Use fast integer parsing**
-            let length_arg: usize = Self::parse_length(arg_len_slice)
-                .map_err(|_| PeekError::InvalidFormat(format!("Argument length not an integer: '{}'", 
+            let length_arg: usize = Self::parse_length(arg_len_slice).map_err(|_| {
+                PeekError::InvalidFormat(format!(
+                    "Argument length not an integer: '{}'",
                     str::from_utf8(arg_len_slice).unwrap_or("<invalid>")
-                )))?;
+                ))
+            })?;
 
             pos = initial_pos_for_arg_len + length_end_arg_rel + 1; // Move past length and ELEM_SEP for arg
 
             if pos + length_arg > buffer_slice.len() {
                 return Err(PeekError::Incomplete); // Not enough for argument value
             }
-            let arg_value_slice = &buffer_slice[pos .. pos + length_arg];
+            let arg_value_slice = &buffer_slice[pos..pos + length_arg];
             let arg_str_slice = str::from_utf8(arg_value_slice)?;
             arg_slices_vec.push(arg_str_slice);
             pos += length_arg;
         }
 
         // After parsing opcode and all args, the current `pos` should be at the terminator
-        if pos == buffer_slice.len() { // Buffer ends exactly where terminator should be
+        if pos == buffer_slice.len() {
+            // Buffer ends exactly where terminator should be
             return Err(PeekError::Incomplete); // Missing terminator / instruction abruptly ends
         }
-        
+
         // We have at least one more character at buffer_slice[pos]
         if buffer_slice[pos] == INST_TERM {
             // Correctly terminated instruction
             // Handles "0.;" specifically to ensure opcode is empty and args are empty
             if length_op == 0 && opcode_value_slice.is_empty() && arg_slices_vec.is_empty() {
-                 return Ok(PeekedInstruction {
-                    opcode: "", 
-                    args: SmallVec::new(), 
+                return Ok(PeekedInstruction {
+                    opcode: "",
+                    args: SmallVec::new(),
                     total_length_in_buffer: pos + 1,
                     is_error_opcode: false,
                 });
@@ -269,7 +285,7 @@ impl GuacdParser {
             Ok(PeekedInstruction {
                 opcode: opcode_str_slice,
                 args: arg_slices_vec,
-                total_length_in_buffer: pos + 1, 
+                total_length_in_buffer: pos + 1,
                 is_error_opcode: is_err_op,
             })
         } else {
@@ -285,33 +301,44 @@ impl GuacdParser {
 
     /// Parses a Guacamole instruction content slice (must NOT include the trailing ';')
     /// into an owned `GuacdInstruction` with `String`s.
-    pub fn parse_instruction_content(content_slice: &[u8]) -> Result<GuacdInstruction, GuacdParserError> {
+    pub fn parse_instruction_content(
+        content_slice: &[u8],
+    ) -> Result<GuacdInstruction, GuacdParserError> {
         let mut args_owned = Vec::new();
         let mut pos = 0;
 
-        if content_slice.is_empty() { // Corresponds to "0.;" if the terminator was removed
+        if content_slice.is_empty() {
+            // Corresponds to "0.;" if the terminator was removed
             return Ok(GuacdInstruction::new("".to_string(), vec![]));
         }
-         // "0." is the content of "0.;"
+        // "0." is the content of "0.;"
         if content_slice.len() == 2 && content_slice[0] == b'0' && content_slice[1] == ELEM_SEP {
             return Ok(GuacdInstruction::new("".to_string(), vec![]));
         }
 
-
         // Parse opcode
-        let length_end_op = content_slice[pos..].iter()
+        let length_end_op = content_slice[pos..]
+            .iter()
             .position(|&b| b == ELEM_SEP)
-            .ok_or_else(|| GuacdParserError::InvalidFormat("Malformed opcode: no length delimiter".to_string()))?;
-        
+            .ok_or_else(|| {
+                GuacdParserError::InvalidFormat("Malformed opcode: no length delimiter".to_string())
+            })?;
+
         let length_str_op = str::from_utf8(&content_slice[pos..pos + length_end_op])?;
-        
-        let length_op: usize = length_str_op.parse()
-            .map_err(|e| GuacdParserError::InvalidFormat(format!("Opcode length not an integer: {}. Original: '{}'", e, length_str_op)))?;
+
+        let length_op: usize = length_str_op.parse().map_err(|e| {
+            GuacdParserError::InvalidFormat(format!(
+                "Opcode length not an integer: {}. Original: '{}'",
+                e, length_str_op
+            ))
+        })?;
 
         pos += length_end_op + 1;
 
         if pos + length_op > content_slice.len() {
-            return Err(GuacdParserError::InvalidFormat("Opcode value goes beyond instruction content".to_string()));
+            return Err(GuacdParserError::InvalidFormat(
+                "Opcode value goes beyond instruction content".to_string(),
+            ));
         }
         let opcode_str = str::from_utf8(&content_slice[pos..pos + length_op])?.to_string();
         pos += length_op;
@@ -327,37 +354,54 @@ impl GuacdParser {
             pos += 1; // Skip ARG_SEP
 
             if pos >= content_slice.len() {
-                return Err(GuacdParserError::InvalidFormat("Dangling comma at end of instruction content".to_string()));
+                return Err(GuacdParserError::InvalidFormat(
+                    "Dangling comma at end of instruction content".to_string(),
+                ));
             }
 
-            let length_end_arg = content_slice[pos..].iter()
+            let length_end_arg = content_slice[pos..]
+                .iter()
                 .position(|&b| b == ELEM_SEP)
-                .ok_or_else(|| GuacdParserError::InvalidFormat("Malformed argument: no length delimiter".to_string()))?;
-            
+                .ok_or_else(|| {
+                    GuacdParserError::InvalidFormat(
+                        "Malformed argument: no length delimiter".to_string(),
+                    )
+                })?;
+
             let length_str_arg = str::from_utf8(&content_slice[pos..pos + length_end_arg])?;
 
-            let length_arg: usize = length_str_arg.parse()
-                .map_err(|e| GuacdParserError::InvalidFormat(format!("Argument length not an integer: {}. Original: '{}'", e, length_str_arg)))?;
+            let length_arg: usize = length_str_arg.parse().map_err(|e| {
+                GuacdParserError::InvalidFormat(format!(
+                    "Argument length not an integer: {}. Original: '{}'",
+                    e, length_str_arg
+                ))
+            })?;
 
             pos += length_end_arg + 1;
 
             if pos + length_arg > content_slice.len() {
-                return Err(GuacdParserError::InvalidFormat("Argument value goes beyond instruction content".to_string()));
+                return Err(GuacdParserError::InvalidFormat(
+                    "Argument value goes beyond instruction content".to_string(),
+                ));
             }
             let arg_str = str::from_utf8(&content_slice[pos..pos + length_arg])?.to_string();
             args_owned.push(arg_str);
             pos += length_arg;
         }
-        
+
         Ok(GuacdInstruction::new(opcode_str, args_owned))
     }
 
-
     /// Encode an instruction into Guacamole protocol format using BytesMut.
     pub fn guacd_encode_instruction(instruction: &GuacdInstruction) -> Bytes {
-        let estimated_size = instruction.opcode.len() +
-            instruction.args.iter().map(|arg| arg.len() + 10).sum::<usize>() +
-            instruction.args.len() * 2 + 10; // Approximation for lengths and separators
+        let estimated_size = instruction.opcode.len()
+            + instruction
+                .args
+                .iter()
+                .map(|arg| arg.len() + 10)
+                .sum::<usize>()
+            + instruction.args.len() * 2
+            + 10; // Approximation for lengths and separators
         let mut buffer = BytesMut::with_capacity(estimated_size);
         buffer.put_slice(instruction.opcode.len().to_string().as_bytes());
         buffer.put_u8(ELEM_SEP);
@@ -375,7 +419,9 @@ impl GuacdParser {
     /// Helper for tests or specific cases: decodes a complete raw instruction slice into GuacdInstruction.
     /// The input slice should be a single, complete Guacamole instruction *without* the final semicolon.
     #[cfg(test)]
-    pub(crate) fn guacd_decode_for_test(data_without_terminator: &[u8]) -> Result<GuacdInstruction, GuacdParserError> {
+    pub(crate) fn guacd_decode_for_test(
+        data_without_terminator: &[u8],
+    ) -> Result<GuacdInstruction, GuacdParserError> {
         Self::parse_instruction_content(data_without_terminator)
     }
 
@@ -393,68 +439,68 @@ impl GuacdParser {
         }
 
         let mut pos = 0;
-        
+
         // Parse opcode length
-        let length_end = Self::find_delimiter(&buffer_slice[pos..], ELEM_SEP)
-            .ok_or(PeekError::Incomplete)?;
-        
+        let length_end =
+            Self::find_delimiter(&buffer_slice[pos..], ELEM_SEP).ok_or(PeekError::Incomplete)?;
+
         if pos + length_end >= buffer_slice.len() {
             return Err(PeekError::Incomplete);
         }
-        
+
         let opcode_len = Self::parse_length(&buffer_slice[pos..pos + length_end])
             .map_err(|_| PeekError::InvalidFormat("Invalid opcode length".to_string()))?;
-        
+
         pos += length_end + 1; // Skip past length and '.'
-        
+
         // Check if we have enough bytes for the opcode
         if pos + opcode_len > buffer_slice.len() {
             return Err(PeekError::Incomplete);
         }
-        
+
         // **KEY OPTIMIZATION: Only check if opcode bytes == "error"**
         let opcode_bytes = &buffer_slice[pos..pos + opcode_len];
         let is_error = opcode_bytes == ERROR_OPCODE_BYTES;
-        
+
         pos += opcode_len;
-        
+
         // Skip through arguments without parsing
         while pos < buffer_slice.len() && buffer_slice[pos] == ARG_SEP {
             pos += 1; // Skip ','
-            
+
             if pos >= buffer_slice.len() {
                 return Err(PeekError::Incomplete);
             }
-            
+
             // Find argument length delimiter
             let arg_len_end = Self::find_delimiter(&buffer_slice[pos..], ELEM_SEP)
                 .ok_or(PeekError::Incomplete)?;
-            
+
             if pos + arg_len_end >= buffer_slice.len() {
                 return Err(PeekError::Incomplete);
             }
-            
+
             let arg_len = Self::parse_length(&buffer_slice[pos..pos + arg_len_end])
                 .map_err(|_| PeekError::InvalidFormat("Invalid argument length".to_string()))?;
-            
+
             pos += arg_len_end + 1; // Skip past length and '.'
-            
+
             if pos + arg_len > buffer_slice.len() {
                 return Err(PeekError::Incomplete);
             }
-            
+
             pos += arg_len; // Skip argument value
         }
-        
+
         // Check for terminator
         if pos >= buffer_slice.len() || buffer_slice[pos] != INST_TERM {
             return if pos >= buffer_slice.len() {
                 Err(PeekError::Incomplete)
             } else {
                 Err(PeekError::InvalidFormat("Missing terminator".to_string()))
-            }
+            };
         }
-        
+
         Ok((pos + 1, is_error))
     }
 }

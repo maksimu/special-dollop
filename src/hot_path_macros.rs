@@ -12,7 +12,7 @@ macro_rules! debug_hot_path {
     };
 }
 
-/// Performance-optimized trace macro for hot paths  
+/// Performance-optimized trace macro for hot paths
 /// Only performs tracing work if TRACE level is enabled
 #[macro_export]
 macro_rules! trace_hot_path {
@@ -24,7 +24,7 @@ macro_rules! trace_hot_path {
 }
 
 /// Performance-optimized warn macro for hot paths
-/// Only performs tracing work if WARN level is enabled  
+/// Only performs tracing work if WARN level is enabled
 #[macro_export]
 macro_rules! warn_hot_path {
     ($($arg:tt)*) => {
@@ -43,4 +43,4 @@ macro_rules! info_hot_path {
             tracing::info!($($arg)*);
         }
     };
-} 
+}

@@ -23,4 +23,3 @@ impl From<anyhow::Error> for ChannelError {
         ChannelError::Other(err.to_string())
     }
 }
-

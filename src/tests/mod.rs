@@ -4,16 +4,16 @@ mod channel_tests;
 #[cfg(test)]
 mod common_tests;
 #[cfg(test)]
-mod misc_tests;
-#[cfg(test)]
-mod tube_tests;
-#[cfg(test)]
-mod tube_registry_tests;
-#[cfg(test)]
-mod protocol_tests;
-#[cfg(test)]
-mod webrtc_basic_tests;
+pub mod guacd_handshake_tests;
 #[cfg(test)]
 mod guacd_parser_tests;
 #[cfg(test)]
-pub mod guacd_handshake_tests;
+mod misc_tests;
+#[cfg(test)]
+mod protocol_tests;
+#[cfg(test)]
+mod tube_registry_tests;
+#[cfg(test)]
+mod tube_tests;
+#[cfg(test)]
+mod webrtc_basic_tests;

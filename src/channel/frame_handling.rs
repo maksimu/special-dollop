@@ -1,11 +1,11 @@
 // Frame handling functionality for Channel
 
-use anyhow::{anyhow, Result};
-use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason, CTRL_NO_LEN};
-use tracing::{debug, error};
 use super::core::Channel;
+use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame, CTRL_NO_LEN};
+use crate::{debug_hot_path, warn_hot_path};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use crate::{debug_hot_path, warn_hot_path}; // Import centralized hot path macros
+use tracing::{debug, error}; // Import centralized hot path macros
 
 // Central dispatcher for incoming frames
 // **BOLD WARNING: HOT PATH - CALLED FOR EVERY INCOMING FRAME**
@@ -17,14 +17,14 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
         payload_len = frame.payload.len(),
         "handle_incoming_frame received frame"
     );
-    
+
     if tracing::enabled!(tracing::Level::DEBUG) && frame.payload.len() <= 100 {
         debug!(channel_id = %channel.channel_id, payload = ?frame.payload, "Frame payload");
     } else if tracing::enabled!(tracing::Level::DEBUG) && frame.payload.len() > 100 {
         let first_bytes = &frame.payload[..std::cmp::min(50, frame.payload.len())];
         debug!(channel_id = %channel.channel_id, first_bytes = ?first_bytes, "Large frame first bytes");
     }
-    
+
     match frame.connection_no {
         0 => {
             debug_hot_path!(channel_id = %channel.channel_id, "Handling control frame");
@@ -40,7 +40,7 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
             forward_to_protocol(channel, conn_no, frame.payload).await?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -53,14 +53,14 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
     let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
     let cmd = ControlMessage::try_from(code)?;
     let data_bytes = frame.payload.slice(CTRL_NO_LEN..);
-    
+
     // Log the control message for debugging
     debug_hot_path!(
         channel_id = %channel.channel_id,
         message_type = ?cmd,
         "Processing control message"
     );
-    
+
     // Use the channel's control message handling methods
     match channel.process_control_message(cmd, &data_bytes).await {
         Ok(_) => {
@@ -70,7 +70,7 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
                 "Successfully processed control message"
             );
             Ok(())
-        },
+        }
         Err(e) => {
             error!(
                 channel_id = %channel.channel_id,
@@ -95,7 +95,7 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
         payload_len = payload_len,
         "Forwarding bytes via lock-free channel"
     );
-    
+
     if tracing::enabled!(tracing::Level::DEBUG) && payload_len > 0 && payload_len <= 100 {
         debug!(channel_id = %channel.channel_id, payload = ?payload, "Payload for backend");
     } else if tracing::enabled!(tracing::Level::DEBUG) && payload_len > 100 {
@@ -106,7 +106,10 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     // **COMPLETELY LOCK-FREE**: DashMap provides efficient concurrent access
     let send_result = if let Some(conn_ref) = channel.conns.get(&conn_no) {
         // Send data to the connection's dedicated task (lock-free!)
-        match conn_ref.data_tx.send(crate::models::ConnectionMessage::Data(payload)) {
+        match conn_ref
+            .data_tx
+            .send(crate::models::ConnectionMessage::Data(payload))
+        {
             Ok(_) => {
                 debug_hot_path!(
                     channel_id = %channel.channel_id,
@@ -123,7 +126,10 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
                     conn_no = conn_no,
                     "Backend task is dead, closing connection"
                 );
-                Some(Err(anyhow!("Backend task for connection {} is dead", conn_no)))
+                Some(Err(anyhow!(
+                    "Backend task for connection {} is dead",
+                    conn_no
+                )))
             }
         }
     } else {
@@ -134,13 +140,15 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
         );
         None
     };
-    
+
     // Handle the result after dropping all DashMap references
     match send_result {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => {
             // Now we can safely call close_backend without borrow issues
-            channel.close_backend(conn_no, CloseConnectionReason::ConnectionLost).await?;
+            channel
+                .close_backend(conn_no, CloseConnectionReason::ConnectionLost)
+                .await?;
             Err(e)
         }
         None => Ok(()),

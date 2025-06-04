@@ -1,7 +1,7 @@
 //! Protocol frame and message tests
-use crate::tube_protocol::{ControlMessage, Frame, try_parse_frame};
-use crate::runtime::get_runtime;
 use crate::buffer_pool::BufferPool;
+use crate::runtime::get_runtime;
+use crate::tube_protocol::{try_parse_frame, ControlMessage, Frame};
 
 #[test]
 fn test_protocol_frame_handling() {
@@ -9,13 +9,16 @@ fn test_protocol_frame_handling() {
     runtime.block_on(async {
         // Create a buffer pool for the test
         let pool = BufferPool::default();
-        
+
         // Test ping/pong control message parsing
         let ping_data = vec![0, 0, 0, 42]; // Connection number 42
         let ping_frame = Frame::new_control_with_pool(ControlMessage::Ping, &ping_data, &pool);
 
         // Verify frame construction
-        assert_eq!(ping_frame.connection_no, 0, "Control frames should have connection_no = 0");
+        assert_eq!(
+            ping_frame.connection_no, 0,
+            "Control frames should have connection_no = 0"
+        );
 
         // The control message is stored as an u16 in the payload
         // ControlMessage::Ping has value 1, so the u16 bytes would be [0, 1]
@@ -52,7 +55,7 @@ fn test_frame_parsing() {
     runtime.block_on(async {
         // Create a buffer pool for the test
         let pool = BufferPool::default();
-        
+
         // Test basic frame parsing functionality
         let data_payload = b"Hello, WebRTC!".to_vec();
         let data_frame = Frame::new_data_with_pool(1, &data_payload, &pool);
@@ -67,7 +70,7 @@ fn test_frame_parsing() {
 
         // Test parsing
         let parsed_frame = try_parse_frame(&mut bytes).expect("Should parse valid frame");
-        
+
         // Verify parsed frame matches original
         assert_eq!(parsed_frame.connection_no, data_frame.connection_no);
         assert_eq!(parsed_frame.payload, data_frame.payload);
@@ -80,7 +83,7 @@ fn test_protocol_ping_pong() {
     runtime.block_on(async {
         // Create a buffer pool for the test
         let pool = BufferPool::default();
-        
+
         // Create a ping control message
         let conn_no: u32 = 0; // Control connection
         let ping_data = conn_no.to_be_bytes().to_vec();
@@ -119,15 +122,15 @@ fn test_protocol_ping_pong() {
 
         // Verify pong contains expected data
         assert_eq!(pong_frame.payload.len(), 2 + 4 + 8); // control msg + conn_no + latency
-        
+
         // Test basic frame parsing for pong
         let pong_encoded = pong_frame.encode_with_pool(&pool);
         let mut pong_bytes = bytes::BytesMut::from(&pong_encoded[..]);
         let parsed_pong = try_parse_frame(&mut pong_bytes).expect("Should parse pong frame");
-        
+
         assert_eq!(parsed_pong.connection_no, 0);
         assert_eq!(parsed_pong.payload, pong_frame.payload);
-        
+
         // Note: In our simplified system, we rely on WebRTC native stats
         // instead of custom ConnectionStats tracking
         println!("Frame parsing test completed - custom stats replaced with WebRTC native stats");

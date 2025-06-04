@@ -1,7 +1,7 @@
+use std::fmt;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
-use std::fmt;
 
 #[cfg(feature = "python")]
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
@@ -18,8 +18,14 @@ pub enum InitializeLoggerError {
 impl fmt::Display for InitializeLoggerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InitializeLoggerError::Pyo3LogError(e) => write!(f, "Failed to initialize pyo3-log: {}", e),
-            InitializeLoggerError::SetGlobalDefaultError(e) => write!(f, "Logger already initialized or failed to set global default subscriber: {}", e),
+            InitializeLoggerError::Pyo3LogError(e) => {
+                write!(f, "Failed to initialize pyo3-log: {}", e)
+            }
+            InitializeLoggerError::SetGlobalDefaultError(e) => write!(
+                f,
+                "Logger already initialized or failed to set global default subscriber: {}",
+                e
+            ),
         }
     }
 }
@@ -42,15 +48,14 @@ pub fn initialize_logger(
 ) -> Result<(), InitializeLoggerError> {
     let rust_level = convert_py_level_to_tracing_level(level, verbose.unwrap_or(false));
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if verbose.unwrap_or(false) {
-                // When verbose is true, ensure lifecycle logs are always visible
-                EnvFilter::new(format!("{},lifecycle=trace", rust_level))
-            } else {
-                EnvFilter::new(format!("{}", rust_level))
-            }
-        });
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if verbose.unwrap_or(false) {
+            // When verbose is true, ensure lifecycle logs are always visible
+            EnvFilter::new(format!("{},lifecycle=trace", rust_level))
+        } else {
+            EnvFilter::new(format!("{}", rust_level))
+        }
+    });
 
     // Get the filter's string representation for logging *before* it's consumed
     let filter_str = filter.to_string();
@@ -69,16 +74,14 @@ pub fn initialize_logger(
 
     #[cfg(feature = "python")]
     {
-        pyo3_log::try_init()
-            .map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?;
+        pyo3_log::try_init().map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?;
     }
 
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| {
-            let msg = format!("Logger already initialized or failed to set: {}", e);
-            tracing::debug!("{}", msg);
-            InitializeLoggerError::SetGlobalDefaultError(e.to_string())
-        })?;
+    tracing::subscriber::set_global_default(subscriber).map_err(|e| {
+        let msg = format!("Logger already initialized or failed to set: {}", e);
+        tracing::debug!("{}", msg);
+        InitializeLoggerError::SetGlobalDefaultError(e.to_string())
+    })?;
 
     tracing::info!(
         module_path = module_path!(),
@@ -99,9 +102,9 @@ fn convert_py_level_to_tracing_level(level: i32, verbose: bool) -> Level {
     }
     match level {
         50 | 40 => Level::ERROR, // CRITICAL, ERROR
-        30 => Level::WARN,    // WARNING
-        20 => Level::INFO,    // INFO
-        10 => Level::DEBUG,   // DEBUG
-        _ => Level::TRACE,   // NOTSET or other values
+        30 => Level::WARN,       // WARNING
+        20 => Level::INFO,       // INFO
+        10 => Level::DEBUG,      // DEBUG
+        _ => Level::TRACE,       // NOTSET or other values
     }
 }

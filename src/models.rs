@@ -115,11 +115,10 @@ impl Conn {
             channel_id.clone(),
         ));
 
-        // Create placeholder for the to_webrtc task (would handle Backend → WebRTC in full implementation)
+        // Create placeholder for the to_webrtc task (backend->WebRTC handled by setup_outbound_task)
         let to_webrtc = tokio::spawn(async move {
-            // Placeholder: In full implementation, this would read from backend and send to WebRTC
             debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
-                   "to_webrtc task started (placeholder)");
+                   "to_webrtc task started (backend->WebRTC handled by setup_outbound_task)");
         });
 
         Self {

@@ -4,7 +4,7 @@ use bytes::{Buf, BufMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
-use super::core::{Channel, BUFFER_LOW_THRESHOLD};
+use super::core::Channel;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, CONN_NO_LEN};
 
 // Import from the new connect_as module
@@ -107,10 +107,9 @@ impl Channel {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let active_connections = self.conns.len();
             let connection_list = self.get_connection_ids();
-            let pending_msg_count = self.get_pending_message_count().await;
 
             debug!(target: "protocol_event", channel_id=%self.channel_id,
-                   ?message_type, active_connections, pending_msg_count, ?connection_list,
+                   ?message_type, active_connections, ?connection_list,
                    "Processing control message - Channel stats");
         }
 
@@ -772,91 +771,6 @@ impl Channel {
         } else {
             error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for ConnectionOpened", connection_no);
             return Ok(());
-        }
-
-        // Attempt to send any pending messages for this newly opened connection
-        if let Err(e) = self.send_pending_messages(connection_no).await {
-            error!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, error = %e, "Error sending pending messages after ConnectionOpened");
-            // Depending on desired strictness, you might not want to return an error from handle_connection_opened itself here,
-            // as the connection is open, but sending pending messages failed.
-        }
-
-        Ok(())
-    }
-
-    // Send any pending messages for a given connection
-    async fn send_pending_messages(&mut self, conn_no: u32) -> Result<()> {
-        // **BOLD WARNING: HOT PATH - SENDING QUEUED MESSAGES**
-        // **NO STRING/OBJECT ALLOCATIONS IN THE LOOP**
-        // **MESSAGES ARE ALREADY ENCODED AS Bytes**
-
-        debug!(
-            "Channel({}): Attempting to send pending messages for conn_no {}",
-            self.channel_id, conn_no
-        );
-        let mut pending_guard = self.pending_messages.lock().await;
-
-        if let Some(queue) = pending_guard.get_mut(&conn_no) {
-            if queue.is_empty() {
-                debug!(
-                    "Channel({}): No pending messages for conn_no {}.",
-                    self.channel_id, conn_no
-                );
-                return Ok(());
-            }
-
-            let mut messages_sent_count = 0;
-            // The WebRTCDataChannel already has set_buffered_amount_low_threshold and on_buffered_amount_low callback.
-            // The check here is to proactively avoid over-sending if we are about to send a batch.
-            while let Some(message_bytes_ref) = queue.front() {
-                // Peek at the front message
-                if message_bytes_ref.is_empty() {
-                    queue.pop_front(); // Remove an empty message
-                    continue; // Skip empty messages
-                }
-
-                let message_bytes_cloned = message_bytes_ref.clone();
-
-                let current_buffered_amount = self.webrtc.buffered_amount().await;
-                if current_buffered_amount >= BUFFER_LOW_THRESHOLD {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(
-                            "Channel({}): Buffer amount {} for conn_no {} is high. Pausing sending of pending messages.",
-                            self.channel_id, current_buffered_amount, conn_no
-                        );
-                    }
-                    break; // Stop sending if the buffer is too full
-                }
-
-                match self.webrtc.send(message_bytes_cloned.clone()).await {
-                    // Send the cloned message
-                    Ok(_) => {
-                        messages_sent_count += 1;
-                        queue.pop_front(); // Successfully sent, now remove from the queue
-                    }
-                    Err(e) => {
-                        error!(
-                            "Channel({}): Failed to send pending message for conn_no {}: {}. Message remains at the front of the queue.",
-                            self.channel_id, conn_no, e
-                        );
-                        break;
-                    }
-                }
-            }
-            if messages_sent_count > 0 {
-                debug!(
-                    "Channel({}): Sent {} pending messages for conn_no {}. Remaining in queue: {}",
-                    self.channel_id,
-                    messages_sent_count,
-                    conn_no,
-                    queue.len()
-                );
-            }
-        } else {
-            debug!(
-                "Channel({}): No pending message queue found for conn_no {}.",
-                self.channel_id, conn_no
-            );
         }
 
         Ok(())

@@ -16,7 +16,7 @@ use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
@@ -110,15 +110,11 @@ pub struct Channel {
     pub(crate) connect_as_settings: ConnectAsSettings,
     pub(crate) guacd_params: Arc<Mutex<HashMap<String, String>>>, // Kept for now for minimal diff
 
-    // Pending message queues for each connection
-    pub(crate) pending_messages: Arc<Mutex<HashMap<u32, VecDeque<Bytes>>>>,
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
     // MPSC channel for frames from receive_message to be processed
     frame_input_tx: mpsc::UnboundedSender<Frame>,
     frame_input_rx: Arc<Mutex<mpsc::UnboundedReceiver<Frame>>>,
-    // Trigger for processing pending messages when the buffer is low
-    pub(crate) process_pending_trigger_rx: Arc<Mutex<mpsc::UnboundedReceiver<()>>>,
     // Timestamp for the last channel-level ping sent (conn_no=0)
     pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
 
@@ -137,7 +133,6 @@ pub struct Channel {
 impl Clone for Channel {
     fn clone(&self) -> Self {
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
-        let (_, pending_trigger_rx) = mpsc::unbounded_channel::<()>();
         // For cloned Channel instances, conn_closed_tx can be a new sender,
         // but conn_closed_rx should be None as run() consumes the original.
         let cloned_conn_closed_tx = mpsc::unbounded_channel::<(u32, String)>().0;
@@ -173,11 +168,9 @@ impl Clone for Channel {
             connect_as_settings: self.connect_as_settings.clone(),
             guacd_params: Arc::clone(&self.guacd_params),
 
-            pending_messages: Arc::clone(&self.pending_messages),
             buffer_pool: self.buffer_pool.clone(),
             frame_input_tx: self.frame_input_tx.clone(),
             frame_input_rx: Arc::clone(&self.frame_input_rx),
-            process_pending_trigger_rx: Arc::new(Mutex::new(pending_trigger_rx)),
             channel_ping_sent_time: Mutex::new(None), // Initialize for clone
             conn_closed_tx: cloned_conn_closed_tx, // Cloned instance gets a new sender (though likely unused if the clone isn't run)
             conn_closed_rx: None, // Cloned instance does not get the original receiver
@@ -216,7 +209,6 @@ impl Channel {
 
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
         let (f_input_tx, f_input_rx) = mpsc::unbounded_channel::<Frame>();
-        let (pending_tx, pending_rx) = mpsc::unbounded_channel::<()>();
         let (conn_closed_tx, conn_closed_rx) = mpsc::unbounded_channel::<(u32, String)>();
 
         webrtc.set_buffered_amount_low_threshold(BUFFER_LOW_THRESHOLD);
@@ -227,9 +219,6 @@ impl Channel {
             resize_on_return: true,
         };
         let buffer_pool = BufferPool::new(buffer_pool_config);
-
-        let pending_messages: Arc<Mutex<HashMap<u32, VecDeque<Bytes>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
 
         let network_checker = parse_network_rules_from_settings(&protocol_settings);
 
@@ -477,22 +466,6 @@ impl Channel {
             warn!(target: "channel_setup", channel_id = %channel_id, "'connect_as_settings' key not found in protocol_settings. Using default.");
         }
 
-        let channel_id_clone = channel_id.clone();
-        let process_pending_trigger_tx_clone = pending_tx.clone();
-
-        webrtc.on_buffered_amount_low(Some(Box::new(move || {
-            let ep_name_cb = channel_id_clone.clone();
-            let trigger_tx = process_pending_trigger_tx_clone.clone();
-            tokio::spawn(async move {
-               if tracing::enabled!(tracing::Level::DEBUG) {
-                   debug!(target: "channel_flow", channel_id = %ep_name_cb, "Buffer amount is now below threshold, signaling to process pending messages");
-               }
-               if let Err(e) = trigger_tx.send(()) {
-                    error!(target: "channel_flow", channel_id = %ep_name_cb, error = %e, "Failed to send pending process trigger");
-               }
-            });
-        })));
-
         let new_channel = Self {
             webrtc,
             conns: Arc::new(DashMap::new()),
@@ -520,11 +493,9 @@ impl Channel {
             connect_as_settings: final_connect_as_settings,
             guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
 
-            pending_messages,
             buffer_pool,
             frame_input_tx: f_input_tx,
             frame_input_rx: Arc::new(Mutex::new(f_input_rx)),
-            process_pending_trigger_rx: Arc::new(Mutex::new(pending_rx)),
             channel_ping_sent_time: Mutex::new(None),
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
@@ -616,7 +587,6 @@ impl Channel {
 
                             // Process pending messages might be triggered by buffer low,
                             // but also good to try after receiving new data if not recently triggered.
-                            self.process_pending_messages().await?;
                         }
                         Ok(None) => {
                             info!(target: "channel_lifecycle", channel_id = %self.channel_id, "WebRTC data channel closed or sender dropped.");
@@ -625,23 +595,6 @@ impl Channel {
                         Err(_) => { // Timeout on rx_from_dc.recv()
                             handle_ping_timeout(&mut self).await?;
                         }
-                    }
-                }
-
-                // Listen for trigger to a process pending messages
-                trigger = async {
-                    let mut guard = self.process_pending_trigger_rx.lock().await;
-                    guard.recv().await
-                } => {
-                    if trigger.is_some() {
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                            debug!(target: "channel_flow", channel_id = %self.channel_id, "Trigger received to process pending messages.");
-                        }
-                        self.process_pending_messages().await?;
-                    } else {
-                        // Trigger channel closed, maybe log or break.
-                        info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Process pending trigger channel closed.");
-                        // Depending on desired behavior, you might want to break the loop.
                     }
                 }
 
@@ -694,119 +647,6 @@ impl Channel {
         self.log_final_stats().await;
 
         self.cleanup_all_connections().await?;
-        Ok(())
-    }
-
-    // New method to process pending messages for all connections with better prioritization
-    // **BOLD WARNING: HOT PATH - PROCESSES QUEUED MESSAGES**
-    // **AVOID UNNECESSARY CLONES AND ALLOCATIONS**
-    pub(crate) async fn process_pending_messages(&mut self) -> Result<()> {
-        let mut pending_guard = self.pending_messages.lock().await;
-        if pending_guard.iter().all(|(_, queue)| queue.is_empty()) {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages in any queue.");
-            }
-            return Ok(());
-        }
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "channel_flow", channel_id = %self.channel_id, num_connections_with_pending = pending_guard.len(), "process_pending_messages: Starting.");
-
-            for (conn_no, queue) in pending_guard.iter() {
-                if !queue.is_empty() {
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, queue_size = queue.len(), "process_pending_messages: Connection has pending messages.");
-                }
-            }
-        }
-
-        let max_to_process = 100;
-        let mut total_processed = 0;
-        let total_messages: usize = pending_guard.values().map(|q| q.len()).sum();
-        if total_messages > 0 && tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "channel_flow", channel_id = %self.channel_id, total_pending_messages = total_messages, "process_pending_messages: Total pending messages across all connections.");
-        }
-        let conn_nos: Vec<u32> = pending_guard
-            .keys()
-            .filter(|&conn_no| !pending_guard[conn_no].is_empty())
-            .copied()
-            .collect();
-        let mut current_index = 0;
-        let buffer_threshold = BUFFER_LOW_THRESHOLD;
-
-        while total_processed < max_to_process && !conn_nos.is_empty() {
-            if conn_nos.is_empty() {
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: conn_nos became empty, breaking.");
-                }
-                break;
-            }
-            let conn_index = current_index % conn_nos.len();
-            let conn_no = conn_nos[conn_index];
-
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Attempting to process queue for connection.");
-            }
-
-            if let Some(queue) = pending_guard.get_mut(&conn_no) {
-                if queue.is_empty() {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue is now empty for connection, skipping.");
-                    }
-                    current_index += 1;
-                    continue;
-                }
-
-                // **PERFORMANCE: Pop the message directly instead of cloning**
-                let message_to_send = match queue.pop_front() {
-                    Some(msg) => msg,
-                    None => {
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                            debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Queue was empty after checking, skipping.");
-                        }
-                        current_index += 1;
-                        continue;
-                    }
-                };
-
-                let current_buffered_amount_before_send = self.webrtc.buffered_amount().await;
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, message_size = message_to_send.len(), buffered_amount_before_send = current_buffered_amount_before_send, "process_pending_messages: Sending message from queue.");
-                }
-
-                if let Err(e) = self.webrtc.send(message_to_send).await {
-                    error!(target: "channel_flow", channel_id = %self.channel_id, conn_no, error = %e, "process_pending_messages: Failed to send queued message for connection. Breaking loop.");
-                    break;
-                }
-
-                total_processed += 1;
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, conn_no, total_processed_in_loop = total_processed, remaining_in_queue = queue.len(), "process_pending_messages: Successfully sent message, already popped from queue.");
-                }
-
-                if total_processed % 10 == 0 {
-                    let current_buffer_after_batch = self.webrtc.buffered_amount().await;
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, current_buffered_amount = current_buffer_after_batch, "process_pending_messages: Checking buffer threshold mid-batch.");
-                    }
-                    if current_buffer_after_batch >= buffer_threshold {
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                            debug!(target: "channel_flow", channel_id = %self.channel_id, total_processed_in_batch = total_processed, "process_pending_messages: Buffer threshold reached during processing, pausing.");
-                        }
-                        break;
-                    }
-                }
-            } else {
-                warn!(target: "channel_flow", channel_id = %self.channel_id, conn_no, "process_pending_messages: Connection not found in pending_messages during processing. This should not happen.");
-            }
-            current_index += 1;
-        }
-
-        if total_processed > 0 {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "channel_flow", channel_id = %self.channel_id, processed_in_batch = total_processed, "process_pending_messages: Finished batch.");
-            }
-        } else if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "channel_flow", channel_id = %self.channel_id, "process_pending_messages: No messages processed in this batch.");
-        }
         Ok(())
     }
 
@@ -881,11 +721,10 @@ impl Channel {
     ) -> Result<()> {
         let total_connections = self.conns.len();
         let remaining_connections = self.get_connection_ids_except(conn_no);
-        let pending_msg_count = self.get_pending_message_count().await;
 
         info!(target: "connection_lifecycle",
               channel_id = %self.channel_id, conn_no, ?reason,
-              total_connections, pending_msg_count, ?remaining_connections,
+              total_connections, ?remaining_connections,
               "Closing connection - Connection summary");
 
         let mut buffer = self.buffer_pool.acquire();
@@ -913,12 +752,6 @@ impl Channel {
                     debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed connection and tasks");
                 }
             }
-
-            // Remove from pending_messages
-            {
-                let mut pending_guard = self.pending_messages.lock().await;
-                pending_guard.remove(&conn_no);
-            }
         } else {
             // Delayed removal - signal shutdown but keep in map briefly for pending messages
             if let Some(conn_ref) = self.conns.get(&conn_no) {
@@ -931,7 +764,6 @@ impl Channel {
 
             // Schedule delayed cleanup
             let conns_arc = Arc::clone(&self.conns);
-            let pending_messages_arc = Arc::clone(&self.pending_messages);
             let channel_id_clone = self.channel_id.clone();
 
             // Spawn a task to remove the connection after a grace period
@@ -941,7 +773,7 @@ impl Channel {
 
                 debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
 
-                // Now remove from both maps
+                // Now remove from maps
                 if let Some((_, conn)) = conns_arc.remove(&conn_no) {
                     // Shutdown the connection gracefully
                     if let Err(e) = conn.shutdown().await {
@@ -950,7 +782,6 @@ impl Channel {
                         debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed connection after grace period");
                     }
                 }
-                pending_messages_arc.lock().await.remove(&conn_no);
             });
         }
 
@@ -1003,12 +834,6 @@ impl Channel {
         }
 
         Ok(())
-    }
-
-    /// Get the total number of pending messages across all connections
-    pub(crate) async fn get_pending_message_count(&self) -> usize {
-        let pending_guard = self.pending_messages.lock().await;
-        pending_guard.values().map(|queue| queue.len()).sum()
     }
 
     /// Get a list of all active connection IDs
@@ -1065,15 +890,14 @@ impl Channel {
         // Log comprehensive connection summary on channel close
         let total_connections = self.conns.len();
         let connection_ids = self.get_connection_ids();
-        let pending_msg_count = self.get_pending_message_count().await;
         let buffered_amount = self.webrtc.buffered_amount().await;
 
         info!(target: "channel_summary",
               channel_id=%self.channel_id, total_connections, ?connection_ids,
-              server_mode=self.server_mode, pending_msg_count, buffered_amount,
+              server_mode=self.server_mode, buffered_amount,
               ?self.active_protocol,
-              "Channel '{}' closing - Final stats: {} connections: {:?}, {} pending messages, {} bytes buffered",
-              self.channel_id, total_connections, connection_ids, pending_msg_count, buffered_amount);
+              "Channel '{}' closing - Final stats: {} connections: {:?}, {} bytes buffered",
+              self.channel_id, total_connections, connection_ids, buffered_amount);
 
         // Note: Full WebRTC native stats (bytes sent/received, round-trip time,
         // packet loss, bandwidth usage, connection quality, etc.) are available

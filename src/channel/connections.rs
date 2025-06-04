@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tracing::{debug, error, info, trace, warn}; // Import centralized hot path macros
+use tracing::{debug, error, info, trace, warn};
 
 use super::core::Channel;
 
@@ -81,7 +81,6 @@ pub async fn setup_outbound_task(
     let dc = channel.webrtc.clone();
     let channel_id_for_task = channel.channel_id.clone();
     let conn_closed_tx_for_task = channel.conn_closed_tx.clone(); // Clone the sender for the task
-    let pending_messages = channel.pending_messages.clone();
     let buffer_pool = channel.buffer_pool.clone();
     let buffer_low_threshold = super::core::BUFFER_LOW_THRESHOLD;
     let is_channel_server_mode = channel.server_mode;
@@ -185,67 +184,73 @@ pub async fn setup_outbound_task(
 
         // Clone Arcs for the helper function
         let dc_clone_for_helper = dc.clone(); // dc is Arc<WebRTCDataChannel>
-        let pending_messages_clone_for_helper = pending_messages.clone(); // pending_messages is Arc<Mutex<...>>
 
-        // Define an async helper function for sending or queueing a frame
-        // It returns Ok(()) if the operation was successful (sent or queued),
-        // and Err(()) if a direct send failed, indicating the connection should be closed.
+        // Define an async helper function for reliable sending with backpressure
+        // Pauses and retries when buffer is full - NEVER drops messages
         #[allow(clippy::too_many_arguments)]
-        async fn try_send_or_queue_frame(
+        async fn send_with_backpressure(
             frame_to_send: bytes::Bytes,
             conn_no_local: u32,
             data_channel: &crate::webrtc_data_channel::WebRTCDataChannel,
-            pending_messages_local: &Arc<
-                Mutex<HashMap<u32, std::collections::VecDeque<bytes::Bytes>>>,
-            >,
             buffer_low_threshold_local: u64,
             channel_id_local: &str,
-            active_protocol_local: ActiveProtocol,
             context_msg: &str,
         ) -> Result<(), ()> {
-            let buffered_amount = data_channel.buffered_amount().await;
-            if buffered_amount >= buffer_low_threshold_local {
-                if tracing::enabled!(tracing::Level::DEBUG) {
+            const MAX_BACKPRESSURE_RETRIES: u32 = 100;
+            const BACKPRESSURE_DELAY_MS: u64 = 10;
+
+            for retry_count in 0..MAX_BACKPRESSURE_RETRIES {
+                let buffered_amount = data_channel.buffered_amount().await;
+
+                // If buffer has space, send immediately
+                if buffered_amount < buffer_low_threshold_local {
+                    match data_channel.send(frame_to_send).await {
+                        Ok(_) => {
+                            trace_hot_path!(
+                                channel_id = %channel_id_local,
+                                conn_no = conn_no_local,
+                                context = context_msg,
+                                retry_count = retry_count,
+                                "Reliable send successful"
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            error!(
+                                channel_id = %channel_id_local,
+                                conn_no = conn_no_local,
+                                context = context_msg,
+                                error = %e,
+                                "Send failed (connection error)"
+                            );
+                            return Err(());
+                        }
+                    }
+                }
+
+                // Buffer is full - apply backpressure by waiting
+                if retry_count == 0 {
                     debug!(
                         channel_id = %channel_id_local,
                         buffered_amount = buffered_amount,
                         conn_no = conn_no_local,
-                        active_protocol = ?active_protocol_local,
-                        message_size = frame_to_send.len(),
                         context = context_msg,
-                        "Buffer high, queueing message"
+                        "Buffer full, applying backpressure (will retry)"
                     );
                 }
-                let mut pending_guard = pending_messages_local.lock().await;
-                if let Some(queue) = pending_guard.get_mut(&conn_no_local) {
-                    queue.push_back(frame_to_send);
-                }
-                Ok(())
-            } else {
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(
-                        channel_id = %channel_id_local,
-                        buffered_amount = buffered_amount,
-                        conn_no = conn_no_local,
-                        active_protocol = ?active_protocol_local,
-                        message_size = frame_to_send.len(),
-                        context = context_msg,
-                        "Buffer low, sending directly"
-                    );
-                }
-                if let Err(e) = data_channel.send(frame_to_send).await {
-                    error!(
-                        channel_id = %channel_id_local,
-                        conn_no = conn_no_local,
-                        context = context_msg,
-                        error = %e,
-                        "Failed to send message"
-                    );
-                    Err(())
-                } else {
-                    Ok(())
-                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(BACKPRESSURE_DELAY_MS)).await;
             }
+
+            // If we exhausted retries, the connection might be stalled
+            warn!(
+                channel_id = %channel_id_local,
+                conn_no = conn_no_local,
+                context = context_msg,
+                max_retries = MAX_BACKPRESSURE_RETRIES,
+                "Max backpressure retries reached - connection may be stalled"
+            );
+            Err(())
         }
 
         // Original task logic starts here
@@ -479,14 +484,12 @@ pub async fn setup_outbound_task(
                                                     );
                                                 let batch_frame_bytes =
                                                     encode_buffer.split_to(bytes_written).freeze();
-                                                if try_send_or_queue_frame(
+                                                if send_with_backpressure(
                                                     batch_frame_bytes,
                                                     conn_no,
                                                     &dc_clone_for_helper,
-                                                    &pending_messages_clone_for_helper,
                                                     buffer_low_threshold,
                                                     &channel_id_for_task,
-                                                    active_protocol,
                                                     "(pre-large) batch",
                                                 )
                                                 .await
@@ -509,14 +512,12 @@ pub async fn setup_outbound_task(
                                             );
                                             let large_frame_bytes =
                                                 encode_buffer.split_to(bytes_written).freeze();
-                                            if try_send_or_queue_frame(
+                                            if send_with_backpressure(
                                                 large_frame_bytes,
                                                 conn_no,
                                                 &dc_clone_for_helper,
-                                                &pending_messages_clone_for_helper,
                                                 buffer_low_threshold,
                                                 &channel_id_for_task,
-                                                active_protocol,
                                                 "large instruction",
                                             )
                                             .await
@@ -540,14 +541,12 @@ pub async fn setup_outbound_task(
                                                     );
                                                 let batch_frame_bytes =
                                                     encode_buffer.split_to(bytes_written).freeze();
-                                                if try_send_or_queue_frame(
+                                                if send_with_backpressure(
                                                     batch_frame_bytes,
                                                     conn_no,
                                                     &dc_clone_for_helper,
-                                                    &pending_messages_clone_for_helper,
                                                     buffer_low_threshold,
                                                     &channel_id_for_task,
-                                                    active_protocol,
                                                     "batch",
                                                 )
                                                 .await
@@ -611,14 +610,12 @@ pub async fn setup_outbound_task(
                                 );
                                 let final_batch_frame_bytes =
                                     encode_buffer.split_to(bytes_written).freeze();
-                                if try_send_or_queue_frame(
+                                if send_with_backpressure(
                                     final_batch_frame_bytes,
                                     conn_no,
                                     &dc_clone_for_helper,
-                                    &pending_messages_clone_for_helper,
                                     buffer_low_threshold,
                                     &channel_id_for_task,
-                                    active_protocol,
                                     "final batch",
                                 )
                                 .await
@@ -666,43 +663,24 @@ pub async fn setup_outbound_task(
                             "PortForward/SOCKS5 POST-ENCODE"
                         );
 
-                        // **PERFORMANCE: Send directly without intermediate storage**
-                        let buffered_amount = dc.buffered_amount().await;
-                        if buffered_amount >= buffer_low_threshold {
-                            if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!(
-                                    channel_id = %channel_id_for_task,
-                                    buffered_amount = buffered_amount,
-                                    conn_no = conn_no,
-                                    active_protocol = ?active_protocol,
-                                    message_size = encoded_frame_bytes.len(),
-                                    "Buffer high, queueing message"
-                                );
-                            }
-                            let mut pending_guard = pending_messages.lock().await;
-                            if let Some(queue) = pending_guard.get_mut(&conn_no) {
-                                queue.push_back(encoded_frame_bytes);
-                            }
-                        } else {
-                            if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!(
-                                    channel_id = %channel_id_for_task,
-                                    buffered_amount = buffered_amount,
-                                    conn_no = conn_no,
-                                    active_protocol = ?active_protocol,
-                                    message_size = encoded_frame_bytes.len(),
-                                    "Buffer low, sending directly"
-                                );
-                            }
-                            if let Err(e) = dc.send(encoded_frame_bytes).await {
-                                error!(
-                                    channel_id = %channel_id_for_task,
-                                    conn_no = conn_no,
-                                    error = %e,
-                                    "Failed to send data for connection"
-                                );
-                                close_conn_and_break = true;
-                            }
+                        // **PERFORMANCE: Send with reliable backpressure instead of dropping**
+                        if send_with_backpressure(
+                            encoded_frame_bytes,
+                            conn_no,
+                            &dc_clone_for_helper,
+                            buffer_low_threshold,
+                            &channel_id_for_task,
+                            "PortForward/SOCKS5 data",
+                        )
+                        .await
+                        .is_err()
+                        {
+                            error!(
+                                channel_id = %channel_id_for_task,
+                                conn_no = conn_no,
+                                "Failed to send PortForward/SOCKS5 data with backpressure - closing connection"
+                            );
+                            close_conn_and_break = true;
                         }
                     }
 
@@ -724,9 +702,6 @@ pub async fn setup_outbound_task(
         if let Some(batch_buffer) = guacd_batch_buffer {
             buffer_pool.release(batch_buffer);
         }
-
-        let mut pending_guard = pending_messages.lock().await;
-        pending_guard.remove(&conn_no);
 
         // Signal that this connection task has exited
         if let Err(e) = conn_closed_tx_for_task.send((conn_no, channel_id_for_task.clone())) {

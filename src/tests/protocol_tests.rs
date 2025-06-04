@@ -1,6 +1,5 @@
 //! Protocol frame and message tests
-use crate::models::ConnectionStats;
-use crate::tube_protocol::{ControlMessage, Frame, now_ms, try_parse_frame};
+use crate::tube_protocol::{ControlMessage, Frame, try_parse_frame};
 use crate::runtime::get_runtime;
 use crate::buffer_pool::BufferPool;
 
@@ -48,47 +47,30 @@ fn test_protocol_frame_handling() {
 }
 
 #[test]
-fn test_latency_tracking() {
+fn test_frame_parsing() {
     let runtime = get_runtime();
     runtime.block_on(async {
-        // Create connection stats and verify functionality
-        let mut stats = ConnectionStats::default();
+        // Create a buffer pool for the test
+        let pool = BufferPool::default();
+        
+        // Test basic frame parsing functionality
+        let data_payload = b"Hello, WebRTC!".to_vec();
+        let data_frame = Frame::new_data_with_pool(1, &data_payload, &pool);
 
-        // Verify default values
-        assert_eq!(stats.receive_size, 0);
-        assert_eq!(stats.transfer_size, 0);
-        assert_eq!(stats.receive_latency_sum, 0);
-        assert_eq!(stats.receive_latency_count, 0);
-        assert_eq!(stats.transfer_latency_sum, 0);
-        assert_eq!(stats.transfer_latency_count, 0);
-        assert_eq!(stats.ping_time, None);
-        assert_eq!(stats.message_counter, 0);
+        // Verify frame construction
+        assert_eq!(data_frame.connection_no, 1);
+        assert_eq!(data_frame.payload, data_payload);
 
-        // Test latency tracking
-        let now = now_ms();
+        // Test encoding
+        let encoded = data_frame.encode_with_pool(&pool);
+        let mut bytes = bytes::BytesMut::from(&encoded[..]);
 
-        // Simulate a ping sent 100 ms ago
-        stats.ping_time = Some(now - 100);
-
-        // Record some receive latency
-        stats.receive_latency_sum += 40;
-        stats.receive_latency_count += 1;
-
-        // Calculate ping-pong latency
-        let ping_time = stats.ping_time.unwrap();
-        let latency = now.saturating_sub(ping_time);
-
-        // Calculate transfer latency (total latency minus receive latency)
-        let receive_latency_avg = stats.receive_latency_sum / stats.receive_latency_count;
-        let transfer_latency = latency.saturating_sub(receive_latency_avg);
-
-        stats.transfer_latency_sum += transfer_latency;
-        stats.transfer_latency_count += 1;
-
-        // Verify values
-        assert_eq!(stats.receive_latency_avg(), 40);
-        assert!(stats.transfer_latency_avg() > 0);
-        assert!(stats.transfer_latency_avg() < 100);
+        // Test parsing
+        let parsed_frame = try_parse_frame(&mut bytes).expect("Should parse valid frame");
+        
+        // Verify parsed frame matches original
+        assert_eq!(parsed_frame.connection_no, data_frame.connection_no);
+        assert_eq!(parsed_frame.payload, data_frame.payload);
     });
 }
 
@@ -101,7 +83,6 @@ fn test_protocol_ping_pong() {
         
         // Create a ping control message
         let conn_no: u32 = 0; // Control connection
-        let timestamp = now_ms();
         let ping_data = conn_no.to_be_bytes().to_vec();
 
         // Create a ping frame
@@ -136,29 +117,19 @@ fn test_protocol_ping_pong() {
         assert_eq!(pong_frame.payload[0], 0);
         assert_eq!(pong_frame.payload[1], ControlMessage::Pong as u8);
 
-        // Create empty connection stats
-        let mut stats = ConnectionStats::default();
-        stats.ping_time = Some(timestamp);
-
-        // Update stats with pong response
-        if pong_frame.payload.len() >= 12 { // 2 bytes for the control message + 4 bytes for conn_no + 8 bytes for u64 latency
-            let receive_latency_bytes: [u8; 8] = pong_frame.payload[6..14].try_into().unwrap();
-            let receive_latency = u64::from_be_bytes(receive_latency_bytes);
-
-            stats.receive_latency_sum += receive_latency;
-            stats.receive_latency_count += 1;
-        }
-
-        // Verify stats were updated correctly
-        assert_eq!(stats.receive_latency_count, 1);
-        assert_eq!(stats.receive_latency_sum, receive_latency);
-
-        // Test average calculation methods
-        assert_eq!(stats.receive_latency_avg(), receive_latency);
-
-        // Create a new stats object with zero counts to test edge cases
-        let empty_stats = ConnectionStats::default();
-        assert_eq!(empty_stats.receive_latency_avg(), 0);
-        assert_eq!(empty_stats.transfer_latency_avg(), 0);
+        // Verify pong contains expected data
+        assert_eq!(pong_frame.payload.len(), 2 + 4 + 8); // control msg + conn_no + latency
+        
+        // Test basic frame parsing for pong
+        let pong_encoded = pong_frame.encode_with_pool(&pool);
+        let mut pong_bytes = bytes::BytesMut::from(&pong_encoded[..]);
+        let parsed_pong = try_parse_frame(&mut pong_bytes).expect("Should parse pong frame");
+        
+        assert_eq!(parsed_pong.connection_no, 0);
+        assert_eq!(parsed_pong.payload, pong_frame.payload);
+        
+        // Note: In our simplified system, we rely on WebRTC native stats
+        // instead of custom ConnectionStats tracking
+        println!("Frame parsing test completed - custom stats replaced with WebRTC native stats");
     });
 }

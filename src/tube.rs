@@ -251,16 +251,16 @@ impl Tube {
                 let label_clone_for_run = rtc_data_channel_label.clone();
                 let runtime_for_run = get_runtime(); 
                 let tube_id_for_log = tube.id.clone();
-                // Clone the tube and peer_connection Arc to move into the spawned task
-                let tube_for_callbacks = Arc::new(tube.clone());
+                // Clone references for spawned task - avoid double Arc wrapping
+                let tube_arc = Arc::new(tube.clone()); // Single Arc wrapping
                 let peer_connection_for_signal = Arc::clone(&tube.peer_connection);
 
                 info!(tube_id = %tube.id, channel_label = %label_clone_for_run, "on_data_channel: Spawning channel.run() task.");
                 runtime_for_run.spawn(async move {
                     debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task started.");
                     
-                    // Send connection_open callback when channel starts running
-                    if let Err(e) = tube_for_callbacks.send_connection_open_callback(&label_clone_for_run).await {
+                    // Send connection_open callback when a channel starts running
+                    if let Err(e) = tube_arc.send_connection_open_callback(&label_clone_for_run).await {
                         warn!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send connection_open callback: {}", e);
                     }
                     
@@ -283,12 +283,15 @@ impl Tube {
                     }
                     
                     // Send connection_close callback when channel finishes
-                    if let Err(e) = tube_for_callbacks.send_connection_close_callback(&label_clone_for_run).await {
+                    if let Err(e) = tube_arc.send_connection_close_callback(&label_clone_for_run).await {
                         warn!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send connection_close callback: {}", e);
                     }
                     
                     // Deregister the channel from the tube
-                    tube_for_callbacks.deregister_channel(&label_clone_for_run).await;
+                    tube_arc.deregister_channel(&label_clone_for_run).await;
+                    
+                    // Remove shutdown signal for this channel
+                    tube_arc.remove_channel_shutdown_signal(&label_clone_for_run).await;
                     
                     // Always send a signal when channel.run() finishes, regardless of reason.
                     let pc_guard = peer_connection_for_signal.lock().await;
@@ -317,9 +320,7 @@ impl Tube {
                         warn!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Peer_connection was None, cannot send channel_closed signal (from on_data_channel).");
                     }
 
-                    debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task finished.");
-                    // Optionally, after the run finishes, remove its shutdown signal from the map.
-                    // Requires cloning tube.channel_shutdown_signals Arc into the task.
+                    debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task finished and cleaned up.");
                 });
                 
                 info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Successfully set up and spawned channel task.");
@@ -619,13 +620,13 @@ impl Tube {
         let peer_connection_for_spawn = Arc::clone(&self.peer_connection); // Clone peer_connection
 
         info!(tube_id = %self.id, channel_name = %name_clone, "create_channel: Spawning channel.run() task.");
-        let tube_for_callbacks = Arc::new(self.clone());
+        let tube_arc = Arc::new(self.clone()); // Single Arc wrapping for callbacks
         runtime_clone.spawn(async move {
             // Use the cloned tube_id_for_spawn which is 'static
             debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task started.");
             
-            // Send connection_open callback when channel starts running
-            if let Err(e) = tube_for_callbacks.send_connection_open_callback(&name_clone).await {
+            // Send connection_open callback when a channel starts running
+            if let Err(e) = tube_arc.send_connection_open_callback(&name_clone).await {
                 warn!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send connection_open callback: {}", e);
             }
             
@@ -648,12 +649,15 @@ impl Tube {
             }
             
             // Send connection_close callback when channel finishes
-            if let Err(e) = tube_for_callbacks.send_connection_close_callback(&name_clone).await {
+            if let Err(e) = tube_arc.send_connection_close_callback(&name_clone).await {
                 warn!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send connection_close callback: {}", e);
             }
             
             // Deregister the channel from the tube
-            tube_for_callbacks.deregister_channel(&name_clone).await;
+            tube_arc.deregister_channel(&name_clone).await;
+            
+            // Remove shutdown signal for this channel
+            tube_arc.remove_channel_shutdown_signal(&name_clone).await;
             
             // Always send a signal when channel.run() finishes, regardless of reason.
             let pc_guard = peer_connection_for_spawn.lock().await;
@@ -682,10 +686,7 @@ impl Tube {
                 warn!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Peer_connection was None, cannot send channel_closed signal.");
             }
             
-            debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task finished.");
-            // TODO: after run finishes (normally or due to error), remove its shutdown signal from the map
-            //  This requires Tube to be passed or its shutdown_signals map Arc to be cloned into the task.
-            //  For now, manual removal via close_channel is the main path.
+            debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task finished and cleaned up.");
         });
         info!(tube_id = %self.id, channel_name = %name, actual_listening_port = ?actual_listening_port, "create_channel: Successfully set up and spawned channel task. Returning listening port.");
         Ok(actual_listening_port)
@@ -918,6 +919,16 @@ impl Tube {
             info!(tube_id = %self.id, channel_name = %channel_name, "Deregistered channel from tube");
         } else {
             warn!(tube_id = %self.id, channel_name = %channel_name, "Attempted to deregister channel that wasn't registered");
+        }
+    }
+
+    // Remove shutdown signal for a channel
+    pub async fn remove_channel_shutdown_signal(&self, channel_name: &str) {
+        let mut signals_guard = self.channel_shutdown_signals.write().await;
+        if signals_guard.remove(channel_name).is_some() {
+            debug!(tube_id = %self.id, channel_name = %channel_name, "Removed shutdown signal for channel");
+        } else {
+            debug!(tube_id = %self.id, channel_name = %channel_name, "No shutdown signal found to remove for channel");
         }
     }
 

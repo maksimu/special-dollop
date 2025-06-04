@@ -104,6 +104,45 @@ pub struct WebRTCPeerConnection {
 }
 
 impl WebRTCPeerConnection {
+    // Helper function to validate signaling state transitions
+    fn validate_signaling_state_transition(
+        current_state: webrtc::peer_connection::signaling_state::RTCSignalingState,
+        is_answer: bool,
+        is_local: bool,
+    ) -> Result<(), String> {
+        let operation = match (is_local, is_answer) {
+            (true, true) => "local answer",
+            (true, false) => "local offer", 
+            (false, true) => "remote answer",
+            (false, false) => "remote offer",
+        };
+        
+        let valid_transition = match (current_state, is_local, is_answer) {
+            // Local descriptions
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer, true, true) => true,  // Local answer after remote offer
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer, true, false) => false, // Local offer after local offer (invalid)
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, true, false) => true,          // Local offer from stable
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, true, true) => false,          // Local answer from stable (invalid)
+            
+            // Remote descriptions  
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer, false, true) => true,  // Remote answer after local offer
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer, false, false) => false, // Remote offer after remote offer (invalid)
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, false, false) => true,         // Remote offer from stable
+            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, false, true) => false,         // Remote answer from stable (invalid)
+            
+            _ => true, // Allow other transitions
+        };
+        
+        if !valid_transition {
+            return Err(format!(
+                "Invalid signaling state transition from {:?} applying {}", 
+                current_state, operation
+            ));
+        }
+        
+        Ok(())
+    }
+    
     pub async fn new(
         config: Option<RTCConfiguration>, 
         trickle_ice: bool, 
@@ -521,19 +560,8 @@ impl WebRTCPeerConnection {
         let current_state = self.peer_connection.signaling_state();
         debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before set_remote_description");
         
-        // Validate that the signaling state transition is valid
-        let valid_transition = match (current_state, is_answer) {
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer, true) => true,
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer, false) => false, // Invalid transition
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, false) => true,
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, true) => false, // Invalid transition
-            _ => true, // Allow other transitions
-        };
-        
-        if !valid_transition {
-            return Err(format!("Invalid proposed signaling state transition from {:?} applying {}", 
-                        current_state, if is_answer { "local answer" } else { "local offer" }));
-        }
+        // Validate the signaling state transition
+        Self::validate_signaling_state_transition(current_state, is_answer, false)?;
 
         // Set the remote description
         self.peer_connection
@@ -645,19 +673,8 @@ impl WebRTCPeerConnection {
         let current_state = self.peer_connection.signaling_state();
         debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before set_local_description");
         
-        // Validate that the signaling state transition is valid
-        let valid_transition = match (current_state, is_answer) {
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer, true) => true,
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::HaveLocalOffer, false) => false, // Invalid transition
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, false) => true,
-            (webrtc::peer_connection::signaling_state::RTCSignalingState::Stable, true) => false, // Invalid transition
-            _ => true, // Allow other transitions
-        };
-        
-        if !valid_transition {
-            return Err(format!("Invalid proposed signaling state transition from {:?} applying {}", 
-                        current_state, if is_answer { "local answer" } else { "local offer" }));
-        }
+        // Validate the signaling state transition
+        Self::validate_signaling_state_transition(current_state, is_answer, true)?;
 
         // Set the local description
         self.peer_connection

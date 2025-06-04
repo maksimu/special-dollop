@@ -9,9 +9,10 @@ use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use dashmap::DashMap;
 pub(crate) use crate::error::ChannelError;
 use crate::tube_protocol::{Frame, ControlMessage, CloseConnectionReason, try_parse_frame};
-use crate::models::{Conn, TunnelTimeouts, NetworkAccessChecker, StreamHalf, ConnectionStats, is_guacd_session, ConversationType};
+use crate::models::{Conn, TunnelTimeouts, NetworkAccessChecker, StreamHalf, is_guacd_session, ConversationType};
 use crate::runtime::get_runtime;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
@@ -77,7 +78,7 @@ pub struct ConnectAsSettings {
 /// Channel instance. Owns the data‑channel and a map of active back‑end TCP streams.
 pub struct Channel {
     pub(crate) webrtc: WebRTCDataChannel,
-    pub(crate) conns: Arc<Mutex<HashMap<u32, Conn>>>,
+    pub(crate) conns: Arc<DashMap<u32, Conn>>,
     pub(crate) next_conn_no: u32,
     pub(crate) rx_from_dc: mpsc::UnboundedReceiver<Bytes>,
     pub(crate) channel_id: String,
@@ -140,7 +141,7 @@ impl Clone for Channel {
         
         Self {
             webrtc: self.webrtc.clone(),
-            conns: Arc::clone(&self.conns),
+            conns: Arc::new(DashMap::new()), // New empty DashMap for clone
             next_conn_no: self.next_conn_no,
             // Each clone gets a new rx_from_dc; this is problematic if the original is consumed.
             // Channel instances are typically Arc<Mutex<Channel>>, and cloning that Arc is preferred.
@@ -316,23 +317,9 @@ impl Channel {
                                                 });
                                             
                                             // If not found, check the guacd field for tunnel connections
-                                            if dest_host.is_none() || dest_port.is_none() {
-                                                if let Some(guacd_obj) = protocol_settings.get("guacd").and_then(|v| v.as_object()) {
-                                                    if dest_host.is_none() {
-                                                        dest_host = guacd_obj.get("guacd_host")
-                                                            .and_then(|v| v.as_str())
-                                                            .map(|s| s.trim().to_string()); // Trim whitespace
-                                                    }
-                                                    if dest_port.is_none() {
-                                                        dest_port = guacd_obj.get("guacd_port")
-                                                            .and_then(|v| v.as_u64())
-                                                            .map(|p| p as u16);
-                                                    }
-                                                    debug!(target:"channel_setup", channel_id = %channel_id, 
-                                                           "Extracted target from guacd field: host={:?}, port={:?}", 
-                                                           dest_host, dest_port);
-                                                }
-                                            }
+                                            (dest_host, dest_port) = Self::extract_host_port_from_guacd(
+                                                &protocol_settings, dest_host, dest_port, &channel_id, "tunnel connections"
+                                            );
                                             
                                             initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState {
                                                 target_host: dest_host,
@@ -356,23 +343,9 @@ impl Channel {
                                         let mut dest_port = protocol_settings.get("target_port").and_then(|v| v.as_u64()).map(|p| p as u16);
                                         
                                         // If not found, check the guacd field
-                                        if dest_host.is_none() || dest_port.is_none() {
-                                            if let Some(guacd_obj) = protocol_settings.get("guacd").and_then(|v| v.as_object()) {
-                                                if dest_host.is_none() {
-                                                    dest_host = guacd_obj.get("guacd_host")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.trim().to_string()); // Trim whitespace
-                                                }
-                                                if dest_port.is_none() {
-                                                    dest_port = guacd_obj.get("guacd_port")
-                                                        .and_then(|v| v.as_u64())
-                                                        .map(|p| p as u16);
-                                                }
-                                                debug!(target:"channel_setup", channel_id = %channel_id, 
-                                                       "Extracted target from guacd field (default case): host={:?}, port={:?}", 
-                                                       dest_host, dest_port);
-                                            }
-                                        }
+                                        (dest_host, dest_port) = Self::extract_host_port_from_guacd(
+                                            &protocol_settings, dest_host, dest_port, &channel_id, "default case"
+                                        );
                                         
                                         initial_protocol_state = ProtocolLogicState::PortForward(ChannelPortForwardState {
                                             target_host: dest_host,
@@ -435,7 +408,7 @@ impl Channel {
         
         let new_channel = Self {
             webrtc,
-            conns: Arc::new(Mutex::new(HashMap::new())),
+            conns: Arc::new(DashMap::new()),
             next_conn_no: 1,
             rx_from_dc,
             channel_id,
@@ -521,15 +494,16 @@ impl Channel {
                             writer,
                         };
                             
-                        // Create a connection
-                        let conn = Conn {
-                            backend: Box::new(stream_half),
-                            to_webrtc: task,
-                            stats: ConnectionStats::default(),
-                        };
+                        // Create a lock-free connection with a dedicated backend task
+                        let conn = Conn::new_with_backend(
+                            Box::new(stream_half),
+                            task,
+                            conn_no,
+                            self.channel_id.clone(),
+                        ).await;
                             
-                        // Store in our registry
-                        self.conns.lock().await.insert(conn_no, conn);
+                        // Store in our lock-free registry
+                        self.conns.insert(conn_no, conn);
                     } else {
                         // server_conn_rx was dropped or closed
                         server_conn_rx = None; // Prevent further polling of this arm
@@ -567,7 +541,7 @@ impl Channel {
                     }
                 }
 
-                // Listen for trigger to process pending messages
+                // Listen for trigger to a process pending messages
                 trigger = async {
                     let mut guard = self.process_pending_trigger_rx.lock().await;
                     guard.recv().await
@@ -629,6 +603,9 @@ impl Channel {
             }
         }
 
+        // Log final stats before cleanup
+        self.log_final_stats().await;
+        
         self.cleanup_all_connections().await?;
         Ok(())
     }
@@ -753,7 +730,8 @@ impl Channel {
             }
         }
 
-        let conn_keys: Vec<u32> = self.conns.lock().await.keys().copied().collect();
+        // Collect connection numbers from DashMap
+        let conn_keys = self.get_connection_ids();
         for conn_no in conn_keys {
             if conn_no != 0 {
                 self.close_backend(conn_no, CloseConnectionReason::Normal).await?;
@@ -795,27 +773,16 @@ impl Channel {
         self.webrtc.send(encoded).await.map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
-    // 
-    // // Method to handle received message bytes from a data channel
-    // pub async fn receive_message(&mut self, bytes: Bytes) -> Result<()> {
-    //     let mut buffer = self.buffer_pool.acquire();
-    //     buffer.clear();
-    //     buffer.extend_from_slice(&bytes);
-    //     
-    //     while let Some(frame) = try_parse_frame(&mut buffer) {
-    //         debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Processing frame from message");
-    //         
-    //         if let Err(e) = handle_incoming_frame(self, frame).await {
-    //             error!(target: "channel_flow", channel_id = %self.channel_id, error = %e, "Error handling frame from message processing");
-    //         }
-    //     }
-    //     
-    //     self.buffer_pool.release(buffer);
-    //     Ok(())
-    // }
 
     pub(crate) async fn close_backend(&mut self, conn_no: u32, reason: CloseConnectionReason) -> Result<()> {
-        info!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, ?reason, "Closing connection");
+        let total_connections = self.conns.len();
+        let remaining_connections = self.get_connection_ids_except(conn_no);
+        let pending_msg_count = self.get_pending_message_count().await;
+        
+        info!(target: "connection_lifecycle", 
+              channel_id = %self.channel_id, conn_no, ?reason, 
+              total_connections, pending_msg_count, ?remaining_connections,
+              "Closing connection - Connection summary");
 
         let mut buffer = self.buffer_pool.acquire();
         buffer.clear();
@@ -831,30 +798,28 @@ impl Channel {
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
         if !should_delay_removal {
-            // Immediate removal
-            if let Some(mut conn) = self.conns.lock().await.remove(&conn_no) {
-                let _ = crate::models::AsyncReadWrite::shutdown(&mut conn.backend).await;
-                conn.to_webrtc.abort();
-                match tokio::time::timeout(self.timeouts.close_connection, conn.to_webrtc).await {
-                    Ok(_) => debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed backend task for connection"),
-                    Err(_) => warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Timeout waiting for backend task to close for connection"),
+            // Immediate removal using DashMap
+            if let Some((_, conn)) = self.conns.remove(&conn_no) {
+                // Shutdown the connection gracefully (closes channels and waits for tasks)
+                if let Err(e) = conn.shutdown().await {
+                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Error during connection shutdown");
+                } else {
+                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed connection and tasks");
                 }
             }
 
-            // Correctly remove from pending_messages
+            // Remove from pending_messages
             {
                 let mut pending_guard = self.pending_messages.lock().await;
                 pending_guard.remove(&conn_no);
             }
         } else {
-            // Delayed removal - shutdown the connection but keep it in the map briefly
-            {
-                let mut conns_guard = self.conns.lock().await;
-                if let Some(conn) = conns_guard.get_mut(&conn_no) {
-                    // Shutdown the backend connection
-                    let _ = crate::models::AsyncReadWrite::shutdown(&mut conn.backend).await;
-                    // Abort the to_webrtc task
-                    conn.to_webrtc.abort();
+            // Delayed removal - signal shutdown but keep in map briefly for pending messages
+            if let Some(conn_ref) = self.conns.get(&conn_no) {
+                // Signal the connection to close its data channel
+                // (dropping the sender will cause the backend task to exit)
+                if !conn_ref.data_tx.is_closed() {
+                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Signaling connection to close data channel");
                 }
             }
 
@@ -862,7 +827,6 @@ impl Channel {
             let conns_arc = Arc::clone(&self.conns);
             let pending_messages_arc = Arc::clone(&self.pending_messages);
             let channel_id_clone = self.channel_id.clone();
-            let close_timeout = self.timeouts.close_connection;
             
             // Spawn a task to remove the connection after a grace period
             tokio::spawn(async move {
@@ -872,11 +836,12 @@ impl Channel {
                 debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
                 
                 // Now remove from both maps
-                if let Some(conn) = conns_arc.lock().await.remove(&conn_no) {
-                    // Wait for the task to finish
-                    match tokio::time::timeout(close_timeout, conn.to_webrtc).await {
-                        Ok(_) => debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed backend task after grace period"),
-                        Err(_) => warn!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Timeout waiting for backend task after grace period"),
+                if let Some((_, conn)) = conns_arc.remove(&conn_no) {
+                    // Shutdown the connection gracefully
+                    if let Err(e) = conn.shutdown().await {
+                        warn!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, error = %e, "Error during delayed connection shutdown");
+                    } else {
+                        debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed connection after grace period");
                     }
                 }
                 pending_messages_arc.lock().await.remove(&conn_no);
@@ -891,19 +856,110 @@ impl Channel {
 
     pub(crate) async fn internal_handle_connection_close(&mut self, conn_no: u32, reason: CloseConnectionReason) -> Result<()> {
         debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, ?reason, "internal_handle_connection_close");
-        match self.active_protocol {
-            ActiveProtocol::Socks5 => {
-                // TODO: SOCKS5 specific close logic
-            }
-            ActiveProtocol::Guacd => {
-                // TODO: GuacD specific close logic
-            }
-            ActiveProtocol::PortForward => {
-                // TODO: PortForward specific close logic (if any beyond TCP stream closure)
+        
+        // If this is the control connection (conn_no 0) or we're shutting down due to an error,
+        // and we're in server mode, stop the server to prevent new connections
+        if self.server_mode && (conn_no == 0 || matches!(reason, CloseConnectionReason::UpstreamClosed | CloseConnectionReason::Error)) {
+            if self.local_client_server_task.is_some() {
+                debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Stopping server due to critical connection closure");
+                if let Err(e) = self.stop_server().await {
+                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, error = %e, "Failed to stop server during connection close");
+                }
             }
         }
-        // Common logic for all protocols after specific handling
+
+        match self.active_protocol {
+            ActiveProtocol::Socks5 => {
+                // SOCKS5 connections are stateless after handshake, no special cleanup needed
+            }
+            ActiveProtocol::Guacd => {
+                // Check if this was the primary data connection
+                if let Some(primary_conn_no) = *self.primary_guacd_conn_no.lock().await {
+                    if primary_conn_no == conn_no {
+                        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Primary GuacD data connection closed, clearing reference");
+                        *self.primary_guacd_conn_no.lock().await = None;
+                    }
+                }
+            }
+            ActiveProtocol::PortForward => {
+                // Port forwarding connections are just TCP streams, no special cleanup needed
+            }
+        }
+        
         Ok(())
+    }
+
+    /// Get the total number of pending messages across all connections
+    pub(crate) async fn get_pending_message_count(&self) -> usize {
+        let pending_guard = self.pending_messages.lock().await;
+        pending_guard.values().map(|queue| queue.len()).sum()
+    }
+
+    /// Get a list of all active connection IDs
+    pub(crate) fn get_connection_ids(&self) -> Vec<u32> {
+        Self::extract_connection_ids(&self.conns)
+    }
+
+    /// Get a list of all active connection IDs except the specified one
+    pub(crate) fn get_connection_ids_except(&self, exclude_conn_no: u32) -> Vec<u32> {
+        self.conns.iter()
+            .map(|entry| *entry.key())
+            .filter(|&id| id != exclude_conn_no)
+            .collect()
+    }
+
+    /// Static helper to extract connection IDs from any DashMap reference
+    fn extract_connection_ids(conns: &DashMap<u32, Conn>) -> Vec<u32> {
+        conns.iter().map(|entry| *entry.key()).collect()
+    }
+
+    /// Helper to extract host/port from guacd settings if not already set
+    fn extract_host_port_from_guacd(
+        protocol_settings: &HashMap<String, JsonValue>,
+        mut dest_host: Option<String>,
+        mut dest_port: Option<u16>,
+        channel_id: &str,
+        context: &str,
+    ) -> (Option<String>, Option<u16>) {
+        if dest_host.is_none() || dest_port.is_none() {
+            if let Some(guacd_obj) = protocol_settings.get("guacd").and_then(|v| v.as_object()) {
+                if dest_host.is_none() {
+                    dest_host = guacd_obj.get("guacd_host")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string()); // Trim whitespace
+                }
+                if dest_port.is_none() {
+                    dest_port = guacd_obj.get("guacd_port")
+                        .and_then(|v| v.as_u64())
+                        .map(|p| p as u16);
+                }
+                debug!(target:"channel_setup", channel_id = %channel_id, 
+                       "Extracted target from guacd field ({}): host={:?}, port={:?}", 
+                       context, dest_host, dest_port);
+            }
+        }
+        (dest_host, dest_port)
+    }
+
+    /// Log comprehensive WebRTC statistics when a channel closes
+    pub async fn log_final_stats(&mut self) {
+        // Log comprehensive connection summary on channel close
+        let total_connections = self.conns.len();
+        let connection_ids = self.get_connection_ids();
+        let pending_msg_count = self.get_pending_message_count().await;
+        let buffered_amount = self.webrtc.buffered_amount().await;
+        
+        info!(target: "channel_summary", 
+              channel_id=%self.channel_id, total_connections, ?connection_ids, 
+              server_mode=self.server_mode, pending_msg_count, buffered_amount, 
+              ?self.active_protocol,
+              "Channel '{}' closing - Final stats: {} connections: {:?}, {} pending messages, {} bytes buffered", 
+              self.channel_id, total_connections, connection_ids, pending_msg_count, buffered_amount);
+              
+        // Note: Full WebRTC native stats (bytes sent/received, round-trip time, 
+        // packet loss, bandwidth usage, connection quality, etc.) are available 
+        // via peer_connection.get_stats() API in browser context.
+        // These provide much more detailed metrics than our previous custom tracking.
     }
 }
 
@@ -922,9 +978,12 @@ impl Drop for Channel {
         let buffer_pool_clone = self.buffer_pool.clone();
 
         runtime.spawn(async move {
-            let conn_keys: Vec<u32> = conns_clone.lock().await.keys().copied().collect();
+            // Collect connection numbers from DashMap
+            let conn_keys = Self::extract_connection_ids(&conns_clone);
             for conn_no in conn_keys {
                 if conn_no == 0 { continue; }
+                
+                // Send close frame to remote peer
                 let mut close_buffer = buffer_pool_clone.acquire();
                 close_buffer.clear();
                 close_buffer.extend_from_slice(&conn_no.to_be_bytes());
@@ -936,8 +995,15 @@ impl Drop for Channel {
                     warn!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error sending close frame in drop for connection");
                 }
                 buffer_pool_clone.release(close_buffer);
+                
+                // Shutdown the connection gracefully
+                if let Some((_, conn)) = conns_clone.remove(&conn_no) {
+                    if let Err(e) = conn.shutdown().await {
+                        debug!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error shutting down connection in drop");
+                    }
+                }
             }
-            info!(target: "channel_lifecycle", channel_id = %channel_id, "Basic resource cleanup initiated in drop for Channel");
+            info!(target: "channel_lifecycle", channel_id = %channel_id, "Lock-free resource cleanup completed in drop for Channel");
         });
     }
 }

@@ -194,18 +194,6 @@ impl PyTubeRegistry {
         })
     }
     
-    /// Get all Connection IDs for a tube
-    fn all_connection_ids(&self, py: Python<'_>, tube_id: &str) -> Vec<String> {
-        let master_runtime = get_runtime();
-        let tube_id_owned = tube_id.to_string();
-        py.allow_threads(|| {
-            master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                registry.conversation_ids_by_tube_id(&tube_id_owned).into_iter().cloned().collect()
-            })
-        })
-    }
-    
     /// Get all Conversation IDs by Tube ID
     fn get_conversation_ids_by_tube_id(&self, py: Python<'_>, tube_id: &str) -> Vec<String> {
         let master_runtime = get_runtime();
@@ -497,7 +485,7 @@ impl PyTubeRegistry {
                     tube.close_channel(&connection_id_owned).await
                         .map_err(|e| PyRuntimeError::new_err(format!("Rust: Failed to close connection {} on tube {}: {}", connection_id_owned, tube_id_owned, e)))
                 } else {
-                    // Tube isn't found, perhaps already closed. Consider if this should be an error or a warning.
+                    // The Tube isn't found, perhaps already closed. Consider if this should be an error or a warning.
                     // For now, mirroring the PyRuntimeError pattern for consistency if an action was expected.
                     // However, if closing a non-existent connection is acceptable, Ok(()) might be better here.
                     // Let's make it an error if the tube itself isn't found, as an action was requested on it.

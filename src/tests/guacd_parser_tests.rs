@@ -278,11 +278,11 @@ fn test_guacd_parser_missing_terminators() {
     let mut buffer = BytesMut::new();
 
     // Case 1: Data is simply too short and doesn't form a full instruction value even if a terminator were present
-    buffer.extend_from_slice(b"14.test,1.inval"); // Declares opcode "test" (4) + arg "inval" (1). Total content "test,1.inval" (13 chars)
-                                              // Declared length 14 for "test", but "test" is 4. This is malformed from the start.
-                                              // The parser should see "14.test" - length 14 for "test".
+    buffer.extend_from_slice(b"14.test,1.inval"); // declares opcode "test" (4) + arg "inval" (1). total content "test,1.inval" (13 chars)
+                                              // declared length 14 for "test", but "test" is 4. This is malformed from the start.
+                                              // the parser should see "14.test" - length 14 for "test".
                                               // "test" is only 4 chars.
-                                              // This should be InvalidFormat("Opcode value goes beyond instruction content") if it were "14.test;",
+                                              // this should be InvalidFormat("Opcode value goes beyond instruction content") if it were "14.test;",
                                               // but since it's just "14.test,1.inval", it's Incomplete.
     
     // Let's use a clearer initial test for incomplete due to missing terminator for a valid prefix
@@ -746,7 +746,7 @@ fn test_parser_handles_data_chunks_correctly_with_peek() { // Renamed
     // After consuming cmd1, cmd2a is still incomplete in the remaining part of the buffer
     assert_eq!(GuacdParser::peek_instruction(current_view), Err(PeekError::Incomplete));
     
-    // Now, modify buffer directly for next part, assuming `current_view` was tracking progress
+    // Now, modify buffer directly for the next part, assuming `current_view` was tracking progress
     // This test needs to manage its buffer carefully.
     // Let's re-construct the buffer for the next stage to be clear.
     let mut buffer_stage2 = BytesMut::from(current_view); // Contains "5.cmd2a"
@@ -977,10 +977,10 @@ fn test_peek_instruction_only_terminator() {
 // Added test: Malformed opcode (no length delimiter)
 #[test]
 fn test_peek_instruction_malformed_opcode_no_len_delim() {
-    let data: &[u8] = b"opcode;"; // Missing "L."
-    // Expect InvalidFormat because no "L." found before a character that isn't ';'.
-    // If it were "opcode" (no ';'), it would be Incomplete.
-    // "opcode;" -> finds no '.', then sees ';', so it's malformed opcode before the instruction end.
+    let data: &[u8] = b"opcode;"; // missing "L."
+    // expect InvalidFormat because no "L." found before a character that isn't ';'.
+    // if it were "opcode" (no, ';'), it would be Incomplete.
+    // "opcode;" -> finds no '.', then sees ';', so it's malformed opcode before the instruction ends.
     match GuacdParser::peek_instruction(data) {
         Err(PeekError::InvalidFormat(msg)) => {
             assert!(msg.contains("Malformed opcode: no length delimiter"));
@@ -1029,13 +1029,13 @@ fn test_peek_instruction_arg_len_not_utf8() {
 // Added test: Arg value goes beyond content
 #[test]
 fn test_peek_instruction_arg_val_overflow() {
-    let data: &[u8] = b"2.op,10.arg;"; // Arg length 10, "arg" is 3. Buffer contains terminator.
-    // Opcode "op": pos=4
+    let data: &[u8] = b"2.op,10.arg;"; // arg length 10, "arg" is 3. Buffer contains terminator.
+    // opcode "op": pos=4
     // Arg: pos=5 (after ',')
     // length_str_arg="10", length_arg=10. pos becomes 5+2+1 = 8 (start of "arg")
     // Check: pos + length_arg > buffer_slice.len()
     // 8 + 10 > len("2.op,10.arg;") (12)  => 18 > 12. True.
-    // Returns Incomplete.
+    // returns Incomplete.
     assert_eq!(GuacdParser::peek_instruction(data), Err(PeekError::Incomplete));
 }
 
@@ -1043,12 +1043,12 @@ fn test_peek_instruction_arg_val_overflow() {
 #[test]
 fn test_peek_instruction_dangling_comma() {
     let data: &[u8] = b"2.op,;";
-    // Opcode "op": pos=4
+    // opcode "op": pos=4
     // Arg loop: pos=5 (after ',')
     // initial_pos_for_arg_len = 5. buffer_slice[5..] is ";".
     // .position(|&b| b == ELEM_SEP) on ";" is None.
     // ok_or_else: buffer_slice[5..].iter().any(|&b| b==INST_TERM) is true.
-    // Returns InvalidFormat("Malformed argument: no length delimiter before instruction end.")
+    // returns InvalidFormat("Malformed argument: no length delimiter before instruction end.")
     match GuacdParser::peek_instruction(data) {
         Err(PeekError::InvalidFormat(msg)) => {
             assert!(msg.contains("Malformed argument: no length delimiter"));

@@ -15,7 +15,7 @@ use crate::tube_registry::{SignalMessage, TubeRegistry};
 use tracing_subscriber::{EnvFilter};
 
 // Helper to create a default tube for testing
-// This helper will create a tube that is NOT automatically added to the global REGISTRY
+// This helper will create a tube NOT automatically added to the global REGISTRY
 // as tests should manage their own registry instances.
 fn new_test_tube_without_registry_add() -> Result<Arc<Tube>> {
     let id = uuid::Uuid::new_v4().to_string();

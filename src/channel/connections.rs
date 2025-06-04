@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::models::{Conn, ConnectionStats, StreamHalf};
+use crate::models::{Conn, StreamHalf};
 use crate::tube_protocol::{Frame, ControlMessage};
 use crate::channel::types::ActiveProtocol;
 use crate::channel::guacd_parser::{GuacdInstruction, GuacdParser, PeekError};
@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use bytes::{Buf, BufMut, BytesMut};
+use crate::trace_hot_path; // Import centralized hot path macros
 
 use super::core::Channel;
 
@@ -27,7 +28,7 @@ pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr,
     );
 
     // Check if the connection already exists
-    if channel.conns.lock().await.contains_key(&conn_no) {
+    if channel.conns.contains_key(&conn_no) {
         warn!("Endpoint {}: Connection {} already exists", channel.channel_id, conn_no);
         return Ok(());
     }
@@ -47,9 +48,13 @@ pub async fn open_backend(channel: &mut Channel, conn_no: u32, addr: SocketAddr,
 
     // Connect to the backend
     let stream = TcpStream::connect(addr).await?;
-    trace!( 
-        "Channel({}): conn_no {}: PRE-CALL to setup_outbound_task for backend address {}. ActiveProtocol: {:?}, Channel ServerMode: {}",
-        channel.channel_id, conn_no, addr, active_protocol, channel.server_mode
+    trace_hot_path!(
+        channel_id = %channel.channel_id,
+        conn_no = conn_no,
+        backend_addr = %addr,
+        active_protocol = ?active_protocol,
+        server_mode = channel.server_mode,
+        "PRE-CALL to setup_outbound_task"
     );
     setup_outbound_task(channel, conn_no, stream, active_protocol).await?;
 
@@ -68,12 +73,12 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
     let buffer_low_threshold = super::core::BUFFER_LOW_THRESHOLD;
     let is_channel_server_mode = channel.server_mode; 
 
-    trace!( 
-        "Channel({}): conn_no {}: ENTERING setup_outbound_task function. ActiveProtocol: {:?}, Captured ServerMode: {}",
-        channel_id_for_task, 
-        conn_no,
-        active_protocol,
-        is_channel_server_mode 
+    trace_hot_path!(
+        channel_id = %channel_id_for_task,
+        conn_no = conn_no,
+        active_protocol = ?active_protocol,
+        server_mode = is_channel_server_mode,
+        "ENTERING setup_outbound_task function"
     );
 
     if active_protocol == ActiveProtocol::Guacd {
@@ -97,30 +102,32 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             }
             Ok(Err(e)) => {
                 error!("Channel({}): Guacd handshake failed for conn_no {}: {}", channel_id_clone, conn_no, e);
-                let close_payload = conn_no.to_be_bytes();
-                let mut temp_control_payload_buf = buffer_pool.acquire(); // Use task's buffer_pool
-                temp_control_payload_buf.clear();
-                temp_control_payload_buf.extend_from_slice(&close_payload);
+                // Reuse a single buffer for both operations to avoid acquire/release cycles
+                let mut reusable_control_buf = buffer_pool.acquire();
+                reusable_control_buf.clear();
+                reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
-                    &mut temp_control_payload_buf
+                    &mut reusable_control_buf
                 );
-                buffer_pool.release(temp_control_payload_buf);
-                let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use the task's dc and buffer_pool
+                let encoded_frame = close_frame.encode_with_pool(&buffer_pool);
+                buffer_pool.release(reusable_control_buf);
+                let _ = dc.send(encoded_frame).await;
                 return Err(e);
             }
             Err(_) => { 
                 error!("Channel({}): Guacd handshake timed out for conn_no {}", channel_id_clone, conn_no);
-                let close_payload = conn_no.to_be_bytes();
-                let mut temp_control_payload_buf = buffer_pool.acquire(); // Use task's buffer_pool
-                temp_control_payload_buf.clear();
-                temp_control_payload_buf.extend_from_slice(&close_payload);
+                // Reuse a single buffer for both operations to avoid acquire/release cycles
+                let mut reusable_control_buf = buffer_pool.acquire();
+                reusable_control_buf.clear();
+                reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
-                    &mut temp_control_payload_buf
+                    &mut reusable_control_buf
                 );
-                buffer_pool.release(temp_control_payload_buf);
-                let _ = dc.send(close_frame.encode_with_pool(&buffer_pool)).await; // Use the task's dc and buffer_pool
+                let encoded_frame = close_frame.encode_with_pool(&buffer_pool);
+                buffer_pool.release(reusable_control_buf);
+                let _ = dc.send(encoded_frame).await;
                 return Err(anyhow::anyhow!("Guacd handshake timed out"));
             }
         }
@@ -128,19 +135,22 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
 
     let channel_id_for_log_after_spawn = channel.channel_id.clone(); 
 
-    trace!(
-        "Channel({}): conn_no {}: PRE-SPAWN (outer scope) in setup_outbound_task. ActiveProtocol: {:?}, is_channel_server_mode_for_this_task: {}",
-        channel.channel_id, 
-        conn_no,
-        active_protocol,
-        is_channel_server_mode 
+    trace_hot_path!(
+        channel_id = %channel.channel_id,
+        conn_no = conn_no,
+        active_protocol = ?active_protocol,
+        server_mode = is_channel_server_mode,
+        "PRE-SPAWN (outer scope) in setup_outbound_task"
     );
 
     let outbound_handle = tokio::spawn(async move {
         // This is the very first log inside the spawned task
-        trace!( 
-            "Channel({}): conn_no {}: setup_outbound_task TASK SPAWNED. ActiveProtocol: {:?}, is_channel_server_mode_in_task: {}",
-            channel_id_for_task, conn_no, active_protocol, is_channel_server_mode
+        trace_hot_path!(
+            channel_id = %channel_id_for_task,
+            conn_no = conn_no,
+            active_protocol = ?active_protocol,
+            server_mode = is_channel_server_mode,
+            "setup_outbound_task TASK SPAWNED"
         );
         
         // Clone Arcs for the helper function
@@ -164,8 +174,13 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             if buffered_amount >= buffer_low_threshold_local {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(
-                        "Endpoint {}: Buffer amount high ({} bytes), QUEUEING {} for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
-                        channel_id_local, buffered_amount, context_msg, conn_no_local, channel_id_local, active_protocol_local, frame_to_send.len()
+                        channel_id = %channel_id_local,
+                        buffered_amount = buffered_amount,
+                        conn_no = conn_no_local,
+                        active_protocol = ?active_protocol_local,
+                        message_size = frame_to_send.len(),
+                        context = context_msg,
+                        "Buffer high, queueing message"
                     );
                 }
                 let mut pending_guard = pending_messages_local.lock().await;
@@ -176,14 +191,22 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             } else {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(
-                        "Endpoint {}: Buffer amount low ({} bytes), SENDING DIRECTLY {} for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
-                        channel_id_local, buffered_amount, context_msg, conn_no_local, channel_id_local, active_protocol_local, frame_to_send.len()
+                        channel_id = %channel_id_local,
+                        buffered_amount = buffered_amount,
+                        conn_no = conn_no_local,
+                        active_protocol = ?active_protocol_local,
+                        message_size = frame_to_send.len(),
+                        context = context_msg,
+                        "Buffer low, sending directly"
                     );
                 }
                 if let Err(e) = data_channel.send(frame_to_send).await {
                     error!(
-                        "Endpoint {}: Failed to send {} for connection {}: {}",
-                        channel_id_local, context_msg, conn_no_local, e
+                        channel_id = %channel_id_local,
+                        conn_no = conn_no_local,
+                        context = context_msg,
+                        error = %e,
+                        "Failed to send message"
                     );
                     Err(())
                 } else {
@@ -193,9 +216,10 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         }
         
         // Original task logic starts here
-        trace!( 
-            "Channel({}): conn_no {}: setup_outbound_task ORIGINAL LOGIC START.",
-            channel_id_for_task, conn_no
+        trace_hot_path!(
+            channel_id = %channel_id_for_task,
+            conn_no = conn_no,
+            "setup_outbound_task ORIGINAL LOGIC START"
         );
 
         let mut reader = backend_reader;
@@ -208,7 +232,7 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         const GUACD_BATCH_SIZE: usize = 16 * 1024; // Batch up to 16KB of Guacd instructions
         const LARGE_INSTRUCTION_THRESHOLD: usize = MAX_READ_SIZE; // If a single instruction is this big, send it directly
 
-        // **BOLD WARNING: HOT PATH - NO STRING/OBJECT ALLOCATIONS ALLOWED IN MAIN LOOP**
+        // **BOLD WARNING: HOT PATH - NO STRING/OBJECT ALLOCATIONS ALLOWED IN THE MAIN LOOP**
         // **USE BUFFER POOL FOR ALL ALLOCATIONS**
         let mut temp_read_buffer = buffer_pool.acquire();
         if active_protocol != ActiveProtocol::Guacd {
@@ -225,9 +249,10 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             None
         };
 
-        trace!( 
-            "Channel({}): conn_no {}: setup_outbound_task BEFORE main loop.",
-            channel_id_for_task, conn_no
+        trace_hot_path!(
+            channel_id = %channel_id_for_task,
+            conn_no = conn_no,
+            "setup_outbound_task BEFORE main loop"
         );
         
         // **BOLD WARNING: ENTERING HOT PATH - BACKEND→WEBRTC MAIN LOOP**
@@ -235,12 +260,13 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         // **USE BORROWED DATA, BUFFER POOLS, AND ZERO-COPY TECHNIQUES**
         loop { 
             loop_iterations += 1;
-            if tracing::enabled!(tracing::Level::TRACE) {
-                trace!( 
-                    "Channel({}): conn_no {}: setup_outbound_task loop iteration {}, main_read_buffer.len(): {}",
-                    channel_id_for_task, conn_no, loop_iterations, main_read_buffer.len()
-                );
-            }
+            trace_hot_path!(
+                channel_id = %channel_id_for_task,
+                conn_no = conn_no,
+                loop_iteration = loop_iterations,
+                buffer_len = main_read_buffer.len(),
+                "setup_outbound_task loop iteration"
+            );
 
             if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE / 2 { 
                  main_read_buffer.reserve(MAX_READ_SIZE);
@@ -255,12 +281,12 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                 }
             }
             
-            if tracing::enabled!(tracing::Level::TRACE) {
-                trace!( 
-                    "Channel({}): conn_no {}: setup_outbound_task PRE-READ from backend (active_protocol: {:?})",
-                    channel_id_for_task, conn_no, active_protocol
-                );
-            }
+            trace_hot_path!(
+                channel_id = %channel_id_for_task,
+                conn_no = conn_no,
+                active_protocol = ?active_protocol,
+                "setup_outbound_task PRE-READ from backend"
+            );
             
             // **ZERO-COPY READ: Use buffer pool buffer directly**
             // For Guacd, read directly into main_read_buffer to append.
@@ -290,12 +316,12 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
             
             match n_read {
                 0 => {
-                    if tracing::enabled!(tracing::Level::TRACE) {
-                        trace!( 
-                            "Channel({}): conn_no {}: setup_outbound_task POST-READ 0 bytes (EOF). EOF_sent: {}",
-                            channel_id_for_task, conn_no, eof_sent
-                        );
-                    }
+                    trace_hot_path!(
+                        channel_id = %channel_id_for_task,
+                        conn_no = conn_no,
+                        eof_sent = eof_sent,
+                        "setup_outbound_task POST-READ 0 bytes (EOF)"
+                    );
 
                     if !eof_sent {
                         let eof_frame = Frame::new_control_with_pool(
@@ -313,12 +339,13 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                     continue; 
                 }
                 _ => {
-                    if tracing::enabled!(tracing::Level::TRACE) {
-                        trace!( 
-                            "Channel({}): conn_no {}: setup_outbound_task POST-READ {} bytes from backend. EOF_sent: {}",
-                            channel_id_for_task, conn_no, n_read, eof_sent
-                        );
-                    }
+                    trace_hot_path!(
+                        channel_id = %channel_id_for_task,
+                        conn_no = conn_no,
+                        bytes_read = n_read,
+                        eof_sent = eof_sent,
+                        "setup_outbound_task POST-READ bytes from backend"
+                    );
                     
                     eof_sent = false;
                     let mut close_conn_and_break = false;
@@ -494,12 +521,12 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                         // **SEND DIRECTLY - NO INTERMEDIATE VECTOR**
                         encode_buffer.clear();
                         
-                        if tracing::enabled!(tracing::Level::TRACE) {
-                            trace!(
-                                "Channel({}): conn_no {}: PortForward/SOCKS5 zero-copy encode. Read {} bytes into temp_read_buffer",
-                                channel_id_for_task, conn_no, n_read
-                            );
-                        }
+                        trace_hot_path!(
+                            channel_id = %channel_id_for_task,
+                            conn_no = conn_no,
+                            bytes_read = n_read,
+                            "PortForward/SOCKS5 zero-copy encode"
+                        );
                         
                         // Encode directly from temp_read_buffer (which was filled by read_buf)
                         let bytes_written = Frame::encode_data_frame_from_slice(
@@ -510,20 +537,24 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                         
                         let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
                         
-                        if tracing::enabled!(tracing::Level::TRACE) {
-                            trace!(
-                                "Channel({}): conn_no {}: PortForward/SOCKS5 POST-ENCODE. Bytes written: {}",
-                                channel_id_for_task, conn_no, bytes_written
-                            );
-                        }
+                        trace_hot_path!(
+                            channel_id = %channel_id_for_task,
+                            conn_no = conn_no,
+                            bytes_written = bytes_written,
+                            "PortForward/SOCKS5 POST-ENCODE"
+                        );
                         
                         // **PERFORMANCE: Send directly without intermediate storage**
                         let buffered_amount = dc.buffered_amount().await;
                         if buffered_amount >= buffer_low_threshold {
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!( 
-                                    "Endpoint {}: Buffer amount high ({} bytes), QUEUEING message for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
-                                    channel_id_for_task, buffered_amount, conn_no, channel_id_for_task, active_protocol, encoded_frame_bytes.len()
+                                debug!(
+                                    channel_id = %channel_id_for_task,
+                                    buffered_amount = buffered_amount,
+                                    conn_no = conn_no,
+                                    active_protocol = ?active_protocol,
+                                    message_size = encoded_frame_bytes.len(),
+                                    "Buffer high, queueing message"
                                 );
                             }
                             let mut pending_guard = pending_messages.lock().await;
@@ -532,15 +563,21 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
                             }
                         } else {
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!( 
-                                    "Endpoint {}: Buffer amount low ({} bytes), SENDING DIRECTLY message for connection {} (channel_id: {}, active_protocol: {:?}). Message size: {}",
-                                    channel_id_for_task, buffered_amount, conn_no, channel_id_for_task, active_protocol, encoded_frame_bytes.len()
+                                debug!(
+                                    channel_id = %channel_id_for_task,
+                                    buffered_amount = buffered_amount,
+                                    conn_no = conn_no,
+                                    active_protocol = ?active_protocol,
+                                    message_size = encoded_frame_bytes.len(),
+                                    "Buffer low, sending directly"
                                 );
                             }
                             if let Err(e) = dc.send(encoded_frame_bytes).await {
                                 error!(
-                                    "Endpoint {}: Failed to send data for connection {}: {}",
-                                    channel_id_for_task, conn_no, e
+                                    channel_id = %channel_id_for_task,
+                                    conn_no = conn_no,
+                                    error = %e,
+                                    "Failed to send data for connection"
                                 );
                                 close_conn_and_break = true;
                             }
@@ -574,10 +611,10 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         }
     });
 
-    trace!( 
-        "Channel({}): conn_no {}: setup_outbound_task tokio::spawn COMPLETE (outer scope). Outbound handle created.",
-        channel_id_for_log_after_spawn, 
-        conn_no
+    trace_hot_path!(
+        channel_id = %channel_id_for_log_after_spawn,
+        conn_no = conn_no,
+        "setup_outbound_task tokio::spawn COMPLETE (outer scope). Outbound handle created"
     );
             
     let stream_half = StreamHalf {
@@ -585,11 +622,15 @@ pub async fn setup_outbound_task(channel: &mut Channel, conn_no: u32, stream: Tc
         writer: backend_writer,
     };
     
-    channel.conns.lock().await.insert(conn_no, Conn {
-        backend: Box::new(stream_half),
-        to_webrtc: outbound_handle,
-        stats: ConnectionStats::default(),
-    });
+    // Create lock-free connection with a dedicated backend task
+    let conn = Conn::new_with_backend(
+        Box::new(stream_half),
+        outbound_handle,
+        conn_no,
+        channel.channel_id.clone(),
+    ).await;
+    
+    channel.conns.insert(conn_no, conn);
     
     debug!("Endpoint {}: Connection {} added to registry", channel.channel_id, conn_no); 
 
@@ -682,7 +723,7 @@ where
                 }
             }
             
-            // Handle the incomplete case - need to read more data
+            // Handle the incomplete case - read more data
             let mut temp_read_buf = [0u8; 1024];
             match reader.read(&mut temp_read_buf).await {
                 Ok(0) => {

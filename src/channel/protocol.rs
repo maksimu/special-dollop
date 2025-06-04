@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn, trace};
-use tokio::io::{AsyncWriteExt};
+
 
 use super::core::{Channel, BUFFER_LOW_THRESHOLD};
 use crate::tube_protocol::{ControlMessage, CloseConnectionReason, CONN_NO_LEN};
@@ -108,7 +108,13 @@ impl Channel {
         data: &[u8]
     ) -> Result<()> {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Processing control message: {:?}", message_type);
+            let active_connections = self.conns.len();
+            let connection_list = self.get_connection_ids();
+            let pending_msg_count = self.get_pending_message_count().await;
+            
+            debug!(target: "protocol_event", channel_id=%self.channel_id, 
+                   ?message_type, active_connections, pending_msg_count, ?connection_list,
+                   "Processing control message - Channel stats");
         }
 
         match message_type {
@@ -332,7 +338,7 @@ impl Channel {
             return Ok(());
         }
 
-        if self.conns.lock().await.contains_key(&target_connection_no) {
+        if self.conns.contains_key(&target_connection_no) {
             debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened.", target_connection_no);
             self.send_control_message(ControlMessage::ConnectionOpened, &target_connection_no.to_be_bytes()).await?;
             return Ok(());
@@ -484,10 +490,10 @@ impl Channel {
         // Extract connection number
         let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         
-        // Connection 0 is a special control connection that doesn't need to exist in the conn's map
+        // Connection 0 is a special control connection that doesn't need to exist in the connection's map
         if conn_no != 0 {
             // Check if the non-control connection exists
-            if !self.conns.lock().await.contains_key(&conn_no) {
+            if !self.conns.contains_key(&conn_no) {
                 error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for Ping", conn_no);
                 return Ok(());
             }
@@ -501,7 +507,6 @@ impl Channel {
         
         // Handle timing information if present
         if data.len() > CONN_NO_LEN {
-            // TODO: transfer_latency tracking implement here. 
             response.extend_from_slice(&data[CONN_NO_LEN..]);
             if tracing::enabled!(tracing::Level::DEBUG) {
                 debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request with timing data for {}", conn_no);
@@ -532,12 +537,8 @@ impl Channel {
         // Extract connection number
         let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         
-        // Update connection state
-        let mut conns_guard = self.conns.lock().await;
-        if let Some(conn) = conns_guard.get_mut(&conn_no) {
-            // Reset message counter
-            conn.stats.message_counter = 0;
-            
+        // Simplified pong handling - no complex stats tracking
+        if let Some(_conn_ref) = self.conns.get(&conn_no) {
             if conn_no == 0 {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong");
@@ -546,32 +547,6 @@ impl Channel {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
                 }
-            }
-            
-            // Handle round-trip latency calculation if ping time was set
-            if let Some(ping_time) = conn.stats.ping_time {
-                let latency = now_ms().saturating_sub(ping_time);
-                
-                // Add to a round-trip latency collection
-                // **PERFORMANCE WARNING: Lock acquisition for round_trip_latency**
-                {
-                    let mut rtl_guard = self.round_trip_latency.lock().await;
-                    rtl_guard.push(latency);
-                    // Keep the collection size bounded
-                    if rtl_guard.len() > 20 {
-                        rtl_guard.remove(0);
-                    }
-                }
-                
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Round trip latency: {} ms", latency);
-                }
-                
-                // Reset ping time
-                conn.stats.ping_time = None;
-                
-                // Handle transfer latency calculation
-                // In Python, there's additional transfer latency tracking that we'd implement here
             }
         } else {
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -594,24 +569,25 @@ impl Channel {
         // Extract connection number
         let conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         
-        // Check if the connection exists and send EOF
-        let mut conns_guard = self.conns.lock().await;
-        if let Some(conn) = conns_guard.get_mut(&conn_no) {
+        // Check if the connection exists and handle EOF
+        if let Some(conn_ref) = self.conns.get(&conn_no) {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending EOF to backend for connection {}", conn_no);
+                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received EOF from remote for connection {}, signaling backend to shutdown write side", conn_no);
             }
             
-            let backend = conn.backend.as_mut(); // Get a mutable reference to the Box<dyn BackendConnection>
-            
-            match backend.shutdown().await { // Call shutdown on the trait object
+            // SendEOF means the remote side closed their writing end
+            // Send EOF signal to the backend task which will call backend.shutdown() (perfect for RDP!)
+            match conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
                 Ok(_) => {
                     if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully sent shutdown to backend for EOF on conn {}", conn_no);
+                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully sent EOF signal to backend for conn {}", conn_no);
                     }
                 }
-                Err(e) => {
-                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Error shutting down backend for EOF on conn {}: {}", conn_no, e);
-                    // Decide if we need to hard close or if shutdown failure is non-fatal for the EOF intent.
+                Err(_) => {
+                    // Channel is closed, connection is already dead
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint EOF signal failed, connection {} already closed", conn_no);
+                    }
                 }
             }
         } else {
@@ -642,52 +618,43 @@ impl Channel {
         }
         
         // Get the connection
-        let mut conns_guard = self.conns.lock().await;
-        let connection = match conns_guard.get_mut(&connection_no) {
-            Some(c) => c,
-            None => {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for ConnectionOpened", connection_no);
-                return Ok(());
-            }
-        };
-        
-        // If it's a SOCKS5 connection, send a success response to the client
-        if self.active_protocol == super::types::ActiveProtocol::Socks5 {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
-            }
-            
-            let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-            
-            let backend = connection.backend.as_mut();
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
-            }
-            
-            match backend.write_all(&response).await {
-                Ok(_) => {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response sent for connection {}", connection_no);
+        if let Some(conn_ref) = self.conns.get(&connection_no) {
+            // If it's a SOCKS5 connection, send a success response to the client
+            if self.active_protocol == super::types::ActiveProtocol::Socks5 {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
+                }
+                
+                let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
+                }
+                
+                // Send SOCKS5 response via the connection's data channel
+                match conn_ref.data_tx.send(crate::models::ConnectionMessage::Data(bytes::Bytes::from(response.to_vec()))) {
+                    Ok(_) => {
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response queued for connection {}", connection_no);
+                        }
+                    },
+                    Err(e) => {
+                        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to queue SOCKS5 success response: {}", e);
                     }
-                    if let Err(e) = backend.flush().await {
-                        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to flush SOCKS5 writer: {}", e);
-                    }
-                },
-                Err(e) => {
-                    error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to send SOCKS5 success response: {}", e);
                 }
             }
+            
+            // The conn.to_webrtc and backend tasks are already set up by the connection creation
+            // to handle reading from the backend and sending to WebRTC. No need to spawn more tasks here.
+            if conn_ref.to_webrtc.is_finished() {
+                warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "In ConnectionOpened, to_webrtc task was already finished. This is unexpected.");
+            }
+            
+            info!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "Connection fully opened and ready.");
+        } else {
+            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for ConnectionOpened", connection_no);
+            return Ok(());
         }
-        
-        // The conn.to_webrtc task is already set up by open_backend (via establish_backend_connection)
-        // to handle reading from the backend and sending to WebRTC. No need to spawn another one here.
-        if connection.to_webrtc.is_finished() {
-            warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "In ConnectionOpened, to_webrtc task was already finished. This is unexpected.");
-        }
-        
-        info!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "Connection fully opened and ready.");
-        
-        drop(conns_guard);
 
         // Attempt to send any pending messages for this newly opened connection
         if let Err(e) = self.send_pending_messages(connection_no).await {

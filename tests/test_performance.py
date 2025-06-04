@@ -36,13 +36,13 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         
         # Clear shared Python-side state more explicitly
         # Although individual tests have finally blocks, this ensures cleanup
-        # even if a test fails before its finally block or if setUp itself had issues.
+        # even if a test fails before its finally block or if the setUp itself had issues.
         with self._lock:
-            # Close any tubes that might still be open due to test errors
+            # Close any tubes that might still be open due to test errors,
             # This requires knowing all created tube_ids.
             # If tests reliably clean up their own tubes, this might be redundant
             # but can act as a fallback.
-            # For now, focusing on clearing the maps used by the shared signal handler.
+            # For now, focus on clearing the maps used by the shared signal handler.
             
             self.tube_states.clear()
             logging.debug("Cleared tube_states in tearDown.")
@@ -86,7 +86,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                     if data.lower() == "connected":
                         self.tube_connection_events[tube_id].set() # Signal that this tube is connected
                     elif data.lower() in ["failed", "closed", "disconnected"]:
-                        # If it was connected and now it's not, clear the event
+                        # If it was connected, and now it's not, clear the event
                         # Or, if tests need to react to failures, set a different event.
                         if tube_id in self.tube_connection_events:
                              self.tube_connection_events[tube_id].clear() # Or handle failure explicitly
@@ -107,9 +107,9 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                     # logging.debug(f"Received other signal for {tube_id}: {kind}")
         except Exception as e:
             logging.error(f"PYTHON _signal_handler CRASHED for signal {signal_dict}: {e}", exc_info=True)
-            # Optionally re-raise if PyO3/Rust should see it, but for now, just log it
+            # Optionally re-raise if PyO3/Rust should see it, but for now, log it
             # to see if this is where the task is dying.
-            # raise # This might be needed if Rust expects to see an error propagate
+            # Raise # This might be needed if Rust expects to see an error propagate
     
     @with_runtime
     def test_data_channel_load(self):
@@ -161,7 +161,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         
         # Wait for a connection establishment
         start_time = time.time()
-        connected = self.wait_for_tube_connection(server_id, client_id, 20) # Increased timeout to 20s
+        connected = self.wait_for_tube_connection(server_id, client_id, 20) # Increased timeout to 20 s
         connection_time = time.time() - start_time
         
         self.assertTrue(connected, "Failed to establish connection")
@@ -229,7 +229,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             }
             
             # The create_tube in Python seems to be a bit different from Rust's.
-            # It might not directly expose on_ice_candidate per-tube object in the same way.
+            # It might not directly expose it on_ice_candidate per-tube object in the same way.
             # We are using the BaseWebRTCTest's on_ice_candidate1/2, which is generic.
             # We need to ensure these are somehow linked or the library handles it.
             # For now, let's assume the library's PyTubeRegistry might have a way to globally set these 
@@ -287,13 +287,13 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
 
             # 4. Signaling: Set remote description
             # The Rust test has a more elaborate ICE exchange via signal channels.
-            # Python tests rely on `wait_for_tube_connection` which implies internal ICE handling after SDP exchange.
+            # Python tests rely on `wait_for_tube_connection,` which implies internal ICE handling after SDP exchange.
             logging.info(f"[E2E_Test] Server tube {server_tube_id} setting remote description (client's answer)")
             self.tube_registry.set_remote_description(server_tube_id, client_answer_sdp, is_answer=True)
             
             # The client tube in Rust's `create_tube` (when offer is provided) also calls `set_remote_description` internally for the offer.
             # And then `create_answer`. The Python `create_tube` with an offer likely does this too.
-            # We might not need an explicit `set_remote_description` on the client side if `create_tube` handles the initial offer.
+            # We might not need explicit `set_remote_description` on the client side if `create_tube` handles the initial offer.
 
             # 5. Wait for connection
             logging.info(f"[E2E_Test] Waiting for WebRTC connection between {server_tube_id} and {client_tube_id}...")
@@ -448,7 +448,7 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         self.assertTrue("a=candidate:" in offer_decoded_str, "Server offer SDP (decoded) should contain ICE candidates")
         
         # Create a client tube with the offer
-        client_settings = {"conversationType": "tunnel"} # Ensure client also has its own settings if needed
+        client_settings = {"conversationType": "tunnel"} # Ensure the client also has its own settings if needed
         client_tube_info = self.tube_registry.create_tube(
             conversation_id="fragmentation-test-client",
             ksm_config=TEST_KSM_CONFIG,

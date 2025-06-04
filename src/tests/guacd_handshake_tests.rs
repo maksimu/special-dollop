@@ -57,6 +57,58 @@ fn encode_guac_instruction(opcode: &str, args: &[&str]) -> Vec<u8> {
     buffer
 }
 
+/// Helper function to parse instructions from buffer and send response when "connect" is found
+async fn parse_and_handle_connect_instruction(
+    temp_parse_buffer: &mut BytesMut,
+    server_stream: &mut DuplexStream,
+    test_name: &str,
+) -> Result<bool, String> {
+    loop {
+        let advance_amount = {
+            let peek_result = GuacdParser::peek_instruction(&temp_parse_buffer);
+            match peek_result {
+                Ok(peeked) => {
+                    if peeked.opcode == "connect" {
+                        let total_length = peeked.total_length_in_buffer;
+                        let content_slice = &temp_parse_buffer[..total_length - 1];
+                        match GuacdParser::parse_instruction_content(content_slice) {
+                            Ok(connect_instr) => {
+                                println!("Server ({}): 'connect' successfully parsed: {:?}. Proceeding to send 'goodbye_cruel_world'.", test_name, connect_instr.args);
+                                let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
+                                server_stream.write_all(&unexpected_response).await.map_err(|e| format!("Server ({}): Failed to send unexpected_opcode: {}", test_name, e))?;
+                                println!("Server ({}): Sent goodbye_cruel_world", test_name);
+                                server_stream.shutdown().await.ok();
+                                return Ok(true); // Connect found and handled
+                            }
+                            Err(e) => {
+                                println!("Server ({}): 'connect' peeked but failed to parse fully: {}. Content: {:?}", test_name, e, content_slice);
+                                None
+                            }
+                        }
+                    } else {
+                        // Not a "connect" instruction, advance anyway for debugging
+                        println!("Server ({}): Parsed instruction: opcode='{}', args={:?}", test_name, peeked.opcode, peeked.args);
+                        Some(peeked.total_length_in_buffer)
+                    }
+                }
+                Err(PeekError::Incomplete) => None,
+                Err(e) => {
+                    println!("Server ({}): Peek Error: {:?}. Stopping.", test_name, e);
+                    None
+                }
+            }
+        };
+        
+        if let Some(advance) = advance_amount {
+            temp_parse_buffer.advance(advance);
+            if temp_parse_buffer.is_empty() { break; }
+        } else {
+            break;
+        }
+    }
+    Ok(false) // Connect not found in current buffer
+}
+
 async fn recv_and_get_instruction(
     stream: &mut DuplexStream, 
 ) -> Result<GuacdInstruction, String> {
@@ -71,10 +123,10 @@ async fn recv_and_get_instruction(
             // println! (SERVER_RECV_FN_MAX_ATTEMPTS): Exceeded max read attempts.
             return Err("Server: Exceeded max read attempts waiting for a complete instruction".to_string());
         }
-        // println! (SERVER_RECV_FN_PEEK_ATTEMPT): Attempting to peek. Buffer len: {}. Content (trunc 64): {:?}
+        // println! (SERVER_RECV_FN_PEEK_ATTEMPT): Attempting to peek. buffer len: {}. Content (trunc 64): {:?}
         //local_buffer.len(), &local_buffer[..std::cmp::min(local_buffer.len(), 64)]
         
-        // Extract what we need from peek result before any buffer mutations
+        // Extract what we need from a peek result before any buffer mutations
         let process_result = {
             let peek_result = GuacdParser::peek_instruction(&local_buffer);
             match peek_result {
@@ -88,7 +140,7 @@ async fn recv_and_get_instruction(
                     Some((instr, total_length))
                 }
                 Err(PeekError::Incomplete) => {
-                    // Handle incomplete case
+                    // Handle an incomplete case
                     None
                 }
                 Err(PeekError::InvalidFormat(e)) => {
@@ -106,7 +158,7 @@ async fn recv_and_get_instruction(
             return Ok(instr);
         }
         
-        // Handle the incomplete case after the match to avoid borrow issues
+        // Handle the incomplete case after the match to avoid borrowing issues
         // println! (SERVER_RECV_FN_PEEK_INCOMPLETE): Peek Incomplete. Current buffer len: {}.
         //local_buffer.len()
         if local_buffer.capacity() == 0 { 
@@ -538,49 +590,14 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
                     diagnostic_buffer.extend_from_slice(&read_buf_array[..n]);
                     println!("Server (fail_ready): DIAGNOSTIC V2: read {} bytes. Total in diagnostic_buffer: {}. Loop iter: {}. Data just read: {:?}", n, diagnostic_buffer.len(), i, &read_buf_array[..n]);
                     
-                    // Try to parse connect from the accumulated buffer
+                    // Try to parse "connect" from the accumulated buffer
                     let mut temp_parse_buffer = diagnostic_buffer.clone(); // Clone for parsing attempts
-                    loop {
-                        let advance_amount = {
-                            let peek_result = GuacdParser::peek_instruction(&temp_parse_buffer);
-                            match peek_result {
-                                Ok(peeked) => {
-                                    if peeked.opcode == "connect" {
-                                        let total_length = peeked.total_length_in_buffer;
-                                        let content_slice = &temp_parse_buffer[..total_length -1];
-                                        match GuacdParser::parse_instruction_content(content_slice) {
-                                            Ok(connect_instr) => {
-                                                println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' successfully parsed: {:?}. Proceeding to send 'goodbye_cruel_world'.", connect_instr.args);
-                                                let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
-                                                server_stream.write_all(&unexpected_response).await.expect("Server (fail_ready): Failed to send unexpected_opcode");
-                                                println!("Server (fail_ready): Sent goodbye_cruel_world");
-                                                server_stream.shutdown().await.ok();
-                                                return; // End server task
-                                            }
-                                            Err(e) => {
-                                                println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' peeked in final parse attempt, but failed to parse fully: {}. Content: {:?}", e, content_slice);
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        // Not a connect instruction, advance anyway for debugging
-                                        println!("Server (fail_ready): DIAGNOSTIC V2: Final parse found: opcode='{}', args={:?}", peeked.opcode, peeked.args);
-                                        Some(peeked.total_length_in_buffer)
-                                    }
-                                }
-                                Err(PeekError::Incomplete) => None,
-                                Err(e) => {
-                                    println!("Server (fail_ready): DIAGNOSTIC V2: Final parse Peek Error: {:?}. Stopping.", e);
-                                    None
-                                }
-                            }
-                        };
-                        
-                        if let Some(advance) = advance_amount {
-                            temp_parse_buffer.advance(advance);
-                            if temp_parse_buffer.is_empty() { break; }
-                        } else {
-                            break;
+                    match parse_and_handle_connect_instruction(&mut temp_parse_buffer, &mut server_stream, "fail_ready").await {
+                        Ok(true) => return, // Connect found and handled, end server task
+                        Ok(false) => {}, // Connect not found, continue reading
+                        Err(e) => {
+                            println!("Server (fail_ready): Error handling connect instruction: {}", e);
+                            return;
                         }
                     }
                 }
@@ -590,64 +607,28 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
                 }
                 Err(_) => { // Timeout from tokio::time::timeout
                     println!("Server (fail_ready): DIAGNOSTIC V2: read timed out (250ms). Loop iter: {}. Total data in diagnostic_buffer: {} bytes.", i, diagnostic_buffer.len());
-                    // Check if connect is already in the buffer before breaking outer loop
+                    // Check if connect is already in the buffer before breaking the outer loop
                     if diagnostic_buffer.windows(7).any(|window| window == b"connect") { // Quick check for "connect"
                          println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' substring found on timeout. Attempting final parse.");
                         // Re-attempt parse on timeout, similar to above
                         let mut final_parse_buffer = diagnostic_buffer.clone();
-                        loop {
-                            let advance_amount = {
-                                let peek_result = GuacdParser::peek_instruction(&final_parse_buffer);
-                                match peek_result {
-                                    Ok(peeked) => {
-                                        if peeked.opcode == "connect" {
-                                            let total_length = peeked.total_length_in_buffer;
-                                            let content_slice = &final_parse_buffer[..total_length -1];
-                                            match GuacdParser::parse_instruction_content(content_slice) {
-                                                Ok(connect_instr) => {
-                                                    println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' successfully parsed: {:?}. Proceeding to send 'goodbye_cruel_world'.", connect_instr.args);
-                                                    let unexpected_response = encode_guac_instruction("goodbye_cruel_world", &["param1"]);
-                                                    server_stream.write_all(&unexpected_response).await.expect("Server (fail_ready): Failed to send unexpected_opcode");
-                                                    println!("Server (fail_ready): Sent goodbye_cruel_world");
-                                                    server_stream.shutdown().await.ok();
-                                                    return;
-                                                }
-                                                Err(e) => {
-                                                    println!("Server (fail_ready): DIAGNOSTIC V2: 'connect' peeked in final parse attempt, but failed to parse fully: {}. Content: {:?}", e, content_slice);
-                                                    None
-                                                }
-                                            }
-                                        } else {
-                                            // Not a connect instruction, advance anyway for debugging
-                                            println!("Server (fail_ready): DIAGNOSTIC V2: Final parse found: opcode='{}', args={:?}", peeked.opcode, peeked.args);
-                                            Some(peeked.total_length_in_buffer)
-                                        }
-                                    }
-                                    Err(PeekError::Incomplete) => None,
-                                    Err(e) => {
-                                        println!("Server (fail_ready): DIAGNOSTIC V2: Final parse Peek Error: {:?}. Stopping.", e);
-                                        None
-                                    }
-                                }
-                            };
-                            
-                            if let Some(advance) = advance_amount {
-                                final_parse_buffer.advance(advance);
-                                if final_parse_buffer.is_empty() { break; }
-                            } else {
-                                break;
+                        match parse_and_handle_connect_instruction(&mut final_parse_buffer, &mut server_stream, "fail_ready").await {
+                            Ok(true) => return, // Connect found and handled
+                            Ok(false) => {}, // Connect not found
+                            Err(e) => {
+                                println!("Server (fail_ready): Error handling connect instruction on timeout: {}", e);
                             }
                         }
                     }
                 }
             }
-             // If connect was found and handled, we would have returned. If loop finishes, connect wasn't fully processed.
+             // If connect was found and handled, we would have returned. If the loop finishes, connect wasn't fully processed.
         }
         println!("Server (fail_ready): DIAGNOSTIC V2: Exited diagnostic read loop. Final diagnostic_buffer ({} bytes): {:?}", diagnostic_buffer.len(), diagnostic_buffer.to_vec());
         println!("Server (fail_ready): DIAGNOSTIC V2: as string (lossy): {}", String::from_utf8_lossy(&diagnostic_buffer));
         
-        // If connect wasn't processed, the test should fail as the client will timeout waiting for ready/goodbye.
-        // We can let the client timeout, or force a server-side panic if connect was expected but not found.
+        // If connect wasn't processed, the test should fail as the client will time out waiting for ready/goodbye.
+        // We can let the client timeout or force a server-side panic if connect was expected but not found.
         panic!("Server (fail_ready): DIAGNOSTIC V2: 'connect' instruction not successfully processed in diagnostic loop.");
 
         // The original logic is now entirely replaced by the diagnostic block for this test case.
@@ -816,8 +797,8 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
                                             } else if instr.opcode == "audio" || instr.opcode == "video" || instr.opcode == "image" {
                                                 assert!(instr.args.is_empty());
                                             } else if instr.opcode == "connect" {
-                                                // For this test, client sends: VERSION_1_5_0, hostname, port
-                                                // guacd_params has: "hostname":"testserver_timeout_ready", "port":"3389"
+                                                // For this test, a client sends: VERSION_1_5_0, hostname, port
+                                                // guacd_params has: "hostname":"testserver_timeout_ready", "port": "3389"
                                                 // args sent by server: VERSION_1_5_0, hostname, port
                                                 // Expected connect args based on perform_guacd_handshake: VERSION_1_5_0, value_for_hostname, value_for_port
                                                 assert_eq!(instr.args, vec!["VERSION_1_5_0".to_string(), "testserver_timeout_ready".to_string(), "3389".to_string()]);
@@ -871,7 +852,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
 
         println!("Server (timeout_ready): Intentionally not sending 'ready'. Simulating server processing then deliberate silence.");
         // Brief pause to ensure client timeout can occur if it hasn't already.
-        // The client timeout is 100ms, so server doesn't need to wait long if connect was processed.
+        // The client timeout is 100 ms, so the server doesn't need to wait long if connect was processed.
         tokio::time::sleep(Duration::from_millis(50)).await; 
         println!("Server (timeout_ready): Shutting down stream and terminating server task.");
         server_stream.shutdown().await.ok();

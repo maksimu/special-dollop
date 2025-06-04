@@ -207,7 +207,7 @@ def run_ack_server_in_thread(host="127.0.0.1", port=0):
 
     # After the loop, double-check conditions if port was set but server might have issues
     if not server.running:
-        # This case might occur if actual_port was set, but running flag was then set to False (e.g. immediate error after listen)
+        # This case might occur if actual_port was set, but running flag was then set to False (e.g., immediate error after listen)
         if server.is_alive():
             server.stop()
         raise RuntimeError(f"AckServer started but is not in a running state. Still alive: {server.is_alive()}, Running: {server.running}, Actual Port: {server.actual_port}")

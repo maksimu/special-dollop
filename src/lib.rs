@@ -17,6 +17,7 @@ mod router_helpers;
 mod webrtc_data_channel;
 mod tube_and_channel_helpers;
 mod tube_registry;
+pub mod hot_path_macros;
 
 pub use webrtc_core::*;
 pub use tube::*;

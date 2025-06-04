@@ -41,6 +41,7 @@ hkdf = "0.12.4"
 aes-gcm = "0.10.3"
 log = "0.4.27"
 smallvec = "1.13.2"
+dashmap = "6.1.0"
 
 [package.metadata.maturin]
 name = "keeper_pam_webrtc_rs"

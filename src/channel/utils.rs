@@ -33,9 +33,6 @@ pub(crate) async fn handle_ping_timeout(channel: &mut Channel) -> Result<(), Cha
         let mut combined = Vec::new();
         combined.extend_from_slice(&length_bytes);
         combined.extend_from_slice(&timestamp_bytes);
-        // Convert length to bytes
-
-        // Now you can use both timestamp_bytes and length_bytes as needed
         // Build ping payload
         let frame = Frame::new_control_with_pool(
             ControlMessage::Ping,

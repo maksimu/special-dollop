@@ -155,7 +155,7 @@ fn test_tube_channel_creation() {
         // Verify channel shutdown signal exists
         assert!(tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should exist after creation");
 
-        // Close the channel and verify the signal is acted upon (signal removed from map)
+        // Close the channel and verify the signal is acted upon (signal removed from the map)
         let close_result = tube.close_channel("test").await;
         assert!(close_result.is_ok(), "close_channel should return Ok. Actual: {:?}", close_result);
         assert!(!tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should be removed after closing");

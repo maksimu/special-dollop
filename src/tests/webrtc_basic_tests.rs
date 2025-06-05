@@ -1,36 +1,17 @@
-// Tests for WebRTC functionality
-use crate::webrtc_core::format_ice_candidate;
-use crate::{get_or_create_runtime, logger};
-
+//! Basic WebRTC functionality tests
+use crate::runtime::get_runtime;
+use crate::tests::common_tests::{create_peer_connection, exchange_ice_candidates};
 use bytes::Bytes;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
-use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::RTCPeerConnection;
-
-// Initialize the logger before any test runs, but allow it to be safely called multiple times
-#[ctor::ctor]
-fn init() {
-    let _ = logger::initialize_logger("test", Some(true), 10);
-}
-
-// Helper function to create a peer connection
-async fn create_peer_connection(
-    config: RTCConfiguration,
-) -> webrtc::error::Result<RTCPeerConnection> {
-    let api = APIBuilder::new().build();
-    api.new_peer_connection(config).await
-}
 
 #[test]
 fn test_webrtc_connection_creation() {
-    let runtime = get_or_create_runtime().expect("Failed to get shared runtime");
+    let runtime = get_runtime();
     let result = runtime.block_on(async {
         let config = RTCConfiguration::default();
         create_peer_connection(config).await
@@ -43,7 +24,7 @@ fn test_webrtc_connection_creation() {
 
 #[test]
 fn test_data_channel_creation() {
-    let runtime = get_or_create_runtime().expect("Failed to get shared runtime");
+    let runtime = get_runtime();
     let result = runtime.block_on(async {
         let config = RTCConfiguration::default();
         let pc = create_peer_connection(config).await?;
@@ -55,98 +36,20 @@ fn test_data_channel_creation() {
     assert_eq!(dc.label(), "test");
 }
 
-// Helper function to exchange ICE candidates
-async fn exchange_ice_candidates(peer1: Arc<RTCPeerConnection>, peer2: Arc<RTCPeerConnection>) {
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-    let _ready_tx = Arc::new(StdMutex::new(Some(ready_tx)));
-    println!("Starting exchange_ice_candidates");
-    let (ice_tx1, mut ice_rx1) = mpsc::channel::<String>(32);
-    let (ice_tx2, mut ice_rx2) = mpsc::channel::<String>(32);
-
-    // Set up ICE candidate handlers
-    let peer1_clone = peer1.clone();
-    peer1_clone.on_ice_candidate(Box::new(move |c| {
-        let ice_tx = ice_tx1.clone();
-        Box::pin(async move {
-            if let Some(candidate) = c {
-                let candidate_str = format_ice_candidate(&candidate);
-                println!("Found ICE candidate for peer1: {:?}", candidate_str);
-                if let Err(e) = ice_tx.send(candidate_str).await {
-                    eprintln!("Failed to send ICE candidate for peer1: {:?}", e);
-                }
-            }
-        })
-    }));
-
-    let peer2_clone = peer2.clone();
-    peer2_clone.on_ice_candidate(Box::new(move |c| {
-        let ice_tx = ice_tx2.clone();
-        Box::pin(async move {
-            if let Some(candidate) = c {
-                let candidate_str = format_ice_candidate(&candidate);
-                println!("Found ICE candidate for peer2: {:?}", candidate_str);
-                if let Err(e) = ice_tx.send(candidate_str).await {
-                    eprintln!("Failed to send ICE candidate for peer2: {:?}", e);
-                }
-            }
-        })
-    }));
-
-    // Handle candidate exchange
-    let peer2_clone = peer2.clone();
-    let handle1 = tokio::spawn(async move {
-        while let Some(candidate) = ice_rx1.recv().await {
-            let init = RTCIceCandidateInit {
-                candidate,
-                sdp_mid: None,
-                sdp_mline_index: None,
-                username_fragment: None,
-            };
-            if let Err(err) = peer2_clone.add_ice_candidate(init).await {
-                eprintln!("Error adding ICE candidate to peer2: {:?}", err);
-            }
-        }
-    });
-
-    let peer1_clone = peer1.clone();
-    let handle2 = tokio::spawn(async move {
-        while let Some(candidate) = ice_rx2.recv().await {
-            let init = RTCIceCandidateInit {
-                candidate,
-                sdp_mid: None,
-                sdp_mline_index: None,
-                username_fragment: None,
-            };
-            if let Err(err) = peer1_clone.add_ice_candidate(init).await {
-                eprintln!("Error adding ICE candidate to peer1: {:?}", err);
-            }
-        }
-    });
-
-    // Set a timeout for ICE gathering
-    let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(5));
-    tokio::pin!(timeout);
-
-    tokio::select! {
-        _ = timeout => {
-            println!("ICE gathering timed out");
-        }
-        _ = ready_rx => {
-            println!("ICE gathering completed successfully");
-        }
-    }
-
-    // Clean up handlers
-    let _ = handle1.abort();
-    let _ = handle2.abort();
-}
-
 #[test]
 fn test_p2p_connection() {
     println!("Starting P2P connection test");
-    let runtime = get_or_create_runtime().expect("Failed to get shared runtime");
+    let runtime = get_runtime();
     runtime.block_on(async {
-        let config = RTCConfiguration::default();
+        // Add STUN servers
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
         let peer1 = Arc::new(create_peer_connection(config.clone()).await.unwrap());
         let peer2 = Arc::new(create_peer_connection(config).await.unwrap());
 
@@ -156,7 +59,7 @@ fn test_p2p_connection() {
         let dc_received = Arc::new(TokioMutex::new(None));
         let dc_received_clone = Arc::clone(&dc_received);
 
-        // Set up connection state callback
+        // Set up the connection state callback
         peer2.on_peer_connection_state_change(Box::new(move |s| {
             let done = Arc::clone(&done_signal_clone);
             Box::pin(async move {
@@ -218,15 +121,18 @@ fn test_p2p_connection() {
         println!("Set remote description on peer1");
 
         println!("Waiting for connection to establish");
-        let mut retries = 50;
-        while retries > 0 && !*done_signal.lock().await {
-            println!(
-                "Connection state - peer1: {:?}, peer2: {:?}",
-                peer1.connection_state(),
-                peer2.connection_state()
-            );
+        for _ in 0..100 {
+            let state1 = peer1.connection_state();
+            let state2 = peer2.connection_state();
+            println!("Connection states: peer1={}, peer2={}", state1, state2);
+
+            if state1 == RTCPeerConnectionState::Connected
+                && state2 == RTCPeerConnectionState::Connected
+            {
+                break;
+            }
+
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            retries -= 1;
         }
 
         // Ensure ICE candidate exchange completed
@@ -266,7 +172,7 @@ fn test_p2p_connection() {
 #[test]
 fn test_p2p_connection_non_trickle() {
     println!("Starting non-trickle P2P connection test");
-    let runtime = get_or_create_runtime().expect("Failed to get shared runtime");
+    let runtime = get_runtime();
     runtime.block_on(async {
         // Create config with STUN servers first
         let config = RTCConfiguration {
@@ -277,14 +183,14 @@ fn test_p2p_connection_non_trickle() {
             ..Default::default()
         };
 
-        let api = APIBuilder::new().build();
+        let api = webrtc::api::APIBuilder::new().build();
         let peer1 = Arc::new(api.new_peer_connection(config.clone()).await.unwrap());
         let peer2 = Arc::new(api.new_peer_connection(config).await.unwrap());
 
         let done_signal = Arc::new(TokioMutex::new(false));
         let done_signal_clone = Arc::clone(&done_signal);
 
-        // Set up connection state callback
+        // Set up the connection state callback
         peer2.on_peer_connection_state_change(Box::new(move |s| {
             let done = Arc::clone(&done_signal_clone);
             Box::pin(async move {
@@ -335,7 +241,7 @@ fn test_p2p_connection_non_trickle() {
             })
         }));
 
-        // Create and set local description for peer1 (offer)
+        // Create and set the local description for peer1 (offer)
         println!("Creating offer and waiting for ICE gathering");
         let offer = peer1.create_offer(None).await.unwrap();
         peer1.set_local_description(offer).await.unwrap();
@@ -359,7 +265,7 @@ fn test_p2p_connection_non_trickle() {
                     // Set the complete offer on peer2
                     peer2.set_remote_description(complete_offer).await.unwrap();
 
-                    // Create and set local description for peer2 (answer)
+                    // Create and set the local description for peer2 (answer)
                     println!("Creating answer and waiting for ICE gathering");
                     let answer = peer2.create_answer(None).await.unwrap();
                     peer2.set_local_description(answer).await.unwrap();
@@ -391,19 +297,24 @@ fn test_p2p_connection_non_trickle() {
 
         // Wait for connection with increased timeout
         println!("Waiting for connection to establish");
-        let mut retries = 50; // 10 seconds total
-        while retries > 0 && !*done_signal.lock().await {
-            println!(
-                "Connection state - peer1: {:?}, peer2: {:?}",
-                peer1.connection_state(),
-                peer2.connection_state()
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            retries -= 1;
+        let mut connected = false;
+        for _ in 0..100 {
+            let state1 = peer1.connection_state();
+            let state2 = peer2.connection_state();
+            println!("Connection states: peer1={}, peer2={}", state1, state2);
+
+            if state1 == RTCPeerConnectionState::Connected
+                && state2 == RTCPeerConnectionState::Connected
+            {
+                connected = true;
+                break;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
         // Give it a bit more time if needed
-        if !*done_signal.lock().await {
+        if !connected {
             println!("Waiting additional time for connection...");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
@@ -428,4 +339,59 @@ fn test_p2p_connection_non_trickle() {
             "Peer2 should be connected or connecting"
         );
     });
+}
+
+#[tokio::test]
+async fn test_turn_only_mode() {
+    // Create a WebRTC peer connection with turn_only set to true
+    let config = Some(RTCConfiguration::default());
+    let trickle_ice = true;
+    let turn_only = true;
+
+    // Create the connection
+    let conn = crate::WebRTCPeerConnection::new(
+        config.clone(),
+        trickle_ice,
+        turn_only,
+        None,
+        "test_tube_id".to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Use reflection to check that the ICE transport policy was set to Relay
+    let ice_transport_policy = conn
+        .peer_connection
+        .get_configuration()
+        .await
+        .ice_transport_policy;
+    assert_eq!(
+        ice_transport_policy,
+        webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::Relay,
+        "ICE transport policy should be set to Relay when turn_only is true"
+    );
+
+    // Create another connection with turn_only set to false
+    let turn_only = false;
+    let conn_regular = crate::WebRTCPeerConnection::new(
+        config,
+        trickle_ice,
+        turn_only,
+        None,
+        "test_tube_id_regular".to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Check that ICE transport policy is set to All for regular mode
+    let ice_transport_policy = conn_regular
+        .peer_connection
+        .get_configuration()
+        .await
+        .ice_transport_policy;
+    assert_eq!(
+        ice_transport_policy,
+        webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
+        "ICE transport policy should be set to All when turn_only is false"
+    );
 }

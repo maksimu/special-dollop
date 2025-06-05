@@ -1,0 +1,38 @@
+# Docker Compose configuration for WebRTC testing
+
+services:
+
+  guacd:
+    platform: linux/amd64
+    image: guacamole/guacd:latest # Or your chosen image
+    restart: unless-stopped
+    ports:
+      - "4822:4822" # Expose guacd port to the host
+
+
+  server-ssh-with-pwd:
+    platform: linux/amd64
+    image: keeper/playground-ssh:latest
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: 'America/Los_Angeles'
+      SUDO_ACCESS: 'true'
+      PASSWORD_ACCESS: 'true'
+      USER_NAME: 'linuxuser'
+      USER_PASSWORD: 'linuxpassword'
+    # ports:
+    #   - "2222:2222" # Expose SSH port
+
+  server-rdp:
+    platform: linux/amd64
+    image: keeper/playground-rdp-xfce:latest
+    shm_size: 2g
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ROOT_PASSWORD: 'rootpassword'
+      USER: 'rdpuser'
+      PASSWORD: 'rdppassword'
+    # ports:
+    #   - "3389:3389" # Expose RDP port

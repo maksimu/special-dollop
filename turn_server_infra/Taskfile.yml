@@ -1,0 +1,208 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task: help
+
+  # Internal Precondition Check Tasks
+  _check-terraform-installed:
+    internal: true
+    desc: "(Internal) Check if Terraform is installed."
+    preconditions:
+      - sh: "command -v terraform"
+        msg: "Terraform is not installed. Please install Terraform (https://www.terraform.io/downloads.html) and ensure it's in your PATH."
+
+  _check-aws-cli-installed:
+    internal: true
+    desc: "(Internal) Check if AWS CLI is installed."
+    preconditions:
+      - sh: "command -v aws"
+        msg: "AWS CLI is not installed. Please install AWS CLI (https://aws.amazon.com/cli/) and ensure it's in your PATH."
+
+  _check-aws-auth:
+    internal: true
+    desc: "(Internal) Check if AWS CLI is configured and authenticated."
+    deps: ["_check-aws-cli-installed"]
+    preconditions:
+      - sh: "aws sts get-caller-identity > /dev/null 2>&1"
+        msg: "AWS CLI is not configured or credentials are not valid. Please configure AWS CLI using 'aws configure'."
+
+  help:
+    desc: "Show help information for managing the TURN server infrastructure."
+    cmds:
+      - |
+        echo "----------------------------------------------------------------------"
+        echo "Usage: task [task_name] [OPTIONS]"
+        echo "----------------------------------------------------------------------"
+        echo "This Taskfile helps manage a temporary TURN server on AWS using Terraform."
+        echo "The TURN server will have a unique DNS name for each deployment."
+        echo ""
+        echo "*** Prerequisites: ***"
+        echo "  - AWS CLI configured (check with 'aws sts get-caller-identity') - checked by 'plan', 'apply', 'destroy'"
+        echo "  - Terraform installed (check with 'terraform version') - checked by most tasks"
+        echo "  - Task installed (check with 'task --version')"
+        echo "  - SSH public key at 'keys/vm_key.pub' (or set TF_VAR_ssh_public_key_path)"
+        echo "  - Ensure 'base_domain_name' (default: keeperpamlab.com) is correct for DNS."
+        echo ""
+        echo "*** Common Tasks: ***"
+        echo "  init         : Initialize Terraform (run once)."
+        echo "                 Example: task init"
+        echo "  set-creds    : (Info) How to set TURN username/password."
+        echo "  plan         : Show Terraform execution plan."
+        echo "                 Example: TF_VAR_domain_name_prefix='mytest' task plan"
+        echo "  apply        : Create or update infrastructure."
+        echo "                 Example: TF_VAR_domain_name_prefix='mytest' task apply"
+        echo "                 (Set TF_VAR_turn_auth_secret for custom auth secret)"
+        echo "  output       : Display server IP, hostname, credentials."
+        echo "                 Example: task output"
+        echo "  destroy      : Destroy infrastructure."
+        echo "                 Example: task destroy"
+        echo "  ssh          : (Info) How to connect via SSH or SSM."
+        echo ""
+        echo "*** Variables (set as TF_VAR_name=value or in terraform.tfvars): ***"
+        echo "  domain_name_prefix : Prefix for DNS name (default: 'rustunnel-test')."
+        echo "  base_domain_name   : Base domain for DNS (default: keeperpamlab.com)."
+        echo "  turn_auth_secret   : TURN authentication secret (default: 'your-secure-turn-secret-123')."
+        echo "  aws_region         : AWS region (default: us-east-1)."
+        echo "  instance_type      : EC2 instance type (default: t3.small)."
+        echo "  ssh_public_key_path: Path to SSH public key (default: keys/vm_key.pub)."
+        echo ""
+        echo "*** Example Workflow: ***"
+        echo "  1. (Optional) export TF_VAR_domain_name_prefix=\"myrun1\"  # Uses 'rustunnel-test' if not set"
+        echo "  2. (Optional) export TF_VAR_turn_auth_secret=\"my-super-secret-key\""
+        echo "  3. task init"
+        echo "  4. task apply"
+        echo "  5. task output"
+        echo "  6. ... use the TURN server ..."
+        echo "  7. task destroy"
+        echo "----------------------------------------------------------------------"
+
+  init:
+    desc: "Initialize Terraform (downloads providers, sets up backend)."
+    dir: "."
+    deps: ["_check-terraform-installed"]
+    cmds:
+      - terraform init
+
+  set-creds:
+    desc: "(Informational) Guide on setting TURN authentication secret before 'apply'."
+    cmds:
+      - |
+        echo ""
+        echo "*** How to Set Custom TURN Authentication Secret: ***"
+        echo "The TURN server uses dynamic authentication with a shared secret."
+        echo "To use a custom secret, set this environment variable BEFORE running 'task apply':"
+        echo ""
+        echo "  export TF_VAR_turn_auth_secret='your-super-secure-secret-here'"
+        echo ""
+        echo "Alternatively, create a 'terraform.tfvars' file in the 'turn_server_infra' directory:"
+        echo "  turn_auth_secret = \"your-super-secure-secret-here\""
+        echo ""
+        echo "(Ensure terraform.tfvars is in .gitignore if it contains sensitive secrets.)"
+        echo "Default secret: your-secure-turn-secret-123"
+        echo ""
+        echo "*** Generate Credentials After Deployment: ***"
+        echo "  ./test_turn_credentials.sh              # 48h credentials for current user"
+        echo "  ./test_turn_credentials.sh -u alice     # 48h credentials for alice"
+        echo "  ./test_turn_credentials.sh -t 24        # 24h credentials"
+        echo "  ./test_turn_credentials.sh --test       # Generate + test server"
+        echo "----------------------------------------------------------------------"
+
+  plan:
+    desc: "Create Terraform execution plan (shows what will be changed)."
+    dir: "."
+    deps: ["_check-terraform-installed", "_check-aws-auth"]
+    cmds:
+      - terraform plan
+    vars:
+      ARGS: "{{.CLI_ARGS}}"
+
+  apply:
+    desc: "Apply Terraform changes (creates or updates infrastructure)."
+    dir: "."
+    deps: ["_check-terraform-installed", "_check-aws-auth"]
+    cmds:
+      - terraform apply -auto-approve {{.ARGS}}
+    vars:
+      ARGS: "{{.CLI_ARGS}}"
+
+  output:
+    desc: "Display Terraform outputs (server IP, hostname, credentials)."
+    dir: "."
+    deps: ["_check-terraform-installed"]
+    cmds:
+      - terraform output
+
+  destroy:
+    desc: "Destroy Terraform managed infrastructure."
+    dir: "."
+    deps: ["_check-terraform-installed", "_check-aws-auth"]
+    cmds:
+      - terraform destroy -auto-approve {{.ARGS}}
+    vars:
+      ARGS: "{{.CLI_ARGS}}"
+
+  ssh:
+    desc: "(Informational) How to connect to the EC2 instance and debug Coturn."
+    deps: ["_check-terraform-installed", "_check-aws-cli-installed"]
+    cmds:
+      - |
+        echo ""
+        echo "*** How to Connect to the EC2 Instance: ***"
+        echo "To connect via SSH (ensure your public key '{{.SSH_KEY_PATH}}' was used):"
+        echo "  1. Get the server IP: task output  (look for 'turn_server_public_ip')"
+        echo "  2. ssh -i {{.SSH_PRIVATE_KEY_PATH}} ec2-user@YOUR_SERVER_PUBLIC_IP"
+        echo ""
+        echo "To connect via AWS SSM Session Manager (preferred, no SSH port needed):"
+        echo "  1. Get the instance ID: task output (look for 'turn_server_instance_id')"
+        echo "  2. aws ssm start-session --target YOUR_INSTANCE_ID --region {{.AWS_REGION}}"
+        echo ""
+        echo "*** Debugging Cloud-Init and Setup (if server setup fails): ***"
+        echo "Check Cloud-Init Status:"
+        echo "  sudo cloud-init status  (shows if cloud-init completed successfully)"
+        echo "  sudo cloud-init status --long  (detailed status)"
+        echo ""
+        echo "View Cloud-Init Logs:"
+        echo "  sudo tail -f /var/log/cloud-init-output.log  (user-data script output - MOST USEFUL)"
+        echo "  sudo cat /var/log/cloud-init-output.log | less  (view entire log)"
+        echo "  sudo tail -f /var/log/cloud-init.log  (cloud-init main log)"
+        echo "  sudo journalctl -u cloud-final -f  (cloud-init final stage logs)"
+        echo ""
+        echo "*** Debugging the Coturn TURN Server (once connected to the instance): ***"
+        echo "Check Coturn Service Status:"
+        echo "  sudo systemctl status coturn"
+        echo "  sudo journalctl -u coturn -f  (to follow logs in real-time)"
+        echo ""
+        echo "Coturn Log File Location (if not logging to stdout via systemd):"
+        echo "  /var/log/coturn.log  (e.g., sudo tail -f /var/log/coturn.log)"
+        echo "  When configured for 'log-file=stdout' (current default), logs go to systemd journal."
+        echo ""
+        echo "Coturn Configuration File:"
+        echo "  /usr/local/etc/turnserver.conf (review this if settings are incorrect)"
+        echo "  (Remember that this file is generated by the user-data script at instance launch)"
+        echo ""
+        echo "Restart Coturn (if you make config changes manually, though user-data handles initial setup):"
+        echo "  sudo systemctl restart coturn"
+        echo ""
+        echo "*** Common Debugging Workflow: ***"
+        echo "If the TURN server isn't working, follow this order:"
+        echo "  1. sudo cloud-init status  (ensure setup completed)"
+        echo "  2. sudo tail -100 /var/log/cloud-init-output.log  (check for setup errors)"
+        echo "  3. sudo systemctl status coturn  (check service status)"
+        echo "  4. sudo journalctl -u coturn --no-pager  (check coturn logs)"
+        echo "  5. cat /usr/local/etc/turnserver.conf  (verify config)"
+        echo "  6. ./test_turn_credentials.sh --test  (test authentication from local machine)"
+        echo ""
+        echo "General Troubleshooting Tips:"
+        echo "  - Verify network connectivity to the server on required ports (3478, 5349, 49152-65535 UDP)."
+        echo "  - Double-check the AWS Security Group rules in the AWS console."
+        echo "  - Ensure the 'external-ip' in turnserver.conf matches the instance's public IP."
+        echo "  - Use online STUN/TURN test tools to check connectivity from an external client."
+        echo "----------------------------------------------------------------------"
+    vars:
+      SSH_KEY_PATH: "{{default \"keys/vm_key.pub\" .SSH_KEY_PATH}}"
+      SSH_PRIVATE_KEY_PATH: "{{default \"keys/vm_key\" .SSH_PRIVATE_KEY_PATH}}"
+      AWS_REGION: "{{default \"us-east-1\" .AWS_REGION}}"
+
+# Add other tasks here, like setting up coturn, etc. 

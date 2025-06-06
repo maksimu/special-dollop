@@ -90,7 +90,7 @@ impl AsyncReadWrite for TcpStream {
     }
 }
 
-// Simplified connection - no complex stats tracking
+// Simplified connection with event-driven sending
 pub(crate) struct Conn {
     pub(crate) data_tx: mpsc::UnboundedSender<ConnectionMessage>,
     pub(crate) backend_task: JoinHandle<()>,

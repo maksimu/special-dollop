@@ -19,13 +19,21 @@ async fn test_buffer_pool_usage() {
     // Create a custom buffer pool for testing
     let buffer_pool_config = BufferPoolConfig {
         buffer_size: 8 * 1024, // 8KB buffer size
-        max_pooled: 5,         // Keep up to 5 buffers in the pool
+        max_pooled: 10,        // Keep up to 10 buffers in the pool (increased for pre-warming)
         resize_on_return: true,
     };
     let buffer_pool = BufferPool::new(buffer_pool_config);
 
-    // Verify initial buffer pool state
-    assert_eq!(buffer_pool.count(), 0, "Buffer pool should start empty");
+    // Verify the initial buffer pool state - now pre-warmed for performance
+    let initial_count = buffer_pool.count();
+    assert!(
+        initial_count > 0,
+        "Buffer pool should be pre-warmed with buffers"
+    );
+    assert!(
+        initial_count <= 8,
+        "Buffer pool should pre-warm with at most 8 buffers"
+    );
 
     // Create a frame using the pool
     let test_data = b"test data for buffer pool";
@@ -38,10 +46,11 @@ async fn test_buffer_pool_usage() {
         buffer_pool.release(buffer);
     }
 
-    // Verify pool usage
+    // Verify pool usage - count should be at least the initial count
+    let count_after_use = buffer_pool.count();
     assert!(
-        buffer_pool.count() > 0,
-        "Buffer pool should have buffers after use"
+        count_after_use >= initial_count,
+        "Buffer pool should maintain or increase count after releasing buffers"
     );
 
     // Create another frame and encode, then release
@@ -54,7 +63,7 @@ async fn test_buffer_pool_usage() {
 
     // The buffer pool count should not exceed max_pooled
     assert!(
-        buffer_pool.count() <= 5,
+        buffer_pool.count() <= 10,
         "Buffer pool should not exceed max_pooled"
     );
 }

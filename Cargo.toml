@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [lib]
@@ -11,6 +11,18 @@ crate-type = ["cdylib"]
 default = ["python"]
 python = ["pyo3", "pyo3-log"]
 profiling = []
+
+# **SIMPLIFIED CONTROLS** - All performance optimizations are now always-on
+production_debug = []           # Enable debug logs in production builds
+disable_hot_path_logging = []   # Nuclear option: completely remove hot path logging
+
+# **ALL OPTIMIZATIONS ALWAYS ENABLED:**
+# ✅ SIMD optimizations (auto-detected)
+# ✅ Lock-free thread-local buffer pools  
+# ✅ Event-driven backpressure
+# ✅ Memory prefetching & branch prediction
+# ✅ Two-connection pattern optimization
+# ✅ Ultra-fast runtime logging checks
 
 [dependencies]
 bytes = "1.10.1"

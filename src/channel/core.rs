@@ -29,7 +29,7 @@ use super::frame_handling::handle_incoming_frame;
 use super::utils::handle_ping_timeout;
 
 // Define the buffer thresholds
-pub(crate) const BUFFER_LOW_THRESHOLD: u64 = 14 * 1024 * 1024; // 14MB for responsive UI
+pub(crate) const BUFFER_LOW_THRESHOLD: u64 = 8 * 1024; // 8KB - optimal for real-time
 
 // --- Protocol-specific state definitions ---
 #[derive(Default, Clone, Debug)]

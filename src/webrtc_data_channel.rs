@@ -1,6 +1,7 @@
 use bytes::Bytes;
 #[cfg(test)]
 use futures::future::BoxFuture;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -273,5 +274,121 @@ impl WebRTCDataChannel {
 
     pub fn label(&self) -> String {
         self.data_channel.label().to_string()
+    }
+}
+
+/// Event-driven sender that uses WebRTC native bufferedAmountLow events
+/// Eliminates polling and provides natural backpressure
+pub struct EventDrivenSender {
+    data_channel: Arc<WebRTCDataChannel>,
+    pending_frames: Arc<Mutex<VecDeque<Bytes>>>,
+    can_send: Arc<AtomicBool>,
+    threshold: u64, // Backpressure threshold for monitoring
+}
+
+impl EventDrivenSender {
+    /// Create a new event-driven sender with the specified threshold
+    pub fn new(data_channel: Arc<WebRTCDataChannel>, threshold: u64) -> Self {
+        let sender = Self {
+            data_channel: data_channel.clone(),
+            pending_frames: Arc::new(Mutex::new(VecDeque::new())),
+            can_send: Arc::new(AtomicBool::new(true)),
+            threshold,
+        };
+
+        // Set up WebRTC native event handling
+        data_channel.set_buffered_amount_low_threshold(threshold);
+
+        let can_send_clone = sender.can_send.clone();
+        let pending_clone = sender.pending_frames.clone();
+        let dc_clone = data_channel.clone();
+
+        // EVENT-DRIVEN: Only wake up when buffer space available
+        data_channel.on_buffered_amount_low(Some(Box::new(move || {
+            can_send_clone.store(true, Ordering::Release);
+
+            // Drain pending frames when space becomes available (batched)
+            let to_send = {
+                let mut pending = pending_clone.lock().unwrap();
+                let batch_size = std::cmp::min(pending.len(), 16); // Max 16 frames per batch
+                pending.drain(..batch_size).collect::<Vec<_>>()
+            };
+
+            if !to_send.is_empty() {
+                let dc = dc_clone.clone();
+                let can_send_for_batch = can_send_clone.clone();
+
+                tokio::spawn(async move {
+                    for frame in to_send {
+                        match dc.send(frame).await {
+                            Ok(_) => continue,
+                            Err(_) => {
+                                // On failure, mark as unable to send
+                                can_send_for_batch.store(false, Ordering::Release);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        })));
+
+        sender
+    }
+
+    /// Send with zero-polling natural backpressure
+    /// Returns immediately - either sends or queues for later
+    pub async fn send_with_natural_backpressure(&self, frame: Bytes) -> Result<(), String> {
+        // Fast path: send immediately if buffer has space
+        if self.can_send.load(Ordering::Acquire) {
+            match self.data_channel.send(frame.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    // Check if it's a buffer full error
+                    if e.contains("buffer") || e.contains("full") || e.contains("would block") {
+                        // Buffer became full, switch to queueing mode
+                        self.can_send.store(false, Ordering::Release);
+                        // Fall through to queueing
+                    } else {
+                        return Err(e); // Real error, not buffer full
+                    }
+                }
+            }
+        }
+
+        // Slow path: queue for later when buffer drains
+        {
+            let mut pending = self.pending_frames.lock().unwrap();
+            pending.push_back(frame);
+
+            // Prevent unbounded growth
+            if pending.len() > 1000 {
+                // Drop oldest frames if queue grows too large
+                pending.pop_front();
+                warn!("Event-driven sender queue full, dropping old frame");
+            }
+        }
+
+        Ok(()) // Queued successfully - no blocking!
+    }
+
+    /// Get queue depth for monitoring
+    pub fn queue_depth(&self) -> usize {
+        self.pending_frames.lock().unwrap().len()
+    }
+
+    /// Check if sender can send immediately (useful for monitoring)
+    pub fn can_send_immediate(&self) -> bool {
+        self.can_send.load(Ordering::Acquire)
+    }
+
+    /// Check if queue depth exceeds threshold (for monitoring/alerting)
+    pub fn is_over_threshold(&self) -> bool {
+        self.queue_depth() as u64 > self.threshold
+    }
+
+    /// Get the configured threshold for monitoring
+    pub fn get_threshold(&self) -> u64 {
+        self.threshold
     }
 }

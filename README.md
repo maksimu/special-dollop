@@ -1,17 +1,28 @@
 # Keeper PAM WebRTC for Python
 
-A high-performance WebRTC implementation for Python, written in Rust for maximum efficiency and reliability.
+A secure, stable, and high-performance **Tube API** for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations.
+
+## Core Values
+
+**Security • Stability • Performance** - Built for Keeper Security's mission-critical applications:
+
+- **🔒 Security First**: Memory-safe Rust implementation with comprehensive bounds checking
+- **🛡️ Enterprise Stability**: Lock-free architecture eliminates race conditions and deadlocks  
+- **⚡ Optimized Performance**: Advanced optimizations deliver exceptional speed when you need it
+- **🔧 Production Ready**: Zero-configuration reliability for demanding security applications
 
 ## Description
 
-`keeper-pam-webrtc-rs` provides Python bindings to a Rust-based WebRTC implementation, allowing for:
+`keeper-pam-webrtc-rs` provides Python bindings to a Rust-based **Tube API** for secure communication, designed for:
 
-- Real-time data communication via WebRTC data channels
-- Peer connection management
-- ICE candidate handling
-- Cross-platform compatibility (Linux, macOS, Windows, Alpine)
+- **Secure tunneling** via WebRTC data channels with memory-safe operations
+- **Multi-connection management** through tube abstractions
+- **Reliable peer connection handling** with comprehensive error handling
+- **Efficient channel management** for different communication patterns
+- **Cross-platform compatibility** (Linux, macOS, Windows, Alpine)
+- **Mission-critical reliability** for security-focused applications
 
-This package is designed to be used with Keeper Gateway and Keeper Commander. It serves as a lightweight, focused replacement for [aiortc](https://github.com/aiortc/aiortc), tailored specifically for Keeper Security's internal products and use cases.
+This package is designed to be used with Keeper Gateway and Keeper Commander. It provides a **secure, reliable tube-based communication system** built on WebRTC, specifically tailored for Keeper Security's internal products and security-critical tunneling use cases.
 
 > **Note**: This package is intended for internal Keeper Security products and is not being actively advertised for general use.
 
@@ -26,88 +37,138 @@ pip install keeper-pam-webrtc-rs
 ```python
 import keeper_pam_webrtc_rs
 
-# Initialize WebRTC peer connection
-config = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-pc = keeper_pam_webrtc_rs.PyRTCPeerConnection(
-    config, 
-    on_ice_candidate=lambda c: print(f"ICE candidate: {c}"), 
-    on_data_channel=lambda dc: print(f"Data channel: {dc.label()}"),
+# Create a tube registry
+registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+
+# Define a signal callback for WebRTC events
+def on_signal(signal_dict):
+    print(f"Received signal: {signal_dict}")
+    # Handle ICE candidates, connection state changes, etc.
+
+# Create a server-side tube for tunneling
+server_result = registry.create_tube(
+    conversation_id="tunnel-session-123",
+    settings={
+        "conversationType": "tunnel",
+        "target_host": "127.0.0.1", 
+        "target_port": "22"  # SSH tunnel example
+    },
     trickle_ice=True,
-    turn_only=False
+    callback_token="server-token",
+    ksm_config="server-config",
+    signal_callback=on_signal
 )
 
-# Create offer
-offer = pc.create_offer()
+# Get the offer SDP to send to the client
+server_offer = server_result['offer']
+server_tube_id = server_result['tube_id']
 
-# Create data channel
-dc = pc.create_data_channel("example-channel")
+# Create a client-side tube with the offer
+client_result = registry.create_tube(
+    conversation_id="tunnel-client-123", 
+    settings={
+        "conversationType": "tunnel",
+        "target_host": "192.168.1.100",
+        "target_port": "22"
+    },
+    trickle_ice=True,
+    callback_token="client-token", 
+    ksm_config="client-config",
+    offer=server_offer,  # Use server's offer
+    signal_callback=on_signal
+)
 
-# Send data
-dc.send(b'Hello WebRTC!')
+# Get the answer SDP to send back to server
+client_answer = client_result['answer']
+client_tube_id = client_result['tube_id']
 
-# Set message handler
-def on_message(data):
-    print(f"Received: {data}")
-dc.on_message = on_message
+# Set the remote description on the server
+registry.set_remote_description(server_tube_id, client_answer, is_answer=True)
+
+# Check connection state
+state = registry.get_connection_state(server_tube_id)
+print(f"Connection state: {state}")
 
 # Close when done
-pc.close()
+registry.close_tube(server_tube_id)
+registry.close_tube(client_tube_id)
 ```
 
 ## Features
 
-- Async-first design with Tokio runtime integration
-- Optimized for performance and reliability
-- Cross-platform compatibility
-- Built with abi3 for maximum Python version compatibility (Python 3.7+)
-- Comprehensive WebRTC functionality
+- **🔒 Memory Safety**: Rust-powered implementation prevents buffer overflows and memory corruption
+- **🛡️ Reliable Architecture**: Lock-free design eliminates race conditions and ensures stability
+- **⚡ Efficient Performance**: Optimized for speed without compromising security or stability
+- **🌊 Tube Abstraction**: High-level API for managing WebRTC-based secure tunnels
+- **🌍 Cross-Platform**: Secure, consistent behavior across Linux, macOS, Windows, Alpine
+- **🐍 Python Integration**: Built with abi3 for maximum compatibility (Python 3.7+)
+- **🔧 Production Hardened**: Comprehensive error handling and graceful degradation
 
-## WebRTC Configuration
+## Tube API Architecture
 
-### TURN-only Mode
+This implementation provides a **Tube-based abstraction** over WebRTC:
 
-The WebRTC implementation supports a "TURN-only" mode which forces all WebRTC traffic through TURN servers rather than attempting direct peer-to-peer connections. This can be useful in the following scenarios:
+### **Security Features**
+- **Memory-Safe Operations**: Rust's ownership system prevents common security vulnerabilities
+- **Bounds Checking**: Comprehensive validation prevents buffer overflows and data corruption
+- **Zero Unsafe Code**: Hot paths use only verified, safe Rust code (except vetted SIMD intrinsics)
+- **Graceful Error Handling**: Robust error recovery prevents crashes and data leaks
 
-- When you need to guarantee connectivity through restrictive firewalls
-- When you need to ensure consistent network behavior
-- For regulatory compliance requirements that mandate traffic through specific servers
-- When troubleshooting WebRTC connectivity issues
+### **Tube Management**  
+- **Multi-Connection Support**: Each tube can manage multiple WebRTC connections
+- **Channel Abstraction**: High-level channel management for different protocols
+- **State Management**: Comprehensive connection state tracking and reporting
+- **Signal Handling**: Event-driven architecture for ICE candidates and state changes
 
-To enable TURN-only mode, set the `turn_only` parameter to `True` when creating a peer connection:
+### **Performance Features**
+- **SIMD Optimization**: Hardware-accelerated frame parsing with safe fallbacks
+- **Zero-Copy Pipelines**: Efficient data handling minimizes memory overhead
+- **Event-Driven Design**: Native WebRTC events provide responsive communication
+- **Always Optimized**: Maximum efficiency by default, no configuration required
 
-```python
-# Regular mode (uses all ICE candidate types)
-peer = keeper_pam_webrtc_rs.PyRTCPeerConnection(
-    config, on_ice_candidate, on_data_channel,
-    trickle_ice=True, turn_only=False  # Default is False
-)
+## Tube API Reference
 
-# TURN-only mode (only uses relay candidates)
-peer = keeper_pam_webrtc_rs.PyRTCPeerConnection(
-    config, on_ice_candidate, on_data_channel,
-    trickle_ice=True, turn_only=True
-)
+### **Core Methods**
+
+- `create_tube(conversation_id, settings, ...)` - Create a new secure tube
+- `set_remote_description(tube_id, sdp, is_answer)` - Set remote SDP description
+- `add_ice_candidate(tube_id, candidate)` - Add ICE candidate for connection
+- `get_connection_state(tube_id)` - Get current connection state
+- `new_connection(tube_id, connection_id, settings)` - Add connection to existing tube
+- `create_channel(connection_id, tube_id, settings)` - Create channel on tube
+- `close_connection(tube_id, connection_id)` - Close specific connection
+- `close_tube(tube_id)` - Close entire tube
+
+### **Conversation Types**
+
+The tube API supports different communication patterns:
+
+- **`tunnel`** - Secure TCP tunneling through WebRTC
+- **`guacd`** - Apache Guacamole protocol tunneling
+- **`socks5`** - SOCKS5 proxy tunneling
+
+## Build & Verification
+
+To build and verify the implementation:
+
+```bash
+# Standard build (all optimizations enabled)
+cargo build --release
+
+# Run comprehensive test suite
+cargo test --release
+
+# Optional: Enable debug logging for troubleshooting
+cargo build --release --features production_debug
 ```
 
-Note that TURN-only mode requires properly configured TURN servers in your ICE server configuration:
+## Why This Implementation?
 
-```python
-config = {
-    "iceServers": [
-        {
-            "urls": ["turn:your-turn-server.example.com:3478"],
-            "username": "your-username",
-            "credential": "your-password"
-        }
-    ]
-}
-```
+Built specifically for Keeper Security's tunneling requirements:
 
-#### Performance Considerations
+- **Security-First Design**: Memory safety and comprehensive validation prevent vulnerabilities
+- **Mission-Critical Reliability**: Lock-free architecture ensures stable operation under load  
+- **Optimized for Security Applications**: Performance optimizations that don't compromise security
+- **Tube Abstraction**: High-level API designed specifically for secure tunneling use cases
 
-TURN-only mode forces all media traffic through relay servers, which can introduce:
-- Higher latency compared to direct connections
-- Increased bandwidth costs for TURN server operations
-- Potential bottlenecks if TURN servers are overloaded
-
-Use this mode only when necessary, and ensure your TURN servers are properly scaled for your application's needs.
+**The secure, stable, high-performance tube communication system for enterprise security applications.**

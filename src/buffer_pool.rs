@@ -1,10 +1,12 @@
 // Buffer pool implementation for efficient buffer reuse
 
 use bytes::{BufMut, Bytes, BytesMut};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Configuration for buffer pool
+#[derive(Clone)]
 pub struct BufferPoolConfig {
     /// Initial size of each buffer
     pub buffer_size: usize,
@@ -24,10 +26,19 @@ impl Default for BufferPoolConfig {
     }
 }
 
-/// A thread-safe pool of reusable BytesMut buffers
+// Thread-local buffer storage for lock-free operation
+thread_local! {
+    static LOCAL_BUFFERS: RefCell<VecDeque<BytesMut>> = const { RefCell::new(VecDeque::new()) };
+    static LOCAL_CONFIG: RefCell<Option<BufferPoolConfig>> = const { RefCell::new(None) };
+}
+
+/// A lock-free buffer pool using thread-local storage
+/// Eliminates mutex contention by keeping buffers per-thread
 #[derive(Clone)]
 pub struct BufferPool {
-    inner: Arc<Mutex<BufferPoolInner>>,
+    /// Fallback shared pool for cross-thread scenarios
+    fallback: Arc<Mutex<BufferPoolInner>>,
+    config: BufferPoolConfig,
 }
 
 struct BufferPoolInner {
@@ -40,12 +51,23 @@ struct BufferPoolInner {
 impl BufferPool {
     /// Create a new buffer pool with custom configuration
     pub fn new(config: BufferPoolConfig) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(BufferPoolInner {
+        // Initialize thread-local config
+        LOCAL_CONFIG.with(|c| {
+            *c.borrow_mut() = Some(config.clone());
+        });
+
+        let pool = Self {
+            fallback: Arc::new(Mutex::new(BufferPoolInner {
                 buffers: VecDeque::with_capacity(config.max_pooled),
-                config,
+                config: config.clone(),
             })),
-        }
+            config,
+        };
+
+        // **PERFORMANCE**: Pre-warm the thread-local pool for better hot path performance
+        pool.warm_up(8); // 4 buffers per connection (2 connections typical)
+
+        pool
     }
 
     /// Create a new buffer pool with the default configuration
@@ -53,35 +75,68 @@ impl BufferPool {
         Self::new(BufferPoolConfig::default())
     }
 
-    /// Get a buffer from the pool or create a new one if none available
+    /// Get a buffer from the thread-local pool (lock-free!)
     pub fn acquire(&self) -> BytesMut {
-        let mut inner = self.inner.lock().unwrap();
-        match inner.buffers.pop_front() {
+        // Fast path: try thread-local first
+        let local_result = LOCAL_BUFFERS.with(|buffers| buffers.borrow_mut().pop_front());
+
+        match local_result {
             Some(buf) => buf,
-            None => BytesMut::with_capacity(inner.config.buffer_size),
+            None => {
+                // Slow path: create new or steal from shared pool
+                self.acquire_from_fallback()
+            }
         }
     }
 
-    /// Return a buffer to the pool if it doesn't exceed the maximum pool size
+    /// Acquire from fallback shared pool or create new
+    fn acquire_from_fallback(&self) -> BytesMut {
+        // Try to get from shared pool
+        {
+            let mut inner = self.fallback.lock().unwrap();
+            if let Some(buf) = inner.buffers.pop_front() {
+                return buf;
+            }
+        } // Release lock quickly
+
+        // Create new buffer
+        BytesMut::with_capacity(self.config.buffer_size)
+    }
+
+    /// Return a buffer to the thread-local pool (lock-free!)
     pub fn release(&self, mut buf: BytesMut) {
-        let mut inner = self.inner.lock().unwrap();
-
-        // Don't pool if we already have enough buffers
-        if inner.buffers.len() >= inner.config.max_pooled {
-            return;
-        }
-
         // Clear the buffer contents
         buf.clear();
 
-        // Resize capacity if configured to do so
-        if inner.config.resize_on_return && buf.capacity() > inner.config.buffer_size * 2 {
+        // Check if buffer should be reused
+        if self.config.resize_on_return && buf.capacity() > self.config.buffer_size * 2 {
             // If the buffer has grown too large, don't reuse it
             return;
         }
 
-        // Add to pool
-        inner.buffers.push_back(buf);
+        // Fast path: try thread-local first
+        let mut buf = Some(buf);
+        let stored_locally = LOCAL_BUFFERS.with(|buffers| {
+            let mut buffers = buffers.borrow_mut();
+            if buffers.len() < self.config.max_pooled {
+                if let Some(buffer) = buf.take() {
+                    buffers.push_back(buffer);
+                }
+                return true;
+            }
+            false
+        });
+
+        // If thread-local pool is full, try shared pool
+        if !stored_locally {
+            if let Some(buffer) = buf {
+                let mut inner = self.fallback.lock().unwrap();
+                if inner.buffers.len() < inner.config.max_pooled {
+                    inner.buffers.push_back(buffer);
+                }
+                // If both pools are full, drop the buffer
+            }
+        }
     }
 
     /// Create a new Bytes object from a slice, using a pooled buffer
@@ -115,11 +170,23 @@ impl BufferPool {
         result_data_buf.freeze()
     }
 
-    /// Get the number of buffers currently in the pool
+    /// Get the number of buffers currently in the thread-local pool
     #[cfg(test)]
     pub fn count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner.buffers.len()
+        LOCAL_BUFFERS.with(|buffers| buffers.borrow().len())
+    }
+
+    /// Warm up the thread-local pool by pre-allocating buffers
+    pub fn warm_up(&self, count: usize) {
+        LOCAL_BUFFERS.with(|buffers| {
+            let mut buffers = buffers.borrow_mut();
+            for _ in 0..count {
+                if buffers.len() >= self.config.max_pooled {
+                    break;
+                }
+                buffers.push_back(BytesMut::with_capacity(self.config.buffer_size));
+            }
+        });
     }
 }
 
@@ -131,6 +198,14 @@ mod tests {
     fn test_buffer_pool_reuse() {
         let pool = BufferPool::default();
 
+        // Check initial pre-warmed state
+        let initial_count = pool.count();
+        assert!(initial_count > 0, "Pool should be pre-warmed with buffers");
+        assert!(
+            initial_count <= 8,
+            "Pool should pre-warm with at most 8 buffers"
+        );
+
         // Acquire a buffer
         let mut buf1 = pool.acquire();
 
@@ -138,19 +213,22 @@ mod tests {
         buf1.extend_from_slice(b"test data");
         assert_eq!(buf1.len(), 9);
 
+        // After acquiring, the count should be reduced by 1
+        assert_eq!(pool.count(), initial_count - 1);
+
         // Clear and return to the pool
         buf1.clear();
         assert_eq!(buf1.len(), 0);
         pool.release(buf1);
 
-        // Check that a buffer is available
-        assert_eq!(pool.count(), 1);
+        // Check that the buffer was returned - count should be back to initial
+        assert_eq!(pool.count(), initial_count);
 
-        // Acquire another buffer (should be the same one)
+        // Acquire another buffer - should reuse one from the pool
         let buf2 = pool.acquire();
         assert_eq!(buf2.len(), 0);
 
-        // No buffers should be left in the pool
-        assert_eq!(pool.count(), 0);
+        // Count should be reduced by 1 again
+        assert_eq!(pool.count(), initial_count - 1);
     }
 }

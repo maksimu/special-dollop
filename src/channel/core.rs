@@ -112,6 +112,11 @@ pub struct Channel {
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
+    // UDP associations for SOCKS5 UDP ASSOCIATE response handling
+    pub(crate) udp_associations: super::udp::UdpAssociations,
+    // Reverse index: conn_no -> set of destination addresses for efficient cleanup
+    pub(crate) udp_conn_index:
+        Arc<std::sync::Mutex<HashMap<u32, std::collections::HashSet<std::net::SocketAddr>>>>,
     // MPSC channel for frames from receive_message to be processed
     frame_input_tx: mpsc::UnboundedSender<Frame>,
     frame_input_rx: Arc<Mutex<mpsc::UnboundedReceiver<Frame>>>,
@@ -169,6 +174,8 @@ impl Clone for Channel {
             guacd_params: Arc::clone(&self.guacd_params),
 
             buffer_pool: self.buffer_pool.clone(),
+            udp_associations: Arc::new(Mutex::new(HashMap::new())),
+            udp_conn_index: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_input_tx: self.frame_input_tx.clone(),
             frame_input_rx: Arc::clone(&self.frame_input_rx),
             channel_ping_sent_time: Mutex::new(None), // Initialize for clone
@@ -494,6 +501,8 @@ impl Channel {
             guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
 
             buffer_pool,
+            udp_associations: Arc::new(Mutex::new(HashMap::new())),
+            udp_conn_index: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_input_tx: f_input_tx,
             frame_input_rx: Arc::new(Mutex::new(f_input_rx)),
             channel_ping_sent_time: Mutex::new(None),

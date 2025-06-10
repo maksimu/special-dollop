@@ -14,6 +14,7 @@ use tracing::warn;
 
 pub(crate) const CONN_NO_LEN: usize = 4;
 pub(crate) const CTRL_NO_LEN: usize = 2;
+pub(crate) const PORT_LENGTH: usize = 2; // Standard u16 port numbers
 const TS_LEN: usize = 8;
 const LEN_LEN: usize = 4;
 
@@ -88,6 +89,11 @@ pub enum ControlMessage {
     CloseConnection = 102,
     SendEOF = 104,
     ConnectionOpened = 103,
+    // UDP ASSOCIATE support
+    UdpAssociate = 201,
+    UdpAssociateOpened = 202,
+    UdpPacket = 203,
+    UdpAssociateClosed = 204,
 }
 impl std::fmt::Display for ControlMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,6 +104,10 @@ impl std::fmt::Display for ControlMessage {
             ControlMessage::CloseConnection => write!(f, "CloseConnection"),
             ControlMessage::SendEOF => write!(f, "SendEOF"),
             ControlMessage::ConnectionOpened => write!(f, "ConnectionOpened"),
+            ControlMessage::UdpAssociate => write!(f, "UdpAssociate"),
+            ControlMessage::UdpAssociateOpened => write!(f, "UdpAssociateOpened"),
+            ControlMessage::UdpPacket => write!(f, "UdpPacket"),
+            ControlMessage::UdpAssociateClosed => write!(f, "UdpAssociateClosed"),
         }
     }
 }
@@ -113,6 +123,10 @@ impl TryFrom<u16> for ControlMessage {
             102 => Ok(CloseConnection),
             104 => Ok(SendEOF),
             103 => Ok(ConnectionOpened),
+            201 => Ok(UdpAssociate),
+            202 => Ok(UdpAssociateOpened),
+            203 => Ok(UdpPacket),
+            204 => Ok(UdpAssociateClosed),
             _ => Err(anyhow::anyhow!("Unknown control message: {}", raw)),
         }
     }

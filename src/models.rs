@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{debug_hot_path, warn_hot_path};
 use anyhow::Result;
@@ -236,39 +239,204 @@ impl Default for TunnelTimeouts {
     }
 }
 
-/// Network access checker
+#[derive(Debug, Clone)]
+struct DnsCacheEntry {
+    ips: smallvec::SmallVec<[IpAddr; 4]>, // Most domains have ≤4 IPs, avoid heap allocation
+    expires_at: Instant,
+}
+
+/// High-performance network access checker with async DNS and caching
 #[derive(Debug, Clone)]
 pub struct NetworkAccessChecker {
-    allowed_hosts: Vec<String>,
-    allowed_ports: Vec<u16>,
+    allowed_networks: Arc<[ipnet::IpNet]>, // CIDR networks for IP matching
+    allowed_hostnames: Arc<[String]>,      // Exact hostname matches
+    allowed_wildcards: Arc<[String]>,      // Wildcard domains (*.example.com)
+    allowed_ports: Arc<[u16]>,             // Immutable slice for faster lookups
+    dns_cache: Arc<tokio::sync::RwLock<HashMap<Arc<str>, DnsCacheEntry>>>, // Use Arc<str> to avoid cloning
+    dns_cache_ttl: Duration,
 }
 
 impl NetworkAccessChecker {
     pub fn new(allowed_hosts: Vec<String>, allowed_ports: Vec<u16>) -> Self {
-        Self {
-            allowed_hosts,
-            allowed_ports,
-        }
-    }
+        let mut allowed_networks = Vec::new();
+        let mut allowed_hostnames = Vec::new();
+        let mut allowed_wildcards = Vec::new();
 
-    pub fn is_host_allowed(&self, host: &str) -> bool {
-        if self.allowed_hosts.is_empty() {
-            return true;
-        }
-        self.allowed_hosts.iter().any(|h| {
-            if h.starts_with("*.") {
-                host.ends_with(&h[1..])
+        for host in allowed_hosts {
+            if host.starts_with("*.") {
+                // Wildcard domain like "*.google.com"
+                allowed_wildcards.push(host[1..].to_string()); // Store ".google.com"
+            } else if let Ok(network) = host.parse::<ipnet::IpNet>() {
+                // CIDR network like "192.168.1.0/24"
+                allowed_networks.push(network);
+            } else if let Ok(ip) = host.parse::<IpAddr>() {
+                // Single IP address
+                let network = match ip {
+                    IpAddr::V4(ipv4) => ipnet::IpNet::V4(ipnet::Ipv4Net::new(ipv4, 32).unwrap()),
+                    IpAddr::V6(ipv6) => ipnet::IpNet::V6(ipnet::Ipv6Net::new(ipv6, 128).unwrap()),
+                };
+                allowed_networks.push(network);
             } else {
-                host == h
+                // Exact hostname like "example.com"
+                allowed_hostnames.push(host);
             }
-        })
+        }
+
+        // Sort ports for binary search optimization
+        let mut sorted_ports = allowed_ports;
+        sorted_ports.sort_unstable();
+
+        Self {
+            allowed_networks: allowed_networks.into(),
+            allowed_hostnames: allowed_hostnames.into(),
+            allowed_wildcards: allowed_wildcards.into(),
+            allowed_ports: sorted_ports.into(),
+            dns_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dns_cache_ttl: Duration::from_secs(300), // 5 minutes
+        }
     }
 
+    /// Zero-allocation IP network checking
+    #[inline]
+    fn is_ip_allowed_fast(&self, ip: IpAddr) -> bool {
+        // Hot path: use iterator without debug logs
+        self.allowed_networks
+            .iter()
+            .any(|network| network.contains(&ip))
+    }
+
+    /// Fast port checking with binary search (O(log n))
+    #[inline]
     pub fn is_port_allowed(&self, port: u16) -> bool {
-        if self.allowed_ports.is_empty() {
-            return true;
+        self.allowed_ports.is_empty() || self.allowed_ports.binary_search(&port).is_ok()
+    }
+
+    /// DNS resolution with minimal allocations
+    async fn resolve_with_minimal_allocation(
+        &self,
+        domain: &str,
+    ) -> Result<smallvec::SmallVec<[IpAddr; 4]>, std::io::Error> {
+        // **OPTIMIZATION**: Use a thread-local static buffer to avoid String allocation
+        use std::fmt::Write;
+
+        // Use a reasonable size buffer on the stack for most hostnames
+        let mut buffer = heapless::String::<256>::new();
+        if write!(&mut buffer, "{}:80", domain).is_err() {
+            // Domain name too long for stack buffer, fall back to heap allocation
+            let addrs = tokio::net::lookup_host(format!("{}:80", domain)).await?;
+            return Ok(addrs.map(|addr| addr.ip()).collect());
         }
-        self.allowed_ports.contains(&port)
+
+        // **ZERO-ALLOCATION DNS LOOKUP** (except for the actual network call)
+        let addrs = tokio::net::lookup_host(buffer.as_str()).await?;
+        Ok(addrs.map(|addr| addr.ip()).collect())
+    }
+
+    /// **PERFORMANCE OPTIMIZED**: Combined permission check + DNS resolution
+    /// Returns resolved IPs if host is allowed, None if denied
+    /// Eliminates double DNS lookup for SOCKS5 (check + connect)
+    pub async fn resolve_if_allowed(
+        &self,
+        domain_name_or_ip: &str,
+    ) -> Option<smallvec::SmallVec<[IpAddr; 4]>> {
+        // If no rules specified, allow everything
+        if self.allowed_networks.is_empty()
+            && self.allowed_hostnames.is_empty()
+            && self.allowed_wildcards.is_empty()
+        {
+            return self
+                .resolve_with_minimal_allocation(domain_name_or_ip)
+                .await
+                .ok();
+        }
+
+        // **ZERO-ALLOCATION HOT PATH 1**: Check exact hostname match
+        for hostname in self.allowed_hostnames.iter() {
+            if hostname == domain_name_or_ip {
+                return self
+                    .resolve_with_minimal_allocation(domain_name_or_ip)
+                    .await
+                    .ok();
+            }
+        }
+
+        // **ZERO-ALLOCATION HOT PATH 2**: Check wildcard match
+        for wildcard_suffix in self.allowed_wildcards.iter() {
+            if domain_name_or_ip.ends_with(wildcard_suffix) {
+                return self
+                    .resolve_with_minimal_allocation(domain_name_or_ip)
+                    .await
+                    .ok();
+            }
+        }
+
+        // **ZERO-ALLOCATION HOT PATH 3**: Direct IP check
+        if let Ok(ip) = domain_name_or_ip.parse::<IpAddr>() {
+            if self.is_ip_allowed_fast(ip) {
+                let mut ips = smallvec::SmallVec::new();
+                ips.push(ip);
+                return Some(ips);
+            } else {
+                return None;
+            }
+        }
+
+        // **DNS PATH**: Check if resolved IPs match allowed networks
+        if !self.allowed_networks.is_empty() {
+            // Check cache first - reuse existing cache logic
+            {
+                let cache = self.dns_cache.read().await;
+                if let Some(entry) = cache.get(domain_name_or_ip) {
+                    if entry.expires_at > Instant::now() {
+                        // Check if any cached IP is allowed
+                        let allowed = entry.ips.iter().any(|&ip| self.is_ip_allowed_fast(ip));
+                        return if allowed {
+                            Some(entry.ips.clone())
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+
+            // Resolve and cache
+            match self
+                .resolve_with_minimal_allocation(domain_name_or_ip)
+                .await
+            {
+                Ok(ips) => {
+                    let allowed = ips.iter().any(|&ip| self.is_ip_allowed_fast(ip));
+
+                    // Cache the result
+                    {
+                        let mut cache = self.dns_cache.write().await;
+                        let domain_key: Arc<str> = domain_name_or_ip.into();
+                        cache.insert(
+                            domain_key,
+                            DnsCacheEntry {
+                                ips: ips.clone(),
+                                expires_at: Instant::now() + self.dns_cache_ttl,
+                            },
+                        );
+
+                        // Cleanup expired entries periodically
+                        if cache.len() > 1000 {
+                            let now = Instant::now();
+                            cache.retain(|_, entry| entry.expires_at > now);
+                        }
+                    }
+
+                    if allowed {
+                        Some(ips)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        } else {
+            None // No rules allow this domain
+        }
     }
 }
 

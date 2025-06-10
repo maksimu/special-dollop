@@ -12,6 +12,8 @@ mod misc_tests;
 #[cfg(test)]
 mod protocol_tests;
 #[cfg(test)]
+mod size_instruction_integration_tests;
+#[cfg(test)]
 mod tube_registry_tests;
 #[cfg(test)]
 mod tube_tests;

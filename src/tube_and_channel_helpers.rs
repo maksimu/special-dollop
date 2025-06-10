@@ -126,12 +126,12 @@ pub(crate) fn parse_network_rules_from_settings(
             .and_then(|v| v.as_str())
             .map(|hosts| {
                 hosts
-                    .split(',')
+                    .split('\n')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<String>>()
             })
-            .unwrap_or_default(); // Unwrap to Vec<String> or empty Vec if None
+            .unwrap_or_default();
 
         // Convert allowed_ports string to Vec<u16>
         let allowed_ports = settings
@@ -139,11 +139,30 @@ pub(crate) fn parse_network_rules_from_settings(
             .and_then(|v| v.as_str())
             .map(|ports| {
                 ports
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u16>().ok())
+                    .split('\n') // Use newline like Python: allowed_ports.strip().split('\n')
+                    .filter_map(|s| {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        match trimmed.parse::<u16>() {
+                            Ok(port) => {
+                                if port > 0 {
+                                    Some(port)
+                                } else {
+                                    debug!("Warning: Port {} is out of the valid range and will be ignored.", port);
+                                    None
+                                }
+                            }
+                            Err(_) => {
+                                debug!("Warning: '{}' is not a valid port number and will be ignored.", trimmed);
+                                None
+                            }
+                        }
+                    })
                     .collect::<Vec<u16>>()
             })
-            .unwrap_or_default(); // Unwrap to Vec<u16> or empty Vec if None
+            .unwrap_or_default();
 
         Some(NetworkAccessChecker::new(allowed_hosts, allowed_ports))
     } else {

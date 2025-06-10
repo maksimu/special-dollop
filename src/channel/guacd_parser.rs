@@ -50,6 +50,55 @@ pub struct PeekedInstruction<'a> {
 // Common opcode constants for fast comparison
 pub const ERROR_OPCODE: &str = "error";
 pub const ERROR_OPCODE_BYTES: &[u8] = b"error";
+#[allow(dead_code)] // Kept for API consistency and future use
+pub const SIZE_OPCODE: &str = "size";
+pub const SIZE_OPCODE_BYTES: &[u8] = b"size";
+
+/// Special opcodes that need custom processing beyond normal batching
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecialOpcode {
+    Error,
+    Size,
+    // Future opcodes can be added here:
+    // Disconnect,
+    // Mouse,
+    // Key,
+    // Clipboard,
+}
+
+impl SpecialOpcode {
+    /// Fast byte-level comparison for hot path performance
+    #[inline(always)]
+    fn matches_bytes(&self, opcode_bytes: &[u8]) -> bool {
+        match self {
+            SpecialOpcode::Error => opcode_bytes == ERROR_OPCODE_BYTES,
+            SpecialOpcode::Size => opcode_bytes == SIZE_OPCODE_BYTES,
+            // Add more cases as needed:
+            // SpecialOpcode::Disconnect => opcode_bytes == b"disconnect",
+        }
+    }
+
+    /// Get the string representation (for logging)
+    #[allow(dead_code)] // Useful for future logging/debugging
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpecialOpcode::Error => ERROR_OPCODE,
+            SpecialOpcode::Size => SIZE_OPCODE,
+            // SpecialOpcode::Disconnect => "disconnect",
+        }
+    }
+}
+
+/// Result of opcode analysis - what type of special processing is needed
+#[derive(Debug, PartialEq)]
+pub enum OpcodeAction {
+    /// Normal instruction - batch with others
+    Normal,
+    /// Error instruction - close connection immediately  
+    CloseConnection,
+    /// Special instruction needing custom processing
+    ProcessSpecial(SpecialOpcode),
+}
 
 /// Error type for the peeking operation.
 #[derive(Debug, PartialEq, Clone)]
@@ -425,17 +474,19 @@ impl GuacdParser {
         Self::parse_instruction_content(data_without_terminator)
     }
 
-    /// **ULTRA-FAST PATH: Validate the Guacd format and check for error opcode only**
-    /// Returns (total_bytes, is_error) without any string parsing except for errors
+    /// **ULTRA-FAST PATH: Validate format and detect special opcodes**
+    /// Returns (total_bytes, action_needed) with zero allocations
     #[inline(always)]
-    pub fn validate_and_check_error(buffer_slice: &[u8]) -> Result<(usize, bool), PeekError> {
+    pub fn validate_and_detect_special(
+        buffer_slice: &[u8],
+    ) -> Result<(usize, OpcodeAction), PeekError> {
         if buffer_slice.is_empty() {
             return Err(PeekError::Incomplete);
         }
 
         // Fast path for common "4.sync;" instruction
         if buffer_slice.len() >= 7 && &buffer_slice[0..7] == b"4.sync;" {
-            return Ok((7, false));
+            return Ok((7, OpcodeAction::Normal));
         }
 
         let mut pos = 0;
@@ -458,9 +509,20 @@ impl GuacdParser {
             return Err(PeekError::Incomplete);
         }
 
-        // **KEY OPTIMIZATION: Only check if opcode bytes == "error"**
+        // **OPTIMIZED: Check all special opcodes with single pass**
         let opcode_bytes = &buffer_slice[pos..pos + opcode_len];
-        let is_error = opcode_bytes == ERROR_OPCODE_BYTES;
+
+        // Check for special opcodes using fast byte comparison
+        let action = if SpecialOpcode::Error.matches_bytes(opcode_bytes) {
+            OpcodeAction::CloseConnection
+        } else if SpecialOpcode::Size.matches_bytes(opcode_bytes) {
+            OpcodeAction::ProcessSpecial(SpecialOpcode::Size)
+        } else {
+            // Add more checks as needed:
+            // } else if SpecialOpcode::Disconnect.matches_bytes(opcode_bytes) {
+            //     OpcodeAction::ProcessSpecial(SpecialOpcode::Disconnect)
+            OpcodeAction::Normal
+        };
 
         pos += opcode_len;
 
@@ -501,6 +563,6 @@ impl GuacdParser {
             };
         }
 
-        Ok((pos + 1, is_error))
+        Ok((pos + 1, action))
     }
 }

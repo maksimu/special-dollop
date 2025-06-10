@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
 use super::core::Channel;
-use crate::tube_protocol::{CloseConnectionReason, ControlMessage, CONN_NO_LEN};
+use crate::tube_protocol::{CloseConnectionReason, ControlMessage, CONN_NO_LEN, PORT_LENGTH};
 
 // Import from the new connect_as module
 use super::connect_as::decrypt_connect_as_payload;
@@ -14,6 +14,10 @@ use super::connect_as::decrypt_connect_as_payload;
 const CONNECT_AS_DETAILS_LEN_FIELD_BYTES: usize = 4;
 const CONNECT_AS_PUBLIC_KEY_BYTES: usize = 65; // As per Python: 65-byte public key
 const CONNECT_AS_NONCE_BYTES: usize = 12; // As per Python: 12 byte nonce
+
+// Compile-time SOCKS5 success response constant for zero-allocation response
+pub(crate) const SOCKS5_SUCCESS_RESPONSE: [u8; 10] =
+    [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 use p256::pkcs8::DecodePrivateKey; // Trait for from_pkcs8_pem
 use p256::SecretKey as P256SecretKey;
 
@@ -134,6 +138,18 @@ impl Channel {
                 // In client mode, we just log and continue
                 self.handle_connection_opened(data).await?;
             }
+            ControlMessage::UdpAssociate => {
+                self.handle_udp_associate(data).await?;
+            }
+            ControlMessage::UdpAssociateOpened => {
+                self.handle_udp_associate_opened(data).await?;
+            }
+            ControlMessage::UdpPacket => {
+                self.handle_udp_packet(data).await?;
+            }
+            ControlMessage::UdpAssociateClosed => {
+                self.handle_udp_associate_closed(data).await?;
+            }
         }
 
         Ok(())
@@ -167,7 +183,13 @@ impl Channel {
         }
 
         // Close the connection
-        self.close_backend(target_connection_no, reason).await
+        self.close_backend(target_connection_no, reason).await?;
+
+        // Clean up any UDP associations for this connection
+        self.cleanup_udp_associations_for_connection(target_connection_no)
+            .await?;
+
+        Ok(())
     }
 
     /// Handle an OpenConnection control message
@@ -461,95 +483,84 @@ impl Channel {
                 }
             }
             super::types::ActiveProtocol::Socks5 => {
-                // SOCKS5 connection opening is more complex and typically driven by client requests *after* initial tunnel setup.
-                // An OpenConnection here might be an acknowledgment or part of a specific sub-protocol.
-                // The original connections.rs deferred SOCKS5 OpenConnection payload parsing.
-                // The current protocol.rs has some SOCKS5 host/port parsing if network_checker is present.
-                // This section needs to be harmonized based on the exact SOCKS5 flow.
-                // For now, let's assume SOCKS5 target details are parsed from `cursor` if present.
-                if cursor.has_remaining()
-                    && self.network_checker.is_some()
-                    && cursor.remaining() >= 4
-                {
-                    // Heuristic: if data remains, it might be SOCKS target
-                    // Assuming SOCKS5 target is host_len (u32), then host, then port (u16)
-                    // Note: SOCKS addresses can be domain (length prefixed) or IP. This is simplified.
-                    // This parsing logic is partially duplicated from below, needs cleanup.
-                    let host_len_u32 = cursor.get_u32(); // Read u32 for host_len
-                    let host_len = host_len_u32 as usize;
+                // SOCKS5 parsing
+                if !self.server_mode && self.network_checker.is_some() {
+                    // Client mode with network checker - parse SOCKS5 target from data
 
-                    if cursor.remaining() >= host_len + 2 {
-                        // host_bytes + port_bytes
-                        let mut host_buffer = self.buffer_pool.acquire();
-                        host_buffer.clear();
-                        host_buffer.resize(host_len, 0);
-                        cursor.copy_to_slice(&mut host_buffer[..host_len]);
-                        let parsed_host = String::from_utf8(host_buffer.to_vec())
-                            .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?;
-                        self.buffer_pool.release(host_buffer);
+                    if cursor.remaining() >= CONN_NO_LEN {
+                        let target_host_length = cursor.get_u32() as usize; // CONNECTION_NO_LENGTH = CONN_NO_LEN
 
-                        let parsed_port = cursor.get_u16();
+                        if cursor.remaining() >= target_host_length + PORT_LENGTH {
+                            let mut host_buffer = self.buffer_pool.acquire();
+                            host_buffer.clear();
+                            host_buffer.resize(target_host_length, 0);
+                            cursor.copy_to_slice(&mut host_buffer[..target_host_length]);
+                            let target_host = String::from_utf8(host_buffer.to_vec())
+                                .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?;
+                            self.buffer_pool.release(host_buffer);
 
-                        if let Some(ref checker) = self.network_checker {
-                            if !checker.is_host_allowed(&parsed_host) {
-                                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target host {} not allowed.", parsed_host);
-                                return Err(anyhow!(
-                                    "SOCKS5 target host {} not allowed",
-                                    parsed_host
-                                ));
-                            }
-                            if !checker.is_port_allowed(parsed_port) {
-                                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 target port {} not allowed.", parsed_port);
-                                return Err(anyhow!(
-                                    "SOCKS5 target port {} not allowed",
-                                    parsed_port
-                                ));
-                            }
-                        }
-                        debug!(
-                            "Channel({}): SOCKS5 OpenConnection for target_conn_no {} to {}:{}.",
-                            self.channel_id, target_connection_no, parsed_host, parsed_port
-                        );
+                            let target_port = cursor.get_u16(); // PORT_LENGTH = 2 (standard u16)
 
-                        // Convert String host to &str for lookup_host
-                        match tokio::net::lookup_host(format!("{}:{}", parsed_host, parsed_port))
-                            .await
-                        {
-                            Ok(mut addrs) => {
-                                if let Some(socket_addr) = addrs.next() {
-                                    super::connections::open_backend(
-                                        self,
-                                        target_connection_no,
-                                        socket_addr,
-                                        super::types::ActiveProtocol::Socks5,
-                                    )
-                                    .await
-                                } else {
-                                    Err(anyhow!(
-                                        "Could not resolve SOCKS5 host {}:{} to any SocketAddr",
-                                        parsed_host,
-                                        parsed_port
-                                    ))
+                            if let Some(ref checker) = self.network_checker {
+                                // **PERFORMANCE OPTIMIZED**: Single DNS lookup + permission check
+                                match checker.resolve_if_allowed(&target_host).await {
+                                    Some(resolved_ips) => {
+                                        // Host is allowed and resolved, check port
+                                        if !checker.is_port_allowed(target_port) {
+                                            error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 port {} not allowed", target_port);
+                                            return Err(anyhow!(
+                                                "SOCKS5 port {} not allowed",
+                                                target_port
+                                            ));
+                                        }
+
+                                        debug!(target: "protocol_event",
+                                            channel_id=%self.channel_id,
+                                            "SOCKS5 connection allowed to {}:{}", target_host, target_port);
+
+                                        // **ZERO-ALLOCATION**: Use first resolved IP directly (no second DNS lookup)
+                                        if let Some(&first_ip) = resolved_ips.first() {
+                                            let socket_addr =
+                                                std::net::SocketAddr::new(first_ip, target_port);
+                                            super::connections::open_backend(
+                                                self,
+                                                target_connection_no,
+                                                socket_addr,
+                                                super::types::ActiveProtocol::Socks5,
+                                            )
+                                            .await
+                                        } else {
+                                            Err(anyhow!(
+                                                "SOCKS5 host {} resolved to empty IP list",
+                                                target_host
+                                            ))
+                                        }
+                                    }
+                                    None => {
+                                        // Host was not allowed or DNS resolution failed
+                                        error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 destination {} not allowed or unresolvable", target_host);
+                                        Err(anyhow!(
+                                            "SOCKS5 destination {} not allowed or unresolvable",
+                                            target_host
+                                        ))
+                                    }
                                 }
+                            } else {
+                                Err(anyhow!("SOCKS5 network checker not configured"))
                             }
-                            Err(e) => Err(anyhow!(
-                                "DNS lookup failed for SOCKS5 host {}:{}: {}",
-                                parsed_host,
-                                parsed_port,
-                                e
-                            )),
+                        } else {
+                            error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 payload too short for host and port data");
+                            Err(anyhow!("SOCKS5 payload too short for host and port data"))
                         }
                     } else {
-                        warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no=target_connection_no, "SOCKS5 OpenConnection for conn_no {} received, but payload for host/port is incomplete or missing. Remaining: {}", target_connection_no, cursor.remaining());
-                        Err(anyhow!(
-                            "SOCKS5 OpenConnection payload incomplete for host/port"
-                        ))
+                        error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 payload missing host length");
+                        Err(anyhow!("SOCKS5 payload missing host length"))
                     }
                 } else {
-                    warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no=target_connection_no, "SOCKS5 OpenConnection for conn_no {} received without host/port payload, or network_checker not configured. Cannot open backend.", target_connection_no);
-                    Err(anyhow!(
-                        "SOCKS5 OpenConnection missing target details or checker"
-                    ))
+                    // Server mode or no network checker - not supported in client mode
+                    warn!(target: "protocol_event", channel_id=%self.channel_id, 
+                        "SOCKS5 OpenConnection received but not in client mode with network checker");
+                    Err(anyhow!("SOCKS5 OpenConnection not supported in this mode"))
                 }
             }
         };
@@ -738,18 +749,16 @@ impl Channel {
                     debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
                 }
 
-                let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
                 }
 
-                // Send SOCKS5 response via the connection's data channel
+                // Send SOCKS5 response via the connection's data channel using zero-allocation constant
+                let response_bytes = bytes::Bytes::from_static(&SOCKS5_SUCCESS_RESPONSE);
                 match conn_ref
                     .data_tx
-                    .send(crate::models::ConnectionMessage::Data(bytes::Bytes::from(
-                        response.to_vec(),
-                    ))) {
+                    .send(crate::models::ConnectionMessage::Data(response_bytes))
+                {
                     Ok(_) => {
                         if tracing::enabled!(tracing::Level::DEBUG) {
                             debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response queued for connection {}", connection_no);

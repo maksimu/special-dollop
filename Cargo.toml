@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [lib]
@@ -54,6 +54,8 @@ aes-gcm = "0.10.3"
 log = "0.4.27"
 smallvec = "1.13.2"
 dashmap = "6.1.0"
+ipnet = "2.8"
+heapless = "0.8"
 
 [package.metadata.maturin]
 name = "keeper_pam_webrtc_rs"

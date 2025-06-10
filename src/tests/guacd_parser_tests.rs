@@ -1329,3 +1329,46 @@ fn test_peek_instruction_multiple_empty_args() {
         Err(e) => panic!("Peek failed for multiple empty args: {:?}", e),
     }
 }
+
+#[test]
+fn test_expandable_opcode_detection() {
+    use crate::channel::guacd_parser::{GuacdParser, OpcodeAction, SpecialOpcode};
+
+    // Test size instruction detection
+    let size_instruction = b"4.size,2.10,3.720,3.480;";
+    let result = GuacdParser::validate_and_detect_special(size_instruction).unwrap();
+    assert_eq!(result.0, size_instruction.len()); // Total length
+    assert_eq!(result.1, OpcodeAction::ProcessSpecial(SpecialOpcode::Size));
+
+    // Test error instruction detection
+    let error_instruction = b"5.error,14.Invalid layer.,2.10;";
+    let result = GuacdParser::validate_and_detect_special(error_instruction).unwrap();
+    assert_eq!(result.0, error_instruction.len());
+    assert_eq!(result.1, OpcodeAction::CloseConnection);
+
+    // Test normal instruction
+    let sync_instruction = b"4.sync,10.1699999999;";
+    let result = GuacdParser::validate_and_detect_special(sync_instruction).unwrap();
+    assert_eq!(result.0, sync_instruction.len());
+    assert_eq!(result.1, OpcodeAction::Normal);
+
+    // Test fast path for sync
+    let fast_sync = b"4.sync;";
+    let result = GuacdParser::validate_and_detect_special(fast_sync).unwrap();
+    assert_eq!(result.0, 7);
+    assert_eq!(result.1, OpcodeAction::Normal);
+
+    // Test another normal instruction
+    let copy_instruction = b"4.copy,2.10,1.0,1.0,3.100,3.100,1.0,1.0,1.0;";
+    let result = GuacdParser::validate_and_detect_special(copy_instruction).unwrap();
+    assert_eq!(result.0, copy_instruction.len());
+    assert_eq!(result.1, OpcodeAction::Normal);
+
+    // Test extensibility - future opcodes can be easily added
+    println!(
+        "✅ Expandable system working: Size={:?}, Error={:?}, Normal={:?}",
+        OpcodeAction::ProcessSpecial(SpecialOpcode::Size),
+        OpcodeAction::CloseConnection,
+        OpcodeAction::Normal
+    );
+}

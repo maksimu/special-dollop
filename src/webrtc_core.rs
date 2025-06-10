@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
@@ -681,6 +681,121 @@ impl WebRTCPeerConnection {
                     RTCPeerConnectionState::Failed |
                     RTCPeerConnectionState::Disconnected => {
                         info!(target: "webrtc_lifecycle", tube_id = %tube_id_for_log, state = %state_str, "Connection ended");
+                    },
+                    _ => {}
+                }
+            })
+        }));
+
+        // Add ICE connection state change handler
+        let tube_id_ice = self.tube_id.clone();
+        let pc_for_analysis = Arc::clone(&self.peer_connection);
+
+        self.peer_connection.on_ice_connection_state_change(Box::new(move |state| {
+            let tube_id_for_ice_log = tube_id_ice.clone();
+            let pc_for_candidate_analysis = Arc::clone(&pc_for_analysis);
+
+            Box::pin(async move {
+                debug!(target: "webrtc_ice_connection", tube_id = %tube_id_for_ice_log, state = ?state, "ICE connection state changed");
+
+                match state {
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Connected => {
+                        info!(target: "webrtc_ice", tube_id = %tube_id_for_ice_log, "ICE connection established");
+
+                        // Enhanced candidate analysis at trace level
+                        // Example outputs you'll see:
+                        // RUST_LOG="webrtc_ice_selected=trace" -> Shows local_type and remote_type
+                        // RUST_LOG="webrtc_ice=info" -> Simple TURN detection
+                        //
+                        // Sample trace output:
+                        // 🎯 ICE candidates: local_type=host remote_type=srflx (no TURN)
+                        // 🎯 ICE candidates: local_type=relay remote_type=host (using TURN)
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            // Helper function to parse candidate type from SDP
+                            fn parse_candidate_type_from_sdp(sdp: &str) -> Option<String> {
+                                // Look for the first candidate line in SDP
+                                for line in sdp.lines() {
+                                    if line.starts_with("a=candidate:") {
+                                        let parts: Vec<&str> = line.split_whitespace().collect();
+                                        if parts.len() >= 8 {
+                                            let candidate_type = parts[7]; // typ field
+                                            return Some(candidate_type.to_string());
+                                        }
+                                    }
+                                }
+                                None
+                            }
+
+                            // Get local and remote descriptions
+                            let local_desc = pc_for_candidate_analysis.local_description().await;
+                            let remote_desc = pc_for_candidate_analysis.remote_description().await;
+
+                            if let (Some(local), Some(remote)) = (local_desc, remote_desc) {
+                                let local_type = parse_candidate_type_from_sdp(&local.sdp);
+                                let remote_type = parse_candidate_type_from_sdp(&remote.sdp);
+
+                                match (local_type, remote_type) {
+                                    (Some(local), Some(remote)) => {
+                                        let using_turn = local == "relay" || remote == "relay";
+
+                                        trace!(target: "webrtc_ice_selected",
+                                            tube_id = %tube_id_for_ice_log,
+                                            local_type = %local,
+                                            remote_type = %remote,
+                                            using_turn = using_turn,
+                                            "🎯 ICE candidates: local_type={} remote_type={} {}",
+                                            local, remote,
+                                            if using_turn { "(using TURN)" } else { "(no TURN)" }
+                                        );
+
+                                        // Simple info-level notification if using TURN
+                                        if using_turn {
+                                            info!(target: "webrtc_ice",
+                                                tube_id = %tube_id_for_ice_log,
+                                                "🔄 TURN relay in use: local={} remote={}",
+                                                local, remote
+                                            );
+                                        }
+                                    },
+                                    _ => {
+                                        trace!(target: "webrtc_ice_selected",
+                                            tube_id = %tube_id_for_ice_log,
+                                            "🎯 ICE connection established but could not parse candidate types"
+                                        );
+                                    }
+                                }
+                            } else {
+                                trace!(target: "webrtc_ice_selected",
+                                    tube_id = %tube_id_for_ice_log,
+                                    "🎯 ICE connection established but SDP descriptions not available"
+                                );
+                            }
+                        }
+                    },
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Failed => {
+                        warn!(target: "webrtc_ice", tube_id = %tube_id_for_ice_log, "ICE connection failed");
+                    },
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Disconnected => {
+                        warn!(target: "webrtc_ice", tube_id = %tube_id_for_ice_log, "ICE connection disconnected");
+                    },
+                    _ => {}
+                }
+            })
+        }));
+
+        // Add ICE gathering state change handler
+        let tube_id_gather = self.tube_id.clone();
+        self.peer_connection.on_ice_gathering_state_change(Box::new(move |state| {
+            let tube_id_for_gather_log = tube_id_gather.clone();
+            Box::pin(async move {
+                debug!(target: "webrtc_ice_gathering", tube_id = %tube_id_for_gather_log, state = ?state, "ICE gathering state changed");
+
+                match state {
+                    RTCIceGathererState::Complete => {
+                        info!(target: "webrtc_ice", tube_id = %tube_id_for_gather_log, "ICE gathering complete");
+                    },
+                    RTCIceGathererState::Gathering => {
+                        debug!(target: "webrtc_ice", tube_id = %tube_id_for_gather_log, "ICE gathering started");
                     },
                     _ => {}
                 }

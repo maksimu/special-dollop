@@ -216,6 +216,8 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
         debug!(channel_id = %channel.channel_id, first_bytes = ?first_bytes, "Large payload first bytes");
     }
 
+    // Skip inbound special instruction detection - user only wants outbound and handshake sizes
+
     // **COMPLETELY LOCK-FREE**: DashMap provides efficient concurrent access
     // **MEMORY OPTIMIZATION**: Smart prefetching for 2-connection pattern (always enabled)
     if likely(conn_no == 1) {

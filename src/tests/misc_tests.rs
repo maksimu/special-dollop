@@ -86,7 +86,7 @@ fn test_realistic_frame_processing_performance() {
     use crate::tube_protocol::{try_parse_frame, ControlMessage, Frame};
     use std::time::Instant;
 
-    println!("\n🔥 REALISTIC FRAME PROCESSING PERFORMANCE TEST 🔥");
+    println!("\nREALISTIC FRAME PROCESSING PERFORMANCE TEST");
     println!("==================================================");
 
     let pool = BufferPool::default();
@@ -101,7 +101,7 @@ fn test_realistic_frame_processing_performance() {
     ];
 
     for (test_name, payload) in test_cases {
-        println!("\n🧪 Testing: {} ({} bytes)", test_name, payload.len());
+        println!("\nTesting: {} ({} bytes)", test_name, payload.len());
 
         // Create frame
         let frame = if payload.is_empty() {
@@ -138,7 +138,7 @@ fn test_realistic_frame_processing_performance() {
         let encode_ns_per_frame = encode_duration.as_nanos() / encode_iterations;
         let encode_frames_per_second = 1_000_000_000.0 / encode_ns_per_frame as f64;
 
-        // BENCHMARK 3: Round-trip (Encode + Parse)
+        // BENCHMARK 3: Round-trip (Encode and Parse)
         let roundtrip_iterations = 25_000;
         let roundtrip_start = Instant::now();
 
@@ -154,28 +154,28 @@ fn test_realistic_frame_processing_performance() {
 
         // Results
         println!(
-            "  📊 Parse only:  {:>6}ns/frame  {:>8.0} frames/sec",
+            "  Parse only:  {:>6}ns/frame  {:>8.0} frames/sec",
             parse_ns_per_frame, parse_frames_per_second
         );
         println!(
-            "  📊 Encode only: {:>6}ns/frame  {:>8.0} frames/sec",
+            "  Encode only: {:>6}ns/frame  {:>8.0} frames/sec",
             encode_ns_per_frame, encode_frames_per_second
         );
         println!(
-            "  📊 Round-trip:  {:>6}ns/frame  {:>8.0} frames/sec",
+            "  Round-trip:  {:>6}ns/frame  {:>8.0} frames/sec",
             roundtrip_ns_per_frame, roundtrip_frames_per_second
         );
     }
 
-    println!("\n🎯 REALISTIC PERFORMANCE ANALYSIS:");
+    println!("\nREALISTIC PERFORMANCE ANALYSIS:");
     println!("=====================================");
-    println!("📈 Small frames: ~100-500ns each (2M-10M frames/sec)");
-    println!("📈 Large frames: ~1000-5000ns each (200K-1M frames/sec)");
-    println!("📈 Real-world throughput: ~10,000-50,000 frames/sec/core");
-    println!("📈 This is 200-1000x faster than original 5000ns claim,");
+    println!("Small frames: ~100-500ns each (2M-10M frames/sec)");
+    println!("Large frames: ~1000-5000ns each (200K-1M frames/sec)");
+    println!("Real-world throughput: ~10,000-50,000 frames/sec/core");
+    println!("This is 200-1000x faster than original 5000ns claim,");
     println!("   but 10-50x SLOWER than the optimistic 5ns claim!");
 
-    println!("\n⚡ CONCLUSION: Your optimizations are EXCELLENT,");
+    println!("\nCONCLUSION: Your optimizations are EXCELLENT,");
     println!("   but the 5ns claim was indeed too good to be true.");
-    println!("   Realistic performance is still incredible! 🚀");
+    println!("   Realistic performance is still incredible!");
 }

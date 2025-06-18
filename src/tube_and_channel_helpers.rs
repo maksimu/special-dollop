@@ -1,8 +1,7 @@
 use crate::channel::Channel;
 use crate::models::{NetworkAccessChecker, TunnelTimeouts};
-use crate::trace_hot_path;
-use crate::tube::Tube;
 use crate::webrtc_data_channel::WebRTCDataChannel;
+use crate::{debug_hot_path, trace_hot_path};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -48,7 +47,6 @@ pub(crate) async fn setup_channel_for_data_channel(
     server_mode: bool,
     callback_token: Option<String>,
     ksm_config: Option<String>,
-    tube: Option<Arc<Tube>>,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -66,18 +64,12 @@ pub(crate) async fn setup_channel_for_data_channel(
     })
     .await?;
 
-    // Register the channel with the tube if provided
-    if let Some(tube_arc) = tube {
-        tube_arc
-            .register_channel(label.clone(), channel_instance.clone())
-            .await?;
-        debug!(target: "channel_setup", channel_name = %label, tube_id = %tube_arc.id, "Channel registered with tube");
-    }
-
     // Set up a message handler for the data channel using zero-copy buffers
     let data_channel_ref = &data_channel.data_channel;
 
-    let buffer_pool = Arc::new(crate::buffer_pool::BufferPool::default());
+    let buffer_pool = Arc::new(crate::buffer_pool::BufferPool::new(
+        crate::buffer_pool::STANDARD_BUFFER_CONFIG,
+    ));
 
     // Tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
     data_channel_ref.on_message(Box::new(move |msg| {
@@ -95,7 +87,7 @@ pub(crate) async fn setup_channel_for_data_channel(
             let message_bytes = buffer_pool_clone.create_bytes(data);
             let message_len = message_bytes.len();
 
-            debug!(
+            debug_hot_path!(
                 target: "channel_flow",
                 channel_id = %label_clone,
                 bytes_count = message_len,

@@ -5,6 +5,14 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// Standard high-performance buffer pool configuration
+/// Used consistently across the system to avoid thread-local conflicts
+pub const STANDARD_BUFFER_CONFIG: BufferPoolConfig = BufferPoolConfig {
+    buffer_size: 32 * 1024, // 32KB - optimal for WebRTC SCTP
+    max_pooled: 64,         // High pooling for performance
+    resize_on_return: true, // Memory efficiency
+};
+
 /// Configuration for buffer pool
 #[derive(Clone)]
 pub struct BufferPoolConfig {
@@ -51,7 +59,7 @@ struct BufferPoolInner {
 impl BufferPool {
     /// Create a new buffer pool with custom configuration
     pub fn new(config: BufferPoolConfig) -> Self {
-        // Initialize thread-local config
+        // Set the thread-local configuration
         LOCAL_CONFIG.with(|c| {
             *c.borrow_mut() = Some(config.clone());
         });
@@ -68,11 +76,6 @@ impl BufferPool {
         pool.warm_up(8); // 4 buffers per connection (2 connections typical)
 
         pool
-    }
-
-    /// Create a new buffer pool with the default configuration
-    pub fn default() -> Self {
-        Self::new(BufferPoolConfig::default())
     }
 
     /// Get a buffer from the thread-local pool (lock-free!)
@@ -190,13 +193,23 @@ impl BufferPool {
     }
 }
 
+impl Default for BufferPool {
+    fn default() -> Self {
+        Self::new(STANDARD_BUFFER_CONFIG)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_buffer_pool_reuse() {
-        let pool = BufferPool::default();
+        let pool = BufferPool::new(BufferPoolConfig {
+            buffer_size: 32 * 1024,
+            max_pooled: 64,
+            resize_on_return: true,
+        });
 
         // Check initial pre-warmed state
         let initial_count = pool.count();

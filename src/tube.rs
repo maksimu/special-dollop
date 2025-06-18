@@ -1,4 +1,3 @@
-use crate::channel::Channel;
 use crate::models::TunnelTimeouts;
 use crate::router_helpers::post_connection_state;
 use crate::runtime::get_runtime;
@@ -18,6 +17,13 @@ use uuid::Uuid;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
+// Lightweight metadata for tracking channel information without storing the full Channel
+#[derive(Clone, Debug)]
+pub struct ChannelMetadata {
+    pub callback_token: Option<String>,
+    pub ksm_config: Option<String>,
+}
+
 // A single tube holding a WebRTC peer connection and channels
 #[derive(Clone)]
 pub struct Tube {
@@ -31,8 +37,8 @@ pub struct Tube {
     pub(crate) control_channel: Arc<TokioRwLock<Option<WebRTCDataChannel>>>,
     // Map of channel names to their shutdown signals
     pub channel_shutdown_signals: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
-    // Active channels registered with this tube
-    pub(crate) active_channels: Arc<TokioRwLock<HashMap<String, Arc<TokioMutex<Channel>>>>>,
+    // Active channel metadata for tracking callbacks and config
+    pub(crate) active_channels: Arc<TokioRwLock<HashMap<String, ChannelMetadata>>>,
     // Indicates if this tube was created in a server or client context by its registry
     pub(crate) is_server_mode_context: bool,
     // Current status
@@ -79,7 +85,7 @@ impl Tube {
         protocol_settings: HashMap<String, serde_json::Value>,
         signal_sender: UnboundedSender<SignalMessage>,
     ) -> Result<()> {
-        info!(
+        debug!(
             "[TUBE_DEBUG] Tube {}: create_peer_connection called. trickle_ice: {}, turn_only: {}",
             self.id, trickle_ice, turn_only
         );
@@ -101,62 +107,229 @@ impl Tube {
 
         let tube_arc_for_pc_state = self.clone();
 
-        info!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
+        debug!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
         connection_arc.setup_ice_candidate_handler();
 
+        // Set up comprehensive connection state monitoring with tube lifecycle management
+        let is_closing_for_tube = Arc::clone(&connection_arc.is_closing);
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
             let tube_clone_for_closure = tube_arc_for_pc_state.clone();
+            let is_closing_for_handler = Arc::clone(&is_closing_for_tube);
 
             Box::pin(async move {
                 let tube_id_log = tube_clone_for_closure.id.clone();
+                let state_str = format!("{:?}", state);
+                // WebRTC monitoring with tube_id context
+                debug!(target: "webrtc_state", tube_id = %tube_id_log, state = %state_str, "Connection state changed");
+
                 match state {
                     RTCPeerConnectionState::Connected => {
+                        debug!(target: "webrtc_state_report", tube_id = %tube_id_log, "Connection established");
+                        // Tube status update
                         *status_clone.write().await = TubeStatus::Active;
-                        info!(tube_id = %tube_id_log, "Tube connection state changed to Active");
+                        debug!(tube_id = %tube_id_log, "Tube connection state changed to Active");
                     },
-                    RTCPeerConnectionState::Failed |
-                    RTCPeerConnectionState::Closed |
-                    RTCPeerConnectionState::Disconnected => {
+                    RTCPeerConnectionState::Failed => {
+                        // Update the closing flag (from comprehensive monitor)
+                        is_closing_for_handler.store(true, std::sync::atomic::Ordering::Release);
+                        debug!(target: "webrtc_lifecycle", tube_id = %tube_id_log, state = %state_str, "Connection failed");
 
+                        // Tube lifecycle management
                         let current_status = *status_clone.read().await;
-                        let new_status = match state {
-                            RTCPeerConnectionState::Failed => TubeStatus::Failed,
-                            RTCPeerConnectionState::Closed => TubeStatus::Closed,
-                            RTCPeerConnectionState::Disconnected => TubeStatus::Disconnected,
-                            _ => current_status, // Should not happen due to outer match
-                        };
-
                         if current_status != TubeStatus::Closing &&
                            current_status != TubeStatus::Closed &&
                            current_status != TubeStatus::Failed &&
                            current_status != TubeStatus::Disconnected {
 
-                            warn!(tube_id = %tube_id_log, old_status = ?current_status, new_state = ?state, "WebRTC peer connection state indicates closure/failure. Initiating Tube close.");
-                            *status_clone.write().await = new_status;
+                            warn!(tube_id = %tube_id_log, old_status = ?current_status, new_state = ?state, "WebRTC peer connection failed. Initiating Tube close.");
+                            *status_clone.write().await = TubeStatus::Failed;
 
-                            // Get the global runtime to spawn the close task
-                            let runtime = get_runtime(); // Ensure get_runtime() is accessible
+                            let runtime = get_runtime();
                             runtime.spawn(async move {
-                                debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection state change.");
+                                debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection failure.");
                                 let mut registry = crate::tube_registry::REGISTRY.write().await;
                                 if let Err(e) = registry.close_tube(&tube_id_log).await {
-                                     error!(tube_id = %tube_id_log, "Error trying to close tube via registry after peer connection failed/closed: {}", e);
+                                     error!(tube_id = %tube_id_log, "Error trying to close tube via registry: {}", e);
                                 } else {
-                                     info!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry after peer connection state change.");
+                                     debug!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry.");
                                 }
                             });
                         } else {
-                            debug!(tube_id = %tube_id_log, current_status = ?current_status, new_state = ?state, "Peer connection reached terminal state, but tube status indicates it's already closing or closed. No new action taken.");
-                            // Ensure the status is updated if it wasn't already the final one
-                            if *status_clone.read().await != new_status {
-                                *status_clone.write().await = new_status;
-                            }
+                            debug!(tube_id = %tube_id_log, current_status = ?current_status, new_state = ?state, "Peer connection failed, but tube already closing/closed.");
+                            *status_clone.write().await = TubeStatus::Failed;
+                        }
+                    },
+                    RTCPeerConnectionState::Closed => {
+                        // Update the closing flag (from comprehensive monitor)
+                        is_closing_for_handler.store(true, std::sync::atomic::Ordering::Release);
+                        info!(target: "webrtc_lifecycle", tube_id = %tube_id_log, state = %state_str, "Connection closed");
+
+                        // Tube lifecycle management
+                        let current_status = *status_clone.read().await;
+                        if current_status != TubeStatus::Closing &&
+                           current_status != TubeStatus::Closed &&
+                           current_status != TubeStatus::Failed &&
+                           current_status != TubeStatus::Disconnected {
+
+                            warn!(tube_id = %tube_id_log, old_status = ?current_status, new_state = ?state, "WebRTC peer connection closed. Initiating Tube close.");
+                            *status_clone.write().await = TubeStatus::Closed;
+
+                            let runtime = get_runtime();
+                            runtime.spawn(async move {
+                                debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection closure.");
+                                let mut registry = crate::tube_registry::REGISTRY.write().await;
+                                if let Err(e) = registry.close_tube(&tube_id_log).await {
+                                     error!(tube_id = %tube_id_log, "Error trying to close tube via registry: {}", e);
+                                } else {
+                                     debug!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry.");
+                                }
+                            });
+                        } else {
+                            debug!(tube_id = %tube_id_log, current_status = ?current_status, new_state = ?state, "Peer connection closed, but tube already closing/closed.");
+                            *status_clone.write().await = TubeStatus::Closed;
+                        }
+                    },
+                    RTCPeerConnectionState::Disconnected => {
+                        debug!(target: "webrtc_lifecycle", tube_id = %tube_id_log, state = %state_str, "Connection disconnected");
+
+                        // Tube lifecycle management
+                        let current_status = *status_clone.read().await;
+                        if current_status != TubeStatus::Closing &&
+                           current_status != TubeStatus::Closed &&
+                           current_status != TubeStatus::Failed &&
+                           current_status != TubeStatus::Disconnected {
+
+                            debug!(tube_id = %tube_id_log, old_status = ?current_status, new_state = ?state, "WebRTC peer connection disconnected. Initiating Tube close.");
+                            *status_clone.write().await = TubeStatus::Disconnected;
+
+                            let runtime = get_runtime();
+                            runtime.spawn(async move {
+                                debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection disconnection.");
+                                let mut registry = crate::tube_registry::REGISTRY.write().await;
+                                if let Err(e) = registry.close_tube(&tube_id_log).await {
+                                     error!(tube_id = %tube_id_log, "Error trying to close tube via registry: {}", e);
+                                } else {
+                                     debug!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry.");
+                                }
+                            });
+                        } else {
+                            debug!(tube_id = %tube_id_log, current_status = ?current_status, new_state = ?state, "Peer connection disconnected, but tube already closing/closed.");
+                            *status_clone.write().await = TubeStatus::Disconnected;
                         }
                     },
                     _ => {
                         debug!(tube_id = %tube_id_log, "Connection state changed to: {:?}", state);
                     }
+                }
+            })
+        }));
+
+        // Set up ICE connection state monitoring with TURN detection
+        let tube_id_for_ice = self.id.clone();
+        let pc_for_analysis = Arc::clone(&connection_arc.peer_connection);
+        connection_arc.peer_connection.on_ice_connection_state_change(Box::new(move |state| {
+            let tube_id_for_ice_log = tube_id_for_ice.clone();
+            let pc_for_candidate_analysis = Arc::clone(&pc_for_analysis);
+
+            Box::pin(async move {
+                debug!(target: "webrtc_ice_connection", tube_id = %tube_id_for_ice_log, state = ?state, "ICE connection state changed");
+
+                match state {
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Connected => {
+                        info!(target: "webrtc_ice", tube_id = %tube_id_for_ice_log, "ICE connection established");
+
+                        // Enhanced candidate analysis at trace level for TURN detection
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            // Helper function to parse candidate type from SDP
+                            fn parse_candidate_type_from_sdp(sdp: &str) -> Option<String> {
+                                for line in sdp.lines() {
+                                    if line.starts_with("a=candidate:") {
+                                        let parts: Vec<&str> = line.split_whitespace().collect();
+                                        if parts.len() >= 8 {
+                                            let candidate_type = parts[7]; // typ field
+                                            return Some(candidate_type.to_string());
+                                        }
+                                    }
+                                }
+                                None
+                            }
+
+                            // Get local and remote descriptions
+                            let local_desc = pc_for_candidate_analysis.local_description().await;
+                            let remote_desc = pc_for_candidate_analysis.remote_description().await;
+
+                            if let (Some(local), Some(remote)) = (local_desc, remote_desc) {
+                                let local_type = parse_candidate_type_from_sdp(&local.sdp);
+                                let remote_type = parse_candidate_type_from_sdp(&remote.sdp);
+                                info!(target: "keeper_pam_webrtc_rs_webrtc",
+                                    tube_id = %tube_id_for_ice_log,
+                                    ""
+                                );
+
+                                match (local_type, remote_type) {
+                                    (Some(local), Some(remote)) => {
+                                        let using_turn = local == "relay" || remote == "relay";
+
+                                        trace!(target: "webrtc_ice_selected",
+                                            tube_id = %tube_id_for_ice_log,
+                                            local_type = %local,
+                                            remote_type = %remote,
+                                            using_turn = using_turn,
+                                            "ICE candidates: local_type={} remote_type={} {}",
+                                            local, remote,
+                                            if using_turn { "(using TURN)" } else { "(no TURN)" }
+                                        );
+
+                                        // Always log connection type with TURN indicator
+                                        info!(target: "keeper_pam_webrtc_rs_webrtc",
+                                            tube_id = %tube_id_for_ice_log,
+                                            "Connection type: local={} remote={}{}",
+                                            local, remote,
+                                            if using_turn { " (TURN relay in use)" } else { "" }
+                                        );
+                                    },
+                                    _ => {
+                                        trace!(target: "webrtc_ice_selected",
+                                            tube_id = %tube_id_for_ice_log,
+                                            "ICE connection established but could not parse candidate types"
+                                        );
+                                    }
+                                }
+                            } else {
+                                trace!(target: "webrtc_ice_selected",
+                                    tube_id = %tube_id_for_ice_log,
+                                    "ICE connection established but SDP descriptions not available"
+                                );
+                            }
+                        }
+                    },
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Failed => {
+                        warn!(target: "webrtc_ice", tube_id = %tube_id_for_ice_log, "ICE connection failed");
+                    },
+                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Disconnected => {
+                        info!(target: "webrtc_ice", tube_id = %tube_id_for_ice_log, "ICE connection disconnected");
+                    },
+                    _ => {}
+                }
+            })
+        }));
+
+        // Set up ICE gathering state monitoring
+        let tube_id_for_gather = self.id.clone();
+        connection_arc.peer_connection.on_ice_gathering_state_change(Box::new(move |state| {
+            let tube_id_for_gather_log = tube_id_for_gather.clone();
+            Box::pin(async move {
+                debug!(target: "webrtc_ice_gathering", tube_id = %tube_id_for_gather_log, state = ?state, "ICE gathering state changed");
+
+                match state {
+                    webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete => {
+                        info!(target: "webrtc_ice", tube_id = %tube_id_for_gather_log, "ICE gathering complete");
+                    },
+                    webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Gathering => {
+                        debug!(target: "webrtc_ice", tube_id = %tube_id_for_gather_log, "ICE gathering started");
+                    },
+                    _ => {}
                 }
             })
         }));
@@ -176,7 +349,7 @@ impl Tube {
             let rtc_data_channel_id = rtc_data_channel.id();
 
             Box::pin(async move {
-                info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, rtc_channel_id = ?rtc_data_channel_id, "on_data_channel: Received data channel from remote peer.");
+                debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, rtc_channel_id = ?rtc_data_channel_id, "on_data_channel: Received data channel from remote peer.");
                 trace!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, ?protocol_settings_for_channel_setup, "on_data_channel: Protocol settings for this channel.");
 
                 // Create our WebRTCDataChannel wrapper
@@ -192,14 +365,14 @@ impl Tube {
                 // If this is the control channel, store it specially
                 if rtc_data_channel_label == "control" {
                     *tube.control_channel.write().await = Some(data_channel.clone());
-                    info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Set as control channel.");
+                    debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Set as control channel.");
                 }
 
                 // Determine server_mode for the new channel based on the Tube's context
                 let current_server_mode = tube.is_server_mode_context;
                 debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, server_mode = current_server_mode, "on_data_channel: Determined server_mode for channel setup.");
 
-                info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: About to call setup_channel_for_data_channel.");
+                debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: About to call setup_channel_for_data_channel.");
                 let channel_result = setup_channel_for_data_channel(
                     &data_channel,
                     rtc_data_channel_label.clone(),
@@ -208,12 +381,11 @@ impl Tube {
                     current_server_mode,
                     Some(callback_token_for_channel), // Use callback_token from tube creation
                     Some(ksm_config_for_channel), // Use ksm_config from tube creation
-                    Some(Arc::new(tube.clone())), // Pass tube reference for registration
                 ).await;
 
                 let mut owned_channel = match channel_result {
                     Ok(ch_instance) => {
-                        info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: setup_channel_for_data_channel successful.");
+                        debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: setup_channel_for_data_channel successful.");
                         ch_instance
                     }
                     Err(e) => {
@@ -221,6 +393,17 @@ impl Tube {
                         return;
                     }
                 };
+
+                // Register the channel metadata with the tube for tracking
+                let metadata = ChannelMetadata {
+                    callback_token: owned_channel.callback_token.clone(),
+                    ksm_config: owned_channel.ksm_config.clone(),
+                };
+                if let Err(e) = tube.register_channel_metadata(rtc_data_channel_label.clone(), metadata).await {
+                    error!("Tube {}: Failed to register channel metadata '{}': {}", tube.id, rtc_data_channel_label, e);
+                    return;
+                }
+                debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Channel metadata registered with tube");
                 trace!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, ?owned_channel.active_protocol, ?owned_channel.local_listen_addr, "on_data_channel: Channel details after setup.");
 
                 // Store the shutdown signal for this newly created channel
@@ -262,7 +445,7 @@ impl Tube {
                 let tube_arc = Arc::new(tube.clone()); // Single Arc wrapping
                 let peer_connection_for_signal = Arc::clone(&tube.peer_connection);
 
-                info!(tube_id = %tube.id, channel_label = %label_clone_for_run, "on_data_channel: Spawning channel.run() task.");
+                debug!(tube_id = %tube.id, channel_label = %label_clone_for_run, "on_data_channel: Spawning channel.run() task.");
                 runtime_for_run.spawn(async move {
                     debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task started.");
 
@@ -323,13 +506,13 @@ impl Tube {
                             warn!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "No signal_sender on peer_connection for channel_closed signal (from on_data_channel).");
                         }
                     } else {
-                        warn!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Peer_connection was None, cannot send channel_closed signal (from on_data_channel).");
+                        debug!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Peer_connection was None, cannot send channel_closed signal (from on_data_channel).");
                     }
 
                     debug!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "on_data_channel: channel.run() task finished and cleaned up.");
                 });
 
-                info!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Successfully set up and spawned channel task.");
+                debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Successfully set up and spawned channel task.");
             })
         }));
 
@@ -360,9 +543,8 @@ impl Tube {
         let channels_guard = self.active_channels.read().await;
         let mut tokens = Vec::new();
 
-        for (_channel_name, channel_arc) in channels_guard.iter() {
-            let channel_guard = channel_arc.lock().await;
-            if let Some(ref token) = channel_guard.callback_token {
+        for (_channel_name, metadata) in channels_guard.iter() {
+            if let Some(ref token) = metadata.callback_token {
                 tokens.push(token.clone());
             }
         }
@@ -376,9 +558,8 @@ impl Tube {
         let channels_guard = self.active_channels.read().await;
 
         // Get ksm_config from the first channel that has one
-        for (_channel_name, channel_arc) in channels_guard.iter() {
-            let channel_guard = channel_arc.lock().await;
-            if let Some(ref config) = channel_guard.ksm_config {
+        for (_channel_name, metadata) in channels_guard.iter() {
+            if let Some(ref config) = metadata.ksm_config {
                 debug!(tube_id = %self.id, "Found KSM config from active channel");
                 return Some(config.clone());
             }
@@ -584,7 +765,6 @@ impl Tube {
 
         let timeouts = timeout_seconds.map(|timeout| TunnelTimeouts {
             read: std::time::Duration::from_secs_f64(timeout),
-            close_connection: std::time::Duration::from_secs_f64(timeout / 2.0),
             guacd_handshake: std::time::Duration::from_secs_f64(timeout / 1.5),
         });
         trace!(tube_id = %self.id, channel_name = %name, ?timeouts, "create_channel: Timeouts configured.");
@@ -598,7 +778,6 @@ impl Tube {
             self.is_server_mode_context,
             callback_token,
             ksm_config,
-            Some(Arc::new(self.clone())), // Pass tube reference for registration
         )
         .await;
 
@@ -612,6 +791,20 @@ impl Tube {
                 return Err(e); // Propagate the error from setup_channel_for_data_channel
             }
         };
+
+        // Register the channel metadata with the tube for tracking
+        let metadata = ChannelMetadata {
+            callback_token: owned_channel.callback_token.clone(),
+            ksm_config: owned_channel.ksm_config.clone(),
+        };
+        if let Err(e) = self
+            .register_channel_metadata(name.to_string(), metadata)
+            .await
+        {
+            error!(tube_id = %self.id, channel_name = %name, "create_channel: Failed to register channel metadata: {}", e);
+            return Err(e);
+        }
+        debug!(tube_id = %self.id, channel_name = %name, "create_channel: Channel metadata registered with tube");
         trace!(tube_id = %self.id, channel_name = %name, ?owned_channel.active_protocol, ?owned_channel.local_listen_addr, server_mode = owned_channel.server_mode, "create_channel: Channel details after setup.");
 
         // Store the shutdown signal for this channel
@@ -859,11 +1052,11 @@ impl Tube {
         &self,
         registry: &mut crate::tube_registry::TubeRegistry,
     ) -> Result<()> {
-        info!("Closing tube with ID: {}", self.id);
+        debug!("Closing tube with ID: {}", self.id);
 
         // Set the status to Closed first to prevent Drop from trying to remove
         *self.status.write().await = TubeStatus::Closed;
-        info!("Set tube status to Closed");
+        debug!("Set tube status to Closed");
 
         // Send connection_close callbacks for all active channels
         let channel_names: Vec<String> = {
@@ -945,7 +1138,7 @@ impl Tube {
         }
 
         // Remove from the global registry using the passed-in mutable reference
-        info!("Removing tube {} from registry via Tube::close()", self.id);
+        debug!("Removing tube {} from registry via Tube::close()", self.id);
         registry.remove_tube(&self.id);
 
         // Verify removal
@@ -957,8 +1150,8 @@ impl Tube {
                 .conversation_mappings
                 .retain(|_, tid| tid != &self.id);
         } else {
-            info!("Successfully removed tube from registry");
-            info!("TUBE CLEANUP COMPLETE: {} - This tube is now fully closed and removed from registry", self.id);
+            debug!("Successfully removed tube from registry");
+            debug!("TUBE CLEANUP COMPLETE: {} - This tube is now fully closed and removed from registry", self.id);
         }
 
         // Add a delay to ensure registry updates propagate
@@ -972,12 +1165,15 @@ impl Tube {
         *self.status.read().await
     }
 
-    // Register a channel with this tube
-    pub async fn register_channel(&self, channel_name: String, channel: Channel) -> Result<()> {
-        let channel_arc = Arc::new(TokioMutex::new(channel));
+    // Register a channel metadata with this tube for tracking purposes
+    pub async fn register_channel_metadata(
+        &self,
+        channel_name: String,
+        metadata: ChannelMetadata,
+    ) -> Result<()> {
         let mut channels_guard = self.active_channels.write().await;
-        channels_guard.insert(channel_name.clone(), channel_arc);
-        info!(tube_id = %self.id, channel_name = %channel_name, "Registered channel with tube");
+        channels_guard.insert(channel_name.clone(), metadata);
+        debug!(tube_id = %self.id, channel_name = %channel_name, "Registered channel metadata with tube");
         Ok(())
     }
 
@@ -987,7 +1183,7 @@ impl Tube {
         if channels_guard.remove(channel_name).is_some() {
             info!(tube_id = %self.id, channel_name = %channel_name, "Deregistered channel from tube");
         } else {
-            warn!(tube_id = %self.id, channel_name = %channel_name, "Attempted to deregister channel that wasn't registered");
+            debug!(tube_id = %self.id, channel_name = %channel_name, "Attempted to deregister channel that wasn't registered");
         }
     }
 
@@ -1004,11 +1200,9 @@ impl Tube {
     // Send connection_open callback for a specific channel
     pub async fn send_connection_open_callback(&self, channel_name: &str) -> Result<()> {
         let channels_guard = self.active_channels.read().await;
-        if let Some(channel_arc) = channels_guard.get(channel_name) {
-            let channel_guard = channel_arc.lock().await;
-
+        if let Some(metadata) = channels_guard.get(channel_name) {
             if let (Some(ref ksm_config), Some(ref callback_token)) =
-                (&channel_guard.ksm_config, &channel_guard.callback_token)
+                (&metadata.ksm_config, &metadata.callback_token)
             {
                 // Skip if in test mode
                 if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
@@ -1046,11 +1240,9 @@ impl Tube {
     // Send connection_close callback for a specific channel
     pub async fn send_connection_close_callback(&self, channel_name: &str) -> Result<()> {
         let channels_guard = self.active_channels.read().await;
-        if let Some(channel_arc) = channels_guard.get(channel_name) {
-            let channel_guard = channel_arc.lock().await;
-
+        if let Some(metadata) = channels_guard.get(channel_name) {
             if let (Some(ref ksm_config), Some(ref callback_token)) =
-                (&channel_guard.ksm_config, &channel_guard.callback_token)
+                (&metadata.ksm_config, &metadata.callback_token)
             {
                 // Skip if in test mode
                 if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
@@ -1083,7 +1275,7 @@ impl Tube {
                 Ok(())
             }
         } else {
-            warn!(tube_id = %self.id, channel_name = %channel_name, "Channel not found when trying to send connection_close callback");
+            debug!(tube_id = %self.id, channel_name = %channel_name, "Channel not found when trying to send connection_close callback");
             Ok(())
         }
     }

@@ -225,7 +225,6 @@ async fn backend_task_runner(
 #[derive(Debug, Clone)]
 pub struct TunnelTimeouts {
     pub read: Duration,
-    pub close_connection: Duration,
     pub guacd_handshake: Duration,
 }
 
@@ -233,7 +232,6 @@ impl Default for TunnelTimeouts {
     fn default() -> Self {
         Self {
             read: Duration::from_secs(15),
-            close_connection: Duration::from_secs(5),
             guacd_handshake: Duration::from_secs(10),
         }
     }

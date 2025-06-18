@@ -464,7 +464,7 @@ pub(crate) async fn forward_udp_packet_to_destination(
         let buffer_pool_clone = channel.buffer_pool.clone();
         let channel_id_clone = channel.channel_id.clone();
         let udp_associations_clone = udp_associations.clone();
-        let udp_conn_index_for_task = udp_conn_index.clone(); // 🔧 FIX: Clone before async move
+        let udp_conn_index_for_task = udp_conn_index.clone(); // FIX: Clone before async move
 
         let response_task = tokio::spawn(async move {
             let mut response_buf = [0u8; 65536];

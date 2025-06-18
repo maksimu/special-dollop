@@ -116,7 +116,7 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
         debug_hot_path!(
             channel_id = %channel.channel_id,
             conn_no = conn_no,
-            "🔥 ULTRA HOT PATH: Connection 1 main traffic"
+            "ULTRA HOT PATH: Connection 1 main traffic"
         );
 
         // **HYPER-OPTIMIZED**: Inline everything for Connection 1

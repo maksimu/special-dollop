@@ -1366,7 +1366,7 @@ fn test_expandable_opcode_detection() {
 
     // Test extensibility - future opcodes can be easily added
     println!(
-        "✅ Expandable system working: Size={:?}, Error={:?}, Normal={:?}",
+        "Expandable system working: Size={:?}, Error={:?}, Normal={:?}",
         OpcodeAction::ProcessSpecial(SpecialOpcode::Size),
         OpcodeAction::CloseConnection,
         OpcodeAction::Normal

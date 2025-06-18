@@ -91,7 +91,7 @@ async fn test_expandable_size_instruction_detection() {
                 info!(target: "size_instruction_test",
                       instruction_num = i,
                       action = ?action,
-                      "✅ Size instruction correctly detected");
+                      "Size instruction correctly detected");
             }
             Err(e) => panic!("Size instruction {} detection failed: {:?}", i, e),
         }
@@ -117,7 +117,7 @@ async fn test_expandable_size_instruction_detection() {
                 info!(target: "size_instruction_test",
                       instruction_num = i,
                       action = ?action,
-                      "✅ Non-size instruction correctly classified");
+                      "Non-size instruction correctly classified");
             }
             Err(e) => panic!("Non-size instruction {} validation failed: {:?}", i, e),
         }
@@ -212,7 +212,7 @@ async fn test_size_instruction_background_processing_pipeline() {
                 info!(target: "size_instruction_test",
                       instruction_len = instruction_len,
                       action = ?action,
-                      "✅ Hot path detected size instruction");
+                      "Hot path detected size instruction");
 
                 // Simulate buffer pool acquisition and copying (hot path)
                 let mut size_buffer = buffer_pool.acquire();
@@ -285,10 +285,10 @@ async fn test_size_instruction_background_processing_pipeline() {
               instruction_num = i,
               channel_id = %processed_channel_id,
               layer = layer,
-              "✅ Verified processed instruction");
+              "Verified processed instruction");
     }
 
-    info!(target: "size_instruction_test", "✅ Background processing pipeline test completed successfully");
+    info!(target: "size_instruction_test", "Background processing pipeline test completed successfully");
 }
 
 #[tokio::test]
@@ -324,7 +324,7 @@ async fn test_size_instruction_channel_backpressure() {
         .send(first_msg)
         .await
         .expect("First send should succeed");
-    info!(target: "size_instruction_test", "✅ First message sent successfully");
+    info!(target: "size_instruction_test", "First message sent successfully");
 
     // Try to send another (should succeed with try_send or timeout with send)
     let mut second_buffer = buffer_pool.acquire();
@@ -343,7 +343,7 @@ async fn test_size_instruction_channel_backpressure() {
         "try_send should fail when channel is full"
     );
 
-    warn!(target: "size_instruction_test", "✅ try_send correctly failed due to channel backpressure");
+    warn!(target: "size_instruction_test", "try_send correctly failed due to channel backpressure");
 
     // The buffer should be automatically released when the message is dropped
     // (This is tested implicitly - if there's a leak, other tests will show it)
@@ -352,7 +352,7 @@ async fn test_size_instruction_channel_backpressure() {
     let _first_received = size_rx.recv().await.expect("Should receive first message");
     debug!(target: "size_instruction_test", "Drained channel for cleanup");
 
-    info!(target: "size_instruction_test", "✅ Channel backpressure test completed successfully");
+    info!(target: "size_instruction_test", "Channel backpressure test completed successfully");
 }
 
 #[tokio::test]
@@ -418,7 +418,7 @@ async fn test_expandable_system_performance() {
               per_instruction_micros = per_instruction.as_micros(),
               "WARNING: Expandable opcode detection may be slower than expected");
     } else {
-        info!(target: "size_instruction_test", "✅ Performance within expected bounds");
+        info!(target: "size_instruction_test", "Performance within expected bounds");
     }
 }
 
@@ -528,7 +528,7 @@ async fn test_realistic_guacamole_scenarios_with_expandable_system() {
                           layer = layer.unwrap(),
                           width = width,
                           height = height,
-                          "✅ Realistic scenario validated successfully");
+                          "Realistic scenario validated successfully");
                 } else {
                     panic!("Failed to peek instruction for: {}", description);
                 }
@@ -537,7 +537,7 @@ async fn test_realistic_guacamole_scenarios_with_expandable_system() {
         }
     }
 
-    info!(target: "size_instruction_test", "✅ All realistic Guacamole scenarios passed with expandable system");
+    info!(target: "size_instruction_test", "All realistic Guacamole scenarios passed with expandable system");
 }
 
 #[tokio::test]
@@ -586,14 +586,14 @@ async fn test_expandable_system_extensibility_demonstration() {
                 info!(target: "size_instruction_test",
                       test_case = %description,
                       action = ?action,
-                      "✅ Opcode correctly classified");
+                      "Opcode correctly classified");
             }
             Err(e) => panic!("Failed to validate {}: {:?}", description, e),
         }
     }
 
     info!(target: "size_instruction_test", 
-          "✅ Extensibility demonstration completed - system correctly classifies all opcode types");
+          "Extensibility demonstration completed - system correctly classifies all opcode types");
 
     // Future opcodes can be added by:
     // 1. Adding to SpecialOpcode enum

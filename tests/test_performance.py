@@ -181,7 +181,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         )
         
         # Clean up
-        self.tube_registry.close_connection(server_id, channel_name)
+        self.tube_registry.close_connection(channel_name)
         self.tube_registry.close_tube(server_id)
         self.tube_registry.close_tube(client_id)
         with self._lock:

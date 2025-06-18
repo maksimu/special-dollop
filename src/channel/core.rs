@@ -1,15 +1,16 @@
 // Core Channel implementation
 
 use super::types::ActiveProtocol;
-use crate::buffer_pool::{BufferPool, BufferPoolConfig};
+use crate::buffer_pool::{BufferPool, STANDARD_BUFFER_CONFIG};
 pub(crate) use crate::error::ChannelError;
 use crate::models::{
     is_guacd_session, Conn, ConversationType, NetworkAccessChecker, StreamHalf, TunnelTimeouts,
 };
 use crate::runtime::get_runtime;
+use crate::trace_ultra_hot_path;
 use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
 use crate::tube_protocol::{try_parse_frame, CloseConnectionReason, ControlMessage, Frame};
-use crate::webrtc_data_channel::WebRTCDataChannel;
+use crate::webrtc_data_channel::{WebRTCDataChannel, STANDARD_BUFFER_THRESHOLD};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use bytes::{Buf, BytesMut};
@@ -22,14 +23,12 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn}; // Add this
+use tracing::{debug, error, info, trace, warn};
+// Add this
 
 // Import from sibling modules
 use super::frame_handling::handle_incoming_frame;
 use super::utils::handle_ping_timeout;
-
-// Define the buffer thresholds
-pub(crate) const BUFFER_LOW_THRESHOLD: u64 = 8 * 1024; // 8KB - optimal for real-time
 
 // --- Protocol-specific state definitions ---
 #[derive(Default, Clone, Debug)]
@@ -80,13 +79,11 @@ pub struct ConnectAsSettings {
 pub struct Channel {
     pub(crate) webrtc: WebRTCDataChannel,
     pub(crate) conns: Arc<DashMap<u32, Conn>>,
-    pub(crate) next_conn_no: u32,
     pub(crate) rx_from_dc: mpsc::UnboundedReceiver<Bytes>,
     pub(crate) channel_id: String,
     pub(crate) timeouts: TunnelTimeouts,
     pub(crate) network_checker: Option<NetworkAccessChecker>,
     pub(crate) ping_attempt: u32,
-    pub(crate) round_trip_latency: Arc<Mutex<Vec<u64>>>,
     pub(crate) is_connected: bool,
     pub(crate) should_exit: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) server_mode: bool,
@@ -117,9 +114,6 @@ pub struct Channel {
     // Reverse index: conn_no -> set of destination addresses for efficient cleanup
     pub(crate) udp_conn_index:
         Arc<std::sync::Mutex<HashMap<u32, std::collections::HashSet<std::net::SocketAddr>>>>,
-    // MPSC channel for frames from receive_message to be processed
-    frame_input_tx: mpsc::UnboundedSender<Frame>,
-    frame_input_rx: Arc<Mutex<mpsc::UnboundedReceiver<Frame>>>,
     // Timestamp for the last channel-level ping sent (conn_no=0)
     pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
 
@@ -134,59 +128,9 @@ pub struct Channel {
     pub(crate) ksm_config: Option<String>,
 }
 
-// Implement Clone for Channel
-impl Clone for Channel {
-    fn clone(&self) -> Self {
-        let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
-        // For cloned Channel instances, conn_closed_tx can be a new sender,
-        // but conn_closed_rx should be None as run() consumes the original.
-        let cloned_conn_closed_tx = mpsc::unbounded_channel::<(u32, String)>().0;
-
-        Self {
-            webrtc: self.webrtc.clone(),
-            conns: Arc::new(DashMap::new()), // New empty DashMap for clone
-            next_conn_no: self.next_conn_no,
-            // Each clone gets a new rx_from_dc; this is problematic if the original is consumed.
-            // Channel instances are typically Arc<Mutex<Channel>>, and cloning that Arc is preferred.
-            // If direct Channel cloning is essential, rx_from_dc handling needs careful thought.
-            rx_from_dc: mpsc::unbounded_channel().1,
-            channel_id: format!("{}_clone", self.channel_id),
-            timeouts: self.timeouts.clone(),
-            network_checker: self.network_checker.clone(),
-            ping_attempt: self.ping_attempt,
-            round_trip_latency: Arc::clone(&self.round_trip_latency),
-            is_connected: self.is_connected,
-            should_exit: Arc::clone(&self.should_exit),
-            server_mode: self.server_mode,
-            local_listen_addr: None,
-            actual_listen_addr: None,
-            local_client_server: None, // Cloned server instances usually don't re-listen on the same port.
-            local_client_server_task: None,
-            local_client_server_conn_tx: Some(server_conn_tx),
-            local_client_server_conn_rx: Some(server_conn_rx),
-            active_protocol: self.active_protocol, // Clone
-            protocol_state: self.protocol_state.clone(), // Clone
-
-            // Clone new fields
-            guacd_host: self.guacd_host.clone(),
-            guacd_port: self.guacd_port,
-            connect_as_settings: self.connect_as_settings.clone(),
-            guacd_params: Arc::clone(&self.guacd_params),
-
-            buffer_pool: self.buffer_pool.clone(),
-            udp_associations: Arc::new(Mutex::new(HashMap::new())),
-            udp_conn_index: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            frame_input_tx: self.frame_input_tx.clone(),
-            frame_input_rx: Arc::clone(&self.frame_input_rx),
-            channel_ping_sent_time: Mutex::new(None), // Initialize for clone
-            conn_closed_tx: cloned_conn_closed_tx, // Cloned instance gets a new sender (though likely unused if the clone isn't run)
-            conn_closed_rx: None, // Cloned instance does not get the original receiver
-            primary_guacd_conn_no: Arc::new(Mutex::new(None)), // Cloned channels start fresh for primary Guacd conn
-            callback_token: self.callback_token.clone(),
-            ksm_config: self.ksm_config.clone(),
-        }
-    }
-}
+// NOTE: Channel is intentionally NOT Clone because it contains a single-consumer receiver
+// (rx_from_dc) that can only be owned by one instance. Cloning would create a broken
+// receiver that never receives messages. Use Arc<Channel> for sharing instead.
 
 pub struct ChannelParams {
     pub webrtc: WebRTCDataChannel,
@@ -211,21 +155,14 @@ impl Channel {
             callback_token,
             ksm_config,
         } = params;
-        info!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
+        debug!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
         trace!(target: "channel_setup", channel_id = %channel_id, ?protocol_settings, "Initial protocol_settings received by Channel::new");
 
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
-        let (f_input_tx, f_input_rx) = mpsc::unbounded_channel::<Frame>();
         let (conn_closed_tx, conn_closed_rx) = mpsc::unbounded_channel::<(u32, String)>();
 
-        webrtc.set_buffered_amount_low_threshold(BUFFER_LOW_THRESHOLD);
-
-        let buffer_pool_config = BufferPoolConfig {
-            buffer_size: 32 * 1024,
-            max_pooled: 64,
-            resize_on_return: true,
-        };
-        let buffer_pool = BufferPool::new(buffer_pool_config);
+        // Use standard buffer pool configuration for consistent performance
+        let buffer_pool = BufferPool::new(STANDARD_BUFFER_CONFIG);
 
         let network_checker = parse_network_rules_from_settings(&protocol_settings);
 
@@ -261,7 +198,7 @@ impl Channel {
                                         .get("guacd_port")
                                         .and_then(|v| v.as_u64())
                                         .map(|p| p as u16);
-                                    info!(target: "channel_setup", channel_id = %channel_id, ?guacd_host_setting, ?guacd_port_setting, "Parsed from dedicated 'guacd' settings block.");
+                                    debug!(target: "channel_setup", channel_id = %channel_id, ?guacd_host_setting, ?guacd_port_setting, "Parsed from dedicated 'guacd' settings block.");
                                 } else {
                                     warn!(target: "channel_setup", channel_id = %channel_id, "'guacd' block was not a JSON Object.");
                                 }
@@ -272,7 +209,7 @@ impl Channel {
                             if let Some(guacd_params_json_val) =
                                 protocol_settings.get("guacd_params")
                             {
-                                info!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd_params' in protocol_settings.");
+                                debug!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd_params' in protocol_settings.");
                                 trace!(target: "channel_setup", channel_id = %channel_id, guacd_params_value = ?guacd_params_json_val, "Raw guacd_params value for direct processing.");
 
                                 if let JsonValue::Object(map) = guacd_params_json_val {
@@ -455,12 +392,12 @@ impl Channel {
 
         let mut final_connect_as_settings = ConnectAsSettings::default();
         if let Some(connect_as_settings_val) = protocol_settings.get("connect_as_settings") {
-            info!(target: "channel_setup", channel_id = %channel_id, "Found 'connect_as_settings' in protocol_settings.");
+            debug!(target: "channel_setup", channel_id = %channel_id, "Found 'connect_as_settings' in protocol_settings.");
             trace!(target: "channel_setup", channel_id = %channel_id, cas_value = ?connect_as_settings_val, "Raw connect_as_settings value.");
             match serde_json::from_value::<ConnectAsSettings>(connect_as_settings_val.clone()) {
                 Ok(parsed_settings) => {
                     final_connect_as_settings = parsed_settings;
-                    info!(target: "channel_setup", channel_id = %channel_id, "Successfully deserialized connect_as_settings into ConnectAsSettings struct.");
+                    debug!(target: "channel_setup", channel_id = %channel_id, "Successfully deserialized connect_as_settings into ConnectAsSettings struct.");
                     trace!(target: "channel_setup", channel_id = %channel_id, ?final_connect_as_settings);
                 }
                 Err(e) => {
@@ -476,13 +413,11 @@ impl Channel {
         let new_channel = Self {
             webrtc,
             conns: Arc::new(DashMap::new()),
-            next_conn_no: 1,
             rx_from_dc,
             channel_id,
             timeouts: timeouts.unwrap_or_default(),
             network_checker,
             ping_attempt: 0,
-            round_trip_latency: Arc::new(Mutex::new(Vec::new())),
             is_connected: true,
             should_exit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             server_mode,
@@ -503,8 +438,6 @@ impl Channel {
             buffer_pool,
             udp_associations: Arc::new(Mutex::new(HashMap::new())),
             udp_conn_index: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            frame_input_tx: f_input_tx,
-            frame_input_rx: Arc::new(Mutex::new(f_input_rx)),
             channel_ping_sent_time: Mutex::new(None),
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
@@ -585,7 +518,7 @@ impl Channel {
                                 debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
 
                                 if !chunk.is_empty() {
-                                    debug!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
+                                    trace_ultra_hot_path!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
                                 }
                             }
 
@@ -630,7 +563,7 @@ impl Channel {
                             if closed_conn_no != 0 { // Avoid self-triggering if conn_no 0 was what closed to signal this.
                                 info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Shutting down control connection (0) due to critical upstream closure.");
                                 if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed).await {
-                                    error!(target: "channel_lifecycle", channel_id = %self.channel_id, error = %e, "Error explicitly closing control connection (0) during critical shutdown.");
+                                    debug!(target: "channel_lifecycle", channel_id = %self.channel_id, error = %e, "Error explicitly closing control connection (0) during critical shutdown.");
                                 }
                             }
                             // Instead of just breaking, return the specific error to indicate why the channel is stopping.
@@ -713,7 +646,8 @@ impl Channel {
         }
 
         let buffered_amount = self.webrtc.buffered_amount().await;
-        if buffered_amount >= BUFFER_LOW_THRESHOLD && tracing::enabled!(tracing::Level::DEBUG) {
+        if buffered_amount >= STANDARD_BUFFER_THRESHOLD && tracing::enabled!(tracing::Level::DEBUG)
+        {
             debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");
         }
         self.webrtc
@@ -731,7 +665,7 @@ impl Channel {
         let total_connections = self.conns.len();
         let remaining_connections = self.get_connection_ids_except(conn_no);
 
-        info!(target: "connection_lifecycle",
+        debug!(target: "connection_lifecycle",
               channel_id = %self.channel_id, conn_no, ?reason,
               total_connections, ?remaining_connections,
               "Closing connection - Connection summary");
@@ -945,7 +879,9 @@ impl Drop for Channel {
                 let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut close_buffer);
                 let encoded = close_frame.encode_with_pool(&buffer_pool_clone);
                 if let Err(e) = webrtc.send(encoded).await {
-                    warn!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error sending close frame in drop for connection");
+                    if !e.contains("Channel is closing") {
+                        warn!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error sending close frame in drop for connection");
+                    }
                 }
                 buffer_pool_clone.release(close_buffer);
 
@@ -956,7 +892,7 @@ impl Drop for Channel {
                     }
                 }
             }
-            info!(target: "channel_lifecycle", channel_id = %channel_id, "Lock-free resource cleanup completed in drop for Channel");
+            info!(target: "channel_lifecycle", channel_id = %channel_id, "Channel cleanup completed");
         });
     }
 }

@@ -25,7 +25,7 @@ pub struct SignalMessage {
 
 // Global registry for all tubes - using Lazy with explicit thread safety
 pub(crate) static REGISTRY: Lazy<RwLock<TubeRegistry>> = Lazy::new(|| {
-    info!("Initializing global tube registry");
+    debug!("Initializing global tube registry");
     RwLock::new(TubeRegistry::new())
 });
 
@@ -250,14 +250,13 @@ impl TubeRegistry {
         self.signal_channels
             .insert(tube_id.clone(), signal_sender.clone());
 
-        info!(target: "ice_config", tube_id = %tube_id, "Received ksm_config for ICE server setup");
-        trace!(target: "ice_config", ksm_config = %ksm_config, "Received ksm_config for ICE server setup");
+        trace!(target: "ice_config", tube_id = %tube_id, ksm_config = %ksm_config, "Received ksm_config for ICE server setup");
 
         let mut ice_servers = Vec::new();
         let mut turn_only_for_config = settings
             .get("turn_only")
             .is_some_and(|v| v.as_bool().unwrap_or(false));
-        info!(target: "ice_config", tube_id = %tube_id, turn_only_setting = turn_only_for_config, "Initial 'turn_only' setting from input");
+        debug!(target: "ice_config", tube_id = %tube_id, turn_only_setting = turn_only_for_config, "Initial 'turn_only' setting from input");
 
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
             info!(target: "ice_config", tube_id = %tube_id, "TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration.");
@@ -277,7 +276,7 @@ impl TubeRegistry {
         } else {
             match krealy_url_from_ksm_config(ksm_config) {
                 Ok(relay_server) => {
-                    info!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Extracted relay server host from ksm_config");
+                    debug!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Extracted relay server host from ksm_config");
                     if !turn_only_for_config {
                         let stun_url_udp = format!("stun:{}:3478", relay_server);
                         ice_servers.push(RTCIceServer {
@@ -285,13 +284,13 @@ impl TubeRegistry {
                             username: String::new(),
                             credential: String::new(),
                         });
-                        info!(target: "ice_config", tube_id = %tube_id, stun_url = %stun_url_udp, "Added STUN server (UDP)");
+                        debug!(target: "ice_config", tube_id = %tube_id, stun_url = %stun_url_udp, "Added STUN server (UDP)");
                     }
 
                     let use_turn_for_config_from_settings = settings
                         .get("use_turn")
                         .is_none_or(|v| v.as_bool().unwrap_or(true));
-                    info!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
+                    debug!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
 
                     if use_turn_for_config_from_settings {
                         match get_relay_access_creds(ksm_config, None).await {
@@ -306,7 +305,7 @@ impl TubeRegistry {
                                     .and_then(|p| p.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                info!(target: "ice_config", tube_id = %tube_id, turn_username = %username, turn_password_is_empty = credential.is_empty(), "Fetched TURN credentials");
+                                debug!(target: "ice_config", tube_id = %tube_id, turn_username = %username, turn_password_is_empty = credential.is_empty(), "Fetched TURN credentials");
 
                                 if !username.is_empty() && !credential.is_empty() {
                                     let turn_url_udp = format!("turn:{}:3478", relay_server);
@@ -315,7 +314,7 @@ impl TubeRegistry {
                                         username: username.clone(),
                                         credential: credential.clone(),
                                     });
-                                    info!(target: "ice_config", tube_id = %tube_id, turn_url = %turn_url_udp, "Added TURN server (UDP)");
+                                    debug!(target: "ice_config", tube_id = %tube_id, turn_url = %turn_url_udp, "Added TURN server (UDP)");
                                 } else {
                                     warn!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Failed to add TURN servers: Usable TURN credentials (empty username/password) not obtained.");
                                 }
@@ -333,7 +332,7 @@ impl TubeRegistry {
         }
         let all_configured_urls: Vec<String> =
             ice_servers.iter().flat_map(|s| s.urls.clone()).collect();
-        info!(target: "ice_config", tube_id = %tube_id, configured_ice_urls = ?all_configured_urls, "Final list of ICE server URLs to be used");
+        debug!(target: "ice_config", tube_id = %tube_id, configured_ice_urls = ?all_configured_urls, "Final list of ICE server URLs to be used");
 
         let rtc_config_obj = {
             let mut rtc_config = RTCConfiguration {
@@ -410,7 +409,7 @@ impl TubeRegistry {
                 }
             }
         } else {
-            info!(target: "tube_lifecycle", tube_id = %tube_id, "Client mode: Expecting client to create data channels via its offer.");
+            debug!(target: "tube_lifecycle", tube_id = %tube_id, "Client mode: Expecting client to create data channels via its offer.");
         }
 
         let mut result_map = HashMap::new();
@@ -421,7 +420,7 @@ impl TubeRegistry {
                     "actual_local_listen_addr".to_string(),
                     format!("127.0.0.1:{}", port),
                 );
-                info!(target: "tube_lifecycle", tube_id = %tube_id, listen_addr = format!("127.0.0.1:{}", port), "Server mode: Reporting listening address.");
+                debug!(target: "tube_lifecycle", tube_id = %tube_id, listen_addr = format!("127.0.0.1:{}", port), "Server mode: Reporting listening address.");
             } else {
                 warn!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: No listening port obtained for main data channel, not adding actual_local_listen_addr to result.");
             }
@@ -516,7 +515,7 @@ impl TubeRegistry {
             })?;
 
         let current_status = *tube_arc.status.read().await;
-        info!(target: "registry", tube_id = %tube_id, status = %current_status, "close_tube: Attempting to close tube.");
+        debug!(target: "registry", tube_id = %tube_id, status = %current_status, "close_tube: Attempting to close tube.");
 
         match current_status {
             crate::tube_and_channel_helpers::TubeStatus::Initializing => {

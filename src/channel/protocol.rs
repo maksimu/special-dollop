@@ -92,12 +92,12 @@ impl Channel {
 
                 let lower_current_state = current_state.to_lowercase();
                 if lower_current_state == "closed" || lower_current_state.starts_with("error") {
-                    info!(target: "protocol_event", channel_id=%channel_id_log, state = %current_state, "Endpoint WebRTC state, stopping state monitoring task.");
+                    debug!(target: "protocol_event", channel_id=%channel_id_log, state = %current_state, "Endpoint WebRTC state, stopping state monitoring task.");
                     break;
                 }
             }
         });
-        info!(target: "protocol_event", channel_id=%channel_id_base, "Channel WebRTC state change monitoring set up.");
+        debug!(target: "protocol_event", channel_id=%channel_id_base, "Channel WebRTC state change monitoring set up.");
     }
 
     /// Process a control message received from the data channel
@@ -585,7 +585,7 @@ impl Channel {
                 );
             }
         } else {
-            info!("Channel({}): Successfully processed OpenConnection for target_conn_no {}, sending ConnectionOpened.", self.channel_id, target_connection_no);
+            debug!("Channel({}): Successfully processed OpenConnection for target_conn_no {}, sending ConnectionOpened.", self.channel_id, target_connection_no);
             temp_payload_buffer.put_u32(target_connection_no);
             if let Err(e) = self
                 .send_control_message(ControlMessage::ConnectionOpened, &temp_payload_buffer)

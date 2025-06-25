@@ -8,6 +8,14 @@ use std::time::Duration;
 use tracing::{debug, warn};
 use webrtc::data_channel::RTCDataChannel;
 
+/// Standard buffer threshold for optimal WebRTC performance.
+/// This value (8KB) is carefully chosen to:
+/// 1. Provide natural backpressure without polling
+/// 2. Minimize latency for real-time communication
+/// 3. Balance memory usage and throughput
+/// 4. Work well with WebRTC's internal buffering
+pub const STANDARD_BUFFER_THRESHOLD: u64 = 8 * 1024; // 8KB - optimal for real-time
+
 // Type alias for complex callback type
 type BufferedAmountLowCallback = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>;
 

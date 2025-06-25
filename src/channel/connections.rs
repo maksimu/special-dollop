@@ -6,10 +6,10 @@ use crate::channel::guacd_parser::{
 };
 use crate::channel::types::ActiveProtocol;
 use crate::models::{Conn, StreamHalf};
-use crate::trace_hot_path;
 use crate::tube_protocol::{ControlMessage, Frame};
 use crate::unlikely; // Import branch prediction macros
-use crate::webrtc_data_channel::EventDrivenSender;
+use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
+use crate::{trace_hot_path, trace_ultra_hot_path};
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ pub async fn open_backend(
         let mut primary_conn_no_guard = channel.primary_guacd_conn_no.lock().await;
         if primary_conn_no_guard.is_none() {
             *primary_conn_no_guard = Some(conn_no);
-            info!(target: "connection_lifecycle", channel_id = %channel.channel_id, conn_no, "Marked as primary Guacd data connection.");
+            debug!(target: "connection_lifecycle", channel_id = %channel.channel_id, conn_no, "Marked as primary Guacd data connection.");
         } else if *primary_conn_no_guard != Some(conn_no) {
             // This case would be unusual - opening a new Guacd connection when one (potentially different conn_no) is already primary.
             // For now, log it. Depending on design, there might be an error or a secondary stream.
@@ -73,41 +73,6 @@ pub async fn open_backend(
     Ok(())
 }
 
-// **OPCODE HANDLERS** - Specialized processing for special opcodes
-
-// Note: Size instruction handling moved to inbound path in frame_handling.rs
-// Size instructions typically flow client→server, not server→client
-
-// Example handler for future opcodes (commented out for now)
-// async fn handle_disconnect_instruction(
-//     current_slice: &[u8],
-//     instruction_len: usize,
-//     channel_id: &str,
-//     conn_no: u32,
-//     buffer_pool: &BufferPool,
-// ) {
-//     const DISCONNECT_OPCODE: &str = "disconnect"; // Would be defined in guacd_parser.rs
-//
-//     debug!(target: "guac_disconnect",
-//         channel_id = %channel_id,
-//         conn_no = conn_no,
-//         opcode = %DISCONNECT_OPCODE,
-//         instruction_len = instruction_len,
-//         "🔌 Processing disconnect instruction"
-//     );
-//
-//     // Parse and validate the disconnect instruction
-//     if let Ok(peeked_instr) = GuacdParser::peek_instruction(current_slice) {
-//         if peeked_instr.opcode == DISCONNECT_OPCODE {
-//             info!(target: "guac_disconnect",
-//                   channel_id = %channel_id,
-//                   opcode = %DISCONNECT_OPCODE,
-//                   "🔌 Client disconnect detected");
-//             // Add disconnect-specific logic here
-//         }
-//     }
-// }
-
 // Set up a task to read from the backend and send to WebRTC
 pub async fn setup_outbound_task(
     channel: &mut Channel,
@@ -121,7 +86,6 @@ pub async fn setup_outbound_task(
     let channel_id_for_task = channel.channel_id.clone();
     let conn_closed_tx_for_task = channel.conn_closed_tx.clone(); // Clone the sender for the task
     let buffer_pool = channel.buffer_pool.clone();
-    let buffer_low_threshold = super::core::BUFFER_LOW_THRESHOLD;
     let is_channel_server_mode = channel.server_mode;
 
     trace_hot_path!(
@@ -226,7 +190,7 @@ pub async fn setup_outbound_task(
         );
 
         // Create event-driven sender for zero-polling backpressure
-        let event_sender = EventDrivenSender::new(Arc::new(dc.clone()), buffer_low_threshold);
+        let event_sender = EventDrivenSender::new(Arc::new(dc.clone()), STANDARD_BUFFER_THRESHOLD);
 
         // **OPTIMIZED EVENT-DRIVEN HELPER** - Zero polling, instant backpressure
         #[inline(always)] // Hot path optimization
@@ -251,18 +215,23 @@ pub async fn setup_outbound_task(
                         can_send_immediate = event_sender.can_send_immediate(),
                         is_over_threshold = event_sender.is_over_threshold(),
                         threshold = event_sender.get_threshold(),
-                        "⚡ Event-driven send successful (0ms latency)"
+                        "Event-driven send successful (0ms latency)"
                     );
                     Ok(())
                 }
                 Err(e) => {
-                    error!(
-                        channel_id = %channel_id_local,
-                        conn_no = conn_no_local,
-                        context = context_msg,
-                        error = %e,
-                        "❌ Event-driven send failed"
-                    );
+                    // Only log if the error is not related to a closed connection
+                    if !e.to_string().contains("DataChannel is not opened")
+                        && !e.to_string().contains("Channel is closing")
+                    {
+                        error!(
+                            channel_id = %channel_id_local,
+                            conn_no = conn_no_local,
+                            context = context_msg,
+                            error = %e,
+                            "Event-driven send failed"
+                        );
+                    }
                     Err(())
                 }
             }
@@ -436,12 +405,12 @@ pub async fn setup_outbound_task(
                             let parse_start = std::time::Instant::now();
 
                             // **ULTRA-FAST PATH: Validate format and detect special opcodes**
-                            debug!(target: "guac_opcode_debug",
+                            trace_ultra_hot_path!(target: "guac_opcode_debug",
                                    channel_id = %channel_id_for_task,
                                    conn_no = conn_no,
                                    slice_len = current_slice.len(),
                                    first_bytes = ?&current_slice[..std::cmp::min(50, current_slice.len())],
-                                   "🔍 OUTBOUND: About to validate and detect special opcodes");
+                                   "OUTBOUND: About to validate and detect special opcodes");
                             match GuacdParser::validate_and_detect_special(current_slice) {
                                 Ok((instruction_len, action)) => {
                                     #[cfg(feature = "profiling")]
@@ -457,14 +426,12 @@ pub async fn setup_outbound_task(
                                     }
 
                                     // Log opcode action for trace-level debugging
-                                    if tracing::enabled!(tracing::Level::TRACE) {
-                                        trace!(target: "guac_opcode_dispatch",
-                                               channel_id = %channel_id_for_task,
-                                               conn_no = conn_no,
-                                               action = ?action,
-                                               instruction_len = instruction_len,
-                                               "🔀 Opcode action dispatched by expandable system");
-                                    }
+                                    trace_ultra_hot_path!(target: "guac_opcode_dispatch",
+                                       channel_id = %channel_id_for_task,
+                                       conn_no = conn_no,
+                                       action = ?action,
+                                       instruction_len = instruction_len,
+                                       "Opcode action dispatched by expandable system");
 
                                     // Dispatch based on opcode action
                                     match action {
@@ -473,7 +440,7 @@ pub async fn setup_outbound_task(
                                                   channel_id = %channel_id_for_task,
                                                   conn_no = conn_no,
                                                   expected_opcode = %crate::channel::guacd_parser::ERROR_OPCODE,
-                                                  "❌ Error opcode detected - preparing to close connection");
+                                                  "Error opcode detected - preparing to close connection");
 
                                             // **COLD PATH**: Error opcode detected
                                             match GuacdParser::peek_instruction(current_slice) {
@@ -484,14 +451,14 @@ pub async fn setup_outbound_task(
                                                         opcode = %error_instr.opcode,
                                                         expected_opcode = %crate::channel::guacd_parser::ERROR_OPCODE,
                                                         args = ?error_instr.args,
-                                                        "💥 Guacd sent error opcode - closing connection");
+                                                        "Guacd sent error opcode - closing connection");
                                                 }
                                                 Err(_) => {
                                                     error!(target: "guac_error_handling",
                                                         channel_id = %channel_id_for_task,
                                                         conn_no = conn_no,
                                                         expected_opcode = %crate::channel::guacd_parser::ERROR_OPCODE,
-                                                        "💥 Guacd sent error opcode but failed to parse args - closing connection");
+                                                        "Guacd sent error opcode but failed to parse args - closing connection");
                                                 }
                                             }
 
@@ -527,12 +494,12 @@ pub async fn setup_outbound_task(
                                             break;
                                         }
                                         OpcodeAction::ProcessSpecial(opcode) => {
-                                            info!(target: "guac_special_opcodes",
+                                            debug!(target: "guac_special_opcodes",
                                                   channel_id = %channel_id_for_task,
                                                   conn_no = conn_no,
                                                   opcode_name = %opcode.as_str(),
                                                   opcode = ?opcode,
-                                                  "⚡ OUTBOUND: Special opcode detected - dispatching to handler");
+                                                  "OUTBOUND: Special opcode detected - dispatching to handler");
 
                                             // Dispatch to appropriate special handler
                                             match opcode {
@@ -542,15 +509,15 @@ pub async fn setup_outbound_task(
                                                         GuacdParser::peek_instruction(current_slice)
                                                     {
                                                         if peeked_instr.args.len() >= 2 {
-                                                            info!(target: "guac_size_instruction_outbound",
+                                                            debug!(target: "guac_size_instruction_outbound",
                                                                   channel_id = %channel_id_for_task,
                                                                   conn_no = conn_no,
                                                                   layer = %peeked_instr.args[0],
                                                                   width = %peeked_instr.args.get(1).unwrap_or(&"unknown"),
                                                                   height = %peeked_instr.args.get(2).unwrap_or(&"unknown"),
-                                                                  "📏 OUTBOUND: Server size instruction (actual session size) - sending to signal system");
+                                                                  "OUTBOUND: Server size instruction (actual session size) - sending to signal system");
 
-                                                            // Send to Python signal system
+                                                            // Send it to the Python signal system
                                                             let channel_id_clone =
                                                                 channel_id_for_task.clone();
                                                             let raw_instruction = GuacdParser::guacd_encode_instruction(&GuacdInstruction::new(
@@ -587,7 +554,7 @@ pub async fn setup_outbound_task(
                                                                         debug!(target: "guac_size_instruction_outbound",
                                                                                channel_id = %channel_id_clone,
                                                                                tube_id = %tube_id,
-                                                                               "✅ OUTBOUND: Found tube containing this channel");
+                                                                               "OUTBOUND: Found tube containing this channel");
                                                                         break;
                                                                     }
                                                                 }
@@ -614,35 +581,34 @@ pub async fn setup_outbound_task(
                                                                                   tube_id = %tube_id,
                                                                                   channel_id = %channel_id_clone,
                                                                                   error = %e,
-                                                                                  "❌ OUTBOUND: Failed to send actual size signal to Python");
+                                                                                  "OUTBOUND: Failed to send actual size signal to Python");
                                                                         } else {
-                                                                            info!(target: "guac_size_instruction_outbound",
+                                                                            debug!(target: "guac_size_instruction_outbound",
                                                                                   tube_id = %tube_id,
                                                                                   channel_id = %channel_id_clone,
-                                                                                  "🐍 OUTBOUND: Successfully sent actual size signal to Python");
+                                                                                  "OUTBOUND: Successfully sent actual size signal to Python");
                                                                         }
                                                                     } else {
                                                                         warn!(target: "guac_size_instruction_outbound",
                                                                               tube_id = %tube_id,
-                                                                              "⚠️ OUTBOUND: No signal sender found for tube");
+                                                                              "OUTBOUND: No signal sender found for tube");
                                                                     }
                                                                 } else {
                                                                     warn!(target: "guac_size_instruction_outbound",
-                                                                          channel_id = %channel_id_clone,
-                                                                          "❓ OUTBOUND: Could not find tube containing this channel");
+                                                                          "OUTBOUND: Could not find tube containing this channel");
                                                                 }
                                                             });
                                                         } else {
                                                             debug!(target: "guac_special_opcodes",
                                                                   channel_id = %channel_id_for_task,
                                                                   opcode_name = %SpecialOpcode::Size.as_str(),
-                                                                  "📏 OUTBOUND: Size instruction with insufficient args - skipping signal");
+                                                                  "OUTBOUND: Size instruction with insufficient args - skipping signal");
                                                         }
                                                     } else {
                                                         debug!(target: "guac_special_opcodes",
                                                               channel_id = %channel_id_for_task,
                                                               opcode_name = %SpecialOpcode::Size.as_str(),
-                                                              "📏 OUTBOUND: Failed to parse size instruction - skipping signal");
+                                                              "OUTBOUND: Failed to parse size instruction - skipping signal");
                                                     }
                                                 }
                                                 SpecialOpcode::Error => {
@@ -653,7 +619,7 @@ pub async fn setup_outbound_task(
                                                   //     info!(target: "guac_special_opcodes",
                                                   //           channel_id = %channel_id_for_task,
                                                   //           opcode_name = %SpecialOpcode::Disconnect.as_str(),
-                                                  //           "🔌 Dispatching to disconnect handler");
+                                                  //           "Dispatching to disconnect handler");
                                                   //     handle_disconnect_instruction(...).await;
                                                   // }
                                             }
@@ -908,11 +874,21 @@ pub async fn setup_outbound_task(
 
         // Signal that this connection task has exited
         if let Err(e) = conn_closed_tx_for_task.send((conn_no, channel_id_for_task.clone())) {
-            // If sending fails, it likely means the Channel's run loop (receiver) has already terminated.
-            // This is not necessarily an error in this context, so a warning or trace might be appropriate.
-            warn!(target: "connection_lifecycle", channel_id = %channel_id_for_task, conn_no, error = %e, "Failed to send connection closure signal; channel might be shutting down.");
+            // Only log if the error is not related to an expected channel closure
+            if !e.to_string().contains("channel closed") {
+                warn!(target: "connection_lifecycle",
+                    channel_id = %channel_id_for_task,
+                    conn_no,
+                    error = %e,
+                    "Failed to send connection closure signal; channel might be shutting down."
+                );
+            }
         } else {
-            debug!(target: "connection_lifecycle", channel_id = %channel_id_for_task, conn_no, "Sent connection closure signal to Channel run loop.");
+            debug!(target: "connection_lifecycle",
+                channel_id = %channel_id_for_task,
+                conn_no,
+                "Sent connection closure signal to Channel run loop."
+            );
         }
     });
 
@@ -1069,7 +1045,22 @@ where
             }
         }
     }
-    let guacd_params_locked = guacd_params_arc.lock().await;
+    let mut guacd_params_locked = guacd_params_arc.lock().await;
+
+    // --- RDP username/domain splitting logic ---
+    if let Some(protocol) = guacd_params_locked.get("protocol") {
+        if protocol.eq_ignore_ascii_case("rdp") {
+            if let Some(username) = guacd_params_locked.get("username").cloned() {
+                if let Some(pos) = username.find('\\') {
+                    let domain = &username[..pos];
+                    let user = &username[pos + 1..];
+                    info!(target: "guac_protocol",  channel_id=%channel_id, conn_no, domain=&domain, username=&user, "Domain found in username");
+                    guacd_params_locked.insert("username".to_string(), user.to_string());
+                    guacd_params_locked.insert("domain".to_string(), domain.to_string());
+                }
+            }
+        }
+    }
 
     let protocol_name_from_params = guacd_params_locked.get("protocol").cloned().unwrap_or_else(|| {
         warn!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd 'protocol' missing in guacd_params, defaulting to 'rdp' for select fallback.");
@@ -1082,10 +1073,10 @@ where
 
     let select_arg: String;
     if let Some(id_to_join) = &join_connection_id_opt {
-        info!(target: "guac_protocol", channel_id=%channel_id, conn_no, session_to_join=%id_to_join, "Guacd Handshake: Preparing to join existing session.");
+        debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, session_to_join=%id_to_join, "Guacd Handshake: Preparing to join existing session.");
         select_arg = id_to_join.clone();
     } else {
-        info!(target: "guac_protocol", channel_id=%channel_id, conn_no, protocol=%protocol_name_from_params, "Guacd Handshake: Preparing for new session with protocol.");
+        debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, protocol=%protocol_name_from_params, "Guacd Handshake: Preparing for new session with protocol.");
         select_arg = protocol_name_from_params;
     }
 
@@ -1201,7 +1192,7 @@ where
             }
         }
     } else {
-        info!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd Handshake: Preparing 'connect' for NEW session.");
+        debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd Handshake: Preparing 'connect' for NEW session.");
 
         let parse_mimetypes = |mimetype_str: &str| -> Vec<String> {
             if mimetype_str.is_empty() {
@@ -1232,7 +1223,7 @@ where
                   width = %size_parts.first().map(|s| s.as_str()).unwrap_or("1024"),
                   height = %size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"),
                   dpi = %size_parts.get(2).map(|s| s.as_str()).unwrap_or("96"),
-                  "📏 HANDSHAKE: Client initial size instruction (debug only - not sent to signal system)");
+                  "HANDSHAKE: Client initial size instruction (debug only - not sent to signal system)");
         }
 
         writer
@@ -1293,7 +1284,8 @@ where
     }
 
     let connect_instruction = GuacdInstruction::new("connect".to_string(), connect_args.clone());
-    debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, instruction=?connect_instruction, "Guacd Handshake: Sending 'connect'");
+    debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd Handshake: Sending 'connect'");
+    trace!(target: "guac_protocol", channel_id=%channel_id, conn_no, instruction=?connect_instruction, "Guacd Handshake: params");
     writer
         .write_all(&GuacdParser::guacd_encode_instruction(&connect_instruction))
         .await?;
@@ -1310,9 +1302,9 @@ where
     )
     .await?;
     if let Some(client_id_from_ready) = ready_instruction.args.first() {
-        info!(target: "guac_protocol", channel_id=%channel_id, conn_no, guacd_client_id=%client_id_from_ready, "Guacd handshake completed.");
+        debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, guacd_client_id=%client_id_from_ready, "Guacd handshake completed.");
     } else {
-        info!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd handshake completed. No client ID received with 'ready'.");
+        debug!(target: "guac_protocol", channel_id=%channel_id, conn_no, "Guacd handshake completed. No client ID received with 'ready'.");
     }
     buffer_pool.release(handshake_buffer);
     Ok(())

@@ -231,8 +231,12 @@ def init_logger():
             logging.info("Rust logger initialized successfully")
             RUST_LOGGER_INITIALIZED = True
         except Exception as e:
-            # Log the error but don't necessarily fail the test run, 
-            # as other tests might still be runnable or the logger might partially work.
-            logging.error(f"Failed to initialize Rust logger: {e}") 
-    # else: # Optional: log if already initialized
-        # logging.debug("Rust logger already initialized.") 
+            # Handle the already-initialized case gracefully
+            error_msg = str(e).lower()
+            if "already initialized" in error_msg or "logging system was already initialized" in error_msg:
+                logging.debug(f"Rust logger already initialized: {e}")
+                RUST_LOGGER_INITIALIZED = True
+            else:
+                # This is a real error - log but don't fail tests
+                logging.error(f"Failed to initialize Rust logger: {e}")
+                # Don't raise - let tests continue with existing logging setup 

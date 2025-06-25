@@ -7,7 +7,7 @@ use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyStrin
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Python bindings for the Rust TubeRegistry.
 ///
@@ -534,38 +534,53 @@ impl PyTubeRegistry {
 
     /// Close a specific connection on a tube
     #[pyo3(signature = (
-        tube_id,
         connection_id,
     ))]
-    fn close_connection(&self, py: Python<'_>, tube_id: &str, connection_id: &str) -> PyResult<()> {
+    fn close_connection(&self, py: Python<'_>, connection_id: &str) -> PyResult<()> {
         let master_runtime = get_runtime();
-        let tube_id_owned = tube_id.to_string();
         let connection_id_owned = connection_id.to_string();
 
         py.allow_threads(move || {
             master_runtime.clone().block_on(async move {
-                let tube_result = {
+                // Get tube reference while holding registry lock, then release lock
+                let tube_arc = {
                     let registry = REGISTRY.read().await;
-                    registry.get_by_tube_id(&tube_id_owned)
+
+                    // Look up the tube ID from the connection ID
+                    let tube_id_owned =
+                        match registry.tube_id_from_conversation_id(&connection_id_owned) {
+                            Some(tube_id) => tube_id.clone(),
+                            None => {
+                                return Err(PyRuntimeError::new_err(format!(
+                                    "Rust: No tube found for connection ID: {}",
+                                    connection_id_owned
+                                )));
+                            }
+                        };
+
+                    // Get tube reference before releasing the lock
+                    match registry.get_by_tube_id(&tube_id_owned) {
+                        Some(tube) => tube.clone(), // Clone the Arc to keep reference
+                        None => {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "Rust: Tube not found {} during close_connection for connection {}",
+                                tube_id_owned, connection_id_owned
+                            )));
+                        }
+                    }
+                    // Registry lock is automatically released here
                 };
 
-                if let Some(tube) = tube_result {
-                    tube.close_channel(&connection_id_owned).await.map_err(|e| {
+                // Now call close_channel without holding any registry locks
+                tube_arc
+                    .close_channel(&connection_id_owned)
+                    .await
+                    .map_err(|e| {
                         PyRuntimeError::new_err(format!(
-                            "Rust: Failed to close connection {} on tube {}: {}",
-                            connection_id_owned, tube_id_owned, e
+                            "Rust: Failed to close connection {}: {}",
+                            connection_id_owned, e
                         ))
                     })
-                } else {
-                    // The Tube isn't found, perhaps already closed. Consider if this should be an error or a warning.
-                    // For now, mirroring the PyRuntimeError pattern for consistency if an action was expected.
-                    // However, if closing a non-existent connection is acceptable, Ok(()) might be better here.
-                    // Let's make it an error if the tube itself isn't found, as an action was requested on it.
-                    Err(PyRuntimeError::new_err(format!(
-                        "Rust: Tube not found {} during close_connection for connection {}",
-                        tube_id_owned, connection_id_owned
-                    )))
-                }
             })
         })
     }
@@ -698,7 +713,7 @@ fn setup_signal_handler(
 ) {
     let task_tube_id = tube_id_key.clone();
     runtime.spawn(async move {
-        info!(target: "python_bindings", "Signal handler task started for tube_id: {}", task_tube_id);
+        debug!(target: "python_bindings", "Signal handler task started for tube_id: {}", task_tube_id);
         let mut signal_count = 0;
         while let Some(signal) = signal_receiver.recv().await {
             signal_count += 1;
@@ -733,7 +748,11 @@ fn setup_signal_handler(
                 if success {
                     let result = callback_pyobj.call1(py, (py_dict,));
                     if let Err(e) = result {
-                        warn!("Error in Python signal callback for tube {}: {:?}", task_tube_id, e);
+                        // Only log if it's not an expected KeyError during closure
+                        if !(e.is_instance_of::<pyo3::exceptions::PyKeyError>(py)
+                            && (signal.kind == "channel_closed" || signal.kind == "disconnect")) {
+                            warn!("Error in Python signal kind:{} callback for tube {}: {:?}: ", signal.kind, task_tube_id, e);
+                        }
                     }
                 } else {
                     warn!("Skipping Python callback for tube {} due to error setting dict items for signal {:?}", task_tube_id, signal.kind);
@@ -741,6 +760,11 @@ fn setup_signal_handler(
             });
             debug!(target: "python_bindings", "Rust task completed Python callback GIL block for signal {}: {:?} for tube {}", signal_count, signal.kind, task_tube_id);
         }
-        warn!(target: "python_bindings", "Signal handler task FOR TUBE {} IS TERMINATING (processed {} signals) because MPSC channel receive loop ended.", task_tube_id, signal_count);
+        // Only log termination if it's not a normal closure
+        if signal_count > 0 {
+            debug!(target: "python_bindings", "Signal handler task for tube {} completed normally after processing {} signals", task_tube_id, signal_count);
+        } else {
+            warn!(target: "python_bindings", "Signal handler task FOR TUBE {} IS TERMINATING (processed {} signals) because MPSC channel receive loop ended.", task_tube_id, signal_count);
+        }
     });
 }

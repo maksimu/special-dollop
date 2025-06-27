@@ -257,7 +257,7 @@ impl Channel {
             }
         } else {
             // No network checker - allow all destinations
-            match tokio::net::lookup_host(format!("{}:{}", dest_host, dest_port)).await {
+            match tokio::net::lookup_host(format!("{dest_host}:{dest_port}")).await {
                 Ok(mut addrs) => {
                     if let Some(dest_socket_addr) = addrs.next() {
                         match forward_udp_packet_to_destination(

@@ -113,7 +113,7 @@ mod challenge_response {
 
             // Need to fetch a new challenge
             let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
-            let url = format!("{}/api/device/get_challenge", router_http_host);
+            let url = format!("{router_http_host}/api/device/get_challenge");
 
             let client = reqwest::Client::builder()
                 .timeout(WEBSOCKET_CONNECTION_TIMEOUT)
@@ -130,18 +130,17 @@ mod challenge_response {
                             "HTTP error response code received fetching challenge string from Keeper"
                         );
                         return Err(Box::new(KRouterError(format!(
-                            "HTTP error response code ({})",
-                            status
+                            "HTTP error response code ({status})"
                         ))));
                     }
                     resp
                 }
                 Err(e) => {
                     let mut error_detail_parts: Vec<String> = Vec::new();
-                    error_detail_parts.push(format!("Main error: {:?}", e));
+                    error_detail_parts.push(format!("Main error: {e:?}"));
                     let mut current_err: Option<&dyn Error> = Some(&e);
                     while let Some(source) = current_err.and_then(Error::source) {
-                        error_detail_parts.push(format!("Caused by: {:?}", source));
+                        error_detail_parts.push(format!("Caused by: {source:?}"));
                         current_err = Some(source);
                     }
                     let detailed_error_log = error_detail_parts.join("\n");
@@ -239,7 +238,7 @@ mod challenge_response {
             s.to_string()
         } else {
             let padding = "=".repeat(4 - s.len() % 4);
-            format!("{}{}", s, padding)
+            format!("{s}{padding}")
         };
 
         // Try URL safe first, then fall back to the standard
@@ -306,7 +305,7 @@ pub(crate) fn router_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result
         ka_hostname = ka_hostname.replace("govcloud.", "");
     }
 
-    let router_hostname = format!("connect.{}", ka_hostname);
+    let router_hostname = format!("connect.{ka_hostname}");
     Ok(router_hostname)
 }
 
@@ -341,7 +340,7 @@ fn http_router_url_from_ksm_config(ksm_config_str: &str) -> Result<String, Box<d
         Ok(router_host)
     } else {
         // Assume it's a hostname and prepend https:// (since VERIFY_SSL is typically true)
-        Ok(format!("https://{}", router_host))
+        Ok(format!("https://{router_host}"))
     }
 }
 
@@ -351,10 +350,9 @@ pub(crate) fn krealy_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result
     if router_host.starts_with("connect") {
         return Ok(router_host.replace("connect", "krelay"));
     }
-    warn!("Router host is not what was is expected: {}", router_host);
+    warn!("Router host is not what was is expected: {router_host}");
     Ok(Err(Box::new(KRouterError(format!(
-        "Invalid router host: {}",
-        router_host
+        "Invalid router host: {router_host}"
     ))))?)
 }
 
@@ -379,7 +377,7 @@ async fn router_request(
     let ksm_config_parsed: KsmConfig = serde_json::from_str(ksm_config)?;
     let client_id = &ksm_config_parsed.client_id;
 
-    let url = format!("{}/{}", router_http_host, url_path);
+    let url = format!("{router_http_host}/{url_path}");
 
     let (challenge_str, signature) =
         challenge_response::ChallengeResponse::fetch(ksm_config).await?;
@@ -397,9 +395,8 @@ async fn router_request(
         "DELETE" => client.delete(&url),
         _ => {
             return Err(Box::new(KRouterError(format!(
-                "Unsupported HTTP method: {}",
-                http_method
-            ))))
+                "Unsupported HTTP method: {http_method}"
+            ))));
         }
     };
 
@@ -407,7 +404,7 @@ async fn router_request(
     request_builder = request_builder
         .header("Challenge", challenge_str)
         .header("Signature", signature)
-        .header("Authorization", format!("KeeperDevice {}", client_id))
+        .header("Authorization", format!("KeeperDevice {client_id}"))
         .header("ClientVersion", KEEPER_CLIENT);
 
     // Add query parameters if provided
@@ -534,8 +531,7 @@ pub async fn post_connection_state(
         }
         _ => {
             return Err(Box::new(KRouterError(format!(
-                "Invalid token type: {:?}",
-                token
+                "Invalid token type: {token:?}"
             ))));
         }
     };

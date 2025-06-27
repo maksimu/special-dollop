@@ -119,7 +119,7 @@ impl Tube {
 
             Box::pin(async move {
                 let tube_id_log = tube_clone_for_closure.id.clone();
-                let state_str = format!("{:?}", state);
+                let state_str = format!("{state:?}");
                 // WebRTC monitoring with tube_id context
                 debug!(target: "webrtc_state", tube_id = %tube_id_log, state = %state_str, "Connection state changed");
 
@@ -463,11 +463,11 @@ impl Tube {
                         }
                         Err(crate::error::ChannelError::CriticalUpstreamClosed(closed_channel_id_from_err)) => {
                             warn!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, channel_id_in_err = %closed_channel_id_from_err, "Channel '{}' (from on_data_channel) exited due to critical upstream closure. Signaling Python.", label_clone_for_run);
-                            format!("critical_upstream_closed: {}", closed_channel_id_from_err)
+                            format!("critical_upstream_closed: {closed_channel_id_from_err}")
                         }
                         Err(e) => {
                             error!(target: "lifecycle", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Channel '{}' (from on_data_channel) encountered an error in run(): {}. Signaling Python.", label_clone_for_run, e);
-                            format!("error: {}", e)
+                            format!("error: {e}")
                         }
                     };
 
@@ -709,7 +709,7 @@ impl Tube {
             }
             Err(e) => {
                 error!("Error sending connection open callback: {}", e);
-                Err(format!("Failed to send connection open callback: {}", e))
+                Err(format!("Failed to send connection open callback: {e}"))
             }
         }
     }
@@ -879,11 +879,11 @@ impl Tube {
                 }
                 Err(crate::error::ChannelError::CriticalUpstreamClosed(closed_channel_id_from_err)) => {
                     warn!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, channel_id_in_err = %closed_channel_id_from_err, "Channel '{}' exited due to critical upstream closure. Signaling Python.", name_clone);
-                    format!("critical_upstream_closed: {}", closed_channel_id_from_err)
+                    format!("critical_upstream_closed: {closed_channel_id_from_err}")
                 }
                 Err(e) => {
                     error!(target: "lifecycle", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Channel '{}' encountered an error in run(): {}. Signaling Python.", name_clone, e);
-                    format!("error: {}", e)
+                    format!("error: {e}")
                 }
             };
 
@@ -1013,13 +1013,13 @@ impl Tube {
             } else {
                 webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp)
             }
-            .map_err(|e| format!("Failed to create session description: {}", e))?;
+            .map_err(|e| format!("Failed to create session description: {e}"))?;
 
             // Set the remote description directly on the peer connection
             pc.peer_connection
                 .set_remote_description(desc)
                 .await
-                .map_err(|e| format!("Failed to set remote description: {}", e))
+                .map_err(|e| format!("Failed to set remote description: {e}"))
         } else {
             Err("No peer connection available".to_string())
         }
@@ -1221,7 +1221,7 @@ impl Tube {
                     }
                     Err(e) => {
                         error!(tube_id = %self.id, channel_name = %channel_name, "Error sending connection open callback: {}", e);
-                        Err(anyhow!("Failed to send connection open callback: {}", e))
+                        Err(anyhow!("Failed to send connection open callback: {e}"))
                     }
                 }
             } else {
@@ -1267,7 +1267,7 @@ impl Tube {
                     }
                     Err(e) => {
                         error!(tube_id = %self.id, channel_name = %channel_name, "Error sending connection close callback: {}", e);
-                        Err(anyhow!("Failed to send connection close callback: {}", e))
+                        Err(anyhow!("Failed to send connection close callback: {e}"))
                     }
                 }
             } else {

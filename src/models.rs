@@ -319,9 +319,9 @@ impl NetworkAccessChecker {
 
         // Use a reasonable size buffer on the stack for most hostnames
         let mut buffer = heapless::String::<256>::new();
-        if write!(&mut buffer, "{}:80", domain).is_err() {
+        if write!(&mut buffer, "{domain}:80").is_err() {
             // Domain name too long for stack buffer, fall back to heap allocation
-            let addrs = tokio::net::lookup_host(format!("{}:80", domain)).await?;
+            let addrs = tokio::net::lookup_host(format!("{domain}:80")).await?;
             return Ok(addrs.map(|addr| addr.ip()).collect());
         }
 
@@ -465,7 +465,7 @@ impl fmt::Display for ConversationType {
             ConversationType::Telnet => write!(f, "telnet"),
             ConversationType::Mysql => write!(f, "mysql"),
             ConversationType::SqlServer => write!(f, "sql-server"),
-            ConversationType::Postgresql => write!(f, "postgresql"),
+            ConversationType::Postgresql => write!(f, "postgres"),
         }
     }
 }
@@ -495,7 +495,7 @@ impl FromStr for ConversationType {
             "telnet" => Ok(ConversationType::Telnet),
             "mysql" => Ok(ConversationType::Mysql),
             "sql-server" => Ok(ConversationType::SqlServer),
-            "postgresql" => Ok(ConversationType::Postgresql),
+            "postgresql" | "postgres" => Ok(ConversationType::Postgresql),
             _ => Err(ParseConversationTypeError),
         }
     }

@@ -278,7 +278,7 @@ impl TubeRegistry {
                 Ok(relay_server) => {
                     debug!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Extracted relay server host from ksm_config");
                     if !turn_only_for_config {
-                        let stun_url_udp = format!("stun:{}:3478", relay_server);
+                        let stun_url_udp = format!("stun:{relay_server}:3478");
                         ice_servers.push(RTCIceServer {
                             urls: vec![stun_url_udp.clone()],
                             username: String::new(),
@@ -308,7 +308,7 @@ impl TubeRegistry {
                                 debug!(target: "ice_config", tube_id = %tube_id, turn_username = %username, turn_password_is_empty = credential.is_empty(), "Fetched TURN credentials");
 
                                 if !username.is_empty() && !credential.is_empty() {
-                                    let turn_url_udp = format!("turn:{}:3478", relay_server);
+                                    let turn_url_udp = format!("turn:{relay_server}:3478");
                                     ice_servers.push(RTCIceServer {
                                         urls: vec![turn_url_udp.clone()],
                                         username: username.clone(),
@@ -418,9 +418,9 @@ impl TubeRegistry {
             if let Some(port) = listening_port_option {
                 result_map.insert(
                     "actual_local_listen_addr".to_string(),
-                    format!("127.0.0.1:{}", port),
+                    format!("127.0.0.1:{port}"),
                 );
-                debug!(target: "tube_lifecycle", tube_id = %tube_id, listen_addr = format!("127.0.0.1:{}", port), "Server mode: Reporting listening address.");
+                debug!(target: "tube_lifecycle", tube_id = %tube_id, listen_addr = format!("127.0.0.1:{port}"), "Server mode: Reporting listening address.");
             } else {
                 warn!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: No listening port obtained for main data channel, not adding actual_local_listen_addr to result.");
             }
@@ -470,12 +470,10 @@ impl TubeRegistry {
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
 
         let sdp_bytes = BASE64_STANDARD.decode(sdp).context(format!(
-            "Failed to decode SDP from base64 for tube_id: {}",
-            tube_id
+            "Failed to decode SDP from base64 for tube_id: {tube_id}"
         ))?;
         let sdp_decoded = String::from_utf8(sdp_bytes).context(format!(
-            "Failed to convert decoded SDP to String for tube_id: {}",
-            tube_id
+            "Failed to convert decoded SDP to String for tube_id: {tube_id}"
         ))?;
 
         // Set the remote description

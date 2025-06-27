@@ -160,7 +160,7 @@ impl WebRTCDataChannel {
             .send(&data)
             .await
             .map(|_| ())
-            .map_err(|e| format!("Failed to send data: {}", e));
+            .map_err(|e| format!("Failed to send data: {e}"));
 
         // No need to manually monitor buffered amount - we rely on the native WebRTC event
         // The onBufferedAmountLow event will fire when the buffer drops below the threshold
@@ -263,7 +263,7 @@ impl WebRTCDataChannel {
 
         // Close with timeout to avoid hanging
         match tokio::time::timeout(Duration::from_secs(3), self.data_channel.close()).await {
-            Ok(result) => result.map_err(|e| format!("Failed to close data channel: {}", e)),
+            Ok(result) => result.map_err(|e| format!("Failed to close data channel: {e}")),
             Err(_) => {
                 warn!("Data channel close operation timed out, forcing abandonment");
                 Ok(()) // Force success even though it timed out

@@ -69,7 +69,7 @@ impl Channel {
         let channel_id_for_error = channel_id_base.clone(); // Clone for on_error
         data_channel.on_error(Box::new(move |err| {
             let tx = state_tx_error.clone();
-            let err_str = format!("Error: {}", err);
+            let err_str = format!("Error: {err}");
             let channel_id_log = channel_id_for_error.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send(err_str).await {
@@ -409,7 +409,7 @@ impl Channel {
                 if let (Some(host), Some(port)) =
                     (effective_guacd_host.as_deref(), effective_guacd_port)
                 {
-                    match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                    match tokio::net::lookup_host(format!("{host}:{port}")).await {
                         Ok(mut addrs) => {
                             if let Some(socket_addr) = addrs.next() {
                                 debug!("Channel({}): Guacd OpenConnection for target_conn_no {} to {}:{} (resolved to {}).",
@@ -448,7 +448,7 @@ impl Channel {
                     if let (Some(host), Some(port)) =
                         (pf_state.target_host.as_deref(), pf_state.target_port)
                     {
-                        match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                        match tokio::net::lookup_host(format!("{host}:{port}")).await {
                             Ok(mut addrs) => {
                                 if let Some(socket_addr) = addrs.next() {
                                     debug!("Channel({}): PortForward OpenConnection for target_conn_no {} to {}:{} (resolved to {}).",

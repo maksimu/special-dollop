@@ -52,7 +52,7 @@ fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value> {
         for (key, value) in dict.iter() {
             let key_str = key
                 .extract::<String>()
-                .map_err(|e| PyRuntimeError::new_err(format!("Dict key is not a string: {}", e)))?;
+                .map_err(|e| PyRuntimeError::new_err(format!("Dict key is not a string: {e}")))?;
             map.insert(key_str, py_any_to_json_value(&value)?);
         }
         Ok(serde_json::Value::Object(map))
@@ -84,8 +84,7 @@ fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value> {
                 .map(serde_json::Value::Number)
                 .ok_or_else(|| {
                     PyRuntimeError::new_err(format!(
-                        "Failed to convert large Python int to JSON number: {:?}",
-                        py_obj
+                        "Failed to convert large Python int to JSON number: {py_obj:?}"
                     ))
                 })
         }
@@ -94,8 +93,7 @@ fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value> {
             .map(serde_json::Value::Number)
             .ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
-                    "Failed to convert float to JSON number: {:?}",
-                    py_obj
+                    "Failed to convert float to JSON number: {py_obj:?}"
                 ))
             })
     } else if py_obj.is_none() || py_obj.is_instance_of::<PyNone>() {
@@ -186,7 +184,7 @@ impl PyTubeRegistry {
                 registry
                     .associate_conversation(&tube_id_owned, &connection_id_owned)
                     .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to associate conversation: {}", e))
+                        PyRuntimeError::new_err(format!("Failed to associate conversation: {e}"))
                     })
             })
         })
@@ -314,8 +312,8 @@ impl PyTubeRegistry {
                     signal_sender_rust, // Pass the sender part of the MPSC channel
                 ).await
                  .map_err(|e| {
-                    error!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube CRITICAL FAILURE: {}", e);
-                    PyRuntimeError::new_err(format!("Failed to create tube via registry: {}", e))
+                    error!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube CRITICAL FAILURE: {e}");
+                    PyRuntimeError::new_err(format!("Failed to create tube via registry: {e}"))
                  })
             })
         })?; // Propagate errors from block_on or create_tube
@@ -356,12 +354,11 @@ impl PyTubeRegistry {
                 let registry = REGISTRY.read().await;
                 if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
                     tube.create_offer().await.map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to create offer: {}", e))
+                        PyRuntimeError::new_err(format!("Failed to create offer: {e}"))
                     })
                 } else {
                     Err(PyRuntimeError::new_err(format!(
-                        "Tube not found: {}",
-                        tube_id_owned
+                        "Tube not found: {tube_id_owned}"
                     )))
                 }
             })
@@ -377,12 +374,11 @@ impl PyTubeRegistry {
                 let registry = REGISTRY.read().await;
                 if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
                     tube.create_answer().await.map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to create answer: {}", e))
+                        PyRuntimeError::new_err(format!("Failed to create answer: {e}"))
                     })
                 } else {
                     Err(PyRuntimeError::new_err(format!(
-                        "Tube not found: {}",
-                        tube_id_owned
+                        "Tube not found: {tube_id_owned}"
                     )))
                 }
             })
@@ -410,7 +406,7 @@ impl PyTubeRegistry {
                     .set_remote_description(tube_id, &sdp, is_answer)
                     .await
                     .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to set remote description: {}", e))
+                        PyRuntimeError::new_err(format!("Failed to set remote description: {e}"))
                     })
             })
         })
@@ -443,7 +439,7 @@ impl PyTubeRegistry {
                     .get_connection_state(&tube_id_owned)
                     .await
                     .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to get connection state: {}", e))
+                        PyRuntimeError::new_err(format!("Failed to get connection state: {e}"))
                     })
             })
         })
@@ -510,7 +506,7 @@ impl PyTubeRegistry {
                     )
                     .await
                     .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to create connection: {}", e))
+                        PyRuntimeError::new_err(format!("Failed to create connection: {e}"))
                     })
             })
         })?;
@@ -552,8 +548,7 @@ impl PyTubeRegistry {
                             Some(tube_id) => tube_id.clone(),
                             None => {
                                 return Err(PyRuntimeError::new_err(format!(
-                                    "Rust: No tube found for connection ID: {}",
-                                    connection_id_owned
+                                    "Rust: No tube found for connection ID: {connection_id_owned}"
                                 )));
                             }
                         };
@@ -563,8 +558,7 @@ impl PyTubeRegistry {
                         Some(tube) => tube.clone(), // Clone the Arc to keep reference
                         None => {
                             return Err(PyRuntimeError::new_err(format!(
-                                "Rust: Tube not found {} during close_connection for connection {}",
-                                tube_id_owned, connection_id_owned
+                                "Rust: Tube not found {tube_id_owned} during close_connection for connection {connection_id_owned}"
                             )));
                         }
                     }
@@ -577,8 +571,7 @@ impl PyTubeRegistry {
                     .await
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!(
-                            "Rust: Failed to close connection {}: {}",
-                            connection_id_owned, e
+                            "Rust: Failed to close connection {connection_id_owned}: {e}"
                         ))
                     })
             })
@@ -595,8 +588,7 @@ impl PyTubeRegistry {
                 let mut registry = REGISTRY.write().await;
                 registry.close_tube(&tube_id_owned).await.map_err(|e| {
                     PyRuntimeError::new_err(format!(
-                        "Rust: Failed to close tube {}: {}",
-                        tube_id_owned, e
+                        "Rust: Failed to close tube {tube_id_owned}: {e}"
                     ))
                 })
             })
@@ -636,8 +628,7 @@ impl PyTubeRegistry {
                     .await
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!(
-                            "Rust: Failed to register channel {} on tube {}: {}",
-                            connection_id_owned, tube_id_owned, e
+                            "Rust: Failed to register channel {connection_id_owned} on tube {tube_id_owned}: {e}"
                         ))
                     })
             })
@@ -659,8 +650,7 @@ impl PyTubeRegistry {
                     Ok(tube.id().to_string())
                 } else {
                     Err(PyRuntimeError::new_err(format!(
-                        "No tube found for conversation: {}",
-                        conversation_id_owned
+                        "No tube found for conversation: {conversation_id_owned}"
                     )))
                 }
             })
@@ -698,7 +688,7 @@ impl PyTubeRegistry {
                 );
 
                 post_connection_state(&ksm_config_from_python, "open_connections", &tokens_json, None).await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to refresh connections on router: {}", e)))
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to refresh connections on router: {e}")))
             })
         })
     }

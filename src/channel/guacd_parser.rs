@@ -114,7 +114,7 @@ pub enum PeekError {
 // Convert std::str::Utf8Error to PeekError for convenience in peek_instruction
 impl From<str::Utf8Error> for PeekError {
     fn from(err: str::Utf8Error) -> Self {
-        PeekError::Utf8Error(format!("UTF-8 conversion error: {}", err))
+        PeekError::Utf8Error(format!("UTF-8 conversion error: {err}"))
     }
 }
 
@@ -233,10 +233,8 @@ impl GuacdParser {
 
         // **PERFORMANCE: Use fast integer parsing**
         let length_op: usize = Self::parse_length(opcode_len_slice).map_err(|_| {
-            PeekError::InvalidFormat(format!(
-                "Opcode length not an integer: '{}'",
-                str::from_utf8(opcode_len_slice).unwrap_or("<invalid>")
-            ))
+            let length_str_op = str::from_utf8(opcode_len_slice).unwrap_or("<invalid>");
+            PeekError::InvalidFormat(format!("Opcode length not an integer: '{length_str_op}'"))
         })?;
 
         pos = initial_pos_for_opcode_len + length_end_op_rel + 1; // Move past length and ELEM_SEP
@@ -294,9 +292,9 @@ impl GuacdParser {
 
             // **PERFORMANCE: Use fast integer parsing**
             let length_arg: usize = Self::parse_length(arg_len_slice).map_err(|_| {
+                let length_str_arg = str::from_utf8(arg_len_slice).unwrap_or("<invalid>");
                 PeekError::InvalidFormat(format!(
-                    "Argument length not an integer: '{}'",
-                    str::from_utf8(arg_len_slice).unwrap_or("<invalid>")
+                    "Argument length not an integer: '{length_str_arg}'"
                 ))
             })?;
 
@@ -377,8 +375,7 @@ impl GuacdParser {
 
         let length_op: usize = length_str_op.parse().map_err(|e| {
             GuacdParserError::InvalidFormat(format!(
-                "Opcode length not an integer: {}. Original: '{}'",
-                e, length_str_op
+                "Opcode length not an integer: {e}. Original: '{length_str_op}'"
             ))
         })?;
 
@@ -421,8 +418,7 @@ impl GuacdParser {
 
             let length_arg: usize = length_str_arg.parse().map_err(|e| {
                 GuacdParserError::InvalidFormat(format!(
-                    "Argument length not an integer: {}. Original: '{}'",
-                    e, length_str_arg
+                    "Argument length not an integer: {e}. Original: '{length_str_arg}'"
                 ))
             })?;
 

@@ -17,12 +17,11 @@ impl fmt::Display for InitializeLoggerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InitializeLoggerError::Pyo3LogError(e) => {
-                write!(f, "Failed to initialize pyo3-log: {}", e)
+                write!(f, "Failed to initialize pyo3-log: {e}")
             }
             InitializeLoggerError::SetGlobalDefaultError(e) => write!(
                 f,
-                "Logger already initialized or failed to set global default subscriber: {}",
-                e
+                "Logger already initialized or failed to set global default subscriber: {e}",
             ),
         }
     }
@@ -152,7 +151,7 @@ pub fn initialize_logger(
     }
 
     tracing::subscriber::set_global_default(subscriber).map_err(|e| {
-        let msg = format!("Logger already initialized or failed to set: {}", e);
+        let msg = format!("Logger already initialized or failed to set: {e}");
         tracing::debug!("{}", msg);
         InitializeLoggerError::SetGlobalDefaultError(e.to_string())
     })?;

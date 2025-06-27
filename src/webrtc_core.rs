@@ -156,8 +156,7 @@ impl WebRTCPeerConnection {
 
         if !valid_transition {
             return Err(format!(
-                "Invalid signaling state transition from {:?} applying {}",
-                current_state, operation
+                "Invalid signaling state transition from {current_state:?} applying {operation}"
             ));
         }
 
@@ -188,7 +187,7 @@ impl WebRTCPeerConnection {
         // Create peer connection
         let peer_connection = create_peer_connection(Some(actual_config.clone()))
             .await
-            .map_err(|e| format!("Failed to create peer connection: {}", e))?;
+            .map_err(|e| format!("Failed to create peer connection: {e}"))?;
 
         // Store the closing state and signal channel
         let is_closing = Arc::new(AtomicBool::new(false));
@@ -368,8 +367,7 @@ impl WebRTCPeerConnection {
                 webrtc::peer_connection::signaling_state::RTCSignalingState::HaveRemoteOffer => {} // This is the expected state
                 _ => {
                     return Err(format!(
-                        "Cannot create answer when in state {:?} - must have remote offer",
-                        current_state
+                        "Cannot create answer when in state {current_state:?} - must have remote offer"
                     ));
                 }
             }
@@ -385,12 +383,12 @@ impl WebRTCPeerConnection {
             self.peer_connection
                 .create_offer(None)
                 .await
-                .map_err(|e| format!("Failed to create initial {}: {}", sdp_type_str, e))?
+                .map_err(|e| format!("Failed to create initial {sdp_type_str}: {e}"))?
         } else {
             self.peer_connection
                 .create_answer(None)
                 .await
-                .map_err(|e| format!("Failed to create initial {}: {}", sdp_type_str, e))?
+                .map_err(|e| format!("Failed to create initial {sdp_type_str}: {e}"))?
         };
 
         if !self.trickle_ice {
@@ -402,10 +400,7 @@ impl WebRTCPeerConnection {
                 RTCSessionDescription::answer(sdp_obj.sdp.clone())
             }
             .map_err(|e| {
-                format!(
-                    "Failed to create RTCSessionDescription for initial {}: {}",
-                    sdp_type_str, e
-                )
+                format!("Failed to create RTCSessionDescription for initial {sdp_type_str}: {e}")
             })?;
 
             self.peer_connection
@@ -413,8 +408,7 @@ impl WebRTCPeerConnection {
                 .await
                 .map_err(|e| {
                     format!(
-                        "Failed to set initial local description for {} (non-trickle): {}",
-                        sdp_type_str, e
+                        "Failed to set initial local description for {sdp_type_str} (non-trickle): {e}"
                     )
                 })?;
 
@@ -505,7 +499,7 @@ impl WebRTCPeerConnection {
                                     debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Inserting 'a=max-message-size:{}' at position {}", negotiated_size, insert_pos);
                                     sdp_str.insert_str(
                                         insert_pos,
-                                        &format!("a=max-message-size:{}\r\n", negotiated_size),
+                                        &format!("a=max-message-size:{negotiated_size}\r\n"),
                                     );
                                     info!(target: "webrtc_sdp", tube_id = %self.tube_id,
                                           "Successfully added max-message-size={} ({}KB) to answer SDP (client requested: {} ({}KB), our max: {} ({}KB))",
@@ -517,13 +511,12 @@ impl WebRTCPeerConnection {
                         Ok(sdp_str)
                     } else {
                         Err(format!(
-                            "Failed to get local description after gathering for {}",
-                            sdp_type_str
+                            "Failed to get local description after gathering for {sdp_type_str}"
                         ))
                     }
                 }
-                Ok(Err(_)) => Err(format!("ICE gathering was cancelled for {}", sdp_type_str)),
-                Err(_) => Err(format!("ICE gathering timeout for {}", sdp_type_str)),
+                Ok(Err(_)) => Err(format!("ICE gathering was cancelled for {sdp_type_str}")),
+                Err(_) => Err(format!("ICE gathering timeout for {sdp_type_str}")),
             }
         } else {
             // Trickle ICE: return the SDP immediately.
@@ -568,7 +561,7 @@ impl WebRTCPeerConnection {
         } else {
             RTCSessionDescription::offer(sdp)
         }
-        .map_err(|e| format!("Failed to create session description: {}", e))?;
+        .map_err(|e| format!("Failed to create session description: {e}"))?;
 
         // Check the current signaling state before setting the remote description
         let current_state = self.peer_connection.signaling_state();
@@ -581,7 +574,7 @@ impl WebRTCPeerConnection {
         self.peer_connection
             .set_remote_description(desc)
             .await
-            .map_err(|e| format!("Failed to set remote description: {}", e))
+            .map_err(|e| format!("Failed to set remote description: {e}"))
     }
 
     pub async fn add_ice_candidate(&self, candidate_str: String) -> Result<(), String> {
@@ -600,7 +593,7 @@ impl WebRTCPeerConnection {
         self.peer_connection
             .add_ice_candidate(candidate_init)
             .await
-            .map_err(|e| format!("Failed to add ICE candidate: {}", e))
+            .map_err(|e| format!("Failed to add ICE candidate: {e}"))
     }
 
     pub fn connection_state(&self) -> String {
@@ -632,7 +625,7 @@ impl WebRTCPeerConnection {
 
         // Then close the connection with a timeout to avoid hanging
         match tokio::time::timeout(Duration::from_secs(5), self.peer_connection.close()).await {
-            Ok(result) => result.map_err(|e| format!("Failed to close peer connection: {}", e)),
+            Ok(result) => result.map_err(|e| format!("Failed to close peer connection: {e}")),
             Err(_) => {
                 // The timeout elapsed.
                 warn!(target: "webrtc_lifecycle", tube_id = %self.tube_id, "Close operation timed out for peer connection. The underlying webrtc-rs close() did not complete in 5 seconds.");
@@ -658,7 +651,7 @@ impl WebRTCPeerConnection {
         } else {
             RTCSessionDescription::offer(sdp)
         }
-        .map_err(|e| format!("Failed to create session description: {}", e))?;
+        .map_err(|e| format!("Failed to create session description: {e}"))?;
 
         // Check the current signaling state before setting the local description
         let current_state = self.peer_connection.signaling_state();
@@ -671,7 +664,7 @@ impl WebRTCPeerConnection {
         self.peer_connection
             .set_local_description(desc)
             .await
-            .map_err(|e| format!("Failed to set local description: {}", e))
+            .map_err(|e| format!("Failed to set local description: {e}"))
     }
 
     // Get all gathered ICE candidates

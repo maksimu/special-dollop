@@ -50,6 +50,17 @@ pub struct Tube {
 }
 
 impl Tube {
+    // Helper method to get the proper conversation_id for a channel
+    fn get_conversation_id_for_channel(&self, channel_label: &str) -> Option<String> {
+        if channel_label == "control" {
+            // For the control channel, use the original conversation ID if available
+            self.original_conversation_id.clone()
+        } else {
+            // For other channels, the label is typically the connection_id
+            Some(channel_label.to_string())
+        }
+    }
+
     // Create a new tube with the optional peer connection
     pub fn new(
         is_server_mode_context: bool,
@@ -96,7 +107,8 @@ impl Tube {
             trickle_ice,
             turn_only,
             Some(signal_sender),
-            self.id.clone(), // Pass tube_id
+            self.id.clone(),                       // Pass tube_id
+            self.original_conversation_id.clone(), // Pass original conversation_id for WebRTC signals
         )
         .await
         .map_err(|e| anyhow!("{}", e))?;
@@ -495,7 +507,13 @@ impl Tube {
                                 tube_id: tube_id_for_log.clone(),
                                 kind: "channel_closed".to_string(),
                                 data: signal_data,
-                                conversation_id: label_clone_for_run.clone(),
+                                conversation_id: tube_arc.get_conversation_id_for_channel(&label_clone_for_run).unwrap_or_else(|| {
+                                    debug!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "No conversation_id mapping found, using channel label");
+                                    label_clone_for_run.clone()
+                                }),
+                                progress_flag: Some(0), // COMPLETE - channel closure is complete
+                                progress_status: Some("Channel closed".to_string()),
+                                is_ok: Some(outcome_details.starts_with("normal")), // true for normal exit, false for errors
                             };
                             if let Err(e) = sender.send(signal_msg) {
                                 error!(target: "python_bindings", tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send channel_closed signal (from on_data_channel) to Python: {}", e);
@@ -911,7 +929,13 @@ impl Tube {
                         tube_id: tube_id_for_spawn.clone(),
                         kind: "channel_closed".to_string(), // Generic kind for any channel closure
                         data: signal_data,
-                        conversation_id: name_clone.clone(), // Use the channel's label/name as conversation_id for this signal
+                        conversation_id: tube_arc.get_conversation_id_for_channel(&name_clone).unwrap_or_else(|| {
+                            debug!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "No conversation_id mapping found, using channel name");
+                            name_clone.clone()
+                        }),
+                        progress_flag: Some(0), // COMPLETE - channel closure is complete
+                        progress_status: Some("Channel closed".to_string()),
+                        is_ok: Some(outcome_details.starts_with("normal")), // true for normal exit, false for errors
                     };
                     if let Err(e) = sender.send(signal_msg) {
                         error!(target: "python_bindings", tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send channel_closed signal to Python: {}", e);
@@ -1108,6 +1132,9 @@ impl Tube {
                     kind: "channel_closed".to_string(),
                     data: signal_data,
                     conversation_id: conversation_id.clone(),
+                    progress_flag: Some(0), // COMPLETE - channel closure due to tube closure is complete
+                    progress_status: Some("Tube closed".to_string()),
+                    is_ok: Some(true), // Tube closure is considered a normal operation
                 };
 
                 if let Err(e) = signal_sender.send(signal_msg) {

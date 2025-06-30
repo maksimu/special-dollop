@@ -571,6 +571,9 @@ pub async fn setup_outbound_task(
                                                                             kind: "guacd_instruction".to_string(),
                                                                             data: raw_instruction_str,
                                                                             conversation_id: channel_id_clone.clone(),
+                                                                            progress_flag: Some(2), // PROGRESS - ongoing data transfer/instruction processing
+                                                                            progress_status: Some("OK".to_string()), // Successful instruction forwarding
+                                                                            is_ok: Some(true), // Successful instruction forwarding
                                                                         };
 
                                                                         if let Err(e) =

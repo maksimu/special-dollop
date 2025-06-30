@@ -355,6 +355,7 @@ async fn test_turn_only_mode() {
         turn_only,
         None,
         "test_tube_id".to_string(),
+        Some("test_conversation_id".to_string()),
     )
     .await
     .unwrap();
@@ -379,6 +380,7 @@ async fn test_turn_only_mode() {
         turn_only,
         None,
         "test_tube_id_regular".to_string(),
+        Some("test_conversation_id_regular".to_string()),
     )
     .await
     .unwrap();

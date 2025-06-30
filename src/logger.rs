@@ -156,7 +156,7 @@ pub fn initialize_logger(
         InitializeLoggerError::SetGlobalDefaultError(e.to_string())
     })?;
 
-    tracing::info!(
+    tracing::debug!(
         module_path = module_path!(),
         target = logger_name,
         "Logger initialized for '{}' with level {:?} (effective filter: {})",

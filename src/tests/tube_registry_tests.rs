@@ -191,6 +191,9 @@ async fn test_signal_channels() -> Result<()> {
         kind: "test_kind".to_string(),
         data: "test_data".to_string(),
         conversation_id: "conv_signal_123".to_string(),
+        progress_flag: Some(2), // Test message with PROGRESS flag
+        progress_status: Some("OK".to_string()), // Test success status
+        is_ok: Some(true),
     };
 
     registry.send_signal(test_signal.clone())?;
@@ -201,6 +204,9 @@ async fn test_signal_channels() -> Result<()> {
             assert_eq!(received_signal.kind, test_signal.kind);
             assert_eq!(received_signal.data, test_signal.data);
             assert_eq!(received_signal.conversation_id, test_signal.conversation_id);
+            assert_eq!(received_signal.progress_flag, test_signal.progress_flag);
+            assert_eq!(received_signal.progress_status, test_signal.progress_status);
+            assert_eq!(received_signal.is_ok, test_signal.is_ok);
         }
         Ok(None) => {
             panic!("Signal channel closed prematurely (received None from recv() within timeout)")

@@ -21,6 +21,9 @@ pub struct SignalMessage {
     pub kind: String, // "icecandidate", "answer", etc.
     pub data: String,
     pub conversation_id: String,
+    pub progress_flag: Option<i32>, // Progress flag for gateway responses (0=COMPLETE, 1=FAIL, 2=PROGRESS, 3=SKIP, 4=ABSENT)
+    pub progress_status: Option<String>, // Progress status message
+    pub is_ok: Option<bool>,        // Success/failure indicator
 }
 
 // Global registry for all tubes - using Lazy with explicit thread safety

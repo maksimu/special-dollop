@@ -98,6 +98,7 @@ pub struct WebRTCPeerConnection {
     pending_ice_candidates: Arc<Mutex<Vec<String>>>,
     pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
     pub tube_id: String,
+    pub(crate) conversation_id: Option<String>,
 }
 
 impl WebRTCPeerConnection {
@@ -169,6 +170,7 @@ impl WebRTCPeerConnection {
         turn_only: bool,
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         tube_id: String,
+        conversation_id: Option<String>,
     ) -> Result<Self, String> {
         // Use the provided configuration or default
         let mut actual_config = config.unwrap_or_default();
@@ -208,6 +210,7 @@ impl WebRTCPeerConnection {
             pending_ice_candidates,
             signal_sender,
             tube_id,
+            conversation_id,
         })
     }
 
@@ -272,12 +275,19 @@ impl WebRTCPeerConnection {
             // Create the ICE candidate message - use one-time allocation with format!
             // The data field of SignalMessage is just a String. We'll send the candidate string directly.
 
+            let _progress_flag = Some(if self.trickle_ice { 2 } else { 0 });
             // Prepare the signaling message
             let message = SignalMessage {
                 tube_id: self.tube_id.clone(),
                 kind: "icecandidate".to_string(),
                 data: candidate.to_string(), // Send the candidate string directly
-                conversation_id: self.tube_id.clone(), // Using tube_id as conversation_id for SignalMessage
+                conversation_id: self
+                    .conversation_id
+                    .clone()
+                    .unwrap_or_else(|| self.tube_id.clone()), // Use conversation_id if available, otherwise tube_id
+                progress_flag: _progress_flag,
+                progress_status: Some("OK".to_string()),
+                is_ok: Some(true),
             };
 
             // Try to send it, but don't fail if the channel is closed
@@ -293,12 +303,20 @@ impl WebRTCPeerConnection {
     pub fn send_answer(&self, answer_sdp: &str) {
         // Only send it if we have a signal channel
         if let Some(sender) = &self.signal_sender {
+            let _progress_flag = Some(if self.trickle_ice { 2 } else { 0 });
+
             // Create and serialize the answer in one step
             let message = SignalMessage {
                 tube_id: self.tube_id.clone(),
                 kind: "answer".to_string(),
                 data: answer_sdp.to_string(), // Send the answer SDP string directly
-                conversation_id: self.tube_id.clone(), // Using tube_id as conversation_id for SignalMessage
+                conversation_id: self
+                    .conversation_id
+                    .clone()
+                    .unwrap_or_else(|| self.tube_id.clone()), // Use conversation_id if available, otherwise tube_id
+                progress_flag: _progress_flag,
+                progress_status: Some("OK".to_string()),
+                is_ok: Some(true),
             };
 
             // Try to send it, but don't fail if the channel is closed

@@ -222,15 +222,15 @@ impl PyTubeRegistry {
             warn!(target: "python_bindings", 
                 "PyTubeRegistry.__del__ called without explicit cleanup! Consider using cleanup_all() explicitly or using a context manager.");
 
-            // Attempt emergency cleanup - ignore errors since we're in destructor
-            let _ = self.do_emergency_cleanup(py);
+            // Attempt force cleanup - ignore errors since we're in destructor
+            let _ = self.do_force_cleanup(py);
         } else {
             debug!(target: "python_bindings", "PyTubeRegistry.__del__ called after explicit cleanup - OK");
         }
     }
 
-    /// Internal emergency cleanup for __del__ - more permissive error handling
-    fn do_emergency_cleanup(&self, py: Python<'_>) -> PyResult<()> {
+    /// Internal Force cleanup for __del__ - more permissive error handling
+    fn do_force_cleanup(&self, py: Python<'_>) -> PyResult<()> {
         let master_runtime = get_runtime();
         py.allow_threads(|| {
             master_runtime.clone().block_on(async move {
@@ -238,22 +238,22 @@ impl PyTubeRegistry {
                     Ok(mut registry) => {
                         let tube_ids: Vec<String> = registry.tubes_by_id.keys().cloned().collect();
                         warn!(target: "python_bindings", tube_count = tube_ids.len(), 
-                            "Emergency cleanup in __del__ - {} tubes to close", tube_ids.len());
-                        // Close all tubes - ignore individual errors in emergency cleanup
+                            "Force cleanup in __del__ - {} tubes to close", tube_ids.len());
+                        // Close all tubes - ignore individual errors in force cleanup
                         for tube_id in tube_ids {
                             if let Err(e) = registry.close_tube(&tube_id).await {
                                 error!(target: "python_bindings", tube_id = %tube_id, 
-                                    "Failed to close tube during emergency cleanup: {}", e);
+                                    "Failed to close tube during force cleanup: {}", e);
                             }
                         }
                         // Clear mappings
                         registry.conversation_mappings.clear();
                         registry.signal_channels.clear();
-                        debug!(target: "python_bindings", "Emergency cleanup complete");
+                        debug!(target: "python_bindings", "Force cleanup complete");
                     }
                     Err(_) => {
                         warn!(target: "python_bindings", 
-                            "Could not acquire registry lock for emergency cleanup - registry may be in use");
+                            "Could not acquire registry lock for Force cleanup - registry may be in use");
                     }
                 }
                 Ok(())
@@ -814,40 +814,31 @@ impl PyTubeRegistry {
 impl Drop for PyTubeRegistry {
     fn drop(&mut self) {
         if !self.explicit_cleanup_called.load(Ordering::SeqCst) {
-            // We can't easily do async work in Drop, and we can't access Python context
-            // So we'll spawn a detached task as emergency cleanup
-            warn!(target: "python_bindings", 
-                "PyTubeRegistry Drop called without explicit cleanup! Spawning emergency cleanup task.");
+            eprintln!("FORCE CLOSE: PyTubeRegistry Drop - forcing immediate cleanup!");
 
-            let runtime = get_runtime();
-            runtime.spawn(async move {
-                match REGISTRY.try_write() {
-                    Ok(mut registry) => {
-                        let tube_ids: Vec<String> = registry.tubes_by_id.keys().cloned().collect();
-                        if !tube_ids.is_empty() {
-                            warn!(target: "python_bindings", tube_count = tube_ids.len(), 
-                                "Drop: Emergency cleanup - {} tubes to close", tube_ids.len());
-                            // Close all tubes
-                            for tube_id in tube_ids {
-                                if let Err(e) = registry.close_tube(&tube_id).await {
-                                    error!(target: "python_bindings", tube_id = %tube_id, 
-                                        "Drop: Failed to close tube during emergency cleanup: {}", e);
-                                }
-                            }
-                            // Clear mappings
-                            registry.conversation_mappings.clear();
-                            registry.signal_channels.clear();
-                            debug!(target: "python_bindings", "Drop: Emergency cleanup complete");
-                        }
-                    }
-                    Err(_) => {
-                        warn!(target: "python_bindings", 
-                            "Drop: Could not acquire registry lock for emergency cleanup");
+            // FORCE CLOSE: No async, no waiting, clean everything up
+            match REGISTRY.try_write() {
+                Ok(mut registry) => {
+                    let tube_count = registry.tubes_by_id.len();
+                    if tube_count > 0 {
+                        eprintln!("FORCE CLOSE: Clearing {tube_count} tubes immediately");
+
+                        // 1. Immediately drop all signal channels (stops background tasks)
+                        registry.signal_channels.clear();
+
+                        // 2. Clear all conversation mappings
+                        registry.conversation_mappings.clear();
+
+                        // 3. Drop all tube references (this will trigger their Drop)
+                        registry.tubes_by_id.clear();
+
+                        eprintln!("FORCE CLOSE: Registry cleaned up successfully");
                     }
                 }
-            });
-        } else {
-            debug!(target: "python_bindings", "PyTubeRegistry Drop called after explicit cleanup - OK");
+                Err(_) => {
+                    eprintln!("FORCE CLOSE: Registry locked - someone else is cleaning up");
+                }
+            }
         }
     }
 }

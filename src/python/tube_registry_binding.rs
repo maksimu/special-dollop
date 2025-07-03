@@ -1,12 +1,11 @@
 use crate::router_helpers::post_connection_state;
-use crate::runtime::get_runtime;
+use crate::runtime::{get_runtime, shutdown_runtime_from_python};
 use crate::tube_registry::REGISTRY;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, trace, warn};
 
@@ -172,9 +171,14 @@ impl PyTubeRegistry {
                 registry.conversation_mappings.clear();
                 registry.signal_channels.clear();
                 debug!(target: "python_bindings", "Registry cleanup complete");
-                Ok(())
             })
-        })
+        });
+
+        // Now shutdown the runtime - this ensures all async tasks are properly terminated
+        debug!(target: "python_bindings", "Shutting down runtime after tube cleanup");
+        crate::runtime::shutdown_runtime_from_python();
+
+        Ok(())
     }
 
     /// Clean up specific tubes by ID
@@ -256,9 +260,14 @@ impl PyTubeRegistry {
                             "Could not acquire registry lock for Force cleanup - registry may be in use");
                     }
                 }
-                Ok(())
             })
-        })
+        });
+
+        // Force shutdown the runtime - this is the safety net for thread cleanup
+        warn!(target: "python_bindings", "Force shutting down runtime in __del__");
+        crate::runtime::shutdown_runtime_from_python();
+
+        Ok(())
     }
 
     /// Set server mode in the registry
@@ -808,6 +817,13 @@ impl PyTubeRegistry {
             })
         })
     }
+
+    /// Shutdown the runtime - useful for clean process termination
+    fn shutdown_runtime(&self, _py: Python<'_>) -> PyResult<()> {
+        debug!(target: "python_bindings", "Python requested runtime shutdown");
+        shutdown_runtime_from_python();
+        Ok(())
+    }
 }
 
 // Implement Drop trait for PyTubeRegistry as a safety net
@@ -839,6 +855,10 @@ impl Drop for PyTubeRegistry {
                     eprintln!("FORCE CLOSE: Registry locked - someone else is cleaning up");
                 }
             }
+
+            // CRITICAL: Force shutdown the runtime to prevent hanging threads
+            eprintln!("FORCE CLOSE: Shutting down runtime to prevent hanging threads");
+            crate::runtime::shutdown_runtime_from_python();
         }
     }
 }
@@ -847,10 +867,11 @@ impl Drop for PyTubeRegistry {
 fn setup_signal_handler(
     tube_id_key: String,
     mut signal_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::tube_registry::SignalMessage>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime_handle: crate::runtime::RuntimeHandle,
     callback_pyobj: PyObject, // Use the passed callback object
 ) {
     let task_tube_id = tube_id_key.clone();
+    let runtime = runtime_handle.runtime().clone(); // Extract the Arc<Runtime>
     runtime.spawn(async move {
         debug!(target: "python_bindings", "Signal handler task started for tube_id: {}", task_tube_id);
         let mut signal_count = 0;

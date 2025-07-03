@@ -44,7 +44,7 @@ pub struct Tube {
     // Current status
     pub(crate) status: Arc<TokioRwLock<TubeStatus>>,
     // Runtime
-    pub(crate) runtime: Arc<tokio::runtime::Runtime>,
+    pub(crate) runtime: crate::runtime::RuntimeHandle,
     // Original conversation ID that created this tube (for control channel mapping)
     pub(crate) original_conversation_id: Option<String>,
 }
@@ -873,7 +873,7 @@ impl Tube {
         }
 
         let name_clone = name.to_string();
-        let runtime_clone = Arc::clone(&self.runtime);
+        let runtime_clone = self.runtime.clone();
         let tube_id_for_spawn = self.id.clone(); // Clone self.id here to make it 'static
         let peer_connection_for_spawn = Arc::clone(&self.peer_connection); // Clone peer_connection
 

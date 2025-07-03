@@ -14,6 +14,8 @@ mod protocol_tests;
 #[cfg(test)]
 mod size_instruction_integration_tests;
 #[cfg(test)]
+mod thread_lifecycle_tests;
+#[cfg(test)]
 mod tube_registry_tests;
 #[cfg(test)]
 mod tube_tests;

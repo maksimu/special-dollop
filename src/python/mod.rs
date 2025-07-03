@@ -1,6 +1,6 @@
 mod tube_registry_binding;
 
-use crate::runtime::get_runtime;
+use crate::runtime::{get_runtime, shutdown_runtime_from_python};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::wrap_pyfunction;
@@ -20,6 +20,9 @@ pub fn keeper_pam_webrtc_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
         use crate::logger::initialize_logger as py_initialize_logger;
         m.add_function(wrap_pyfunction!(py_initialize_logger, py)?)?;
     }
+
+    // Add runtime shutdown function for Python cleanup
+    m.add_function(wrap_pyfunction!(shutdown_runtime_from_python, py)?)?;
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

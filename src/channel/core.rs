@@ -126,6 +126,8 @@ pub struct Channel {
     pub(crate) callback_token: Option<String>,
     // KSM config for router communication
     pub(crate) ksm_config: Option<String>,
+    // Client version for router communication
+    pub(crate) client_version: String,
 }
 
 // NOTE: Channel is intentionally NOT Clone because it contains a single-consumer receiver
@@ -141,6 +143,7 @@ pub struct ChannelParams {
     pub server_mode: bool,
     pub callback_token: Option<String>,
     pub ksm_config: Option<String>,
+    pub client_version: String,
 }
 
 impl Channel {
@@ -154,6 +157,7 @@ impl Channel {
             server_mode,
             callback_token,
             ksm_config,
+            client_version,
         } = params;
         debug!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
         trace!(target: "channel_setup", channel_id = %channel_id, ?protocol_settings, "Initial protocol_settings received by Channel::new");
@@ -444,6 +448,7 @@ impl Channel {
             primary_guacd_conn_no: Arc::new(Mutex::new(None)),
             callback_token,
             ksm_config,
+            client_version,
         };
 
         info!(target: "channel_lifecycle", channel_id = %new_channel.channel_id, server_mode = new_channel.server_mode, "Channel initialized");

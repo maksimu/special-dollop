@@ -97,6 +97,7 @@ async fn test_server_mode_data_flow() -> Result<()> {
         server_mode: true,           // server_mode=true
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await?;
 
@@ -278,6 +279,7 @@ async fn test_client_mode_data_flow() -> Result<()> {
         server_mode: false,          // server_mode=false
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await?;
 

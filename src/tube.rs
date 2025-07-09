@@ -22,6 +22,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 pub struct ChannelMetadata {
     pub callback_token: Option<String>,
     pub ksm_config: Option<String>,
+    pub client_version: String,
 }
 
 // A single tube holding a WebRTC peer connection and channels
@@ -47,6 +48,8 @@ pub struct Tube {
     pub(crate) runtime: crate::runtime::RuntimeHandle,
     // Original conversation ID that created this tube (for control channel mapping)
     pub(crate) original_conversation_id: Option<String>,
+    // Client version for authentication
+    pub(crate) client_version: Arc<TokioRwLock<Option<String>>>,
 }
 
 impl Tube {
@@ -80,6 +83,7 @@ impl Tube {
             status: Arc::new(TokioRwLock::new(TubeStatus::Initializing)),
             runtime,
             original_conversation_id,
+            client_version: Arc::new(TokioRwLock::new(None)),
         });
 
         Ok(tube)
@@ -93,6 +97,7 @@ impl Tube {
         turn_only: bool,
         ksm_config: String,
         callback_token: String,
+        client_version: &str,
         protocol_settings: HashMap<String, serde_json::Value>,
         signal_sender: UnboundedSender<SignalMessage>,
     ) -> Result<()> {
@@ -101,6 +106,14 @@ impl Tube {
             self.id, trickle_ice, turn_only
         );
         trace!(tube_id = %self.id, ?protocol_settings, "Create_peer_connection protocol_settings");
+
+        // Store client_version in the tube
+        {
+            let mut tube_client_version_guard = self.client_version.write().await;
+            if tube_client_version_guard.is_none() {
+                *tube_client_version_guard = Some(client_version.to_string());
+            }
+        }
 
         let connection = WebRTCPeerConnection::new(
             config,
@@ -351,18 +364,29 @@ impl Tube {
         let protocol_settings_clone_for_on_data_channel = protocol_settings.clone(); // Clone for the outer closure
         let callback_token_for_on_data_channel = callback_token.clone(); // Clone for on_data_channel
         let ksm_config_for_on_data_channel = ksm_config.clone(); // Clone for on_data_channel
+        let tube_client_version_for_on_data_channel = self.client_version.clone(); // Clone for on_data_channel
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
             let callback_token_for_channel = callback_token_for_on_data_channel.clone();
             let ksm_config_for_channel = ksm_config_for_on_data_channel.clone();
+            let client_version_arc_for_channel = tube_client_version_for_on_data_channel.clone();
             let rtc_data_channel_label = rtc_data_channel.label().to_string(); // Get the label once for logging
             let rtc_data_channel_id = rtc_data_channel.id();
 
             Box::pin(async move {
                 debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, rtc_channel_id = ?rtc_data_channel_id, "on_data_channel: Received data channel from remote peer.");
                 trace!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, ?protocol_settings_for_channel_setup, "on_data_channel: Protocol settings for this channel.");
+
+                // Get client_version from the tube
+                let client_version = match client_version_arc_for_channel.read().await.clone() {
+                    Some(version) => version,
+                    None => {
+                        error!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "client_version not set in tube - cannot create channel. This indicates a bug in tube initialization.");
+                        return;
+                    }
+                };
 
                 // Create our WebRTCDataChannel wrapper
                 let data_channel = WebRTCDataChannel::new(rtc_data_channel);
@@ -393,6 +417,7 @@ impl Tube {
                     current_server_mode,
                     Some(callback_token_for_channel), // Use callback_token from tube creation
                     Some(ksm_config_for_channel), // Use ksm_config from tube creation
+                    client_version,
                 ).await;
 
                 let mut owned_channel = match channel_result {
@@ -410,6 +435,7 @@ impl Tube {
                 let metadata = ChannelMetadata {
                     callback_token: owned_channel.callback_token.clone(),
                     ksm_config: owned_channel.ksm_config.clone(),
+                    client_version: owned_channel.client_version.clone(),
                 };
                 if let Err(e) = tube.register_channel_metadata(rtc_data_channel_label.clone(), metadata).await {
                     error!("Tube {}: Failed to register channel metadata '{}': {}", tube.id, rtc_data_channel_label, e);
@@ -620,6 +646,7 @@ impl Tube {
         label: &str,
         ksm_config: String,
         callback_token: String,
+        client_version: &str,
     ) -> Result<WebRTCDataChannel> {
         let pc_guard = self.peer_connection.lock().await;
 
@@ -633,6 +660,7 @@ impl Tube {
                 label.to_string(),
                 ksm_config,
                 callback_token,
+                client_version,
             );
 
             // Clone for release outside the lock
@@ -657,6 +685,7 @@ impl Tube {
         label: String,
         ksm_config: String,
         callback_token: String,
+        client_version: &str,
     ) {
         // Store references directly where possible
         let dc_ref = &data_channel.data_channel;
@@ -665,18 +694,24 @@ impl Tube {
         let label_for_open = label.clone();
         let ksm_config_for_open = ksm_config.clone();
         let callback_token_for_open = callback_token.clone();
+        let client_version_for_open = client_version.to_string();
         let self_clone_for_open = self.clone();
 
         dc_ref.on_open(Box::new(move || {
             let label_clone = label_for_open.clone();
             let ksm_config_clone = ksm_config_for_open.clone();
             let callback_token_clone = callback_token_for_open.clone();
+            let client_version_clone = client_version_for_open.clone();
             let self_clone = self_clone_for_open.clone();
 
             Box::pin(async move {
                 info!("Data channel '{}' opened", label_clone);
                 if let Err(e) = self_clone
-                    .report_connection_open(ksm_config_clone, callback_token_clone)
+                    .report_connection_open(
+                        ksm_config_clone,
+                        callback_token_clone,
+                        &client_version_clone,
+                    )
                     .await
                 {
                     error!("Failed to report connection open: {}", e);
@@ -685,17 +720,23 @@ impl Tube {
         }));
 
         let self_clone_for_close = self.clone();
+        let client_version_for_close = client_version.to_string();
 
         dc_ref.on_close(Box::new(move || {
             let label_clone = label.clone();
             let ksm_config_clone = ksm_config.clone();
             let callback_token_clone = callback_token.clone();
+            let client_version_clone = client_version_for_close.clone();
             let self_clone = self_clone_for_close.clone();
 
             Box::pin(async move {
                 info!("Data channel '{}' closed", label_clone);
                 if let Err(e) = self_clone
-                    .report_connection_close(ksm_config_clone, callback_token_clone)
+                    .report_connection_close(
+                        ksm_config_clone,
+                        callback_token_clone,
+                        &client_version_clone,
+                    )
                     .await
                 {
                     error!("Failed to report connection close: {}", e);
@@ -709,6 +750,7 @@ impl Tube {
         &self,
         ksm_config: String,
         callback_token: String,
+        client_version: &str,
     ) -> std::result::Result<(), String> {
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
             debug!(
@@ -720,7 +762,15 @@ impl Tube {
         debug!("Sending connection open callback to router");
         let token_value = serde_json::Value::String(callback_token);
 
-        match post_connection_state(&ksm_config, "connection_open", &token_value, None).await {
+        match post_connection_state(
+            &ksm_config,
+            "connection_open",
+            &token_value,
+            None,
+            client_version,
+        )
+        .await
+        {
             Ok(_) => {
                 debug!("Connection open callback sent successfully");
                 Ok(())
@@ -736,6 +786,7 @@ impl Tube {
         &self,
         ksm_config: String,
         callback_token: String,
+        client_version: &str,
     ) -> std::result::Result<(), String> {
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
             debug!(
@@ -753,7 +804,8 @@ impl Tube {
             &ksm_config,
             "connection_close",
             &token_value,
-            Some(true), // Assuming terminated=true as default for simplicity
+            Some(true),
+            client_version,
         )
         .await
         {
@@ -769,6 +821,7 @@ impl Tube {
     }
 
     // Create a channel with the given name, using an existing data channel
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_channel(
         &self,
         name: &str,
@@ -777,6 +830,7 @@ impl Tube {
         protocol_settings: HashMap<String, serde_json::Value>,
         callback_token: Option<String>,
         ksm_config: Option<String>,
+        client_version: Option<String>,
     ) -> Result<Option<u16>> {
         info!(tube_id = %self.id, channel_name = %name, "create_channel: Called.");
         trace!(tube_id = %self.id, channel_name = %name, ?timeout_seconds, ?protocol_settings, "create_channel: Initial parameters.");
@@ -788,6 +842,14 @@ impl Tube {
         trace!(tube_id = %self.id, channel_name = %name, ?timeouts, "create_channel: Timeouts configured.");
 
         info!(tube_id = %self.id, channel_name = %name, "create_channel: About to call setup_channel_for_data_channel.");
+        let client_version = match client_version {
+            Some(version) => version,
+            None => {
+                error!(tube_id = %self.id, channel_name = %name, "client_version is required for channel creation but was not provided");
+                return Err(anyhow!("client_version is required for channel creation"));
+            }
+        };
+
         let setup_result = setup_channel_for_data_channel(
             data_channel,
             name.to_string(),
@@ -796,6 +858,7 @@ impl Tube {
             self.is_server_mode_context,
             callback_token,
             ksm_config,
+            client_version,
         )
         .await;
 
@@ -814,6 +877,7 @@ impl Tube {
         let metadata = ChannelMetadata {
             callback_token: owned_channel.callback_token.clone(),
             ksm_config: owned_channel.ksm_config.clone(),
+            client_version: owned_channel.client_version.clone(),
         };
         if let Err(e) = self
             .register_channel_metadata(name.to_string(), metadata)
@@ -960,9 +1024,10 @@ impl Tube {
         &self,
         ksm_config: String,
         callback_token: String,
+        client_version: &str,
     ) -> Result<WebRTCDataChannel> {
         let control_channel = self
-            .create_data_channel("control", ksm_config, callback_token)
+            .create_data_channel("control", ksm_config, callback_token, client_version)
             .await?;
         *self.control_channel.write().await = Some(control_channel.clone());
         Ok(control_channel)
@@ -1231,6 +1296,8 @@ impl Tube {
             if let (Some(ref ksm_config), Some(ref callback_token)) =
                 (&metadata.ksm_config, &metadata.callback_token)
             {
+                let client_version = &metadata.client_version;
+
                 // Skip if in test mode
                 if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
                     debug!(tube_id = %self.id, channel_name = %channel_name, "TEST MODE: Skipping connection_open callback");
@@ -1240,7 +1307,14 @@ impl Tube {
                 debug!(tube_id = %self.id, channel_name = %channel_name, "Sending connection_open callback to router");
                 let token_value = serde_json::Value::String(callback_token.clone());
 
-                match post_connection_state(ksm_config, "connection_open", &token_value, None).await
+                match post_connection_state(
+                    ksm_config,
+                    "connection_open",
+                    &token_value,
+                    None,
+                    client_version,
+                )
+                .await
                 {
                     Ok(_) => {
                         debug!(tube_id = %self.id, channel_name = %channel_name, "Connection open callback sent successfully");
@@ -1271,6 +1345,8 @@ impl Tube {
             if let (Some(ref ksm_config), Some(ref callback_token)) =
                 (&metadata.ksm_config, &metadata.callback_token)
             {
+                let client_version = &metadata.client_version;
+
                 // Skip if in test mode
                 if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
                     debug!(tube_id = %self.id, channel_name = %channel_name, "TEST MODE: Skipping connection_close callback");
@@ -1285,6 +1361,7 @@ impl Tube {
                     "connection_close",
                     &token_value,
                     Some(true),
+                    client_version,
                 )
                 .await
                 {

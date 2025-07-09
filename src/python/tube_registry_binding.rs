@@ -388,6 +388,7 @@ impl PyTubeRegistry {
         trickle_ice = false,
         callback_token = "",
         ksm_config = "",
+        client_version = None,
         offer = None,
         signal_callback = None,
     ))]
@@ -400,10 +401,16 @@ impl PyTubeRegistry {
         trickle_ice: bool,
         callback_token: &str,
         ksm_config: &str,
+        client_version: Option<&str>,
         offer: Option<&str>,
         signal_callback: Option<PyObject>,
     ) -> PyResult<PyObject> {
         let master_runtime = get_runtime();
+
+        // Validate that client_version is provided
+        let client_version = client_version.ok_or_else(|| {
+            PyRuntimeError::new_err("client_version is required and must be provided")
+        })?;
 
         // Convert Python settings dictionary to Rust HashMap<String, serde_json::Value>
         let settings_json = pyobj_to_json_hashmap(py, &settings)?;
@@ -417,6 +424,7 @@ impl PyTubeRegistry {
         let conversation_id_owned = conversation_id.to_string();
         let callback_token_owned = callback_token.to_string();
         let ksm_config_owned = ksm_config.to_string();
+        let client_version_owned = client_version.to_string();
 
         // This outer block_on will handle the call to the registry's create_tube and setup signal handler
         let creation_result_map = py.allow_threads(|| {
@@ -434,6 +442,7 @@ impl PyTubeRegistry {
                     trickle_ice,
                     &callback_token_owned,
                     &ksm_config_owned,
+                    &client_version_owned,
                     signal_sender_rust, // Pass the sender part of the MPSC channel
                 ).await
                  .map_err(|e| {
@@ -577,6 +586,7 @@ impl PyTubeRegistry {
         settings,
         offer = None,
         trickle_ice = false,
+        client_version = None,
         signal_callback = None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -588,9 +598,15 @@ impl PyTubeRegistry {
         settings: PyObject,
         offer: Option<&str>,
         trickle_ice: bool,
+        client_version: Option<&str>,
         signal_callback: Option<PyObject>,
     ) -> PyResult<String> {
         let master_runtime = get_runtime();
+
+        // Validate that client_version is provided
+        let client_version = client_version.ok_or_else(|| {
+            PyRuntimeError::new_err("client_version is required and must be provided")
+        })?;
 
         let settings_json = pyobj_to_json_hashmap(py, &settings)?;
 
@@ -627,7 +643,8 @@ impl PyTubeRegistry {
                         settings_json,
                         offer_string,
                         Some(trickle_ice),
-                        opt_signal_sender_for_rust, // Pass the sender if created
+                        opt_signal_sender_for_rust,
+                        client_version,
                     )
                     .await
                     .map_err(|e| {
@@ -725,6 +742,7 @@ impl PyTubeRegistry {
         connection_id,
         tube_id,
         settings,
+        client_version = None,
         signal_callback = None,
     ))]
     fn create_channel(
@@ -733,9 +751,15 @@ impl PyTubeRegistry {
         connection_id: &str,
         tube_id: &str,
         settings: PyObject,
+        client_version: Option<&str>,
         signal_callback: Option<PyObject>,
     ) -> PyResult<()> {
         let master_runtime = get_runtime();
+
+        // Validate that client_version is provided
+        let client_version = client_version.ok_or_else(|| {
+            PyRuntimeError::new_err("client_version is required and must be provided")
+        })?;
 
         let settings_json = pyobj_to_json_hashmap(py, &settings)?;
         let tube_id_owned = tube_id.to_string();
@@ -749,7 +773,7 @@ impl PyTubeRegistry {
             master_runtime.clone().block_on(async move {
                 let mut registry = REGISTRY.write().await;
                 registry
-                    .register_channel(&connection_id_owned, &tube_id_owned, &settings_json)
+                    .register_channel(&connection_id_owned, &tube_id_owned, &settings_json, client_version)
                     .await
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!(
@@ -783,7 +807,12 @@ impl PyTubeRegistry {
     }
 
     /// Refresh connections on router - collect all callback tokens and send to router
-    fn refresh_connections(&self, py: Python<'_>, ksm_config_from_python: String) -> PyResult<()> {
+    fn refresh_connections(
+        &self,
+        py: Python<'_>,
+        ksm_config_from_python: String,
+        client_version: String,
+    ) -> PyResult<()> {
         let master_runtime = get_runtime();
         py.allow_threads(|| {
             master_runtime.clone().block_on(async move {
@@ -812,7 +841,7 @@ impl PyTubeRegistry {
                         .collect()
                 );
 
-                post_connection_state(&ksm_config_from_python, "open_connections", &tokens_json, None).await
+                post_connection_state(&ksm_config_from_python, "open_connections", &tokens_json, None, &client_version).await
                     .map_err(|e| PyRuntimeError::new_err(format!("Failed to refresh connections on router: {e}")))
             })
         })

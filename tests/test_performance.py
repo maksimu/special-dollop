@@ -125,7 +125,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             settings=settings,
             trickle_ice=True,
             callback_token=TEST_CALLBACK_TOKEN,
-            signal_callback=self._signal_handler
+            signal_callback=self._signal_handler,
+            client_version="ms16.5.0"
         )
         
         # Get the offer from a server
@@ -142,7 +143,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             trickle_ice=True,
             callback_token=TEST_CALLBACK_TOKEN,
             offer=offer,
-            signal_callback=self._signal_handler
+            signal_callback=self._signal_handler,
+            client_version="ms16.5.0"
         )
         
         # Get the answer from a client
@@ -177,7 +179,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         self.tube_registry.create_channel(
             channel_name, # connection_id for Rust binding
             server_id,    # tube_id for Rust binding
-            channel_settings
+            channel_settings,
+            client_version="ms16.5.0"
         )
         
         # Clean up
@@ -243,7 +246,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                 settings=server_settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                signal_callback=self._signal_handler
+                signal_callback=self._signal_handler,
+                client_version="ms16.5.0"
             )
             self.assertIsNotNone(server_tube_info, "Server tube creation failed")
             server_offer_sdp = server_tube_info['offer']
@@ -270,7 +274,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
                 offer=server_offer_sdp,
-                signal_callback=self._signal_handler
+                signal_callback=self._signal_handler,
+                client_version="ms16.5.0"
             )
             self.assertIsNotNone(client_tube_info, "Client tube creation failed")
             client_answer_sdp = client_tube_info['answer']
@@ -429,6 +434,7 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
             settings=settings,
             trickle_ice=False,  # Use non-trickle ICE
             callback_token=TEST_CALLBACK_TOKEN,
+            client_version="ms16.5.0"
         )
         
         # Get the offer from a server
@@ -456,6 +462,7 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
             trickle_ice=False,  # Use non-trickle ICE
             callback_token=TEST_CALLBACK_TOKEN,
             offer=offer_b64, # Pass the original base64 encoded offer
+            client_version="ms16.5.0"
         )
         
         # Get the answer from a client

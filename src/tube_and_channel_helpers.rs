@@ -47,6 +47,7 @@ pub(crate) async fn setup_channel_for_data_channel(
     server_mode: bool,
     callback_token: Option<String>,
     ksm_config: Option<String>,
+    client_version: String,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -61,6 +62,7 @@ pub(crate) async fn setup_channel_for_data_channel(
         server_mode,
         callback_token,
         ksm_config,
+        client_version,
     })
     .await?;
 

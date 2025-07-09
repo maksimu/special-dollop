@@ -247,6 +247,7 @@ async fn test_guacd_handshake_successful_new_connection() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel");
@@ -464,6 +465,7 @@ async fn test_guacd_handshake_join_existing_connection_readonly() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel for join test");
@@ -561,6 +563,7 @@ async fn test_guacd_handshake_join_existing_connection_not_readonly() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel for join_not_readonly test");
@@ -654,6 +657,7 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_args() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel for fail_args test");
@@ -739,6 +743,7 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel for fail_ready test");
@@ -923,6 +928,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel for timeout_args test");
@@ -1014,6 +1020,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
         server_mode: false,
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
+        client_version: "ms16.5.0".to_string(),
     })
     .await
     .expect("Failed to create channel for timeout_ready test");

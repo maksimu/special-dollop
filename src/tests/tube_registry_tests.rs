@@ -33,6 +33,7 @@ fn new_test_tube_without_registry_add() -> Result<Arc<Tube>> {
         )),
         runtime,
         original_conversation_id: None,
+        client_version: Arc::new(tokio::sync::RwLock::new(Some("ms16.5.0".to_string()))),
     }))
 }
 
@@ -500,6 +501,7 @@ async fn test_registry_e2e_server_client_echo(
             true,
             TEST_CALLBACK_TOKEN,
             TEST_MODE_KSM_CONFIG,
+            "ms16.5.0",
             server_signal_tx,
         )
         .await?;
@@ -541,6 +543,7 @@ async fn test_registry_e2e_server_client_echo(
             true,                       // trickle_ice
             TEST_CALLBACK_TOKEN,
             TEST_MODE_KSM_CONFIG,
+            "ms16.5.0",
             client_signal_tx,
         )
         .await?;

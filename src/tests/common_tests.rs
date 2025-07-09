@@ -33,6 +33,7 @@ pub async fn create_test_webrtc_data_channel() -> WebRTCDataChannel {
                     if tx.send(dc).await.is_err() {
                         eprintln!("create_test_webrtc_data_channel: Receiver dropped before channel was sent");
                     }
+                    // Don't drop error_tx immediately, let it be dropped naturally
                 }
                 Err(e) => {
                     let err_msg = format!("create_test_webrtc_data_channel: Failed to setup channel pair: {}", e);
@@ -47,8 +48,24 @@ pub async fn create_test_webrtc_data_channel() -> WebRTCDataChannel {
 
     // Asynchronously wait for the result from the spawned thread
     let result = tokio::select! {
-        res = rx.recv() => res.ok_or_else(|| "Failed to receive WebRTCDataChannel from setup task".to_string()),
-        err_res = error_rx.recv() => Err(err_res.unwrap_or_else(|| "Unknown error in setup task and error channel closed".to_string())),
+        res = rx.recv() => {
+            match res {
+                Some(dc) => Ok(dc),
+                None => Err("Failed to receive WebRTCDataChannel from setup task".to_string())
+            }
+        },
+        err_res = error_rx.recv() => {
+            match err_res {
+                Some(err) => Err(err),
+                None => {
+                    // Error channel closed without error - wait for success result
+                    match rx.recv().await {
+                        Some(dc) => Ok(dc),
+                        None => Err("Setup task completed but no result received".to_string())
+                    }
+                }
+            }
+        },
         _ = tokio::time::sleep(Duration::from_secs(25)) => Err("Timeout waiting for WebRTCDataChannel setup (increased to 25s)".to_string()),
     };
 

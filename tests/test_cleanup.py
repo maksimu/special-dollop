@@ -59,7 +59,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
-                callback_token=TEST_CALLBACK_TOKEN
+                callback_token=TEST_CALLBACK_TOKEN,
+                client_version="ms16.5.0"
             )
             
             tube2_info = tube_registry.create_tube(
@@ -67,7 +68,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
-                callback_token=TEST_CALLBACK_TOKEN
+                callback_token=TEST_CALLBACK_TOKEN,
+                client_version="ms16.5.0"
             )
             
             tube1_id = tube1_info['tube_id']
@@ -117,7 +119,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                     ksm_config=TEST_KSM_CONFIG,
                     settings=settings,
                     trickle_ice=True,
-                    callback_token=TEST_CALLBACK_TOKEN
+                    callback_token=TEST_CALLBACK_TOKEN,
+                    client_version="ms16.5.0"
                 )
                 tube_infos.append(tube_info)
             
@@ -165,7 +168,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
-                callback_token=TEST_CALLBACK_TOKEN
+                callback_token=TEST_CALLBACK_TOKEN,
+                client_version="ms16.5.0"
             )
             
             tube_id = tube_info['tube_id']
@@ -211,7 +215,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                     ksm_config=TEST_KSM_CONFIG,
                     settings=settings,
                     trickle_ice=True,
-                    callback_token=TEST_CALLBACK_TOKEN
+                    callback_token=TEST_CALLBACK_TOKEN,
+                    client_version="ms16.5.0"
                 )
                 
                 tube_id = tube_info['tube_id']
@@ -256,7 +261,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
-                callback_token=TEST_CALLBACK_TOKEN
+                callback_token=TEST_CALLBACK_TOKEN,
+                client_version="ms16.5.0"
             )
             
             server_id = server_info['tube_id']
@@ -268,7 +274,8 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                offer=server_info['offer']
+                offer=server_info['offer'],
+                client_version="ms16.5.0"
             )
             
             client_id = client_info['tube_id']
@@ -386,6 +393,7 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
         """Helper to create tube and track it for cleanup"""
         result = self.tube_registry.create_tube(
             conversation_id=conversation_id,
+            client_version="ms16.5.0",
             **kwargs
         )
         
@@ -508,7 +516,7 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
                     self.registry.cleanup_all()
                 
             def create_tube(self, **kwargs):
-                result = self.registry.create_tube(**kwargs)
+                result = self.registry.create_tube(client_version="ms16.5.0", **kwargs)
                 if 'tube_id' in result:
                     self.created_tubes.add(result['tube_id'])
                 return result

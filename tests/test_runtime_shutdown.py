@@ -88,7 +88,8 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
             ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
-            callback_token="TEST_MODE_CALLBACK_TOKEN"
+            callback_token="TEST_MODE_CALLBACK_TOKEN",
+            client_version="ms16.5.0"
         )
         
         # Verify tube was created
@@ -160,7 +161,8 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
             ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
-            callback_token="TEST_MODE_CALLBACK_TOKEN"
+            callback_token="TEST_MODE_CALLBACK_TOKEN",
+            client_version="ms16.5.0"
         )
         
         # Verify tube was created
@@ -258,7 +260,8 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
             ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
-            callback_token="TEST_MODE_CALLBACK_TOKEN"
+            callback_token="TEST_MODE_CALLBACK_TOKEN",
+            client_version="ms16.5.0"
         )
         
         tube2_info = registry.create_tube(
@@ -266,7 +269,8 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
             ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
-            callback_token="TEST_MODE_CALLBACK_TOKEN"
+            callback_token="TEST_MODE_CALLBACK_TOKEN",
+            client_version="ms16.5.0"
         )
         
         # Verify tubes were created
@@ -302,7 +306,8 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
             ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
-            callback_token="TEST_MODE_CALLBACK_TOKEN"
+            callback_token="TEST_MODE_CALLBACK_TOKEN",
+            client_version="ms16.5.0"
         )
         
         # Verify tube was created

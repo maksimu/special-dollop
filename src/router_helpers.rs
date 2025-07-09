@@ -51,9 +51,6 @@ struct ConnectionStateBody {
 // Constants
 const VERIFY_SSL: bool = true;
 
-// Uses the name and version from Cargo.toml at compile time
-const KEEPER_CLIENT: &str = concat!(env!("CARGO_PKG_NAME"), ":", env!("CARGO_PKG_VERSION"));
-
 const KEY_PRIVATE_KEY: &str = "privateKey";
 const KEY_CLIENT_ID: &str = "clientId";
 
@@ -363,6 +360,7 @@ async fn router_request(
     url_path: &str,
     query_params: Option<std::collections::HashMap<String, String>>,
     body: Option<serde_json::Value>,
+    client_version: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
     trace!(
@@ -370,6 +368,7 @@ async fn router_request(
         method = %http_method,
         path = %url_path,
         ?ksm_config,
+        client_version = %client_version,
         "Router request"
     );
 
@@ -405,7 +404,7 @@ async fn router_request(
         .header("Challenge", challenge_str)
         .header("Signature", signature)
         .header("Authorization", format!("KeeperDevice {client_id}"))
-        .header("ClientVersion", KEEPER_CLIENT);
+        .header("ClientVersion", client_version);
 
     // Add query parameters if provided
     if let Some(params) = query_params {
@@ -444,6 +443,7 @@ async fn router_request(
 pub async fn get_relay_access_creds(
     ksm_config: &str,
     expire_sec: Option<u64>,
+    client_version: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Special handling for test mode
     if ksm_config == "TEST_MODE_KSM_CONFIG" {
@@ -467,6 +467,7 @@ pub async fn get_relay_access_creds(
         "api/device/relay_access_creds",
         Some(query_params),
         None,
+        client_version,
     )
     .await
 }
@@ -477,6 +478,7 @@ pub async fn post_connection_state(
     connection_state: &str,
     token: &serde_json::Value,
     is_terminated: Option<bool>,
+    client_version: &str,
 ) -> Result<(), Box<dyn Error>> {
     // Special handling for test mode
     if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
@@ -561,6 +563,7 @@ pub async fn post_connection_state(
         "api/device/connect_state",
         None,
         Some(request_body),
+        client_version,
     )
     .await?;
 

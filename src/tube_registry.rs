@@ -228,6 +228,7 @@ impl TubeRegistry {
         trickle_ice: bool,
         callback_token: &str,
         ksm_config: &str,
+        client_version: &str,
         signal_sender: UnboundedSender<SignalMessage>,
     ) -> Result<HashMap<String, String>> {
         let initial_offer_sdp_decoded = if let Some(ref b64_offer) = initial_offer_sdp {
@@ -296,34 +297,40 @@ impl TubeRegistry {
                     debug!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
 
                     if use_turn_for_config_from_settings {
-                        match get_relay_access_creds(ksm_config, None).await {
-                            Ok(creds) => {
-                                let username = creds
-                                    .get("username")
-                                    .and_then(|u| u.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let credential = creds
-                                    .get("password")
-                                    .and_then(|p| p.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                debug!(target: "ice_config", tube_id = %tube_id, turn_username = %username, turn_password_is_empty = credential.is_empty(), "Fetched TURN credentials");
+                        // Get TURN credentials if needed
+                        if !ksm_config.is_empty() && !ksm_config.starts_with("TEST_MODE_KSM_CONFIG")
+                        {
+                            debug!(target: "ice_config", tube_id = %tube_id, "Fetching TURN credentials from router");
+                            match get_relay_access_creds(ksm_config, None, client_version).await {
+                                Ok(creds) => {
+                                    debug!(target: "ice_config", tube_id = %tube_id, "Successfully fetched TURN credentials");
+                                    trace!(target: "ice_config", tube_id = %tube_id, credentials = %creds, "Received TURN credentials");
 
-                                if !username.is_empty() && !credential.is_empty() {
-                                    let turn_url_udp = format!("turn:{relay_server}:3478");
-                                    ice_servers.push(RTCIceServer {
-                                        urls: vec![turn_url_udp.clone()],
-                                        username: username.clone(),
-                                        credential: credential.clone(),
-                                    });
-                                    debug!(target: "ice_config", tube_id = %tube_id, turn_url = %turn_url_udp, "Added TURN server (UDP)");
-                                } else {
-                                    warn!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Failed to add TURN servers: Usable TURN credentials (empty username/password) not obtained.");
+                                    // Extract username and password from credentials
+                                    if let (Some(username), Some(password)) = (
+                                        creds.get("username").and_then(|v| v.as_str()),
+                                        creds.get("password").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(relay_url) =
+                                            krealy_url_from_ksm_config(ksm_config)
+                                        {
+                                            debug!(target: "ice_config", tube_id = %tube_id, relay_url = %relay_url, "Using TURN server");
+                                            ice_servers.push(RTCIceServer {
+                                                urls: vec![format!("turn:{}", relay_url)],
+                                                username: username.to_string(),
+                                                credential: password.to_string(),
+                                            });
+                                        } else {
+                                            warn!(target: "ice_config", tube_id = %tube_id, "Failed to parse relay URL from KSM config");
+                                        }
+                                    } else {
+                                        warn!(target: "ice_config", tube_id = %tube_id, "Invalid TURN credentials format");
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, error = %e, "Failed to get relay access credentials for TURN. TURN servers will not be added.");
+                                Err(e) => {
+                                    error!(target: "ice_config", tube_id = %tube_id, "Failed to get TURN credentials: {}", e);
+                                    // Don't fail the entire operation, just log the error
+                                }
                             }
                         }
                     }
@@ -357,10 +364,12 @@ impl TubeRegistry {
                 turn_only_for_config,
                 ksm_config.to_string(),
                 callback_token.to_string(),
+                client_version,
                 settings.clone(),
                 signal_sender.clone(),
             )
-            .await?;
+            .await
+            .context("Failed to create peer connection")?;
 
         let mut listening_port_option: Option<u16> = None; // Initialize outside if
 
@@ -368,7 +377,11 @@ impl TubeRegistry {
         if is_server_mode {
             info!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: Proactively creating control and main data channels.");
             if let Err(e) = tube_arc
-                .create_control_channel(ksm_config.to_string(), callback_token.to_string())
+                .create_control_channel(
+                    ksm_config.to_string(),
+                    callback_token.to_string(),
+                    client_version,
+                )
                 .await
             {
                 warn!(
@@ -385,6 +398,7 @@ impl TubeRegistry {
                     conversation_id,
                     ksm_config.to_string(),
                     callback_token.to_string(),
+                    client_version,
                 )
                 .await
             {
@@ -398,6 +412,7 @@ impl TubeRegistry {
                             settings.clone(),
                             Some(callback_token.to_string()),
                             Some(ksm_config.to_string()),
+                            Some(client_version.to_string()),
                         )
                         .await
                     {
@@ -554,6 +569,7 @@ impl TubeRegistry {
         channel_id: &str,
         tube_id: &str,
         settings: &HashMap<String, serde_json::Value>,
+        client_version: &str,
     ) -> Result<()> {
         self.associate_conversation(tube_id, channel_id)?;
 
@@ -578,7 +594,12 @@ impl TubeRegistry {
 
         // Create a data channel for this new logical channel
         let data_channel = tube
-            .create_data_channel(channel_id, ksm_config.clone(), callback_token.clone())
+            .create_data_channel(
+                channel_id,
+                ksm_config.clone(),
+                callback_token.clone(),
+                client_version,
+            )
             .await?;
 
         // Create the logical channel handler
@@ -589,6 +610,7 @@ impl TubeRegistry {
             settings.clone(),
             Some(callback_token),
             Some(ksm_config),
+            Some(client_version.to_string()),
         )
         .await?;
 
@@ -597,6 +619,7 @@ impl TubeRegistry {
 
     /// Create a new connection, either using an existing tube or creating a new one
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_connection(
         &mut self,
         tube_id: Option<&str>,
@@ -605,6 +628,7 @@ impl TubeRegistry {
         initial_offer_sdp: Option<String>,
         trickle_ice: Option<bool>,
         signal_sender: Option<UnboundedSender<SignalMessage>>,
+        client_version: &str,
     ) -> Result<String> {
         let the_tube_id_str;
         let new_tube_created;
@@ -651,6 +675,7 @@ impl TubeRegistry {
                         trickle_ice_value,
                         &callback_token_for_new_tube,
                         &ksm_config_for_new_tube,
+                        client_version,
                         signal_sender_value,
                     )
                     .await?;
@@ -666,7 +691,7 @@ impl TubeRegistry {
         // If a new tube was created, create_tube already made a data channel and logical channel for channel_id.
         // So, only call register_channel if we are adding a channel to an *existing* tube.
         if !new_tube_created {
-            self.register_channel(channel_id, &the_tube_id_str, &settings)
+            self.register_channel(channel_id, &the_tube_id_str, &settings, client_version)
                 .await?;
         } else {
             // If a new tube was created, create_tube already handled the initial channel creation for channel_id.

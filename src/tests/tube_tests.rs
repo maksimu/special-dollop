@@ -45,6 +45,7 @@ fn test_tube_creation() {
             false,
             "TEST_MODE_KSM_CONFIG_1".to_string(),
             "TEST_CALLBACK_TOKEN_1".to_string(),
+            "ms16.5.0",
             settings,
             signal_tx,
         );
@@ -65,6 +66,7 @@ fn test_tube_creation() {
             "test-channel",
             "TEST_MODE_KSM_CONFIG_1".to_string(),
             "TEST_CALLBACK_TOKEN_1".to_string(),
+            "ms16.5.0",
         );
         let timeout_fut = tokio::time::timeout(Duration::from_secs(3), data_channel_fut);
         let data_channel = match timeout_fut.await {
@@ -95,6 +97,7 @@ fn test_tube_creation() {
         let control_channel_fut = tube.create_control_channel(
             "TEST_MODE_KSM_CONFIG_1".to_string(),
             "TEST_CALLBACK_TOKEN_1".to_string(),
+            "ms16.5.0",
         );
         let timeout_fut = tokio::time::timeout(Duration::from_secs(3), control_channel_fut);
         let control_channel = match timeout_fut.await {
@@ -152,13 +155,13 @@ fn test_tube_channel_creation() {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            tube.create_peer_connection(None, true, false, "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), settings.clone(), signal_tx)
+            tube.create_peer_connection(None, true, false, "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), "ms16.5.0", settings.clone(), signal_tx)
         ).await.map_or_else(
             |_| println!("Timeout creating peer connection, continuing with test"),
             |res| res.expect("Failed to create peer connection")
         );
 
-        let data_channel_fut = tube.create_data_channel("test-channel", "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string());
+        let data_channel_fut = tube.create_data_channel("test-channel", "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), "ms16.5.0");
         let data_channel = match tokio::time::timeout(Duration::from_secs(3), data_channel_fut).await {
             Ok(Ok(dc)) => dc,
             Ok(Err(e)) => panic!("Failed to create data channel: {}", e),
@@ -175,7 +178,8 @@ fn test_tube_channel_creation() {
             Some(5.0),
             settings,
             Some("TEST_CALLBACK_TOKEN_1".to_string()),
-            Some("TEST_MODE_KSM_CONFIG_1".to_string())
+            Some("TEST_MODE_KSM_CONFIG_1".to_string()),
+            Some("ms16.5.0".to_string()),
         ).await.expect("Call to create_channel itself failed");
 
         // Verify channel shutdown signal exists
@@ -220,6 +224,7 @@ async fn test_tube_create_with_pc() {
         false, // turn_only
         "TEST_MODE_KSM_CONFIG_1".to_string(),
         "TEST_CALLBACK_TOKEN_1".to_string(),
+        "ms16.5.0",
         settings,
         signal_tx,
     );
@@ -242,6 +247,7 @@ async fn test_tube_webrtc_connection() {
         false, // turn_only
         "TEST_MODE_KSM_CONFIG_1".to_string(),
         "TEST_CALLBACK_TOKEN_1".to_string(),
+        "ms16.5.0",
         settings,
         signal_tx,
     )
@@ -266,6 +272,7 @@ async fn test_tube_create_channel() {
         false,
         "TEST_MODE_KSM_CONFIG".to_string(),
         "test_callback_token".to_string(),
+        "ms16.5.0",
         settings.clone(),
         signal_tx,
     )
@@ -277,6 +284,7 @@ async fn test_tube_create_channel() {
             "test_dc",
             "ksm_config_val".to_string(),
             "token_val".to_string(),
+            "ms16.5.0",
         )
         .await
         .expect("Failed to create data channel");
@@ -289,6 +297,7 @@ async fn test_tube_create_channel() {
             settings,
             Some("token_val".to_string()),
             Some("ksm_config_val".to_string()),
+            Some("ms16.5.0".to_string()),
         )
         .await
         .expect("Failed to create channel instance");
@@ -616,6 +625,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             false,
             ksm_config_t1.clone(),
             token_t1.clone(),
+            "ms16.5.0",
             settings.clone(),
             signal_tx1,
         )
@@ -628,6 +638,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             false,
             ksm_config_t2.clone(),
             token_t2.clone(),
+            "ms16.5.0",
             settings,
             signal_tx2,
         )
@@ -641,7 +652,12 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         dc_label
     );
     let dc1_out = tube1
-        .create_data_channel(&dc_label, ksm_config_t1.clone(), token_t1.clone())
+        .create_data_channel(
+            &dc_label,
+            ksm_config_t1.clone(),
+            token_t1.clone(),
+            "ms16.5.0",
+        )
         .await?;
     info!(
         "[E2E_TEST] Tube1: create_data_channel call returned for '{}'",

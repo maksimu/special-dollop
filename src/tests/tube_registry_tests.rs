@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -252,7 +252,11 @@ const TEST_CALLBACK_TOKEN: &str = "test_callback_token_e2e_registry";
 async fn run_ack_server(
     mut kill_signal_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    // Try IPv6 localhost first, fall back to IPv4 if needed
+    let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+        Ok(listener) => listener,
+        Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+    };
     let actual_addr = listener.local_addr()?;
     info!("[AckServer] Listening on {}", actual_addr);
 
@@ -500,7 +504,8 @@ async fn test_registry_e2e_server_client_echo(
             None,
             true,
             TEST_CALLBACK_TOKEN,
-            TEST_MODE_KSM_CONFIG,
+            "test.relay.server.com",    // krelay_server parameter
+            Some(TEST_MODE_KSM_CONFIG), // ksm_config is now optional
             "ms16.5.0",
             server_signal_tx,
         )
@@ -526,11 +531,12 @@ async fn test_registry_e2e_server_client_echo(
     let client_conversation_id = "e2e_conv_client_proxied_1";
     let mut client_settings = HashMap::new();
     client_settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
-    // Parse the server address to extract host and port separately
-    let binding = ack_server_addr.to_string();
-    let addr_parts: Vec<&str> = binding.split(':').collect();
-    let host = addr_parts[0];
-    let port = addr_parts[1];
+
+    // Properly parse the server address to handle both IPv4 and IPv6
+    let (host, port) = match ack_server_addr {
+        std::net::SocketAddr::V4(v4_addr) => (v4_addr.ip().to_string(), v4_addr.port().to_string()),
+        std::net::SocketAddr::V6(v6_addr) => (v6_addr.ip().to_string(), v6_addr.port().to_string()),
+    };
 
     client_settings.insert("target_host".to_string(), serde_json::json!(host));
     client_settings.insert("target_port".to_string(), serde_json::json!(port));
@@ -542,7 +548,8 @@ async fn test_registry_e2e_server_client_echo(
             Some(server_offer.clone()), // Client mode, with server's offer
             true,                       // trickle_ice
             TEST_CALLBACK_TOKEN,
-            TEST_MODE_KSM_CONFIG,
+            "test.relay.server.com",    // krelay_server parameter
+            Some(TEST_MODE_KSM_CONFIG), // ksm_config is now optional
             "ms16.5.0",
             client_signal_tx,
         )

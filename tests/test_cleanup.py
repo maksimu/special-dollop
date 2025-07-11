@@ -56,20 +56,22 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
             
             tube1_info = tube_registry.create_tube(
                 conversation_id="cleanup-test-1",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                client_version="ms16.5.0"
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG
             )
             
             tube2_info = tube_registry.create_tube(
                 conversation_id="cleanup-test-2", 
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                client_version="ms16.5.0"
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG
             )
             
             tube1_id = tube1_info['tube_id']
@@ -116,11 +118,12 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
             for i in range(3):
                 tube_info = tube_registry.create_tube(
                     conversation_id=f"selective-test-{i}",
-                    ksm_config=TEST_KSM_CONFIG,
                     settings=settings,
                     trickle_ice=True,
                     callback_token=TEST_CALLBACK_TOKEN,
-                    client_version="ms16.5.0"
+                    krelay_server="test.relay.server.com",
+                    client_version="ms16.5.0",
+                    ksm_config=TEST_KSM_CONFIG
                 )
                 tube_infos.append(tube_info)
             
@@ -165,11 +168,12 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
             # Create a tube
             tube_info = tube_registry.create_tube(
                 conversation_id="idempotent-test",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                client_version="ms16.5.0"
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG
             )
             
             tube_id = tube_info['tube_id']
@@ -212,11 +216,12 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 
                 tube_info = tube_registry.create_tube(
                     conversation_id="del-test",
-                    ksm_config=TEST_KSM_CONFIG,
                     settings=settings,
                     trickle_ice=True,
                     callback_token=TEST_CALLBACK_TOKEN,
-                    client_version="ms16.5.0"
+                    krelay_server="test.relay.server.com",
+                    client_version="ms16.5.0",
+                    ksm_config=TEST_KSM_CONFIG
                 )
                 
                 tube_id = tube_info['tube_id']
@@ -258,11 +263,12 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
             # Create a server tube
             server_info = tube_registry.create_tube(
                 conversation_id="cleanup-server",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                client_version="ms16.5.0"
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG
             )
             
             server_id = server_info['tube_id']
@@ -270,12 +276,13 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
             # Create a client tube
             client_info = tube_registry.create_tube(
                 conversation_id="cleanup-client",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                offer=server_info['offer'],
-                client_version="ms16.5.0"
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG,
+                offer=server_info['offer']
             )
             
             client_id = client_info['tube_id']
@@ -393,6 +400,7 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
         """Helper to create tube and track it for cleanup"""
         result = self.tube_registry.create_tube(
             conversation_id=conversation_id,
+            krelay_server="test.relay.server.com",
             client_version="ms16.5.0",
             **kwargs
         )
@@ -433,10 +441,10 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
             # NEW WAY: Use tracked creation
             server_tube_info = self.create_tube_tracked(
                 conversation_id="integration-server",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
+                ksm_config=TEST_KSM_CONFIG,
                 signal_callback=self._signal_handler
             )
             
@@ -445,10 +453,10 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
             
             client_tube_info = self.create_tube_tracked(
                 conversation_id="integration-client",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
+                ksm_config=TEST_KSM_CONFIG,
                 offer=offer,
                 signal_callback=self._signal_handler
             )
@@ -516,7 +524,11 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
                     self.registry.cleanup_all()
                 
             def create_tube(self, **kwargs):
-                result = self.registry.create_tube(client_version="ms16.5.0", **kwargs)
+                result = self.registry.create_tube(
+                    krelay_server="test.relay.server.com",
+                    client_version="ms16.5.0", 
+                    **kwargs
+                )
                 if 'tube_id' in result:
                     self.created_tubes.add(result['tube_id'])
                 return result
@@ -527,10 +539,10 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
             
             tube_info = ctx.create_tube(
                 conversation_id="context-test",
-                ksm_config=TEST_KSM_CONFIG,
                 settings=settings,
                 trickle_ice=True,
-                callback_token=TEST_CALLBACK_TOKEN
+                callback_token=TEST_CALLBACK_TOKEN,
+                ksm_config=TEST_KSM_CONFIG
             )
             
             tube_id = tube_info['tube_id']

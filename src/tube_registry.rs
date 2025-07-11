@@ -1,4 +1,4 @@
-use crate::router_helpers::{get_relay_access_creds, krealy_url_from_ksm_config};
+use crate::router_helpers::get_relay_access_creds;
 use crate::Tube;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -227,7 +227,8 @@ impl TubeRegistry {
         initial_offer_sdp: Option<String>,
         trickle_ice: bool,
         callback_token: &str,
-        ksm_config: &str,
+        krelay_server: &str,
+        ksm_config: Option<&str>,
         client_version: &str,
         signal_sender: UnboundedSender<SignalMessage>,
     ) -> Result<HashMap<String, String>> {
@@ -254,7 +255,14 @@ impl TubeRegistry {
         self.signal_channels
             .insert(tube_id.clone(), signal_sender.clone());
 
-        trace!(target: "ice_config", tube_id = %tube_id, ksm_config = %ksm_config, "Received ksm_config for ICE server setup");
+        // Log the received parameters differently based on mode
+        if is_server_mode {
+            trace!(target: "ice_config", tube_id = %tube_id, krelay_server = %krelay_server, "Server mode: Received krelay_server for ICE server setup");
+        } else if let Some(ksm_cfg) = ksm_config {
+            trace!(target: "ice_config", tube_id = %tube_id, krelay_server = %krelay_server, ksm_config = %ksm_cfg, "Client mode: Received krelay_server and ksm_config for ICE server setup");
+        } else {
+            trace!(target: "ice_config", tube_id = %tube_id, krelay_server = %krelay_server, "Client mode: Received krelay_server for ICE server setup, no ksm_config provided");
+        }
 
         let mut ice_servers = Vec::new();
         let mut turn_only_for_config = settings
@@ -262,7 +270,10 @@ impl TubeRegistry {
             .is_some_and(|v| v.as_bool().unwrap_or(false));
         debug!(target: "ice_config", tube_id = %tube_id, turn_only_setting = turn_only_for_config, "Initial 'turn_only' setting from input");
 
-        if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
+        // Check for test mode - ksm_config might be None in server mode, so check carefully
+        let is_test_mode = ksm_config.is_some_and(|cfg| cfg.starts_with("TEST_MODE_KSM_CONFIG"));
+
+        if is_test_mode {
             info!(target: "ice_config", tube_id = %tube_id, "TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration.");
             turn_only_for_config = false;
             ice_servers.push(RTCIceServer {
@@ -277,69 +288,63 @@ impl TubeRegistry {
                 credential: String::new(),
             });
             info!(target: "ice_config", tube_id = %tube_id, stun_url = "stun:stun1.l.google.com:19302?transport=udp&family=ipv4", "Added Google STUN server");
-        } else {
-            match krealy_url_from_ksm_config(ksm_config) {
-                Ok(relay_server) => {
-                    debug!(target: "ice_config", tube_id = %tube_id, relay_server_host = %relay_server, "Extracted relay server host from ksm_config");
-                    if !turn_only_for_config {
-                        let stun_url_udp = format!("stun:{relay_server}:3478");
-                        ice_servers.push(RTCIceServer {
-                            urls: vec![stun_url_udp.clone()],
-                            username: String::new(),
-                            credential: String::new(),
-                        });
-                        debug!(target: "ice_config", tube_id = %tube_id, stun_url = %stun_url_udp, "Added STUN server (UDP)");
-                    }
+        } else if !krelay_server.is_empty() {
+            debug!(target: "ice_config", tube_id = %tube_id, relay_server_host = %krelay_server, "Using provided krelay_server for ICE configuration");
 
-                    let use_turn_for_config_from_settings = settings
-                        .get("use_turn")
-                        .is_none_or(|v| v.as_bool().unwrap_or(true));
-                    debug!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
+            if !turn_only_for_config {
+                let stun_url_udp = format!("stun:{krelay_server}:3478");
+                ice_servers.push(RTCIceServer {
+                    urls: vec![stun_url_udp.clone()],
+                    username: String::new(),
+                    credential: String::new(),
+                });
+                debug!(target: "ice_config", tube_id = %tube_id, stun_url = %stun_url_udp, "Added STUN server (UDP)");
+            }
 
-                    if use_turn_for_config_from_settings {
-                        // Get TURN credentials if needed
-                        if !ksm_config.is_empty() && !ksm_config.starts_with("TEST_MODE_KSM_CONFIG")
-                        {
-                            debug!(target: "ice_config", tube_id = %tube_id, "Fetching TURN credentials from router");
-                            match get_relay_access_creds(ksm_config, None, client_version).await {
-                                Ok(creds) => {
-                                    debug!(target: "ice_config", tube_id = %tube_id, "Successfully fetched TURN credentials");
-                                    trace!(target: "ice_config", tube_id = %tube_id, credentials = %creds, "Received TURN credentials");
+            let use_turn_for_config_from_settings = settings
+                .get("use_turn")
+                .is_none_or(|v| v.as_bool().unwrap_or(true));
+            debug!(target: "ice_config", tube_id = %tube_id, use_turn_setting = use_turn_for_config_from_settings, "'use_turn' setting");
 
-                                    // Extract username and password from credentials
-                                    if let (Some(username), Some(password)) = (
-                                        creds.get("username").and_then(|v| v.as_str()),
-                                        creds.get("password").and_then(|v| v.as_str()),
-                                    ) {
-                                        if let Ok(relay_url) =
-                                            krealy_url_from_ksm_config(ksm_config)
-                                        {
-                                            debug!(target: "ice_config", tube_id = %tube_id, relay_url = %relay_url, "Using TURN server");
-                                            ice_servers.push(RTCIceServer {
-                                                urls: vec![format!("turn:{}", relay_url)],
-                                                username: username.to_string(),
-                                                credential: password.to_string(),
-                                            });
-                                        } else {
-                                            warn!(target: "ice_config", tube_id = %tube_id, "Failed to parse relay URL from KSM config");
-                                        }
-                                    } else {
-                                        warn!(target: "ice_config", tube_id = %tube_id, "Invalid TURN credentials format");
-                                    }
+            if use_turn_for_config_from_settings {
+                // Get TURN credentials if needed - only in client mode when ksm_config is available
+                if let Some(ksm_cfg) = ksm_config {
+                    if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
+                        debug!(target: "ice_config", tube_id = %tube_id, "Fetching TURN credentials from router");
+                        match get_relay_access_creds(ksm_cfg, None, client_version).await {
+                            Ok(creds) => {
+                                debug!(target: "ice_config", tube_id = %tube_id, "Successfully fetched TURN credentials");
+                                trace!(target: "ice_config", tube_id = %tube_id, credentials = %creds, "Received TURN credentials");
+
+                                // Extract username and password from credentials
+                                if let (Some(username), Some(password)) = (
+                                    creds.get("username").and_then(|v| v.as_str()),
+                                    creds.get("password").and_then(|v| v.as_str()),
+                                ) {
+                                    debug!(target: "ice_config", tube_id = %tube_id, relay_url = %krelay_server, "Using TURN server");
+                                    ice_servers.push(RTCIceServer {
+                                        urls: vec![format!("turn:{}", krelay_server)],
+                                        username: username.to_string(),
+                                        credential: password.to_string(),
+                                    });
+                                } else {
+                                    warn!(target: "ice_config", tube_id = %tube_id, "Invalid TURN credentials format");
                                 }
-                                Err(e) => {
-                                    error!(target: "ice_config", tube_id = %tube_id, "Failed to get TURN credentials: {}", e);
-                                    // Don't fail the entire operation, just log the error
-                                }
+                            }
+                            Err(e) => {
+                                error!(target: "ice_config", tube_id = %tube_id, "Failed to get TURN credentials: {}", e);
+                                // Don't fail the entire operation, just log the error
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    warn!(target: "ice_config", tube_id = %tube_id, error = %e, "Failed to extract relay server URL from ksm_config. STUN/TURN servers (except potentially Google STUN) will not be configured based on ksm_config.");
+                } else {
+                    debug!(target: "ice_config", tube_id = %tube_id, "Server mode: Skipping TURN credential fetch (no ksm_config available)");
                 }
             }
+        } else {
+            warn!(target: "ice_config", tube_id = %tube_id, "No krelay_server provided. STUN/TURN servers will not be configured.");
         }
+
         let all_configured_urls: Vec<String> =
             ice_servers.iter().flat_map(|s| s.urls.clone()).collect();
         debug!(target: "ice_config", tube_id = %tube_id, configured_ice_urls = ?all_configured_urls, "Final list of ICE server URLs to be used");
@@ -357,12 +362,15 @@ impl TubeRegistry {
             Some(rtc_config)
         };
 
+        // For server mode, use empty string for ksm_config when creating peer connection since it's not needed
+        let ksm_config_for_peer_connection = ksm_config.unwrap_or("");
+
         tube_arc
             .create_peer_connection(
                 rtc_config_obj,
                 trickle_ice,
                 turn_only_for_config,
-                ksm_config.to_string(),
+                ksm_config_for_peer_connection.to_string(),
                 callback_token.to_string(),
                 client_version,
                 settings.clone(),
@@ -378,7 +386,7 @@ impl TubeRegistry {
             info!(target: "tube_lifecycle", tube_id = %tube_id, "Server mode: Proactively creating control and main data channels.");
             if let Err(e) = tube_arc
                 .create_control_channel(
-                    ksm_config.to_string(),
+                    ksm_config_for_peer_connection.to_string(),
                     callback_token.to_string(),
                     client_version,
                 )
@@ -396,7 +404,7 @@ impl TubeRegistry {
             match tube_arc
                 .create_data_channel(
                     conversation_id,
-                    ksm_config.to_string(),
+                    ksm_config_for_peer_connection.to_string(),
                     callback_token.to_string(),
                     client_version,
                 )
@@ -411,7 +419,7 @@ impl TubeRegistry {
                             None,
                             settings.clone(),
                             Some(callback_token.to_string()),
-                            Some(ksm_config.to_string()),
+                            Some(ksm_config_for_peer_connection.to_string()),
                             Some(client_version.to_string()),
                         )
                         .await
@@ -651,14 +659,7 @@ impl TubeRegistry {
                 // Create a new tube. This will set up its peer connection via self.create_tube.
                 // We need to call self.create_tube here, not just Tube::new(),
                 // so that it goes through the full setup including signal channel registration for the E2E test.
-                // The ksm_config and callback_token for create_tube will come from settings for this new_connection call.
-                let ksm_config_for_new_tube = settings
-                    .get("ksm_config")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow!("ksm_config missing in settings for new_connection/new_tube")
-                    })?
-                    .to_string();
+                // The ksm_config, krelay_server and callback_token for create_tube will come from settings for this new_connection call.
                 let callback_token_for_new_tube = settings
                     .get("callback_token")
                     .and_then(|v| v.as_str())
@@ -667,6 +668,17 @@ impl TubeRegistry {
                     })?
                     .to_string();
 
+                let krelay_server_for_new_tube = settings
+                    .get("krelay_server")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow!("krelay_server missing in settings for new_connection/new_tube")
+                    })?
+                    .to_string();
+
+                // ksm_config is optional, only required in client mode
+                let ksm_config_for_new_tube = settings.get("ksm_config").and_then(|v| v.as_str());
+
                 let response_map = self
                     .create_tube(
                         channel_id,
@@ -674,7 +686,8 @@ impl TubeRegistry {
                         initial_offer_sdp,
                         trickle_ice_value,
                         &callback_token_for_new_tube,
-                        &ksm_config_for_new_tube,
+                        &krelay_server_for_new_tube,
+                        ksm_config_for_new_tube,
                         client_version,
                         signal_sender_value,
                     )

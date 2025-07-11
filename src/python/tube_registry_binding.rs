@@ -381,14 +381,15 @@ impl PyTubeRegistry {
         })
     }
 
-    /// Create a new tube with WebRTC connection
+    /// Create a tube with settings
     #[pyo3(signature = (
         conversation_id,
         settings,
-        trickle_ice = false,
-        callback_token = "",
-        ksm_config = "",
+        trickle_ice,
+        callback_token,
+        krelay_server,
         client_version = None,
+        ksm_config = None,
         offer = None,
         signal_callback = None,
     ))]
@@ -400,8 +401,9 @@ impl PyTubeRegistry {
         settings: PyObject,
         trickle_ice: bool,
         callback_token: &str,
-        ksm_config: &str,
+        krelay_server: &str,
         client_version: Option<&str>,
+        ksm_config: Option<&str>,
         offer: Option<&str>,
         signal_callback: Option<PyObject>,
     ) -> PyResult<PyObject> {
@@ -423,7 +425,8 @@ impl PyTubeRegistry {
         let offer_string_owned = offer.map(String::from);
         let conversation_id_owned = conversation_id.to_string();
         let callback_token_owned = callback_token.to_string();
-        let ksm_config_owned = ksm_config.to_string();
+        let krelay_server_owned = krelay_server.to_string();
+        let ksm_config_owned = ksm_config.map(String::from);
         let client_version_owned = client_version.to_string();
 
         // This outer block_on will handle the call to the registry's create_tube and setup signal handler
@@ -441,7 +444,8 @@ impl PyTubeRegistry {
                     offer_string_owned,
                     trickle_ice,
                     &callback_token_owned,
-                    &ksm_config_owned,
+                    &krelay_server_owned,
+                    ksm_config_owned.as_deref(),
                     &client_version_owned,
                     signal_sender_rust, // Pass the sender part of the MPSC channel
                 ).await

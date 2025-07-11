@@ -5,7 +5,6 @@ use base64::{
 
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use log::warn;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
@@ -339,18 +338,6 @@ fn http_router_url_from_ksm_config(ksm_config_str: &str) -> Result<String, Box<d
         // Assume it's a hostname and prepend https:// (since VERIFY_SSL is typically true)
         Ok(format!("https://{router_host}"))
     }
-}
-
-pub(crate) fn krealy_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result<String> {
-    let router_host = router_url_from_ksm_config(ksm_config_str)?;
-
-    if router_host.starts_with("connect") {
-        return Ok(router_host.replace("connect", "krelay"));
-    }
-    warn!("Router host is not what was is expected: {router_host}");
-    Ok(Err(Box::new(KRouterError(format!(
-        "Invalid router host: {router_host}"
-    ))))?)
 }
 
 // Main router request function

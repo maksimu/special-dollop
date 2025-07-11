@@ -1,3 +1,6 @@
+use anyhow::Result;
+use bytes::Bytes;
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -7,17 +10,77 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-
-use crate::{debug_hot_path, warn_hot_path};
-use anyhow::Result;
-use bytes::Bytes;
-use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn}; // Import centralized hot path macros
+use tracing::{debug, info, warn};
+
+/// Dual-stack socket binding utilities for IPv6/IPv4 compatibility
+pub mod dual_stack {
+    use anyhow::{anyhow, Result};
+    use tokio::net::UdpSocket;
+    use tracing::debug;
+
+    /// Creates a dual-stack UDP socket, preferring IPv6 but falling back to IPv4
+    /// Binds to \[::]:port first, then 0.0.0.0:port if IPv6 fails
+    pub async fn bind_udp_dual_stack(port: u16) -> Result<UdpSocket> {
+        // Try IPv6 first (dual-stack on most systems)
+        let ipv6_addr = format!("[::]:{port}");
+        match UdpSocket::bind(&ipv6_addr).await {
+            Ok(socket) => {
+                debug!("UDP bound to IPv6 dual-stack address: {}", ipv6_addr);
+                Ok(socket)
+            }
+            Err(ipv6_err) => {
+                debug!("IPv6 UDP bind failed ({}), trying IPv4", ipv6_err);
+                // Fallback to IPv4
+                let ipv4_addr = format!("0.0.0.0:{port}");
+                match UdpSocket::bind(&ipv4_addr).await {
+                    Ok(socket) => {
+                        debug!("UDP bound to IPv4 address: {}", ipv4_addr);
+                        Ok(socket)
+                    }
+                    Err(ipv4_err) => Err(anyhow!(
+                        "Failed to bind UDP socket - IPv6 error: {}, IPv4 error: {}",
+                        ipv6_err,
+                        ipv4_err
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Creates a dual-stack localhost UDP socket for testing/internal use
+    /// Binds to \[::1]:port first, then 127.0.0.1:port if IPv6 fails
+    pub async fn bind_udp_localhost(port: u16) -> Result<UdpSocket> {
+        // Try IPv6 localhost first
+        let ipv6_addr = format!("[::1]:{port}");
+        match UdpSocket::bind(&ipv6_addr).await {
+            Ok(socket) => {
+                debug!("UDP bound to IPv6 localhost: {}", ipv6_addr);
+                Ok(socket)
+            }
+            Err(ipv6_err) => {
+                debug!("IPv6 localhost UDP bind failed ({ipv6_err}), trying IPv4");
+                // Fallback to IPv4 localhost
+                let ipv4_addr = format!("127.0.0.1:{port}");
+                match UdpSocket::bind(&ipv4_addr).await {
+                    Ok(socket) => {
+                        debug!("UDP bound to IPv4 localhost: {ipv4_addr}");
+                        Ok(socket)
+                    }
+                    Err(ipv4_err) => Err(anyhow!(
+                        "Failed to bind UDP localhost socket - IPv6 error: {}, IPv4 error: {}",
+                        ipv6_err,
+                        ipv4_err
+                    )),
+                }
+            }
+        }
+    }
+}
 
 // Connection message types for channel communication
 #[derive(Debug)]
@@ -170,7 +233,7 @@ async fn backend_task_runner(
                 match backend.write_all(payload.as_ref()).await {
                     Ok(_) => {
                         if let Err(flush_err) = backend.flush().await {
-                            warn_hot_path!(
+                            warn!(
                                 channel_id = %channel_id,
                                 conn_no = conn_no,
                                 error = %flush_err,
@@ -179,7 +242,7 @@ async fn backend_task_runner(
                             break; // Exit the task on flush error
                         }
 
-                        debug_hot_path!(
+                        debug!(
                             channel_id = %channel_id,
                             conn_no = conn_no,
                             bytes_written = payload.len(),
@@ -187,7 +250,7 @@ async fn backend_task_runner(
                         );
                     }
                     Err(write_err) => {
-                        warn_hot_path!(
+                        warn!(
                             channel_id = %channel_id,
                             conn_no = conn_no,
                             error = %write_err,
@@ -313,15 +376,16 @@ impl NetworkAccessChecker {
     async fn resolve_with_minimal_allocation(
         &self,
         domain: &str,
-    ) -> Result<smallvec::SmallVec<[IpAddr; 4]>, std::io::Error> {
+    ) -> Result<smallvec::SmallVec<[IpAddr; 4]>, io::Error> {
         // **OPTIMIZATION**: Use a thread-local static buffer to avoid String allocation
         use std::fmt::Write;
 
         // Use a reasonable size buffer on the stack for most hostnames
+        // Use port 0 which works for DNS resolution but doesn't assume a specific service
         let mut buffer = heapless::String::<256>::new();
-        if write!(&mut buffer, "{domain}:80").is_err() {
+        if write!(&mut buffer, "{domain}:0").is_err() {
             // Domain name too long for stack buffer, fall back to heap allocation
-            let addrs = tokio::net::lookup_host(format!("{domain}:80")).await?;
+            let addrs = tokio::net::lookup_host(format!("{domain}:0")).await?;
             return Ok(addrs.map(|addr| addr.ip()).collect());
         }
 
@@ -370,13 +434,13 @@ impl NetworkAccessChecker {
 
         // **ZERO-ALLOCATION HOT PATH 3**: Direct IP check
         if let Ok(ip) = domain_name_or_ip.parse::<IpAddr>() {
-            if self.is_ip_allowed_fast(ip) {
+            return if self.is_ip_allowed_fast(ip) {
                 let mut ips = smallvec::SmallVec::new();
                 ips.push(ip);
-                return Some(ips);
+                Some(ips)
             } else {
-                return None;
-            }
+                None
+            };
         }
 
         // **DNS PATH**: Check if resolved IPs match allowed networks

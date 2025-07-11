@@ -29,7 +29,6 @@ impl Channel {
     /// Handle a UDP associate request from server side
     pub(crate) async fn handle_udp_associate(&mut self, data: &[u8]) -> Result<()> {
         use bytes::Buf;
-        use tokio::net::UdpSocket;
 
         if data.len() < CONN_NO_LEN + 2 {
             return Err(anyhow!("UdpAssociate message too short"));
@@ -43,8 +42,8 @@ impl Channel {
                "Client received UdpAssociate for connection {} with relay port {}", 
                conn_no, relay_port);
 
-        // Create UDP socket for this association
-        let udp_socket = UdpSocket::bind("127.0.0.1:0").await?;
+        // Create UDP socket for this association using dual-stack binding
+        let udp_socket = crate::models::dual_stack::bind_udp_localhost(0).await?;
         let local_addr = udp_socket.local_addr()?;
 
         info!(
@@ -429,8 +428,6 @@ pub(crate) async fn forward_udp_packet_to_destination(
     conn_no: u32,
     channel: &Channel,
 ) -> Result<()> {
-    use tokio::net::UdpSocket;
-
     let udp_associations = channel.udp_associations.clone();
     let udp_conn_index = channel.udp_conn_index.clone();
 
@@ -448,8 +445,8 @@ pub(crate) async fn forward_udp_packet_to_destination(
             bytes_sent, dest_addr, conn_no
         );
     } else {
-        // Create new UDP socket and association
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        // Create new UDP socket and association using dual-stack binding
+        let socket = Arc::new(crate::models::dual_stack::bind_udp_dual_stack(0).await?);
 
         // Send the packet immediately
         let bytes_sent = socket.send_to(payload, dest_addr).await?;

@@ -220,7 +220,10 @@ async fn test_server_mode_data_flow() -> Result<()> {
 #[tokio::test]
 async fn test_client_mode_data_flow() -> Result<()> {
     // Set up a mock TCP server to represent the remote host
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+        Ok(listener) => listener,
+        Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+    };
     let server_addr = listener.local_addr()?;
     println!("Mock TCP server listening on: {}", server_addr);
 

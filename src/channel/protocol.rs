@@ -182,8 +182,10 @@ impl Channel {
             return Ok(());
         }
 
-        // Close the connection
-        self.close_backend(target_connection_no, reason).await?;
+        // Close the connection WITHOUT sending another CloseConnection message
+        // This prevents feedback loops where both sides keep sending CloseConnection messages
+        self.internal_close_backend_no_message(target_connection_no, reason)
+            .await?;
 
         // Clean up any UDP associations for this connection
         self.cleanup_udp_associations_for_connection(target_connection_no)

@@ -752,6 +752,9 @@ impl Tube {
         callback_token: String,
         client_version: &str,
     ) -> std::result::Result<(), String> {
+        if self.is_server_mode_context {
+            return Ok(());
+        }
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
             debug!(
                 "TEST MODE: Skipping report_connection_open for ksm_config: {}",
@@ -788,6 +791,9 @@ impl Tube {
         callback_token: String,
         client_version: &str,
     ) -> std::result::Result<(), String> {
+        if self.is_server_mode_context {
+            return Ok(());
+        }
         if ksm_config.starts_with("TEST_MODE_KSM_CONFIG_") {
             debug!(
                 "TEST MODE: Skipping report_connection_close for ksm_config: {}",
@@ -940,14 +946,13 @@ impl Tube {
         let runtime_clone = self.runtime.clone();
         let tube_id_for_spawn = self.id.clone(); // Clone self.id here to make it 'static
         let peer_connection_for_spawn = Arc::clone(&self.peer_connection); // Clone peer_connection
-
         info!(tube_id = %self.id, channel_name = %name_clone, "create_channel: Spawning channel.run() task.");
         let tube_arc = Arc::new(self.clone()); // Single Arc wrapping for callbacks
         runtime_clone.spawn(async move {
             // Use the cloned tube_id_for_spawn which is 'static
             debug!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "create_channel: channel.run() task started.");
 
-            // Send connection_open callback when a channel starts running
+            // Only send connection_open callback for client mode channels
             if let Err(e) = tube_arc.send_connection_open_callback(&name_clone).await {
                 warn!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send connection_open callback: {}", e);
             }
@@ -1152,7 +1157,6 @@ impl Tube {
             let channels_guard = self.active_channels.read().await;
             channels_guard.keys().cloned().collect()
         };
-
         for channel_name in &channel_names {
             if let Err(e) = self.send_connection_close_callback(channel_name).await {
                 warn!(tube_id = %self.id, channel_name = %channel_name, "Failed to send connection_close callback during tube closure: {}", e);
@@ -1291,6 +1295,9 @@ impl Tube {
 
     // Send connection_open callback for a specific channel
     pub async fn send_connection_open_callback(&self, channel_name: &str) -> Result<()> {
+        if self.is_server_mode_context {
+            return Ok(());
+        }
         let channels_guard = self.active_channels.read().await;
         if let Some(metadata) = channels_guard.get(channel_name) {
             if let (Some(ref ksm_config), Some(ref callback_token)) =
@@ -1340,6 +1347,9 @@ impl Tube {
 
     // Send connection_close callback for a specific channel
     pub async fn send_connection_close_callback(&self, channel_name: &str) -> Result<()> {
+        if self.is_server_mode_context {
+            return Ok(());
+        }
         let channels_guard = self.active_channels.read().await;
         if let Some(metadata) = channels_guard.get(channel_name) {
             if let (Some(ref ksm_config), Some(ref callback_token)) =

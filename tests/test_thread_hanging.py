@@ -370,20 +370,22 @@ class TestThreadHanging(BaseWebRTCTest, unittest.TestCase):
         
         tube1_info = registry.create_tube(
             conversation_id="hanging-test-1",
-            ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
             callback_token="TEST_MODE_CALLBACK_TOKEN",
-            client_version="ms16.5.0"
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config="TEST_MODE_KSM_CONFIG"
         )
         
         tube2_info = registry.create_tube(
             conversation_id="hanging-test-2",
-            ksm_config="TEST_MODE_KSM_CONFIG",
             settings=settings,
             trickle_ice=True,
             callback_token="TEST_MODE_CALLBACK_TOKEN",
-            client_version="ms16.5.0"
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config="TEST_MODE_KSM_CONFIG"
         )
         
         # Verify tubes were created

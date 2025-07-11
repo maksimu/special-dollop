@@ -121,12 +121,13 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         # Create a server tube
         server_tube_info = self.tube_registry.create_tube(
             conversation_id="performance-test-server",
-            ksm_config=TEST_KSM_CONFIG,
             settings=settings,
             trickle_ice=True,
             callback_token=TEST_CALLBACK_TOKEN,
-            signal_callback=self._signal_handler,
-            client_version="ms16.5.0"
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config=TEST_KSM_CONFIG,
+            signal_callback=self._signal_handler
         )
         
         # Get the offer from a server
@@ -138,13 +139,14 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         # Create a client tube with the offer
         client_tube_info = self.tube_registry.create_tube(
             conversation_id="performance-test-client",
-            ksm_config=TEST_KSM_CONFIG,
             settings=settings,
             trickle_ice=True,
             callback_token=TEST_CALLBACK_TOKEN,
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config=TEST_KSM_CONFIG,
             offer=offer,
-            signal_callback=self._signal_handler,
-            client_version="ms16.5.0"
+            signal_callback=self._signal_handler
         )
         
         # Get the answer from a client
@@ -242,12 +244,13 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             logging.info(f"[E2E_Test] Creating server tube with settings: {server_settings}")
             server_tube_info = self.tube_registry.create_tube(
                 conversation_id=server_conv_id,
-                ksm_config=TEST_KSM_CONFIG, 
                 settings=server_settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
-                signal_callback=self._signal_handler,
-                client_version="ms16.5.0"
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG,
+                signal_callback=self._signal_handler
             )
             self.assertIsNotNone(server_tube_info, "Server tube creation failed")
             server_offer_sdp = server_tube_info['offer']
@@ -269,13 +272,14 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             logging.info(f"[E2E_Test] Creating client tube with offer and settings: {client_settings}")
             client_tube_info = self.tube_registry.create_tube(
                 conversation_id=client_conv_id,
-                ksm_config=TEST_KSM_CONFIG,
                 settings=client_settings,
                 trickle_ice=True,
                 callback_token=TEST_CALLBACK_TOKEN,
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG,
                 offer=server_offer_sdp,
-                signal_callback=self._signal_handler,
-                client_version="ms16.5.0"
+                signal_callback=self._signal_handler
             )
             self.assertIsNotNone(client_tube_info, "Client tube creation failed")
             client_answer_sdp = client_tube_info['answer']
@@ -430,11 +434,12 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         # Create a server tube with non-trickle ICE
         server_tube_info = self.tube_registry.create_tube(
             conversation_id="fragmentation-test-server",
-            ksm_config=TEST_KSM_CONFIG,
             settings=settings,
             trickle_ice=False,  # Use non-trickle ICE
             callback_token=TEST_CALLBACK_TOKEN,
-            client_version="ms16.5.0"
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config=TEST_KSM_CONFIG
         )
         
         # Get the offer from a server
@@ -457,12 +462,13 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         client_settings = {"conversationType": "tunnel"} # Ensure the client also has its own settings if needed
         client_tube_info = self.tube_registry.create_tube(
             conversation_id="fragmentation-test-client",
-            ksm_config=TEST_KSM_CONFIG,
             settings=client_settings, # Pass original settings, not modified ones
             trickle_ice=False,  # Use non-trickle ICE
             callback_token=TEST_CALLBACK_TOKEN,
-            offer=offer_b64, # Pass the original base64 encoded offer
-            client_version="ms16.5.0"
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config=TEST_KSM_CONFIG,
+            offer=offer_b64 # Pass the original base64 encoded offer
         )
         
         # Get the answer from a client

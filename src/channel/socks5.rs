@@ -348,6 +348,28 @@ pub(crate) async fn send_socks5_response(
     Ok(())
 }
 
+/// Send a SOCKS5 response to the client with IPv6 address
+pub(crate) async fn send_socks5_response_ipv6(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    rep: u8,
+    addr: &[u8; 16], // IPv6 address as 16 bytes
+    port: u16,
+    buffer_pool: &crate::buffer_pool::BufferPool,
+) -> Result<()> {
+    let mut response = buffer_pool.acquire();
+    response.clear();
+    response.put_u8(SOCKS5_VERSION);
+    response.put_u8(rep);
+    response.put_u8(0x00); // Reserved
+    response.put_u8(SOCKS5_ATYP_IPV6); // IPv6 address type
+    response.extend_from_slice(addr); // 16 bytes for IPv6
+    response.extend_from_slice(&port.to_be_bytes());
+
+    writer.write_all(&response).await?;
+    buffer_pool.release(response);
+    Ok(())
+}
+
 /// Handle a SOCKS5 UDP ASSOCIATE request
 pub(crate) async fn handle_socks5_udp_associate(
     mut reader: tokio::net::tcp::OwnedReadHalf,
@@ -358,8 +380,6 @@ pub(crate) async fn handle_socks5_udp_associate(
     buffer_pool: crate::buffer_pool::BufferPool,
     channel_id: String,
 ) -> Result<()> {
-    use tokio::net::UdpSocket;
-
     // Parse the client's desired UDP relay address (usually 0.0.0.0:0 for "any")
     let _client_udp_host = match addr_type {
         SOCKS5_ADDR_TYPE_IPV4 => {
@@ -405,8 +425,8 @@ pub(crate) async fn handle_socks5_udp_associate(
     reader.read_exact(&mut port_buf).await?;
     let _client_udp_port = u16::from_be_bytes(port_buf);
 
-    // Create UDP socket for this association (bind to localhost only for security)
-    let udp_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    // Create UDP socket for this association using dual-stack binding
+    let udp_socket = crate::models::dual_stack::bind_udp_localhost(0).await?;
     let udp_local_addr = udp_socket.local_addr()?;
 
     info!(
@@ -430,10 +450,16 @@ pub(crate) async fn handle_socks5_udp_associate(
             )
             .await?;
         }
-        std::net::IpAddr::V6(_) => {
-            // For simplicity, reject IPv6 for now
-            send_socks5_response(&mut writer, 0x08, &[0, 0, 0, 0], 0, &buffer_pool).await?;
-            return Err(anyhow!("IPv6 UDP relay not supported"));
+        std::net::IpAddr::V6(ipv6) => {
+            let octets = ipv6.octets();
+            send_socks5_response_ipv6(
+                &mut writer,
+                0x00, // Success
+                &octets,
+                local_port,
+                &buffer_pool,
+            )
+            .await?;
         }
     }
 

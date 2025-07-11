@@ -740,6 +740,77 @@ impl Channel {
         Ok(())
     }
 
+    /// Internal method for closing connections without sending a CloseConnection message
+    /// This is used when handling received CloseConnection messages to prevent feedback loops
+    pub(crate) async fn internal_close_backend_no_message(
+        &mut self,
+        conn_no: u32,
+        reason: CloseConnectionReason,
+    ) -> Result<()> {
+        let total_connections = self.conns.len();
+        let remaining_connections = self.get_connection_ids_except(conn_no);
+
+        debug!(target: "connection_lifecycle",
+              channel_id = %self.channel_id, conn_no, ?reason,
+              total_connections, ?remaining_connections,
+              "Closing connection (no message) - Connection summary");
+
+        self.internal_handle_connection_close(conn_no, reason)
+            .await?;
+
+        // For control connections or explicit cleanup, remove immediately
+        let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
+
+        if !should_delay_removal {
+            // Immediate removal using DashMap
+            if let Some((_, conn)) = self.conns.remove(&conn_no) {
+                // Shutdown the connection gracefully (closes channels and waits for tasks)
+                if let Err(e) = conn.shutdown().await {
+                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Error during connection shutdown");
+                } else {
+                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed connection and tasks");
+                }
+            }
+        } else {
+            // Delayed removal - signal shutdown but keep in map briefly for pending messages
+            if let Some(conn_ref) = self.conns.get(&conn_no) {
+                // Signal the connection to close its data channel
+                // (dropping the sender will cause the backend task to exit)
+                if !conn_ref.data_tx.is_closed() {
+                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Signaling connection to close data channel");
+                }
+            }
+
+            // Schedule delayed cleanup
+            let conns_arc = Arc::clone(&self.conns);
+            let channel_id_clone = self.channel_id.clone();
+
+            // Spawn a task to remove the connection after a grace period
+            tokio::spawn(async move {
+                // Wait a bit to allow in-flight messages to be processed
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
+
+                // Now remove from maps
+                if let Some((_, conn)) = conns_arc.remove(&conn_no) {
+                    // Shutdown the connection gracefully
+                    if let Err(e) = conn.shutdown().await {
+                        warn!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, error = %e, "Error during delayed connection shutdown");
+                    } else {
+                        debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed connection after grace period");
+                    }
+                }
+            });
+        }
+
+        if conn_no == 0 {
+            self.should_exit
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn internal_handle_connection_close(
         &mut self,
         conn_no: u32,

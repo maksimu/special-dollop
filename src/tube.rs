@@ -1,7 +1,9 @@
+use crate::buffer_pool::BufferPool;
 use crate::models::TunnelTimeouts;
 use crate::router_helpers::post_connection_state;
 use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::{setup_channel_for_data_channel, TubeStatus};
+use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
 use crate::tube_registry::SignalMessage;
 use crate::webrtc_core::{create_data_channel, WebRTCPeerConnection};
 use crate::webrtc_data_channel::WebRTCDataChannel;
@@ -68,8 +70,9 @@ impl Tube {
     pub fn new(
         is_server_mode_context: bool,
         original_conversation_id: Option<String>,
+        custom_tube_id: Option<String>,
     ) -> Result<Arc<Self>> {
-        let id = Uuid::new_v4().to_string();
+        let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();
 
         let tube = Arc::new(Self {
@@ -137,10 +140,12 @@ impl Tube {
 
         // Set up comprehensive connection state monitoring with tube lifecycle management
         let is_closing_for_tube = Arc::clone(&connection_arc.is_closing);
+        let connection_arc_for_signals = Arc::clone(&connection_arc); // Clone for signal sending
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
             let tube_clone_for_closure = tube_arc_for_pc_state.clone();
             let is_closing_for_handler = Arc::clone(&is_closing_for_tube);
+            let connection_for_signals = Arc::clone(&connection_arc_for_signals);
 
             Box::pin(async move {
                 let tube_id_log = tube_clone_for_closure.id.clone();
@@ -154,6 +159,9 @@ impl Tube {
                         // Tube status update
                         *status_clone.write().await = TubeStatus::Active;
                         debug!(tube_id = %tube_id_log, "Tube connection state changed to Active");
+                        // Send connection state changed signal to Python
+                        info!(target: "webrtc_signal", tube_id = %tube_id_log, "Sending 'connected' signal to Python");
+                        connection_for_signals.send_connection_state_changed("connected");
                     },
                     RTCPeerConnectionState::Failed => {
                         // Update the closing flag (from comprehensive monitor)
@@ -492,7 +500,11 @@ impl Tube {
                         warn!(tube_id = %tube_id_for_log, channel_label = %label_clone_for_run, "Failed to send connection_open callback: {}", e);
                     }
 
+                    // Clone the Arc so we can access it after run() consumes the channel
+                    let close_reason_arc = owned_channel.channel_close_reason.clone();
                     let run_result = owned_channel.run().await;
+                    // Get the close reason after run completes - use try_lock to avoid blocking
+                    let close_reason = close_reason_arc.try_lock().ok().and_then(|guard| *guard);
 
                     let outcome_details: String = match &run_result {
                         Ok(()) => {
@@ -524,10 +536,20 @@ impl Tube {
                     let pc_guard = peer_connection_for_signal.lock().await;
                     if let Some(pc_instance_arc) = &*pc_guard {
                         if let Some(sender) = &pc_instance_arc.signal_sender {
-                            let signal_data = serde_json::json!({
+                            let mut signal_json = serde_json::json!({
                                 "channel_id": label_clone_for_run, // The label of the channel from on_data_channel
                                 "outcome": outcome_details
-                            }).to_string();
+                            });
+                            // Add close reason if available
+                            if let Some(reason) = close_reason {
+                                signal_json["close_reason"] = serde_json::json!({
+                                    "code": reason as u16,
+                                    "name": format!("{:?}", reason),
+                                    "is_critical": reason.is_critical(),
+                                    "is_retryable": reason.is_retryable(),
+                                });
+                            }
+                            let signal_data = signal_json.to_string();
 
                             let signal_msg = SignalMessage {
                                 tube_id: tube_id_for_log.clone(),
@@ -957,7 +979,11 @@ impl Tube {
                 warn!(tube_id = %tube_id_for_spawn, channel_name = %name_clone, "Failed to send connection_open callback: {}", e);
             }
 
+            // Clone the Arc so we can access it after run() consumes the channel
+            let close_reason_arc = owned_channel.channel_close_reason.clone();
             let run_result = owned_channel.run().await;
+            // Get the close reason after run completes - use try_lock to avoid blocking
+            let close_reason = close_reason_arc.try_lock().ok().and_then(|guard| *guard);
 
             let outcome_details: String = match &run_result {
                 Ok(()) => {
@@ -989,10 +1015,20 @@ impl Tube {
             let pc_guard = peer_connection_for_spawn.lock().await;
             if let Some(pc_instance_arc) = &*pc_guard {
                 if let Some(sender) = &pc_instance_arc.signal_sender {
-                    let signal_data = serde_json::json!({
+                    let mut signal_json = serde_json::json!({
                         "channel_id": name_clone, // This is the label of the channel that finished
                         "outcome": outcome_details
-                    }).to_string();
+                    });
+                    // Add close reason if available
+                    if let Some(reason) = close_reason {
+                        signal_json["close_reason"] = serde_json::json!({
+                            "code": reason as u16,
+                            "name": format!("{:?}", reason),
+                            "is_critical": reason.is_critical(),
+                            "is_retryable": reason.is_retryable(),
+                        });
+                    }
+                    let signal_data = signal_json.to_string();
 
                     let signal_msg = SignalMessage {
                         tube_id: tube_id_for_spawn.clone(),
@@ -1040,10 +1076,37 @@ impl Tube {
 
     // Close a specific channel by signaling its run loop to exit
     pub(crate) async fn close_channel(&self, name: &str) -> Result<()> {
+        // First, try to send a CloseConnection message with AdminClosed reason
+        // This ensures the remote side knows it was an administrative closure
+        let data_channels = self.data_channels.read().await;
+        if let Some(channel) = data_channels.get(name) {
+            // Send CloseConnection for the control connection with AdminClosed reason
+            let mut close_data = Vec::with_capacity(6);
+            close_data.extend_from_slice(&0u32.to_be_bytes()); // conn_no 0 (control connection)
+            close_data
+                .extend_from_slice(&(CloseConnectionReason::AdminClosed as u16).to_be_bytes());
+
+            // We need a buffer pool for frame creation
+            let buffer_pool = BufferPool::default();
+            let close_frame = Frame::new_control_with_pool(
+                ControlMessage::CloseConnection,
+                &close_data,
+                &buffer_pool,
+            );
+
+            let encoded = close_frame.encode_with_pool(&buffer_pool);
+            let _ = channel.send(encoded).await; // Ignore errors if channel is already closing
+        }
+        drop(data_channels);
+
+        // Then signal the channel to exit
         let mut signals = self.channel_shutdown_signals.write().await;
         if let Some(signal_arc) = signals.remove(name) {
             // Remove from the map once signaled
-            info!("Tube {}: Signaling channel '{}' to close.", self.id, name);
+            info!(
+                "Tube {}: Signaling channel '{}' to close with AdminClosed reason.",
+                self.id, name
+            );
             signal_arc.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         } else {

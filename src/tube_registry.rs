@@ -231,7 +231,69 @@ impl TubeRegistry {
         ksm_config: Option<&str>,
         client_version: &str,
         signal_sender: UnboundedSender<SignalMessage>,
+        tube_id: Option<String>,
     ) -> Result<HashMap<String, String>> {
+        // Check if tube_id is provided and already exists
+        if let Some(ref provided_tube_id) = tube_id {
+            if let Some(existing_tube) = self.get_by_tube_id(provided_tube_id) {
+                // Tube already exists, use it
+                info!(target: "tube_lifecycle", tube_id = %provided_tube_id, conversation_id = %conversation_id, "Using existing tube for conversation");
+
+                // Associate this conversation_id with the existing tube
+                self.associate_conversation(provided_tube_id, conversation_id)?;
+
+                // Register the signal channel for this tube
+                self.signal_channels
+                    .insert(provided_tube_id.clone(), signal_sender);
+
+                // Create a new data channel for this conversation on the existing tube
+                let ksm_config_for_channel = ksm_config.unwrap_or("").to_string();
+                match existing_tube
+                    .create_data_channel(
+                        conversation_id,
+                        ksm_config_for_channel.clone(),
+                        callback_token.to_string(),
+                        client_version,
+                    )
+                    .await
+                {
+                    Ok(data_channel) => {
+                        // Create the logical channel handler
+                        match existing_tube
+                            .create_channel(
+                                conversation_id,
+                                &data_channel,
+                                None,
+                                settings.clone(),
+                                Some(callback_token.to_string()),
+                                Some(ksm_config_for_channel),
+                                Some(client_version.to_string()),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(target: "tube_lifecycle", tube_id = %provided_tube_id, conversation_id = %conversation_id, "Successfully created new channel on existing tube");
+                            }
+                            Err(e) => {
+                                warn!(target: "tube_lifecycle", tube_id = %provided_tube_id, conversation_id = %conversation_id, "Failed to create logical channel on existing tube: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: "tube_lifecycle", tube_id = %provided_tube_id, conversation_id = %conversation_id, "Failed to create data channel on existing tube: {}", e);
+                    }
+                }
+
+                // Return basic information about the existing tube
+                let mut result_map = HashMap::new();
+                result_map.insert("tube_id".to_string(), provided_tube_id.clone());
+                // Note: We don't generate new offer/answer for existing tubes
+                // The caller should handle WebRTC signaling separately if needed
+
+                return Ok(result_map);
+            }
+        }
+
         let initial_offer_sdp_decoded = if let Some(ref b64_offer) = initial_offer_sdp {
             let bytes = BASE64_STANDARD
                 .decode(b64_offer)
@@ -246,7 +308,7 @@ impl TubeRegistry {
 
         let is_server_mode = initial_offer_sdp_decoded.is_none();
 
-        let tube_arc = Tube::new(is_server_mode, Some(conversation_id.to_string()))?;
+        let tube_arc = Tube::new(is_server_mode, Some(conversation_id.to_string()), tube_id)?;
         let tube_id = tube_arc.id();
 
         self.add_tube(Arc::clone(&tube_arc));
@@ -567,160 +629,6 @@ impl TubeRegistry {
                 })
             }
         }
-    }
-
-    /// Register a channel and set up a data channel on an EXISTING tube.
-    /// This function assumes the tube and its peer connection are already established.
-    #[allow(dead_code)]
-    pub(crate) async fn register_channel(
-        &mut self,
-        channel_id: &str,
-        tube_id: &str,
-        settings: &HashMap<String, serde_json::Value>,
-        client_version: &str,
-    ) -> Result<()> {
-        self.associate_conversation(tube_id, channel_id)?;
-
-        let tube = match self.get_by_tube_id(tube_id) {
-            Some(existing_tube) => existing_tube,
-            None => return Err(anyhow::anyhow!("Tube not found: {}", tube_id)),
-        };
-
-        // Check for required configuration keys for creating data channel and channel context
-        let ksm_config = settings
-            .get("ksm_config")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("ksm_config is not a string in settings for register_channel"))?
-            .to_string();
-        let callback_token = settings
-            .get("callback_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                anyhow!("callback_token is not a string in settings for register_channel")
-            })?
-            .to_string();
-
-        // Create a data channel for this new logical channel
-        let data_channel = tube
-            .create_data_channel(
-                channel_id,
-                ksm_config.clone(),
-                callback_token.clone(),
-                client_version,
-            )
-            .await?;
-
-        // Create the logical channel handler
-        tube.create_channel(
-            channel_id,
-            &data_channel,
-            None,
-            settings.clone(),
-            Some(callback_token),
-            Some(ksm_config),
-            Some(client_version.to_string()),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Create a new connection, either using an existing tube or creating a new one
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn new_connection(
-        &mut self,
-        tube_id: Option<&str>,
-        channel_id: &str,
-        settings: HashMap<String, serde_json::Value>,
-        initial_offer_sdp: Option<String>,
-        trickle_ice: Option<bool>,
-        signal_sender: Option<UnboundedSender<SignalMessage>>,
-        client_version: &str,
-    ) -> Result<String> {
-        let the_tube_id_str;
-        let new_tube_created;
-
-        match tube_id {
-            Some(id) => {
-                if !self.tubes_by_id.contains_key(id) {
-                    return Err(anyhow!("Tube not found: {}", id));
-                }
-                the_tube_id_str = id.to_string();
-                new_tube_created = false;
-            }
-            None => {
-                // When creating a new tube, trickle_ice and signal_sender are required
-                let trickle_ice_value = trickle_ice
-                    .ok_or_else(|| anyhow!("trickle_ice is required when creating a new tube"))?;
-                let signal_sender_value = signal_sender
-                    .ok_or_else(|| anyhow!("signal_sender is required when creating a new tube"))?;
-
-                // Create a new tube. This will set up its peer connection via self.create_tube.
-                // We need to call self.create_tube here, not just Tube::new(),
-                // so that it goes through the full setup including signal channel registration for the E2E test.
-                // The ksm_config, krelay_server and callback_token for create_tube will come from settings for this new_connection call.
-                let callback_token_for_new_tube = settings
-                    .get("callback_token")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow!("callback_token missing in settings for new_connection/new_tube")
-                    })?
-                    .to_string();
-
-                let krelay_server_for_new_tube = settings
-                    .get("krelay_server")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow!("krelay_server missing in settings for new_connection/new_tube")
-                    })?
-                    .to_string();
-
-                // ksm_config is optional, only required in client mode
-                let ksm_config_for_new_tube = settings.get("ksm_config").and_then(|v| v.as_str());
-
-                let response_map = self
-                    .create_tube(
-                        channel_id,
-                        settings.clone(),
-                        initial_offer_sdp,
-                        trickle_ice_value,
-                        &callback_token_for_new_tube,
-                        &krelay_server_for_new_tube,
-                        ksm_config_for_new_tube,
-                        client_version,
-                        signal_sender_value,
-                    )
-                    .await?;
-                the_tube_id_str = response_map
-                    .get("tube_id")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Tube_id missing"))?;
-                new_tube_created = true;
-            }
-        };
-
-        // If an existing tube was used, we still need to register this new channel_id on it.
-        // If a new tube was created, create_tube already made a data channel and logical channel for channel_id.
-        // So, only call register_channel if we are adding a channel to an *existing* tube.
-        if !new_tube_created {
-            self.register_channel(channel_id, &the_tube_id_str, &settings, client_version)
-                .await?;
-        } else {
-            // If a new tube was created, create_tube already handled the initial channel creation for channel_id.
-            // We might still need to associate the conversation_id (channel_id) with the tube if create_tube
-            // used a different primary identifier for the tube's initial data channel.
-            // However, create_tube already does: self.associate_conversation(&tube.id(), conversation_id)?;
-            // where conversation_id is the channel_id passed to new_connection. So this should be covered.
-            info!(
-                target: "tube_lifecycle",
-                tube_id = %the_tube_id_str,
-                channel_id = %channel_id,
-                "New tube created by new_connection, initial channel set up by create_tube."
-            );
-        }
-
-        Ok(the_tube_id_str)
     }
 
     /// Add an ICE candidate received from the external source

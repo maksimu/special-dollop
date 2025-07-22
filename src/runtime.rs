@@ -45,7 +45,6 @@ impl Drop for DropGuard {
         let count = RUNTIME_MANAGER
             .reference_count
             .fetch_sub(1, Ordering::SeqCst);
-        eprintln!("RUNTIME: Reference dropped, remaining count: {}", count - 1);
 
         if count == 1 {
             // This was the last reference
@@ -101,9 +100,6 @@ impl RuntimeManager {
             *state = Some(new_runtime.clone());
             new_runtime
         };
-
-        let count = self.reference_count.fetch_add(1, Ordering::SeqCst);
-        eprintln!("RUNTIME: New reference created, count: {}", count + 1);
 
         RuntimeHandle {
             runtime: runtime.clone(),

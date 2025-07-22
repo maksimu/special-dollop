@@ -122,6 +122,9 @@ pub struct Channel {
     conn_closed_rx: Option<mpsc::UnboundedReceiver<(u32, String)>>,
     // Stores the conn_no of the primary Guacd data connection
     pub(crate) primary_guacd_conn_no: Arc<Mutex<Option<u32>>>,
+
+    // Store the close reason when control connection closes
+    pub(crate) channel_close_reason: Arc<Mutex<Option<CloseConnectionReason>>>,
     // Callback token for router communication
     pub(crate) callback_token: Option<String>,
     // KSM config for router communication
@@ -446,6 +449,7 @@ impl Channel {
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
             primary_guacd_conn_no: Arc::new(Mutex::new(None)),
+            channel_close_reason: Arc::new(Mutex::new(None)),
             callback_token,
             ksm_config,
             client_version,

@@ -179,6 +179,11 @@ impl Channel {
         if target_connection_no == 0 {
             self.should_exit
                 .store(true, std::sync::atomic::Ordering::Release);
+            // Store the close reason for the channel - use try_lock to avoid blocking
+            if let Ok(mut guard) = self.channel_close_reason.try_lock() {
+                *guard = Some(reason);
+            }
+            // Even if we can't store the reason, we still need to exit
             return Ok(());
         }
 

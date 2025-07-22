@@ -130,13 +130,11 @@ This implementation provides a **Tube-based abstraction** over WebRTC:
 
 ### **Core Methods**
 
-- `create_tube(conversation_id, settings, ...)` - Create a new secure tube
+- `create_tube(conversation_id, settings, ...)` - Create a new secure tube or add conversation to existing tube
 - `set_remote_description(tube_id, sdp, is_answer)` - Set remote SDP description
 - `add_ice_candidate(tube_id, candidate)` - Add ICE candidate for connection
 - `get_connection_state(tube_id)` - Get current connection state
-- `new_connection(tube_id, connection_id, settings)` - Add connection to existing tube
-- `create_channel(connection_id, tube_id, settings)` - Create channel on tube
-- `close_connection(tube_id, connection_id)` - Close specific connection
+- `close_connection(connection_id)` - Close specific connection
 - `close_tube(tube_id)` - Close entire tube
 
 ### **Conversation Types**

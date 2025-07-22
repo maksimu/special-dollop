@@ -389,9 +389,17 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
                             
                 elif kind == "icecandidate":
                     peer_tube_id = self.peer_map.get(tube_id)
-                    if peer_tube_id and data:
-                        logging.info(f"Relaying ICE from {tube_id} to {peer_tube_id}")
-                        self.tube_registry.add_ice_candidate(peer_tube_id, data)
+                    if peer_tube_id:
+                        # Always relay ICE candidates, including empty ones (end-of-candidates signal)
+                        if data:  # Non-empty candidate
+                            logging.info(f"Relaying ICE candidate from {tube_id} to {peer_tube_id}")
+                        else:  # Empty candidate = end-of-candidates signal
+                            logging.info(f"Relaying end-of-candidates signal from {tube_id} to {peer_tube_id}")
+                        
+                        try:
+                            self.tube_registry.add_ice_candidate(peer_tube_id, data)
+                        except Exception as e:
+                            logging.error(f"Failed to add ICE candidate to {peer_tube_id}: {e}")
                         
         except Exception as e:
             logging.error(f"Signal handler error: {e}", exc_info=True)

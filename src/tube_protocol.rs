@@ -36,9 +36,9 @@ mod simd_optimizations {
             return false;
         }
 
-        // For single-byte terminator, just check the exact position
+        // For single-byte terminator, check the exact position
         // SIMD would be overkill for a single byte, but we use it for consistency
-        // and potential future multi-byte terminators
+        // and potential future multibyte terminators
         if expected_pos + 1 > buf.len() {
             return false;
         }
@@ -184,6 +184,29 @@ impl CloseConnectionReason {
             20 => CloseConnectionReason::UpstreamClosed,
             _ => CloseConnectionReason::Unknown,
         }
+    }
+
+    pub fn is_critical(&self) -> bool {
+        matches!(
+            self,
+            CloseConnectionReason::Error
+                | CloseConnectionReason::DecryptionFailed
+                | CloseConnectionReason::ConfigurationError
+                | CloseConnectionReason::ProtocolError
+                | CloseConnectionReason::GuacdError
+                | CloseConnectionReason::ErrorRecording
+        )
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            CloseConnectionReason::Timeout
+                | CloseConnectionReason::ConnectionLost
+                | CloseConnectionReason::ConnectionFailed
+                | CloseConnectionReason::AddressResolutionFailed
+                | CloseConnectionReason::ServerRefuse
+        )
     }
 }
 
@@ -340,7 +363,7 @@ impl Frame {
 #[cold]
 fn unlikely_parse_failure(msg: &str) {
     // Cold function for error cases - rarely executed
-    tracing::warn!(target: "protocol_parse", "Parse failure: {}", msg);
+    warn!(target: "protocol_parse", "Parse failure: {}", msg);
 }
 
 /// Try to parse the first complete frame from `buf` with SIMD optimizations.
@@ -385,7 +408,7 @@ pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
     prefetch_frame_data(buf, term_expected_pos);
 
     // **SECURITY + PERFORMANCE**: Use position-specific verification with branch prediction
-    // This completely eliminates the risk of finding terminators inside payload data
+    // This eliminates the risk of finding terminators inside payload data
     let terminator_valid = verify_terminator_at_position_simd(buf, term_expected_pos);
 
     // **BRANCH PREDICTION**: Valid frames are the overwhelming common case (99.9%+)

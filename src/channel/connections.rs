@@ -6,7 +6,7 @@ use crate::channel::guacd_parser::{
 };
 use crate::channel::types::ActiveProtocol;
 use crate::models::{Conn, StreamHalf};
-use crate::tube_protocol::{ControlMessage, Frame};
+use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
 use crate::unlikely; // Import branch prediction macros
 use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
 use crate::{trace_hot_path, trace_ultra_hot_path};
@@ -135,6 +135,8 @@ pub async fn setup_outbound_task(
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
+                reusable_control_buf
+                    .extend_from_slice(&(CloseConnectionReason::GuacdError as u16).to_be_bytes());
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
                     &mut reusable_control_buf,
@@ -155,6 +157,8 @@ pub async fn setup_outbound_task(
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
+                reusable_control_buf
+                    .extend_from_slice(&(CloseConnectionReason::GuacdError as u16).to_be_bytes());
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
                     &mut reusable_control_buf,
@@ -462,12 +466,46 @@ pub async fn setup_outbound_task(
                                                 }
                                             }
 
-                                            // Common error handling for Guacd "error" opcode
-                                            let close_payload_bytes = conn_no.to_be_bytes();
+                                            // Forward the error instruction to the other side before closing
+                                            // Extract the instruction data for forwarding
+                                            let error_instruction_slice =
+                                                &current_slice[..instruction_len];
+
+                                            // Send the error instruction immediately
+                                            let data_frame = Frame::new_data_with_pool(
+                                                conn_no,
+                                                error_instruction_slice,
+                                                &buffer_pool,
+                                            );
+                                            let encoded_data =
+                                                data_frame.encode_with_pool(&buffer_pool);
+
+                                            if send_with_event_backpressure(
+                                                encoded_data,
+                                                conn_no,
+                                                &event_sender,
+                                                &channel_id_for_task,
+                                                "Guacd error instruction forward",
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                error!(
+                                                    "Channel({}): Conn {}: Failed to forward Guacd error instruction",
+                                                    channel_id_for_task, conn_no
+                                                );
+                                            }
+
+                                            // Now send CloseConnection with GuacdError reason
                                             let mut temp_buf_for_control = buffer_pool.acquire();
                                             temp_buf_for_control.clear();
                                             temp_buf_for_control
-                                                .extend_from_slice(&close_payload_bytes);
+                                                .extend_from_slice(&conn_no.to_be_bytes());
+                                            temp_buf_for_control.extend_from_slice(
+                                                &(CloseConnectionReason::GuacdError as u16)
+                                                    .to_be_bytes(),
+                                            );
+
                                             let close_frame = Frame::new_control_with_buffer(
                                                 ControlMessage::CloseConnection,
                                                 &mut temp_buf_for_control,
@@ -740,10 +778,13 @@ pub async fn setup_outbound_task(
                                         "Channel({}): Conn {}: Error peeking/parsing Guacd instruction: {:?}. Buffer content (approx): {:?}. Closing connection.",
                                         channel_id_for_task, conn_no, e, &main_read_buffer[..std::cmp::min(main_read_buffer.len(), 100)]
                                     );
-                                    let close_payload_bytes = conn_no.to_be_bytes();
                                     let mut temp_buf_for_control = buffer_pool.acquire();
                                     temp_buf_for_control.clear();
-                                    temp_buf_for_control.extend_from_slice(&close_payload_bytes);
+                                    temp_buf_for_control.extend_from_slice(&conn_no.to_be_bytes());
+                                    temp_buf_for_control.extend_from_slice(
+                                        &(CloseConnectionReason::ProtocolError as u16)
+                                            .to_be_bytes(),
+                                    );
                                     let close_frame = Frame::new_control_with_buffer(
                                         ControlMessage::CloseConnection,
                                         &mut temp_buf_for_control,

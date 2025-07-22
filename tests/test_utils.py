@@ -81,6 +81,8 @@ class BaseWebRTCTest:
         """Exchange ICE candidates between peers"""
         logging.info(f"Starting ICE candidate exchange (timeout: {timeout}s)")
         start_time = time.time()
+        candidates_exchanged = 0
+        
         while time.time() - start_time < timeout:
             # Handle peer1's candidates
             try:
@@ -88,7 +90,11 @@ class BaseWebRTCTest:
                     candidate = self.ice_candidates1.get_nowait()
                     try:
                         peer2.add_ice_candidate(candidate)
-                        logging.info("Added ICE candidate to peer2")
+                        candidates_exchanged += 1
+                        if candidate:  # Non-empty candidate
+                            logging.info(f"Added ICE candidate to peer2 (total: {candidates_exchanged})")
+                        else:  # Empty candidate = end-of-candidates
+                            logging.info(f"Added end-of-candidates signal to peer2 (total: {candidates_exchanged})")
                     except Exception as e:
                         logging.error(f"Failed to add ICE candidate to peer2: {e}")
             except Empty:
@@ -100,7 +106,11 @@ class BaseWebRTCTest:
                     candidate = self.ice_candidates2.get_nowait()
                     try:
                         peer1.add_ice_candidate(candidate)
-                        logging.info("Added ICE candidate to peer1")
+                        candidates_exchanged += 1
+                        if candidate:  # Non-empty candidate
+                            logging.info(f"Added ICE candidate to peer1 (total: {candidates_exchanged})")
+                        else:  # Empty candidate = end-of-candidates
+                            logging.info(f"Added end-of-candidates signal to peer1 (total: {candidates_exchanged})")
                     except Exception as e:
                         logging.error(f"Failed to add ICE candidate to peer1: {e}")
             except Empty:
@@ -108,12 +118,12 @@ class BaseWebRTCTest:
 
             # Check if a connection is established
             if peer1.connection_state == "Connected" and peer2.connection_state == "Connected":
-                logging.info("Connection established during ICE exchange")
+                logging.info(f"Connection established during ICE exchange after {candidates_exchanged} candidates")
                 return True
 
             time.sleep(0.1)
 
-        logging.warning("ICE exchange timed out")
+        logging.warning(f"ICE exchange timed out after {candidates_exchanged} candidates exchanged")
         return False
 
 class AckServer(threading.Thread):

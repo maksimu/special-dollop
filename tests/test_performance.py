@@ -60,7 +60,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         logging.info(f"{self.__class__.__name__} tearDown completed.")
 
     def _signal_handler(self, signal_dict):
-        """Handles signals from the Rust layer."""
+        """Enhanced signal handler with ICE candidate buffering for missing peer mappings"""
         try:
             # This handler can be called from a Rust thread, so protect shared data
             with self._lock:
@@ -93,15 +93,29 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                 elif kind == "icecandidate":
                     peer_tube_id = self.peer_map.get(tube_id)
                     if peer_tube_id:
-                        if data: # Ensure data is not empty, empty candidate means end-of-candidates
-                            logging.info(f"PYTHON _signal_handler: Relaying ICE from {tube_id} to {peer_tube_id}. Candidate: {data}")
+                        # Always relay ICE candidates, including empty ones (end-of-candidates signal)
+                        if data:  # Non-empty candidate
+                            logging.info(f"PYTHON _signal_handler: Relaying ICE candidate from {tube_id} to {peer_tube_id}. Candidate: {data}")
+                        else:  # Empty candidate = end-of-candidates signal
+                            logging.info(f"PYTHON _signal_handler: Relaying end-of-candidates signal from {tube_id} to {peer_tube_id}")
+                        
+                        try:
                             self.tube_registry.add_ice_candidate(peer_tube_id, data)
-                        else:
-                            logging.info(f"PYTHON _signal_handler: Received end-of-candidates signal from {tube_id} for {peer_tube_id}. Not relaying empty data.")
-                    elif tube_id in self.peer_map: 
-                         logging.warning(f"PYTHON _signal_handler: Peer for {tube_id} (value: {peer_tube_id}) not fully mapped yet, ICE candidate {data[:50]}... dropped.")
+                        except Exception as e:
+                            logging.error(f"PYTHON _signal_handler: Failed to add ICE candidate to {peer_tube_id}: {e}")
                     else:
-                        logging.warning(f"PYTHON _signal_handler: No peer entry found for {tube_id} in peer_map to relay ICE candidate. Data: {data[:50]}...")
+                        # Buffer ICE candidates for missing peer mappings instead of dropping them
+                        if not hasattr(self, '_buffered_ice_candidates'):
+                            self._buffered_ice_candidates = {}
+                        if tube_id not in self._buffered_ice_candidates:
+                            self._buffered_ice_candidates[tube_id] = []
+                        self._buffered_ice_candidates[tube_id].append(data)
+                        
+                        candidate_preview = data[:50] + "..." if data and len(data) > 50 else (data or "<empty>")
+                        logging.warning(f"PYTHON _signal_handler: No peer entry found for {tube_id} in peer_map. Buffering ICE candidate. Data: {candidate_preview}")
+                        
+                        # Try to flush buffered candidates if peer mapping becomes available
+                        self._try_flush_buffered_candidates_unlocked(tube_id)
                 # else: 
                     # Potentially handle other signal kinds like 'icecandidate', 'answer' if needed by tests directly
                     # logging.debug(f"Received other signal for {tube_id}: {kind}")
@@ -110,6 +124,26 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             # Optionally re-raise if PyO3/Rust should see it, but for now, log it
             # to see if this is where the task is dying.
             # Raise # This might be needed if Rust expects to see an error propagate
+
+    def _try_flush_buffered_candidates_unlocked(self, tube_id):
+        """Try to flush buffered ICE candidates if peer mapping is now available (assumes lock is held)"""
+        try:
+            peer_tube_id = self.peer_map.get(tube_id)
+            if peer_tube_id and hasattr(self, '_buffered_ice_candidates') and tube_id in self._buffered_ice_candidates:
+                buffered_candidates = self._buffered_ice_candidates.pop(tube_id)
+                logging.info(f"PYTHON _signal_handler: Flushing {len(buffered_candidates)} buffered ICE candidates from {tube_id} to {peer_tube_id}")
+                
+                for candidate_data in buffered_candidates:
+                    try:
+                        self.tube_registry.add_ice_candidate(peer_tube_id, candidate_data)
+                        if candidate_data:
+                            logging.info(f"PYTHON _signal_handler: Flushed buffered ICE candidate from {tube_id} to {peer_tube_id}")
+                        else:
+                            logging.info(f"PYTHON _signal_handler: Flushed buffered end-of-candidates signal from {tube_id} to {peer_tube_id}")
+                    except Exception as e:
+                        logging.error(f"PYTHON _signal_handler: Failed to flush buffered ICE candidate to {peer_tube_id}: {e}")
+        except Exception as e:
+            logging.error(f"PYTHON _signal_handler: Exception flushing buffered candidates for {tube_id}: {e}", exc_info=True)
     
     @with_runtime
     def test_data_channel_load(self):
@@ -178,11 +212,16 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             "callback_token": TEST_CALLBACK_TOKEN
         } 
         
-        self.tube_registry.create_channel(
-            channel_name, # connection_id for Rust binding
-            server_id,    # tube_id for Rust binding
-            channel_settings,
-            client_version="ms16.5.0"
+        # Add a new conversation to the existing server tube
+        self.tube_registry.create_tube(
+            conversation_id=channel_name,
+            settings=channel_settings,
+            trickle_ice=True,
+            callback_token=TEST_CALLBACK_TOKEN,
+            krelay_server="test.relay.server.com",
+            client_version="ms16.5.0",
+            ksm_config=TEST_KSM_CONFIG,
+            tube_id=server_id  # Add to existing tube
         )
         
         # Clean up
@@ -226,18 +265,23 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             self.assertIsNotNone(ack_server.actual_port, "AckServer did not start or report port")
             logging.info(f"[E2E_Test] AckServer running on 127.0.0.1:{ack_server.actual_port}")
 
-            # 2. Server Tube Setup
+            # 2. Pre-populate peer map to avoid losing early ICE candidates
+            # We'll generate tube IDs and set up the mapping before creating tubes
+            server_tube_id = None
+            client_tube_id = None
+            
+            # 3. Server Tube Setup
             server_conv_id = "e2e-server-conv"
             server_settings = {
                 "conversationType": "tunnel", # As per Rust test
                 "local_listen_addr": "127.0.0.1:0" # Server tube listens here, dynamic port
             }
-            
+
             # The create_tube in Python seems to be a bit different from Rust's.
             # It might not directly expose it on_ice_candidate per-tube object in the same way.
             # We are using the BaseWebRTCTest's on_ice_candidate1/2, which is generic.
             # We need to ensure these are somehow linked or the library handles it.
-            # For now, let's assume the library's PyTubeRegistry might have a way to globally set these 
+            # For now, let's assume the library's PyTubeRegistry might have a way to globally set these
             # or that `create_tube` itself registers some internal callbacks.
             # The existing tests use self.tube_registry.get_connection_state, implying ICE is handled.
 
@@ -256,13 +300,13 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             server_offer_sdp = server_tube_info['offer']
             server_tube_id = server_tube_info['tube_id']
             server_actual_listen_addr_str = server_tube_info.get('actual_local_listen_addr') # Use .get for safety
-            
+
             self.assertIsNotNone(server_offer_sdp, "Server should generate an offer")
             self.assertIsNotNone(server_tube_id, "Server tube should have an ID")
             self.assertIsNotNone(server_actual_listen_addr_str, "Server tube should have actual_local_listen_addr")
             logging.info(f"[E2E_Test] Server tube {server_tube_id} created. Offer generated. Listening on {server_actual_listen_addr_str}")
 
-            # 3. Client Tube Setup
+            # 4. Client Tube Setup
             client_conv_id = "e2e-client-conv"
             client_settings = {
                 "conversationType": "tunnel",
@@ -289,12 +333,18 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             self.assertIsNotNone(client_tube_id, "Client tube should have an ID")
             logging.info(f"[E2E_Test] Client tube {client_tube_id} created. Answer generated.")
 
-            # Populate the peer map for ICE candidate relaying
+            # 5. Populate the peer map for ICE candidate relaying (Do this immediately after getting tube IDs)
             with self._lock:
                 self.peer_map[server_tube_id] = client_tube_id
                 self.peer_map[client_tube_id] = server_tube_id
+                
+                # Flush any buffered ICE candidates now that peer mapping is available
+                self._try_flush_buffered_candidates_unlocked(server_tube_id)
+                self._try_flush_buffered_candidates_unlocked(client_tube_id)
+                
+            logging.info(f"[E2E_Test] Peer map populated: {server_tube_id} <-> {client_tube_id}")
 
-            # 4. Signaling: Set remote description
+            # 6. Signaling: Set remote description
             # The Rust test has a more elaborate ICE exchange via signal channels.
             # Python tests rely on `wait_for_tube_connection,` which implies internal ICE handling after SDP exchange.
             logging.info(f"[E2E_Test] Server tube {server_tube_id} setting remote description (client's answer)")
@@ -304,7 +354,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             # And then `create_answer`. The Python `create_tube` with an offer likely does this too.
             # We might not need explicit `set_remote_description` on the client side if `create_tube` handles the initial offer.
 
-            # 5. Wait for connection
+            # 7. Wait for connection
             logging.info(f"[E2E_Test] Waiting for WebRTC connection between {server_tube_id} and {client_tube_id}...")
             connected = self.wait_for_tube_connection(server_tube_id, client_tube_id, timeout=20) # Increased timeout for E2E
             self.assertTrue(connected, f"WebRTC connection failed between {server_tube_id} and {client_tube_id}")
@@ -314,7 +364,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             # The Rust test waits for data channels to open. Here, we assume the connection implies data channel readiness for simplicity,
             # unless specific API calls for data channel status are available and necessary.
 
-            # 6. Simulate External Client connecting to Server Tube's local TCP endpoint
+            # 8. Simulate External Client connecting to Server Tube's local TCP endpoint
             self.assertIsNotNone(server_actual_listen_addr_str, "Server actual_local_listen_addr is None") # Check from .get()
             parts = server_actual_listen_addr_str.split(':')
             self.assertEqual(len(parts), 2, "server_actual_listen_addr_str is not in host:port format")
@@ -327,13 +377,13 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             external_client_socket.connect((server_listen_host, server_listen_port))
             logging.info("[E2E_Test] External client connected.")
 
-            # 7. Send a message from External Client
+            # 9. Send a message from External Client
             message_content = "Hello Proxied World via Python!"
             message_bytes = message_content.encode('utf-8')
             external_client_socket.sendall(message_bytes)
             logging.info(f"[E2E_Test] External client sent: '{message_content}'")
 
-            # 8. Receive acked message by External Client
+            # 10. Receive acked message by External Client
             # Expected flow: External Client -> ServerTube(TCP) -> ServerTube(WebRTC) -> ClientTube(WebRTC) 
             # -> ClientTube(TCP) -> AckServer -> ClientTube(TCP) -> ClientTube(WebRTC) 
             # -> ServerTube(WebRTC) -> ServerTube(TCP) -> External Client

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
@@ -94,8 +94,7 @@ pub struct WebRTCPeerConnection {
     pub peer_connection: Arc<RTCPeerConnection>,
     pub(crate) trickle_ice: bool,
     pub(crate) is_closing: Arc<AtomicBool>,
-    answer_sent: Arc<AtomicBool>,
-    pending_ice_candidates: Arc<Mutex<Vec<String>>>,
+    pending_incoming_ice_candidates: Arc<Mutex<Vec<String>>>, // Buffer incoming candidates until ready
     pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
     pub tube_id: String,
     pub(crate) conversation_id: Option<String>,
@@ -193,7 +192,7 @@ impl WebRTCPeerConnection {
 
         // Store the closing state and signal channel
         let is_closing = Arc::new(AtomicBool::new(false));
-        let pending_ice_candidates = Arc::new(Mutex::new(Vec::new()));
+        let pending_incoming_ice_candidates = Arc::new(Mutex::new(Vec::new()));
 
         // Create an Arc<RTCPeerConnection> first
         let pc_arc = Arc::new(peer_connection);
@@ -206,8 +205,7 @@ impl WebRTCPeerConnection {
             peer_connection: pc_arc,
             trickle_ice,
             is_closing,
-            answer_sent: Arc::new(AtomicBool::new(false)),
-            pending_ice_candidates,
+            pending_incoming_ice_candidates,
             signal_sender,
             tube_id,
             conversation_id,
@@ -230,7 +228,23 @@ impl WebRTCPeerConnection {
         self.peer_connection
             .on_ice_candidate(Box::new(|_| Box::pin(async {})));
 
-        // Set up handler for ICE candidates
+        // Set up handler for signaling state changes to flush buffered INCOMING candidates when ready
+        let self_for_signaling = self_ref.clone();
+        self.peer_connection.on_signaling_state_change(Box::new(move |state| {
+            debug!(target: "webrtc_ice", tube_id = %self_for_signaling.tube_id, "Signaling state changed to: {:?}", state);
+            let self_clone = self_for_signaling.clone();
+            Box::pin(async move {
+                // Check if both descriptions are now set, regardless of specific state
+                let local_desc = self_clone.peer_connection.local_description().await;
+                let remote_desc = self_clone.peer_connection.remote_description().await;
+                if local_desc.is_some() && remote_desc.is_some() {
+                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "Both descriptions set after signaling state change, flushing buffered INCOMING ICE candidates");
+                    self_clone.flush_buffered_incoming_ice_candidates().await;
+                }
+            })
+        }));
+
+        // Set up handler for ICE candidates - SEND IMMEDIATELY (proper trickle ICE)
         self.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
             info!(target: "webrtc_ice_internal", tube_id = %self_ref.tube_id, ?candidate, "on_ice_candidate triggered");
 
@@ -243,24 +257,53 @@ impl WebRTCPeerConnection {
                     info!(target: "webrtc_ice", tube_id = %self_clone.tube_id, candidate = %candidate_str, "ICE candidate gathered");
                     debug!(target: "webrtc_ice_verbose", tube_id = %self_clone.tube_id, candidate = %candidate_str, "New ICE candidate details");
 
-                    // Store the candidate for later use if an answer hasn't been sent
-                    if !self_clone.answer_sent.load(Ordering::Acquire) {
-                        let mut candidates_lock = self_clone.pending_ice_candidates.lock().unwrap();
-                        candidates_lock.push(candidate_str.clone());
-                        debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "Stored ICE candidate (trickle_ice: {}, answer_sent: {})", self_clone.trickle_ice, self_clone.answer_sent.load(Ordering::Acquire));
-                    }
-
-                    self_clone.send_ice_candidate(
-                        &candidate_str,
-                    );
+                    // Send immediately - no buffering on send side!
+                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "Sending ICE candidate immediately (trickle ICE)");
+                    self_clone.send_ice_candidate(&candidate_str);
                 } else {
-                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "All ICE candidates gathered (received None). Sending empty candidate signal.");
-                    self_clone.send_ice_candidate(
-                        "",
-                    );
+                    // All ICE candidates gathered (received None) - send immediately
+                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "All ICE candidates gathered (received None). Sending empty candidate signal immediately.");
+                    self_clone.send_ice_candidate("");
                 }
             })
         }));
+    }
+
+    // Method to flush buffered INCOMING ICE candidates (receive-side buffering)
+    async fn flush_buffered_incoming_ice_candidates(&self) {
+        info!(target: "webrtc_ice", tube_id = %self.tube_id, "flush_buffered_incoming_ice_candidates called");
+
+        // Take the buffered candidates with a single lock operation
+        let pending_candidates = {
+            let mut lock = self.pending_incoming_ice_candidates.lock().unwrap();
+            std::mem::take(&mut *lock)
+        };
+
+        // Add any buffered incoming candidates to the peer connection
+        if !pending_candidates.is_empty() {
+            warn!(target: "webrtc_ice", tube_id = %self.tube_id, count = pending_candidates.len(), "Flushing {} buffered incoming ICE candidates", pending_candidates.len());
+            for (index, candidate_str) in pending_candidates.iter().enumerate() {
+                if !candidate_str.is_empty() {
+                    let candidate_init = RTCIceCandidateInit {
+                        candidate: candidate_str.clone(),
+                        ..Default::default()
+                    };
+
+                    match self.peer_connection.add_ice_candidate(candidate_init).await {
+                        Ok(()) => {
+                            info!(target: "webrtc_ice", tube_id = %self.tube_id, index = index, candidate = %candidate_str, "Successfully added buffered incoming ICE candidate");
+                        }
+                        Err(e) => {
+                            error!(target: "webrtc_ice", tube_id = %self.tube_id, index = index, candidate = %candidate_str, error = %e, "Failed to add buffered incoming ICE candidate");
+                        }
+                    }
+                } else {
+                    info!(target: "webrtc_ice", tube_id = %self.tube_id, index = index, "Processed buffered end-of-candidates signal");
+                }
+            }
+        } else {
+            debug!(target: "webrtc_ice", tube_id = %self.tube_id, "No buffered incoming ICE candidates to flush");
+        }
     }
 
     // Set or update the signal channel
@@ -299,7 +342,7 @@ impl WebRTCPeerConnection {
         }
     }
 
-    // Method to send answer to router and flush-buffered candidates
+    // Method to send answer to router (no buffering - immediate sending)
     pub fn send_answer(&self, answer_sdp: &str) {
         // Only send it if we have a signal channel
         if let Some(sender) = &self.signal_sender {
@@ -322,28 +365,40 @@ impl WebRTCPeerConnection {
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
                 warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send answer signal");
-                return; // Don't process candidates if we can't send the answer
             }
         } else {
             warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for answer");
-            return; // Don't process candidates if we have no signal channel
         }
+    }
 
-        // Set the answer_sent flag
-        self.answer_sent.store(true, Ordering::Release);
+    // Method to send connection state change signals
+    pub fn send_connection_state_changed(&self, state: &str) {
+        // Only send it if we have a signal channel
+        if let Some(sender) = &self.signal_sender {
+            let _progress_flag = Some(if self.trickle_ice { 2 } else { 0 });
 
-        // Take the buffered candidates with a single lock operation
-        let pending_candidates = {
-            let mut lock = self.pending_ice_candidates.lock().unwrap();
-            std::mem::take(&mut *lock)
-        };
+            // Create the connection state changed message
+            let message = SignalMessage {
+                tube_id: self.tube_id.clone(),
+                kind: "connection_state_changed".to_string(),
+                data: state.to_string(),
+                conversation_id: self
+                    .conversation_id
+                    .clone()
+                    .unwrap_or_else(|| self.tube_id.clone()), // Use conversation_id if available, otherwise tube_id
+                progress_flag: _progress_flag,
+                progress_status: Some("OK".to_string()),
+                is_ok: Some(true),
+            };
 
-        // Send any buffered candidates
-        if !pending_candidates.is_empty() {
-            debug!(target: "webrtc_ice", count = pending_candidates.len(), "Sending buffered ICE candidates");
-            for candidate in pending_candidates {
-                self.send_ice_candidate(&candidate);
+            // Try to send it, but don't fail if the channel is closed
+            if let Err(e) = sender.send(message) {
+                warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send connection state changed signal");
+            } else {
+                info!(target: "webrtc_signal", tube_id = %self.tube_id, state = %state, "Successfully sent connection state changed signal");
             }
+        } else {
+            warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for connection state change");
         }
     }
 
@@ -589,29 +644,77 @@ impl WebRTCPeerConnection {
         Self::validate_signaling_state_transition(current_state, is_answer, false)?;
 
         // Set the remote description
-        self.peer_connection
+        let result = self
+            .peer_connection
             .set_remote_description(desc)
             .await
-            .map_err(|e| format!("Failed to set remote description: {e}"))
+            .map_err(|e| format!("Failed to set remote description: {e}"));
+
+        // If successful and we now have both descriptions set, flush buffered incoming candidates
+        if result.is_ok() {
+            let local_desc = self.peer_connection.local_description().await;
+            let remote_desc = self.peer_connection.remote_description().await;
+            if local_desc.is_some() && remote_desc.is_some() {
+                debug!(target: "webrtc_ice", tube_id = %self.tube_id, "Both descriptions now set after remote description, flushing buffered incoming ICE candidates");
+                self.flush_buffered_incoming_ice_candidates().await;
+            }
+        }
+
+        result
     }
 
     pub async fn add_ice_candidate(&self, candidate_str: String) -> Result<(), String> {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
+            warn!(target: "webrtc_ice", tube_id = %self.tube_id, "add_ice_candidate called but connection is closing");
             return Err("Connection is closing".to_string());
         }
 
-        // Create the RTCIceCandidateInit
-        let candidate_init = RTCIceCandidateInit {
-            candidate: candidate_str,
-            ..Default::default()
-        };
+        info!(target: "webrtc_ice", tube_id = %self.tube_id, candidate = %candidate_str, "add_ice_candidate called");
 
-        // Add a candidate to the peer connection
-        self.peer_connection
-            .add_ice_candidate(candidate_init)
-            .await
-            .map_err(|e| format!("Failed to add ICE candidate: {e}"))
+        // Check if we can add candidates immediately (both descriptions must be set)
+        let local_desc = self.peer_connection.local_description().await;
+        let remote_desc = self.peer_connection.remote_description().await;
+        let can_add_immediately = local_desc.is_some() && remote_desc.is_some();
+
+        info!(target: "webrtc_ice", tube_id = %self.tube_id, local_set = local_desc.is_some(), remote_set = remote_desc.is_some(), can_add_immediately = can_add_immediately, "Checking if can add ICE candidate immediately");
+
+        if can_add_immediately {
+            // Connection is ready, add the candidate immediately
+            info!(target: "webrtc_ice", tube_id = %self.tube_id, "Both descriptions set, adding incoming ICE candidate immediately");
+
+            if !candidate_str.is_empty() {
+                let candidate_init = RTCIceCandidateInit {
+                    candidate: candidate_str.clone(),
+                    ..Default::default()
+                };
+
+                match self.peer_connection.add_ice_candidate(candidate_init).await {
+                    Ok(()) => {
+                        info!(target: "webrtc_ice", tube_id = %self.tube_id, "Successfully added ICE candidate immediately");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!(target: "webrtc_ice", tube_id = %self.tube_id, error = %e, "Failed to add ICE candidate immediately");
+                        Err(format!("Failed to add ICE candidate: {e}"))
+                    }
+                }
+            } else {
+                // Empty candidate string means end-of-candidates, which is valid
+                info!(target: "webrtc_ice", tube_id = %self.tube_id, "Received end-of-candidates signal");
+                Ok(())
+            }
+        } else {
+            // Connection is not ready yet, buffer the incoming candidate
+            let mut candidates_lock = self.pending_incoming_ice_candidates.lock().unwrap();
+            candidates_lock.push(candidate_str.clone());
+            let buffered_count = candidates_lock.len();
+            drop(candidates_lock);
+
+            warn!(target: "webrtc_ice", tube_id = %self.tube_id, candidate = %candidate_str, "Descriptions not ready (local: {}, remote: {}), buffering incoming ICE candidate (total buffered: {})", 
+                   local_desc.is_some(), remote_desc.is_some(), buffered_count);
+            Ok(())
+        }
     }
 
     pub fn connection_state(&self) -> String {
@@ -679,15 +782,30 @@ impl WebRTCPeerConnection {
         Self::validate_signaling_state_transition(current_state, is_answer, true)?;
 
         // Set the local description
-        self.peer_connection
+        let result = self
+            .peer_connection
             .set_local_description(desc)
             .await
-            .map_err(|e| format!("Failed to set local description: {e}"))
+            .map_err(|e| format!("Failed to set local description: {e}"));
+
+        // If successful and we now have both descriptions set, flush buffered incoming candidates
+        if result.is_ok() {
+            let local_desc = self.peer_connection.local_description().await;
+            let remote_desc = self.peer_connection.remote_description().await;
+            if local_desc.is_some() && remote_desc.is_some() {
+                debug!(target: "webrtc_ice", tube_id = %self.tube_id, "Both descriptions now set after local description, flushing buffered incoming ICE candidates");
+                self.flush_buffered_incoming_ice_candidates().await;
+            }
+        }
+
+        result
     }
 
-    // Get all gathered ICE candidates
+    // Get buffered incoming ICE candidates (for debugging/monitoring)
     pub fn get_ice_candidates(&self) -> Vec<String> {
-        let candidates = self.pending_ice_candidates.lock().unwrap();
+        // NOTE: Outgoing candidates are sent immediately (no buffering)
+        // This returns currently buffered incoming candidates
+        let candidates = self.pending_incoming_ice_candidates.lock().unwrap();
         candidates.clone()
     }
 }

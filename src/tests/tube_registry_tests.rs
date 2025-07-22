@@ -508,6 +508,7 @@ async fn test_registry_e2e_server_client_echo(
             Some(TEST_MODE_KSM_CONFIG), // ksm_config is now optional
             "ms16.5.0",
             server_signal_tx,
+            None,
         )
         .await?;
     let server_offer = server_response
@@ -552,6 +553,7 @@ async fn test_registry_e2e_server_client_echo(
             Some(TEST_MODE_KSM_CONFIG), // ksm_config is now optional
             "ms16.5.0",
             client_signal_tx,
+            None,
         )
         .await?;
     let client_answer_sdp = client_response

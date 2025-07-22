@@ -9,6 +9,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, trace, warn};
 
+/// Helper function to safely execute async code from Python bindings
+fn safe_python_async_execute<F, R>(py: Python<'_>, future: F) -> R
+where
+    F: std::future::Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    py.allow_threads(|| {
+        // Check if we're already in a runtime context
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // We're in a runtime context, spawn the task and wait for it
+            let (tx, rx) = std::sync::mpsc::channel();
+            handle.spawn(async move {
+                let result = future.await;
+                let _ = tx.send(result);
+            });
+            // Block on the std channel receiver (safe in runtime context)
+            rx.recv().expect("Task failed to complete")
+        } else {
+            // We're not in a runtime, safe to use block_on
+            let runtime = get_runtime();
+            runtime.block_on(future)
+        }
+    })
+}
+
 /// Python bindings for the Rust TubeRegistry.
 ///
 /// This module provides a thin wrapper around the Rust TubeRegistry implementation with
@@ -356,15 +381,12 @@ impl PyTubeRegistry {
 
     /// find tube by connection ID
     fn tube_id_from_connection_id(&self, py: Python<'_>, connection_id: &str) -> Option<String> {
-        let master_runtime = get_runtime();
         let connection_id_owned = connection_id.to_string();
-        py.allow_threads(|| {
-            master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                registry
-                    .tube_id_from_conversation_id(&connection_id_owned)
-                    .cloned()
-            })
+        safe_python_async_execute(py, async move {
+            let registry = REGISTRY.read().await;
+            registry
+                .tube_id_from_conversation_id(&connection_id_owned)
+                .cloned()
         })
     }
 
@@ -392,6 +414,7 @@ impl PyTubeRegistry {
         ksm_config = None,
         offer = None,
         signal_callback = None,
+        tube_id = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create_tube(
@@ -406,6 +429,7 @@ impl PyTubeRegistry {
         ksm_config: Option<&str>,
         offer: Option<&str>,
         signal_callback: Option<PyObject>,
+        tube_id: Option<&str>,
     ) -> PyResult<PyObject> {
         let master_runtime = get_runtime();
 
@@ -428,6 +452,7 @@ impl PyTubeRegistry {
         let krelay_server_owned = krelay_server.to_string();
         let ksm_config_owned = ksm_config.map(String::from);
         let client_version_owned = client_version.to_string();
+        let tube_id_owned = tube_id.map(String::from);
 
         // This outer block_on will handle the call to the registry's create_tube and setup signal handler
         let creation_result_map = py.allow_threads(|| {
@@ -448,6 +473,7 @@ impl PyTubeRegistry {
                     ksm_config_owned.as_deref(),
                     &client_version_owned,
                     signal_sender_rust, // Pass the sender part of the MPSC channel
+                    tube_id_owned,
                 ).await
                  .map_err(|e| {
                     error!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube CRITICAL FAILURE: {e}");
@@ -556,13 +582,13 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.to_string();
         let candidate_owned = candidate;
 
-        // Spawn the async work onto the runtime, don't block the current (potentially Tokio worker) thread
         master_runtime.spawn(async move {
             let registry = REGISTRY.read().await;
             if let Err(e) = registry.add_external_ice_candidate(&tube_id_owned, &candidate_owned).await {
-                warn!(target: "python_bindings", "Error in spawned add_ice_candidate for tube {}: {}", tube_id_owned, e);
+                warn!(target: "python_bindings", "Error adding ICE candidate for tube {}: {}", tube_id_owned, e);
             }
         });
+
         Ok(())
     }
 
@@ -583,230 +609,82 @@ impl PyTubeRegistry {
         })
     }
 
-    /// Add a connection
-    #[pyo3(signature = (
-        tube_id,
-        connection_id,
-        settings,
-        offer = None,
-        trickle_ice = false,
-        client_version = None,
-        signal_callback = None,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn new_connection(
-        &self,
-        py: Python<'_>,
-        tube_id: Option<&str>,
-        connection_id: &str,
-        settings: PyObject,
-        offer: Option<&str>,
-        trickle_ice: bool,
-        client_version: Option<&str>,
-        signal_callback: Option<PyObject>,
-    ) -> PyResult<String> {
-        let master_runtime = get_runtime();
-
-        // Validate that client_version is provided
-        let client_version = client_version.ok_or_else(|| {
-            PyRuntimeError::new_err("client_version is required and must be provided")
-        })?;
-
-        let settings_json = pyobj_to_json_hashmap(py, &settings)?;
-
-        // Conditionally prepare for signal handling if a new tube is created with a callback
-        let mut opt_signal_sender_for_rust: Option<
-            tokio::sync::mpsc::UnboundedSender<crate::tube_registry::SignalMessage>,
-        > = None;
-        let mut opt_signal_receiver_for_handler: Option<
-            tokio::sync::mpsc::UnboundedReceiver<crate::tube_registry::SignalMessage>,
-        > = None;
-        let mut cb_obj_for_handler: Option<PyObject> = None;
-
-        if tube_id.is_none() {
-            // If creating a new tube
-            if let Some(cb_provided) = signal_callback {
-                let (tx, rx) = unbounded_channel();
-                opt_signal_sender_for_rust = Some(tx);
-                opt_signal_receiver_for_handler = Some(rx);
-                cb_obj_for_handler = Some(cb_provided.clone_ref(py)); // Clone for the handler task
-            }
-        }
-
-        let offer_string = offer.map(String::from);
-        let connection_id_owned = connection_id.to_string();
-        let tube_id_for_rust = tube_id.map(String::from);
-
-        let result_new_tube_id = py.allow_threads(|| {
-            master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
-                registry
-                    .new_connection(
-                        tube_id_for_rust.as_deref(),
-                        &connection_id_owned,
-                        settings_json,
-                        offer_string,
-                        Some(trickle_ice),
-                        opt_signal_sender_for_rust,
-                        client_version,
-                    )
-                    .await
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to create connection: {e}"))
-                    })
-            })
-        })?;
-
-        // If a new tube was created, and we have a receiver and callback, set up the handler
-        if tube_id.is_none() {
-            if let (Some(receiver), Some(cb)) =
-                (opt_signal_receiver_for_handler, cb_obj_for_handler)
-            {
-                setup_signal_handler(
-                    result_new_tube_id.clone(),
-                    receiver,
-                    master_runtime.clone(),
-                    cb,
-                );
-            }
-        }
-
-        Ok(result_new_tube_id)
-    }
-
     /// Close a specific connection on a tube
     #[pyo3(signature = (
         connection_id,
     ))]
     fn close_connection(&self, py: Python<'_>, connection_id: &str) -> PyResult<()> {
-        let master_runtime = get_runtime();
         let connection_id_owned = connection_id.to_string();
 
-        py.allow_threads(move || {
-            master_runtime.clone().block_on(async move {
-                // Get tube reference while holding registry lock, then release lock
-                let tube_arc = {
-                    let registry = REGISTRY.read().await;
+        safe_python_async_execute(py, async move {
+            // Get tube reference while holding registry lock, then release lock
+            let tube_arc = {
+                let registry = REGISTRY.read().await;
 
-                    // Look up the tube ID from the connection ID
-                    let tube_id_owned =
-                        match registry.tube_id_from_conversation_id(&connection_id_owned) {
-                            Some(tube_id) => tube_id.clone(),
-                            None => {
-                                return Err(PyRuntimeError::new_err(format!(
-                                    "Rust: No tube found for connection ID: {connection_id_owned}"
-                                )));
-                            }
-                        };
-
-                    // Get tube reference before releasing the lock
-                    match registry.get_by_tube_id(&tube_id_owned) {
-                        Some(tube) => tube.clone(), // Clone the Arc to keep reference
+                // Look up the tube ID from the connection ID
+                let tube_id_owned =
+                    match registry.tube_id_from_conversation_id(&connection_id_owned) {
+                        Some(tube_id) => tube_id.clone(),
                         None => {
                             return Err(PyRuntimeError::new_err(format!(
-                                "Rust: Tube not found {tube_id_owned} during close_connection for connection {connection_id_owned}"
+                                "Rust: No tube found for connection ID: {connection_id_owned}"
                             )));
                         }
-                    }
-                    // Registry lock is automatically released here
-                };
+                    };
 
-                // Now call close_channel without holding any registry locks
-                tube_arc
-                    .close_channel(&connection_id_owned)
-                    .await
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!(
-                            "Rust: Failed to close connection {connection_id_owned}: {e}"
-                        ))
-                    })
-            })
+                // Get tube reference before releasing the lock
+                match registry.get_by_tube_id(&tube_id_owned) {
+                    Some(tube) => tube.clone(), // Clone the Arc to keep reference
+                    None => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "Rust: Tube not found {tube_id_owned} during close_connection for connection {connection_id_owned}"
+                        )));
+                    }
+                }
+                // Registry lock is automatically released here
+            };
+
+            // Now call close_channel without holding any registry locks
+            tube_arc
+                .close_channel(&connection_id_owned)
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Rust: Failed to close connection {connection_id_owned}: {e}"
+                    ))
+                })
         })
     }
 
     /// Close an entire tube
     fn close_tube(&self, py: Python<'_>, tube_id: &str) -> PyResult<()> {
-        let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
 
-        py.allow_threads(move || {
-            master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
-                registry.close_tube(&tube_id_owned).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "Rust: Failed to close tube {tube_id_owned}: {e}"
-                    ))
-                })
+        safe_python_async_execute(py, async move {
+            let mut registry = REGISTRY.write().await;
+            registry.close_tube(&tube_id_owned).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Rust: Failed to close tube {tube_id_owned}: {e}"))
             })
         })
     }
 
-    /// Create a channel on a tube
-    #[pyo3(signature = (
-        connection_id,
-        tube_id,
-        settings,
-        client_version = None,
-        signal_callback = None,
-    ))]
-    fn create_channel(
-        &self,
-        py: Python<'_>,
-        connection_id: &str,
-        tube_id: &str,
-        settings: PyObject,
-        client_version: Option<&str>,
-        signal_callback: Option<PyObject>,
-    ) -> PyResult<()> {
-        let master_runtime = get_runtime();
-
-        // Validate that client_version is provided
-        let client_version = client_version.ok_or_else(|| {
-            PyRuntimeError::new_err("client_version is required and must be provided")
-        })?;
-
-        let settings_json = pyobj_to_json_hashmap(py, &settings)?;
-        let tube_id_owned = tube_id.to_string();
-        let connection_id_owned = connection_id.to_string();
-
-        if signal_callback.is_some() {
-            warn!(target: "python_bindings", "PyTubeRegistry.create_channel was called with a signal_callback, but this is currently ignored for existing tubes.");
-        }
-
-        py.allow_threads(move || {
-            master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
-                registry
-                    .register_channel(&connection_id_owned, &tube_id_owned, &settings_json, client_version)
-                    .await
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!(
-                            "Rust: Failed to register channel {connection_id_owned} on tube {tube_id_owned}: {e}"
-                        ))
-                    })
-            })
-        })
-    }
-
+    ///
     /// Get a tube object by conversation ID
     fn get_tube_id_by_conversation_id(
         &self,
         py: Python<'_>,
         conversation_id: &str,
     ) -> PyResult<String> {
-        let master_runtime = get_runtime();
         let conversation_id_owned = conversation_id.to_string();
-        py.allow_threads(|| {
-            master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_conversation_id(&conversation_id_owned) {
-                    Ok(tube.id().to_string())
-                } else {
-                    Err(PyRuntimeError::new_err(format!(
-                        "No tube found for conversation: {conversation_id_owned}"
-                    )))
-                }
-            })
+        safe_python_async_execute(py, async move {
+            let registry = REGISTRY.read().await;
+            if let Some(tube) = registry.get_by_conversation_id(&conversation_id_owned) {
+                Ok(tube.id().to_string())
+            } else {
+                Err(PyRuntimeError::new_err(format!(
+                    "No tube found for conversation: {conversation_id_owned}"
+                )))
+            }
         })
     }
 
@@ -856,6 +734,65 @@ impl PyTubeRegistry {
         debug!(target: "python_bindings", "Python requested runtime shutdown");
         shutdown_runtime_from_python();
         Ok(())
+    }
+
+    /// Print all existing tubes with their connections for debugging
+    fn print_tubes_with_connections(&self, py: Python<'_>) -> PyResult<()> {
+        let master_runtime = get_runtime();
+        py.allow_threads(|| {
+            master_runtime.clone().block_on(async move {
+                let registry = REGISTRY.read().await;
+
+                debug!("=== Tube Registry Status ===");
+                debug!("Total tubes: {}", registry.tubes_by_id.len());
+                debug!("Server mode: {}\n", registry.is_server_mode());
+
+                if registry.tubes_by_id.is_empty() {
+                    debug!("No active tubes.");
+                    return Ok(());
+                }
+
+                for tube_id in registry.tubes_by_id.keys() {
+                    debug!("Tube ID: {tube_id}");
+
+                    // Get conversation IDs for this tube
+                    let conversation_ids = registry.conversation_ids_by_tube_id(tube_id);
+                    if conversation_ids.is_empty() {
+                        debug!("  └─ No conversations");
+                    } else {
+                        debug!("  └─ Conversations ({}):", conversation_ids.len());
+                        for (i, conv_id) in conversation_ids.iter().enumerate() {
+                            let is_last = i == conversation_ids.len() - 1;
+                            let prefix = if is_last {
+                                "     └─"
+                            } else {
+                                "     ├─"
+                            };
+                            debug!("{prefix}  {conv_id}");
+                        }
+                    }
+
+                    // Check if there's a signal channel for this tube
+                    let has_signal_channel = registry.signal_channels.contains_key(tube_id);
+                    debug!(
+                        "  └─ Signal channel: {}\n",
+                        if has_signal_channel { "Active" } else { "None" }
+                    );
+                }
+
+                // Show reverse mapping summary
+                debug!("=== Conversation Mappings ===");
+                debug!("Total mappings: {}", registry.conversation_mappings.len());
+                if !registry.conversation_mappings.is_empty() {
+                    for (conv_id, mapped_tube_id) in &registry.conversation_mappings {
+                        debug!("  {conv_id} → {mapped_tube_id}");
+                    }
+                }
+                debug!("============================");
+
+                Ok(())
+            })
+        })
     }
 }
 

@@ -213,7 +213,7 @@ async fn recv_and_get_instruction(stream: &mut DuplexStream) -> Result<GuacdInst
 }
 
 #[tokio::test]
-async fn test_guacd_handshake_successful_new_connection() {
+async fn test_guacd_handshake_successful() {
     let (client_stream, mut server_stream): (DuplexStream, DuplexStream) = tokio::io::duplex(4096);
     let (_dc_tx_for_channel, dc_rx_for_channel) = tokio::sync::mpsc::unbounded_channel();
     let mock_webrtc_dc_for_channel = create_mock_webrtc_data_channel_for_channel_new().await;

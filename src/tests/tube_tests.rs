@@ -28,7 +28,7 @@ fn test_tube_creation() {
     let runtime = get_runtime();
     runtime.block_on(async {
         // Create a tube
-        let tube = Tube::new(false, None).expect("Failed to create tube");
+        let tube = Tube::new(false, None, None).expect("Failed to create tube");
         let tube_id = tube.id();
         println!("Created tube with ID: {}", tube_id);
 
@@ -147,7 +147,7 @@ fn test_tube_channel_creation() {
     println!("Starting test_tube_channel_creation");
     let runtime = get_runtime();
     runtime.block_on(async {
-        let tube = Tube::new(false, None).expect("Failed to create tube");
+        let tube = Tube::new(false, None, None).expect("Failed to create tube");
         let tube_id = tube.id();
         let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
         let mut settings = HashMap::new();
@@ -209,7 +209,7 @@ fn test_tube_channel_creation() {
 
 #[tokio::test]
 async fn test_tube_create_with_pc() {
-    let tube = Tube::new(false, None).expect("Failed to create tube");
+    let tube = Tube::new(false, None, None).expect("Failed to create tube");
 
     // Create a signaling channel
     let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
@@ -233,7 +233,7 @@ async fn test_tube_create_with_pc() {
 
 #[tokio::test]
 async fn test_tube_webrtc_connection() {
-    let tube = Tube::new(false, None).expect("Failed to create tube");
+    let tube = Tube::new(false, None, None).expect("Failed to create tube");
 
     // Create a signaling channel
     let (signal_tx, _) = mpsc::unbounded_channel();
@@ -261,7 +261,7 @@ async fn test_tube_webrtc_connection() {
 
 #[tokio::test]
 async fn test_tube_create_channel() {
-    let tube = Tube::new(false, None).expect("Failed to create tube");
+    let tube = Tube::new(false, None, None).expect("Failed to create tube");
     let (signal_tx, _) = mpsc::unbounded_channel();
     let mut settings = HashMap::new();
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
@@ -580,8 +580,8 @@ async fn perform_signaling_and_ice_exchange(
 async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     info!("[E2E_TEST] Starting test_tube_p2p_data_transfer_end_to_end");
 
-    let tube1 = Tube::new(false, None)?;
-    let tube2 = Tube::new(false, None)?;
+    let tube1 = Tube::new(false, None, None)?;
+    let tube2 = Tube::new(false, None, None)?;
     info!(
         "[E2E_TEST] Tube1 ID: {}, Tube2 ID: {}",
         tube1.id(),

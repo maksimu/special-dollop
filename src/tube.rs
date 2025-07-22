@@ -68,8 +68,9 @@ impl Tube {
     pub fn new(
         is_server_mode_context: bool,
         original_conversation_id: Option<String>,
+        custom_tube_id: Option<String>,
     ) -> Result<Arc<Self>> {
-        let id = Uuid::new_v4().to_string();
+        let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();
 
         let tube = Arc::new(Self {
@@ -137,10 +138,12 @@ impl Tube {
 
         // Set up comprehensive connection state monitoring with tube lifecycle management
         let is_closing_for_tube = Arc::clone(&connection_arc.is_closing);
+        let connection_arc_for_signals = Arc::clone(&connection_arc); // Clone for signal sending
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
             let tube_clone_for_closure = tube_arc_for_pc_state.clone();
             let is_closing_for_handler = Arc::clone(&is_closing_for_tube);
+            let connection_for_signals = Arc::clone(&connection_arc_for_signals);
 
             Box::pin(async move {
                 let tube_id_log = tube_clone_for_closure.id.clone();
@@ -154,6 +157,9 @@ impl Tube {
                         // Tube status update
                         *status_clone.write().await = TubeStatus::Active;
                         debug!(tube_id = %tube_id_log, "Tube connection state changed to Active");
+                        // Send connection state changed signal to Python
+                        info!(target: "webrtc_signal", tube_id = %tube_id_log, "Sending 'connected' signal to Python");
+                        connection_for_signals.send_connection_state_changed("connected");
                     },
                     RTCPeerConnectionState::Failed => {
                         // Update the closing flag (from comprehensive monitor)

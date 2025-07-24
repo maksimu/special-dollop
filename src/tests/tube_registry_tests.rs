@@ -700,8 +700,18 @@ async fn test_registry_e2e_server_client_echo(
     let _ = ack_server_actual_kill_tx_for_test.send(());
     tokio::time::sleep(Duration::from_millis(200)).await; // Give time for the server to shut down
 
-    server_registry.close_tube(&server_tube_id).await?;
-    client_registry.close_tube(&client_tube_id).await?;
+    server_registry
+        .close_tube(
+            &server_tube_id,
+            Some(crate::tube_protocol::CloseConnectionReason::Normal),
+        )
+        .await?;
+    client_registry
+        .close_tube(
+            &client_tube_id,
+            Some(crate::tube_protocol::CloseConnectionReason::Normal),
+        )
+        .await?;
     info!("[E2E_Test] Test finished.");
 
     Ok(())

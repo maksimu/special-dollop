@@ -5,11 +5,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::wrap_pyfunction;
 use pyo3::Bound;
-pub use tube_registry_binding::PyTubeRegistry;
+pub use tube_registry_binding::{PyCloseConnectionReason, PyTubeRegistry};
 
 #[pymodule]
 pub fn keeper_pam_webrtc_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTubeRegistry>()?;
+    m.add_class::<PyCloseConnectionReason>()?;
 
     // Initialize the Tokio runtime at module import time
     let _ = get_runtime();

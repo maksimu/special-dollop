@@ -1,5 +1,6 @@
 use crate::router_helpers::post_connection_state;
 use crate::runtime::{get_runtime, shutdown_runtime_from_python};
+use crate::tube_protocol::CloseConnectionReason;
 use crate::tube_registry::REGISTRY;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -166,6 +167,75 @@ pub struct PyTubeRegistry {
     explicit_cleanup_called: AtomicBool,
 }
 
+/// Python-accessible enum for CloseConnectionReason
+///
+/// This enum represents the various reasons why a connection might be closed.
+/// It can be used when calling close_connection() or close_tube() methods.
+///
+/// Example:
+///     reason = PyCloseConnectionReason.Normal
+///     registry.close_connection("connection_id", reason.value())
+#[pyclass]
+#[derive(Clone, Copy)]
+pub enum PyCloseConnectionReason {
+    Normal = 0,
+    Error = 1,
+    Timeout = 2,
+    ServerRefuse = 4,
+    Client = 5,
+    Unknown = 6,
+    InvalidInstruction = 7,
+    GuacdRefuse = 8,
+    ConnectionLost = 9,
+    ConnectionFailed = 10,
+    TunnelClosed = 11,
+    AdminClosed = 12,
+    ErrorRecording = 13,
+    GuacdError = 14,
+    AIClosed = 15,
+    AddressResolutionFailed = 16,
+    DecryptionFailed = 17,
+    ConfigurationError = 18,
+    ProtocolError = 19,
+    UpstreamClosed = 20,
+}
+
+#[pymethods]
+impl PyCloseConnectionReason {
+    /// Get the numeric value of the reason
+    fn value(&self) -> u16 {
+        *self as u16
+    }
+
+    /// Create from a numeric code
+    #[staticmethod]
+    fn from_code(code: u16) -> Self {
+        match code {
+            0 => PyCloseConnectionReason::Normal,
+            1 => PyCloseConnectionReason::Error,
+            2 => PyCloseConnectionReason::Timeout,
+            4 => PyCloseConnectionReason::ServerRefuse,
+            5 => PyCloseConnectionReason::Client,
+            6 => PyCloseConnectionReason::Unknown,
+            7 => PyCloseConnectionReason::InvalidInstruction,
+            8 => PyCloseConnectionReason::GuacdRefuse,
+            9 => PyCloseConnectionReason::ConnectionLost,
+            10 => PyCloseConnectionReason::ConnectionFailed,
+            11 => PyCloseConnectionReason::TunnelClosed,
+            12 => PyCloseConnectionReason::AdminClosed,
+            13 => PyCloseConnectionReason::ErrorRecording,
+            14 => PyCloseConnectionReason::GuacdError,
+            15 => PyCloseConnectionReason::AIClosed,
+            16 => PyCloseConnectionReason::AddressResolutionFailed,
+            17 => PyCloseConnectionReason::DecryptionFailed,
+            18 => PyCloseConnectionReason::ConfigurationError,
+            19 => PyCloseConnectionReason::ProtocolError,
+            20 => PyCloseConnectionReason::UpstreamClosed,
+            _ => PyCloseConnectionReason::Unknown,
+        }
+    }
+}
+
 #[pymethods]
 impl PyTubeRegistry {
     #[new]
@@ -188,7 +258,7 @@ impl PyTubeRegistry {
                 debug!(target: "python_bindings", tube_count = tube_ids.len(), "Starting explicit cleanup of all tubes");
                 // Close all tubes (this will also clean up their signal channels)
                 for tube_id in tube_ids {
-                    if let Err(e) = registry.close_tube(&tube_id).await {
+                    if let Err(e) = registry.close_tube(&tube_id, Some(CloseConnectionReason::Normal)).await {
                         error!(target: "python_bindings", tube_id = %tube_id, "Failed to close tube during cleanup: {}", e);
                     }
                 }
@@ -214,7 +284,7 @@ impl PyTubeRegistry {
                 let mut registry = REGISTRY.write().await;
                 debug!(target: "python_bindings", tube_count = tube_ids.len(), "Starting cleanup of specific tubes");
                 for tube_id in tube_ids {
-                    if let Err(e) = registry.close_tube(&tube_id).await {
+                    if let Err(e) = registry.close_tube(&tube_id, Some(CloseConnectionReason::Normal)).await {
                         error!(target: "python_bindings", tube_id = %tube_id, "Failed to close tube during selective cleanup: {}", e);
                     }
                 }
@@ -270,7 +340,7 @@ impl PyTubeRegistry {
                             "Force cleanup in __del__ - {} tubes to close", tube_ids.len());
                         // Close all tubes - ignore individual errors in force cleanup
                         for tube_id in tube_ids {
-                            if let Err(e) = registry.close_tube(&tube_id).await {
+                            if let Err(e) = registry.close_tube(&tube_id, Some(CloseConnectionReason::Unknown)).await {
                                 error!(target: "python_bindings", tube_id = %tube_id, 
                                     "Failed to close tube during force cleanup: {}", e);
                             }
@@ -612,8 +682,14 @@ impl PyTubeRegistry {
     /// Close a specific connection on a tube
     #[pyo3(signature = (
         connection_id,
+        reason = None,
     ))]
-    fn close_connection(&self, py: Python<'_>, connection_id: &str) -> PyResult<()> {
+    fn close_connection(
+        &self,
+        py: Python<'_>,
+        connection_id: &str,
+        reason: Option<u16>,
+    ) -> PyResult<()> {
         let connection_id_owned = connection_id.to_string();
 
         safe_python_async_execute(py, async move {
@@ -644,9 +720,35 @@ impl PyTubeRegistry {
                 // Registry lock is automatically released here
             };
 
-            // Now call close_channel without holding any registry locks
+            // Convert the reason code to CloseConnectionReason enum
+            let close_reason = match reason {
+                Some(0) => CloseConnectionReason::Normal,
+                Some(1) => CloseConnectionReason::Error,
+                Some(2) => CloseConnectionReason::Timeout,
+                Some(4) => CloseConnectionReason::ServerRefuse,
+                Some(5) => CloseConnectionReason::Client,
+                Some(6) => CloseConnectionReason::Unknown,
+                Some(7) => CloseConnectionReason::InvalidInstruction,
+                Some(8) => CloseConnectionReason::GuacdRefuse,
+                Some(9) => CloseConnectionReason::ConnectionLost,
+                Some(10) => CloseConnectionReason::ConnectionFailed,
+                Some(11) => CloseConnectionReason::TunnelClosed,
+                Some(12) => CloseConnectionReason::AdminClosed,
+                Some(13) => CloseConnectionReason::ErrorRecording,
+                Some(14) => CloseConnectionReason::GuacdError,
+                Some(15) => CloseConnectionReason::AIClosed,
+                Some(16) => CloseConnectionReason::AddressResolutionFailed,
+                Some(17) => CloseConnectionReason::DecryptionFailed,
+                Some(18) => CloseConnectionReason::ConfigurationError,
+                Some(19) => CloseConnectionReason::ProtocolError,
+                Some(20) => CloseConnectionReason::UpstreamClosed,
+                Some(_) => CloseConnectionReason::Unknown, // Unknown code defaults to Unknown
+                None => CloseConnectionReason::Unknown,    // Default when no reason specified
+            };
+
+            // Now call close_channel_with_reason without holding any registry locks
             tube_arc
-                .close_channel(&connection_id_owned)
+                .close_channel(&connection_id_owned, Some(close_reason))
                 .await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!(
@@ -657,14 +759,24 @@ impl PyTubeRegistry {
     }
 
     /// Close an entire tube
-    fn close_tube(&self, py: Python<'_>, tube_id: &str) -> PyResult<()> {
+    #[pyo3(signature = (
+        tube_id,
+        reason = None,
+    ))]
+    fn close_tube(&self, py: Python<'_>, tube_id: &str, reason: Option<u16>) -> PyResult<()> {
         let tube_id_owned = tube_id.to_string();
 
         safe_python_async_execute(py, async move {
             let mut registry = REGISTRY.write().await;
-            registry.close_tube(&tube_id_owned).await.map_err(|e| {
-                PyRuntimeError::new_err(format!("Rust: Failed to close tube {tube_id_owned}: {e}"))
-            })
+            let close_reason = reason.map(CloseConnectionReason::from_code);
+            registry
+                .close_tube(&tube_id_owned, close_reason)
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Rust: Failed to close tube {tube_id_owned}: {e}"
+                    ))
+                })
         })
     }
 

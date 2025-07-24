@@ -1,6 +1,7 @@
 //! Tube-related tests
 use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::TubeStatus;
+use crate::tube_protocol::CloseConnectionReason;
 use crate::tube_registry::REGISTRY;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use crate::Tube;
@@ -186,12 +187,12 @@ fn test_tube_channel_creation() {
         assert!(tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should exist after creation");
 
         // Close the channel and verify the signal is acted upon (signal removed from the map)
-        let close_result = tube.close_channel("test").await;
+        let close_result = tube.close_channel("test", Some(CloseConnectionReason::Normal)).await;
         assert!(close_result.is_ok(), "close_channel should return Ok. Actual: {:?}", close_result);
         assert!(!tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should be removed after closing");
 
         // Try to close a non-existent channel
-        assert!(tube.close_channel("nonexistent").await.is_err(), "Non-existent channel should return an error on close");
+        assert!(tube.close_channel("nonexistent", Some(CloseConnectionReason::Error)).await.is_err(), "Non-existent channel should return an error on close");
 
         { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube");
 

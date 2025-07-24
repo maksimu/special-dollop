@@ -11,6 +11,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock as TokioRwLock;
@@ -182,7 +183,7 @@ impl Tube {
                             runtime.spawn(async move {
                                 debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection failure.");
                                 let mut registry = crate::tube_registry::REGISTRY.write().await;
-                                if let Err(e) = registry.close_tube(&tube_id_log).await {
+                                if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionFailed)).await {
                                      error!(tube_id = %tube_id_log, "Error trying to close tube via registry: {}", e);
                                 } else {
                                      debug!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry.");
@@ -212,7 +213,7 @@ impl Tube {
                             runtime.spawn(async move {
                                 debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection closure.");
                                 let mut registry = crate::tube_registry::REGISTRY.write().await;
-                                if let Err(e) = registry.close_tube(&tube_id_log).await {
+                                if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::Normal)).await {
                                      error!(tube_id = %tube_id_log, "Error trying to close tube via registry: {}", e);
                                 } else {
                                      debug!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry.");
@@ -240,7 +241,7 @@ impl Tube {
                             runtime.spawn(async move {
                                 debug!(tube_id = %tube_id_log, "Spawning task to close tube due to peer connection disconnection.");
                                 let mut registry = crate::tube_registry::REGISTRY.write().await;
-                                if let Err(e) = registry.close_tube(&tube_id_log).await {
+                                if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionLost)).await {
                                      error!(tube_id = %tube_id_log, "Error trying to close tube via registry: {}", e);
                                 } else {
                                      debug!(tube_id = %tube_id_log, "Successfully initiated tube closure via registry.");
@@ -1075,16 +1076,20 @@ impl Tube {
     }
 
     // Close a specific channel by signaling its run loop to exit
-    pub(crate) async fn close_channel(&self, name: &str) -> Result<()> {
-        // First, try to send a CloseConnection message with AdminClosed reason
-        // This ensures the remote side knows it was an administrative closure
+    pub(crate) async fn close_channel(
+        &self,
+        name: &str,
+        reason: Option<CloseConnectionReason>,
+    ) -> Result<()> {
+        let reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
+        // First, try to send a CloseConnection message with the specified reason
+        // This ensures the remote side knows why it was closed
         let data_channels = self.data_channels.read().await;
         if let Some(channel) = data_channels.get(name) {
-            // Send CloseConnection for the control connection with AdminClosed reason
+            // Send CloseConnection for the control connection with specified reason
             let mut close_data = Vec::with_capacity(6);
             close_data.extend_from_slice(&0u32.to_be_bytes()); // conn_no 0 (control connection)
-            close_data
-                .extend_from_slice(&(CloseConnectionReason::AdminClosed as u16).to_be_bytes());
+            close_data.extend_from_slice(&(reason as u16).to_be_bytes());
 
             // We need a buffer pool for frame creation
             let buffer_pool = BufferPool::default();
@@ -1096,6 +1101,10 @@ impl Tube {
 
             let encoded = close_frame.encode_with_pool(&buffer_pool);
             let _ = channel.send(encoded).await; // Ignore errors if channel is already closing
+
+            // Give the close frame time to be transmitted before signaling shutdown
+            // This ensures the remote side receives the close reason
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         drop(data_channels);
 
@@ -1104,8 +1113,8 @@ impl Tube {
         if let Some(signal_arc) = signals.remove(name) {
             // Remove from the map once signaled
             info!(
-                "Tube {}: Signaling channel '{}' to close with AdminClosed reason.",
-                self.id, name
+                "Tube {}: Signaling channel '{}' to close with {:?} reason.",
+                self.id, name, reason
             );
             signal_arc.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
@@ -1204,10 +1213,11 @@ impl Tube {
         }
     }
 
-    // Close the entire tube
-    pub(crate) async fn close(
+    // Close the entire tube with a specific reason
+    pub(crate) async fn close_with_reason(
         &self,
         registry: &mut crate::tube_registry::TubeRegistry,
+        reason: CloseConnectionReason,
     ) -> Result<()> {
         debug!("Closing tube with ID: {}", self.id);
 
@@ -1253,11 +1263,18 @@ impl Tube {
                     channel_label_str.to_string()
                 };
 
-                let signal_data = serde_json::json!({
+                let mut signal_json = serde_json::json!({
                     "channel_id": conversation_id,
                     "outcome": "tube_closed"
-                })
-                .to_string();
+                });
+                // Add close reason
+                signal_json["close_reason"] = serde_json::json!({
+                    "code": reason as u16,
+                    "name": format!("{:?}", reason),
+                    "is_critical": reason.is_critical(),
+                    "is_retryable": reason.is_retryable(),
+                });
+                let signal_data = signal_json.to_string();
 
                 let signal_msg = SignalMessage {
                     tube_id: self.id.clone(),
@@ -1277,6 +1294,13 @@ impl Tube {
             }
         } else {
             warn!(target: "python_bindings", tube_id = %self.id, "No signal sender available to notify Python of channel closures during tube close");
+        }
+
+        // Close all channels with the specified reason before clearing
+        for channel_name in &channel_names {
+            if let Err(e) = self.close_channel(channel_name, Some(reason)).await {
+                warn!(tube_id = %self.id, channel_name = %channel_name, "Failed to close channel with reason during tube closure: {}", e);
+            }
         }
 
         // Clear all channel shutdown signals
@@ -1317,6 +1341,16 @@ impl Tube {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         Ok(())
+    }
+
+    // Close the entire tube (defaults to AdminClosed reason)
+    #[cfg(test)]
+    pub(crate) async fn close(
+        &self,
+        registry: &mut crate::tube_registry::TubeRegistry,
+    ) -> Result<()> {
+        self.close_with_reason(registry, CloseConnectionReason::AdminClosed)
+            .await
     }
 
     // Get status

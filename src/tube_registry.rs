@@ -1,4 +1,5 @@
 use crate::router_helpers::get_relay_access_creds;
+use crate::tube_protocol::CloseConnectionReason;
 use crate::Tube;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -593,7 +594,11 @@ impl TubeRegistry {
     }
 
     /// Close a tube
-    pub(crate) async fn close_tube(&mut self, tube_id: &str) -> Result<()> {
+    pub(crate) async fn close_tube(
+        &mut self,
+        tube_id: &str,
+        reason: Option<CloseConnectionReason>,
+    ) -> Result<()> {
         let tube_arc = self.get_by_tube_id(tube_id)
             .ok_or_else(|| {
                 warn!(target: "registry", tube_id = %tube_id, "close_tube: Tube not found in registry.");
@@ -623,9 +628,11 @@ impl TubeRegistry {
                     crate::tube_and_channel_helpers::TubeStatus::Closing;
                 info!(target: "registry", tube_id = %tube_id, "close_tube: Transitioned tube status to Closing. Proceeding with close.");
 
-                tube_arc.close(self).await.map_err(|e| {
-                    error!(target: "registry", tube_id = %tube_id, "close_tube: tube.close() failed: {}", e);
-                    anyhow!("Failed during tube.close() for {}: {}", tube_id, e)
+                // Use the provided reason or default to AdminClosed
+                let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
+                tube_arc.close_with_reason(self, close_reason).await.map_err(|e| {
+                    error!(target: "registry", tube_id = %tube_id, "close_tube: tube.close_with_reason() failed: {}", e);
+                    anyhow!("Failed during tube.close_with_reason() for {}: {}", tube_id, e)
                 })
             }
         }

@@ -165,7 +165,7 @@ impl Channel {
 
         // Extract reason if available
         let reason = if data.len() > CONN_NO_LEN {
-            let reason_code = u16::from_be_bytes([data[CONN_NO_LEN], data[CONN_NO_LEN + 1]]);
+            let reason_code = data[CONN_NO_LEN] as u16;
             CloseConnectionReason::from_code(reason_code)
         } else {
             CloseConnectionReason::Normal
@@ -580,7 +580,7 @@ impl Channel {
             error!("Channel({}): Failed to process OpenConnection for target_conn_no {}: {}. Sending CloseConnection back.",
                 self.channel_id, target_connection_no, e);
             temp_payload_buffer.put_u32(target_connection_no);
-            temp_payload_buffer.put_u16(CloseConnectionReason::ConnectionFailed as u16);
+            temp_payload_buffer.put_u8(CloseConnectionReason::ConnectionFailed as u8);
             // Use self.send_control_message for sending
             if let Err(send_err) = self
                 .send_control_message(ControlMessage::CloseConnection, &temp_payload_buffer)

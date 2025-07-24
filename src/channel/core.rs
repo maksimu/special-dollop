@@ -13,7 +13,7 @@ use crate::tube_protocol::{try_parse_frame, CloseConnectionReason, ControlMessag
 use crate::webrtc_data_channel::{WebRTCDataChannel, STANDARD_BUFFER_THRESHOLD};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
@@ -682,7 +682,7 @@ impl Channel {
         let mut buffer = self.buffer_pool.acquire();
         buffer.clear();
         buffer.extend_from_slice(&conn_no.to_be_bytes());
-        buffer.extend_from_slice(&(reason as u16).to_be_bytes());
+        buffer.put_u8(reason as u8);
         let msg_data = buffer.freeze();
 
         self.internal_handle_connection_close(conn_no, reason)
@@ -954,7 +954,7 @@ impl Drop for Channel {
                 let mut close_buffer = buffer_pool_clone.acquire();
                 close_buffer.clear();
                 close_buffer.extend_from_slice(&conn_no.to_be_bytes());
-                close_buffer.extend_from_slice(&(CloseConnectionReason::Normal as u16).to_be_bytes());
+                close_buffer.put_u8(CloseConnectionReason::Normal as u8);
 
                 let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut close_buffer);
                 let encoded = close_frame.encode_with_pool(&buffer_pool_clone);

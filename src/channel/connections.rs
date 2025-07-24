@@ -135,8 +135,7 @@ pub async fn setup_outbound_task(
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
-                reusable_control_buf
-                    .extend_from_slice(&(CloseConnectionReason::GuacdError as u16).to_be_bytes());
+                reusable_control_buf.put_u8(CloseConnectionReason::GuacdError as u8);
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
                     &mut reusable_control_buf,
@@ -157,8 +156,7 @@ pub async fn setup_outbound_task(
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
-                reusable_control_buf
-                    .extend_from_slice(&(CloseConnectionReason::GuacdError as u16).to_be_bytes());
+                reusable_control_buf.put_u8(CloseConnectionReason::GuacdError as u8);
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
                     &mut reusable_control_buf,
@@ -501,10 +499,8 @@ pub async fn setup_outbound_task(
                                             temp_buf_for_control.clear();
                                             temp_buf_for_control
                                                 .extend_from_slice(&conn_no.to_be_bytes());
-                                            temp_buf_for_control.extend_from_slice(
-                                                &(CloseConnectionReason::GuacdError as u16)
-                                                    .to_be_bytes(),
-                                            );
+                                            temp_buf_for_control
+                                                .put_u8(CloseConnectionReason::GuacdError as u8);
 
                                             let close_frame = Frame::new_control_with_buffer(
                                                 ControlMessage::CloseConnection,
@@ -781,10 +777,8 @@ pub async fn setup_outbound_task(
                                     let mut temp_buf_for_control = buffer_pool.acquire();
                                     temp_buf_for_control.clear();
                                     temp_buf_for_control.extend_from_slice(&conn_no.to_be_bytes());
-                                    temp_buf_for_control.extend_from_slice(
-                                        &(CloseConnectionReason::ProtocolError as u16)
-                                            .to_be_bytes(),
-                                    );
+                                    temp_buf_for_control
+                                        .put_u8(CloseConnectionReason::ProtocolError as u8);
                                     let close_frame = Frame::new_control_with_buffer(
                                         ControlMessage::CloseConnection,
                                         &mut temp_buf_for_control,

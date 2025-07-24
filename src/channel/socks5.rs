@@ -253,8 +253,7 @@ pub(crate) async fn handle_socks5_connection(
                     let mut close_buffer = buffer_pool_clone.acquire();
                     close_buffer.clear();
                     close_buffer.extend_from_slice(&conn_no.to_be_bytes());
-                    close_buffer
-                        .extend_from_slice(&(CloseConnectionReason::Normal as u16).to_be_bytes());
+                    close_buffer.put_u8(CloseConnectionReason::Normal as u8);
 
                     let close_frame = Frame::new_control_with_pool(
                         ControlMessage::CloseConnection,

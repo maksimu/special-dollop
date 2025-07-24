@@ -1087,9 +1087,9 @@ impl Tube {
         let data_channels = self.data_channels.read().await;
         if let Some(channel) = data_channels.get(name) {
             // Send CloseConnection for the control connection with specified reason
-            let mut close_data = Vec::with_capacity(6);
+            let mut close_data = Vec::with_capacity(5);
             close_data.extend_from_slice(&0u32.to_be_bytes()); // conn_no 0 (control connection)
-            close_data.extend_from_slice(&(reason as u16).to_be_bytes());
+            close_data.push(reason as u8); // reason - 1 byte
 
             // We need a buffer pool for frame creation
             let buffer_pool = BufferPool::default();

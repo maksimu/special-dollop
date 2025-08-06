@@ -331,10 +331,28 @@ impl NetworkAccessChecker {
                 // CIDR network like "192.168.1.0/24"
                 allowed_networks.push(network);
             } else if let Ok(ip) = host.parse::<IpAddr>() {
-                // Single IP address
+                // Single IP address or special "allow all" cases
                 let network = match ip {
-                    IpAddr::V4(ipv4) => ipnet::IpNet::V4(ipnet::Ipv4Net::new(ipv4, 32).unwrap()),
-                    IpAddr::V6(ipv6) => ipnet::IpNet::V6(ipnet::Ipv6Net::new(ipv6, 128).unwrap()),
+                    IpAddr::V4(ipv4) => {
+                        if ipv4.is_unspecified() {
+                            // 0.0.0.0 means allow all IPv4
+                            ipnet::IpNet::V4(ipnet::Ipv4Net::new(ipv4, 0).unwrap())
+                        // 0.0.0.0/0
+                        } else {
+                            ipnet::IpNet::V4(ipnet::Ipv4Net::new(ipv4, 32).unwrap())
+                            // Single IP
+                        }
+                    }
+                    IpAddr::V6(ipv6) => {
+                        if ipv6.is_unspecified() {
+                            // :: means allow all IPv6
+                            ipnet::IpNet::V6(ipnet::Ipv6Net::new(ipv6, 0).unwrap())
+                        // ::/0
+                        } else {
+                            ipnet::IpNet::V6(ipnet::Ipv6Net::new(ipv6, 128).unwrap())
+                            // Single IP
+                        }
+                    }
                 };
                 allowed_networks.push(network);
             } else {

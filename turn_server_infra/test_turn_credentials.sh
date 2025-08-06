@@ -76,14 +76,14 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo -e "${RED}❌ Unknown option: $1${NC}"
+            echo -e "${RED}Unknown option: $1${NC}"
             show_help
             exit 1
             ;;
     esac
 done
 
-echo -e "${BLUE}🔄 TURN Server Credential Generator & Tester${NC}"
+echo -e "${BLUE}TURN Server Credential Generator & Tester${NC}"
 echo "============================================="
 
 # Auto-detect values from terraform if not provided
@@ -100,12 +100,12 @@ if [ -z "$TURN_SECRET" ] || [ -z "$TURN_SERVER" ]; then
         fi
         
         if [ -z "$TURN_SECRET" ] || [ -z "$TURN_SERVER" ]; then
-            echo -e "${RED}❌ Could not auto-detect values from Terraform${NC}"
+            echo -e "${RED}Could not auto-detect values from Terraform${NC}"
             echo "Please provide them manually with -s and -h options"
             exit 1
         fi
     else
-        echo -e "${RED}❌ No terraform state found and no manual values provided${NC}"
+        echo -e "${RED}No terraform state found and no manual values provided${NC}"
         echo "Please provide secret and server manually:"
         echo "  $0 -s \"your-secret\" -h \"turn.example.com\""
         exit 1
@@ -118,7 +118,7 @@ TIMESTAMP=$(($(date +%s) + EXPIRY_SECONDS))
 USERNAME="${TIMESTAMP}:${USER_SUFFIX}"
 
 # Generate password using HMAC-SHA1
-echo -e "${YELLOW}🔐 Generating credentials...${NC}"
+echo -e "${YELLOW}Generating credentials...${NC}"
 PASSWORD=$(echo -n "$USERNAME" | openssl dgst -sha1 -hmac "$TURN_SECRET" -binary | base64)
 
 # Calculate and display expiration
@@ -126,7 +126,7 @@ EXPIRES_DATE=$(date -d "@$TIMESTAMP" 2>/dev/null || date -r "$TIMESTAMP" 2>/dev/
 
 # Display results
 echo ""
-echo -e "${GREEN}✅ ${EXPIRY_HOURS}-Hour TURN Credentials Generated:${NC}"
+echo -e "${GREEN}${EXPIRY_HOURS}-Hour TURN Credentials Generated:${NC}"
 echo "================================================"
 echo "Server:   $TURN_SERVER"
 echo "Username: $USERNAME"
@@ -135,7 +135,7 @@ echo "Expires:  $EXPIRES_DATE"
 echo ""
 
 # WebRTC configuration example
-echo -e "${BLUE}💡 WebRTC ICE Configuration:${NC}"
+echo -e "${BLUE}WebRTC ICE Configuration:${NC}"
 echo "============================"
 echo "{"
 echo "  iceServers: ["
@@ -152,7 +152,7 @@ echo "}"
 echo ""
 
 # Test commands
-echo -e "${BLUE}🧪 Manual Test Commands:${NC}"
+echo -e "${BLUE}Manual Test Commands:${NC}"
 echo "========================"
 echo "turnutils_uclient -t -y -u \"$USERNAME\" -w \"$PASSWORD\" $TURN_SERVER"
 echo "turnutils_stunclient $TURN_SERVER"
@@ -161,24 +161,24 @@ echo ""
 # Optional automatic test
 if [ "$RUN_TEST" = true ]; then
     if command -v turnutils_uclient &> /dev/null; then
-        echo -e "${YELLOW}🚀 Running automatic TURN test...${NC}"
+        echo -e "${YELLOW}Running automatic TURN test...${NC}"
         echo "===================================="
         echo ""
         turnutils_uclient -t -y -u "$USERNAME" -w "$PASSWORD" "$TURN_SERVER" || {
-            echo -e "${RED}❌ TURN test failed. Check server status and network connectivity.${NC}"
+            echo -e "${RED}TURN test failed. Check server status and network connectivity.${NC}"
             exit 1
         }
         echo ""
-        echo -e "${GREEN}✅ TURN server test completed successfully!${NC}"
+        echo -e "${GREEN}TURN server test completed successfully!${NC}"
     else
-        echo -e "${YELLOW}💡 turnutils_uclient not found. Install coturn-utils to run automatic tests:${NC}"
+        echo -e "${YELLOW}turnutils_uclient not found. Install coturn-utils to run automatic tests:${NC}"
         echo "   Ubuntu/Debian: sudo apt-get install coturn-utils"
         echo "   macOS:         brew install coturn"
         echo "   CentOS/RHEL:   sudo yum install coturn-utils"
     fi
 else
-    echo -e "${YELLOW}💡 Add --test flag to run automatic testing${NC}"
+    echo -e "${YELLOW}Add --test flag to run automatic testing${NC}"
 fi
 
 echo ""
-echo -e "${GREEN}🎉 Done! Use the credentials above in your WebRTC application.${NC}" 
+echo -e "${GREEN}Done! Use the credentials above in your WebRTC application.${NC}"

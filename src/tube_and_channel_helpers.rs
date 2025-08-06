@@ -113,51 +113,52 @@ pub(crate) async fn setup_channel_for_data_channel(
 pub(crate) fn parse_network_rules_from_settings(
     settings: &HashMap<String, serde_json::Value>,
 ) -> Option<NetworkAccessChecker> {
-    if settings.get("allowed_hosts").is_some() || settings.get("allowed_ports").is_some() {
-        // Convert allowed_hosts string to Vec<String>
-        let allowed_hosts = settings
-            .get("allowed_hosts")
-            .and_then(|v| v.as_str())
-            .map(|hosts| {
-                hosts
-                    .split('\n')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+    // Convert allowed_hosts string to Vec<String>
+    let allowed_hosts = settings
+        .get("allowed_hosts")
+        .and_then(|v| v.as_str())
+        .map(|hosts| {
+            hosts
+                .split(',') // Comma-separated from Python join
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
 
-        // Convert allowed_ports string to Vec<u16>
-        let allowed_ports = settings
-            .get("allowed_ports")
-            .and_then(|v| v.as_str())
-            .map(|ports| {
-                ports
-                    .split('\n') // Use newline like Python: allowed_ports.strip().split('\n')
-                    .filter_map(|s| {
-                        let trimmed = s.trim();
-                        if trimmed.is_empty() {
-                            return None;
-                        }
-                        match trimmed.parse::<u16>() {
-                            Ok(port) => {
-                                if port > 0 {
-                                    Some(port)
-                                } else {
-                                    debug!("Warning: Port {} is out of the valid range and will be ignored.", port);
-                                    None
-                                }
-                            }
-                            Err(_) => {
-                                debug!("Warning: '{}' is not a valid port number and will be ignored.", trimmed);
+    // Convert allowed_ports string to Vec<u16>
+    let allowed_ports = settings
+        .get("allowed_ports")
+        .and_then(|v| v.as_str())
+        .map(|ports| {
+            ports
+                .split(',') // Comma-separated from Python join
+                .filter_map(|s| {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    match trimmed.parse::<u16>() {
+                        Ok(port) => {
+                            if port > 0 {
+                                Some(port)
+                            } else {
+                                debug!("Warning: Port {} is out of the valid range and will be ignored.", port);
                                 None
                             }
                         }
-                    })
-                    .collect::<Vec<u16>>()
-            })
-            .unwrap_or_default();
+                        Err(_) => {
+                            debug!("Warning: '{}' is not a valid port number and will be ignored.", trimmed);
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<u16>>()
+        })
+        .unwrap_or_default();
 
+    // Only create NetworkAccessChecker if there are actual rules to enforce
+    if !allowed_hosts.is_empty() || !allowed_ports.is_empty() {
         Some(NetworkAccessChecker::new(allowed_hosts, allowed_ports))
     } else {
         None

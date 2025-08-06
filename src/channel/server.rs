@@ -4,6 +4,7 @@ use crate::tube_protocol::{ControlMessage, Frame};
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
 use bytes::BufMut;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,10 +28,40 @@ impl Channel {
             .parse::<SocketAddr>()
             .map_err(|e| anyhow!("Invalid server address '{}': {}", addr_str, e))?;
 
-        // Create the TCP listener
-        let listener = TcpListener::bind(parsed_addr)
-            .await
+        // Create the TCP listener with SO_REUSEADDR for immediate reuse after shutdown
+        let domain = if parsed_addr.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
+
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|e| anyhow!("Failed to create socket: {}", e))?;
+
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| anyhow!("Failed to set SO_REUSEADDR: {}", e))?;
+
+        // On Unix systems, also set SO_REUSEPORT for more immediate reuse
+        #[cfg(unix)]
+        socket
+            .set_reuse_port(true)
+            .map_err(|e| anyhow!("Failed to set SO_REUSEPORT: {}", e))?;
+
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| anyhow!("Failed to set socket as non-blocking: {}", e))?;
+
+        socket
+            .bind(&parsed_addr.into())
             .map_err(|e| anyhow!("Failed to bind to {}: {}", parsed_addr, e))?;
+
+        socket
+            .listen(128)
+            .map_err(|e| anyhow!("Failed to listen on {}: {}", parsed_addr, e))?;
+
+        let listener = TcpListener::from_std(socket.into())
+            .map_err(|e| anyhow!("Failed to convert socket to TcpListener: {}", e))?;
 
         let actual_addr = listener
             .local_addr()
@@ -204,7 +235,14 @@ impl Channel {
             }
         }
 
-        self.local_client_server = None;
+        // Explicitly drop the listener reference to ensure immediate socket release
+        if let Some(listener) = self.local_client_server.take() {
+            drop(listener);
+        }
+
+        // Give the system a brief moment to fully release the socket
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         info!("Endpoint {}: Server stopped", self.channel_id);
         Ok(())
     }

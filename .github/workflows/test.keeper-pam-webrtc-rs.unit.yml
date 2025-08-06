@@ -1,4 +1,4 @@
-name: Test pam-rustwebrtc
+name: Test keeper-pam-webrtc-rs
 
 on:
   pull_request:

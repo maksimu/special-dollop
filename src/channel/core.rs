@@ -272,8 +272,15 @@ impl Channel {
                             // Handle non-Guacd types like Tunnel or SOCKS5 if network rules are present
                             match parsed_conversation_type {
                                 ConversationType::Tunnel => {
-                                    if network_checker.is_some() && server_mode {
-                                        debug!(target:"channel_setup", channel_id = %channel_id, "Configuring for SOCKS5 protocol (Tunnel type with network rules)");
+                                    // Check if we should use SOCKS5 protocol
+                                    let should_use_socks5 = network_checker.is_some()
+                                        || protocol_settings
+                                            .get("socks_mode")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+
+                                    if should_use_socks5 {
+                                        debug!(target:"channel_setup", channel_id = %channel_id, server_mode, "Configuring for SOCKS5 protocol (Tunnel type with network rules or socks_mode)");
                                         determined_protocol = ActiveProtocol::Socks5;
                                         initial_protocol_state = ProtocolLogicState::Socks5(
                                             ChannelSocks5State::default(),

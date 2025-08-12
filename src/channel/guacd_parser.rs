@@ -180,7 +180,7 @@ impl GuacdParser {
     ///   Returns borrowed data that references the input buffer
     ///   Returns Ok with instruction details and total length, or Err if incomplete/invalid
     #[inline(always)]
-    pub fn peek_instruction(buffer_slice: &[u8]) -> Result<PeekedInstruction, PeekError> {
+    pub fn peek_instruction(buffer_slice: &[u8]) -> Result<PeekedInstruction<'_>, PeekError> {
         // **BOLD WARNING: HOT PATH - CALLED FOR EVERY GUACD INSTRUCTION**
         // **NO STRING ALLOCATIONS, NO HEAP ALLOCATIONS**
         // **RETURN ONLY BORROWED SLICES FROM INPUT BUFFER**

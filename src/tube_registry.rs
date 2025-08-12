@@ -1,3 +1,4 @@
+use crate::resource_manager::RESOURCE_MANAGER;
 use crate::router_helpers::get_relay_access_creds;
 use crate::tube_protocol::CloseConnectionReason;
 use crate::Tube;
@@ -373,30 +374,52 @@ impl TubeRegistry {
                 // Get TURN credentials if needed - only in client mode when ksm_config is available
                 if let Some(ksm_cfg) = ksm_config {
                     if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
-                        debug!(target: "ice_config", tube_id = %tube_id, "Fetching TURN credentials from router");
-                        match get_relay_access_creds(ksm_cfg, None, client_version).await {
-                            Ok(creds) => {
-                                debug!(target: "ice_config", tube_id = %tube_id, "Successfully fetched TURN credentials");
-                                trace!(target: "ice_config", tube_id = %tube_id, credentials = %creds, "Received TURN credentials");
+                        // First, check if we can reuse an existing TURN connection
+                        if let Some(existing_conn) =
+                            RESOURCE_MANAGER.get_turn_connection(krelay_server)
+                        {
+                            debug!(target: "ice_config", tube_id = %tube_id, relay_url = %krelay_server, 
+                                   username = %existing_conn.username, "Reusing existing TURN connection from pool");
+                            ice_servers.push(RTCIceServer {
+                                urls: vec![format!("turn:{}", krelay_server)],
+                                username: existing_conn.username,
+                                credential: existing_conn.password, // Use pooled credential
+                            });
+                        } else {
+                            // Create new TURN connection
+                            debug!(target: "ice_config", tube_id = %tube_id, "Fetching new TURN credentials from router");
+                            match get_relay_access_creds(ksm_cfg, None, client_version).await {
+                                Ok(creds) => {
+                                    debug!(target: "ice_config", tube_id = %tube_id, "Successfully fetched TURN credentials");
+                                    trace!(target: "ice_config", tube_id = %tube_id, credentials = %creds, "Received TURN credentials");
 
-                                // Extract username and password from credentials
-                                if let (Some(username), Some(password)) = (
-                                    creds.get("username").and_then(|v| v.as_str()),
-                                    creds.get("password").and_then(|v| v.as_str()),
-                                ) {
-                                    debug!(target: "ice_config", tube_id = %tube_id, relay_url = %krelay_server, "Using TURN server");
-                                    ice_servers.push(RTCIceServer {
-                                        urls: vec![format!("turn:{}", krelay_server)],
-                                        username: username.to_string(),
-                                        credential: password.to_string(),
-                                    });
-                                } else {
-                                    warn!(target: "ice_config", tube_id = %tube_id, "Invalid TURN credentials format");
+                                    // Extract username and password from credentials
+                                    if let (Some(username), Some(password)) = (
+                                        creds.get("username").and_then(|v| v.as_str()),
+                                        creds.get("password").and_then(|v| v.as_str()),
+                                    ) {
+                                        // Add to connection pool
+                                        let _ref_count = RESOURCE_MANAGER.add_turn_connection(
+                                            krelay_server.to_string(),
+                                            username.to_string(),
+                                            password.to_string(),
+                                        );
+
+                                        debug!(target: "ice_config", tube_id = %tube_id, relay_url = %krelay_server, 
+                                               username = %username, "Created new TURN connection and added to pool");
+                                        ice_servers.push(RTCIceServer {
+                                            urls: vec![format!("turn:{}", krelay_server)],
+                                            username: username.to_string(),
+                                            credential: password.to_string(),
+                                        });
+                                    } else {
+                                        warn!(target: "ice_config", tube_id = %tube_id, "Invalid TURN credentials format");
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                error!(target: "ice_config", tube_id = %tube_id, "Failed to get TURN credentials: {}", e);
-                                // Don't fail the entire operation, just log the error
+                                Err(e) => {
+                                    error!(target: "ice_config", tube_id = %tube_id, "Failed to get TURN credentials: {}", e);
+                                    // Don't fail the entire operation, just log the error
+                                }
                             }
                         }
                     }
@@ -422,7 +445,10 @@ impl TubeRegistry {
             } else {
                 rtc_config.ice_transport_policy = RTCIceTransportPolicy::All;
             }
-            Some(rtc_config)
+
+            // Apply resource management RTCConfiguration tuning
+            let tuned_config = RESOURCE_MANAGER.apply_rtc_config_tuning(rtc_config, &tube_id);
+            Some(tuned_config)
         };
 
         // For server mode, use empty string for ksm_config when creating peer connection since it's not needed

@@ -1,4 +1,5 @@
 mod logger;
+pub mod resource_manager;
 pub mod webrtc_core;
 
 #[cfg(test)]

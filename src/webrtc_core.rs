@@ -1,3 +1,4 @@
+use crate::resource_manager::{IceAgentGuard, ResourceError, RESOURCE_MANAGER};
 use crate::tube_registry::SignalMessage;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -98,6 +99,7 @@ pub struct WebRTCPeerConnection {
     pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
     pub tube_id: String,
     pub(crate) conversation_id: Option<String>,
+    _ice_agent_guard: Arc<Option<IceAgentGuard>>, // Keep guard to maintain resource allocation
 }
 
 impl WebRTCPeerConnection {
@@ -171,8 +173,31 @@ impl WebRTCPeerConnection {
         tube_id: String,
         conversation_id: Option<String>,
     ) -> Result<Self, String> {
+        // Acquire ICE agent permit before creating peer connection
+        let ice_agent_guard = match RESOURCE_MANAGER.acquire_ice_agent_permit().await {
+            Ok(guard) => Some(guard),
+            Err(ResourceError::Exhausted { resource, limit }) => {
+                warn!(target: "resource_management", tube_id = %tube_id, 
+                      "ICE agent resource exhausted: {} limit ({}) exceeded", resource, limit);
+                return Err(format!(
+                    "Resource exhausted: {resource} limit ({limit}) exceeded"
+                ));
+            }
+            Err(e) => {
+                error!(target: "resource_management", tube_id = %tube_id, 
+                       "Failed to acquire ICE agent permit: {}", e);
+                return Err(format!("Failed to acquire ICE agent permit: {e}"));
+            }
+        };
+
         // Use the provided configuration or default
         let mut actual_config = config.unwrap_or_default();
+
+        // Apply resource limits from the resource manager
+        let limits = RESOURCE_MANAGER.get_limits();
+
+        // Limit ICE candidate pool size to reduce socket usage
+        actual_config.ice_candidate_pool_size = limits.max_interfaces_per_agent as u8;
 
         // Apply ICE transport policy settings based on the turn_only flag
         if turn_only {
@@ -200,6 +225,9 @@ impl WebRTCPeerConnection {
         // No longer setting up ICE candidate handler here - this will be done in setup_ice_candidate_handler
         // to avoid duplicate handlers
 
+        info!(target: "resource_management", tube_id = %tube_id, 
+              "Successfully created WebRTC peer connection with resource management");
+
         // Return the new WebRTCPeerConnection struct
         Ok(Self {
             peer_connection: pc_arc,
@@ -209,6 +237,7 @@ impl WebRTCPeerConnection {
             signal_sender,
             tube_id,
             conversation_id,
+            _ice_agent_guard: Arc::new(ice_agent_guard),
         })
     }
 

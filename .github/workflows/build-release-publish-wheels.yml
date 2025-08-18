@@ -44,7 +44,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
         shell: bash
 
       - name: Build wheel
@@ -239,7 +239,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
         shell: bash
 
       - name: Build wheels (x86_64 and arm64)
@@ -286,7 +286,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
         shell: bash
 
       - name: Build wheel
@@ -459,6 +459,39 @@ jobs:
           name: keeper-pam-webrtc-rs-alpine-x86_64
           path: target/wheels/*.whl
 
+  # Build source distribution
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: stable
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin>=0.15,<2.0
+
+      - name: Build source distribution
+        run: |
+          echo "Building source distribution"
+          maturin sdist
+          ls -la target/wheels/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-sdist
+          path: target/wheels/*.tar.gz
+
   # Create release with all wheels if on tag
   create_release:
     name: Create Release
@@ -466,7 +499,7 @@ jobs:
     # Explicitly grant write permission for release creation
     permissions:
       contents: write
-    needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine]
+    needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine, build_sdist]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -479,26 +512,27 @@ jobs:
           VERSION=$(grep -m 1 version Cargo.toml | cut -d '"' -f2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-      - name: Download all wheels
+      - name: Download all wheels and source distribution
         uses: actions/download-artifact@v4
         with:
           path: dist/
           pattern: keeper-pam-webrtc-rs-*
           merge-multiple: true
 
-      - name: Debug wheel files
+      - name: Debug wheel and sdist files
         run: |
-          echo "Listing all wheel files in dist/"
-          find dist -type f -name "*.whl" | sort
+          echo "Listing all files in dist/"
+          find dist -type f \( -name "*.whl" -o -name "*.tar.gz" \) | sort
           echo "Contents of each directory:"
           find dist -type d | while read dir; do
             echo "Contents of $dir:"
             ls -la "$dir"
           done
           
-          # Ensure wheels are in the correct location for twine
+          # Ensure wheels and sdist are in the correct location for twine
           mkdir -p dist/wheels
           find dist -type f -name "*.whl" -exec cp {} dist/wheels/ \;
+          find dist -type f -name "*.tar.gz" -exec cp {} dist/wheels/ \;
           echo "Files copied to dist/wheels/:"
           ls -la dist/wheels/
         shell: bash
@@ -507,18 +541,20 @@ jobs:
         # Pin to a specific commit hash instead of using a tag
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
-          files: dist/wheels/*.whl
+          files: |
+            dist/wheels/*.whl
+            dist/wheels/*.tar.gz
           name: keeper-pam-webrtc-rs ${{ env.VERSION }}
           body: |
             WebRTC Python extension module using Rust
 
-            This release includes wheels for:
-            - Linux (x86_64, aarch64)
-            - macOS (x86_64, arm64)
-            - Windows (x86_64)
-            - Alpine Linux (x86_64)
+            This release includes:
+            - Wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64), Windows (x86_64), Alpine Linux (x86_64)
+            - Source distribution (sdist) for building from source
             
             Built with abi3 for maximum Python version compatibility (Python 3.7+).
+            
+            **Note:** Building from source requires Rust toolchain to be installed.
           tag_name: v${{ env.VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -547,6 +583,6 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          echo "Publishing wheels to PyPI..."
-          twine upload dist/wheels/*.whl
+          echo "Publishing wheels and source distribution to PyPI..."
+          twine upload dist/wheels/*
         shell: bash

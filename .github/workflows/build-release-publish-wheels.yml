@@ -44,7 +44,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
         shell: bash
 
       - name: Build wheel
@@ -239,7 +239,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
         shell: bash
 
       - name: Build wheels (x86_64 and arm64)
@@ -286,7 +286,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
         shell: bash
 
       - name: Build wheel
@@ -479,7 +479,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install maturin==0.15.1
+          pip install maturin>=0.15,<2.0
 
       - name: Build source distribution
         run: |
@@ -584,5 +584,5 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           echo "Publishing wheels and source distribution to PyPI..."
-          twine upload dist/wheels/*.whl dist/wheels/*.tar.gz
+          twine upload dist/wheels/*
         shell: bash

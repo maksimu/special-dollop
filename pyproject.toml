@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=0.15,<1.0"]
+requires = ["maturin>=0.15,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -26,5 +26,4 @@ classifiers = [
 ]
 
 [tool.maturin]
-python-source = "python"
 module-name = "keeper_pam_webrtc_rs"

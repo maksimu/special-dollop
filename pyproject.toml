@@ -7,7 +7,7 @@ name = "keeper-pam-webrtc-rs"
 dynamic = ["version"]
 description = "Keeper PAM WebRTC for Python - A secure, stable, and high-performance Tube API for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations."
 readme = "README.md"
-license = { file = "LICENSE" }
+license = { text = "MIT" }
 requires-python = ">=3.7"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -27,3 +27,4 @@ classifiers = [
 
 [tool.maturin]
 module-name = "keeper_pam_webrtc_rs"
+exclude = ["LICENSE*"]

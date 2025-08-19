@@ -137,7 +137,7 @@ jobs:
             source \$HOME/.cargo/env
           
             # Install maturin
-            /opt/python/cp311-cp311/bin/pip install maturin==0.15.1
+            /opt/python/cp311-cp311/bin/pip install 'maturin>=1.9'
           
             # Build the wheel
             cd /io
@@ -360,7 +360,7 @@ jobs:
             source \$HOME/.cargo/env
           
             # Install maturin with patchelf support
-            pip3 install 'maturin[patchelf]==0.15.1'
+            pip3 install 'maturin[patchelf]>=1.9'
           
             # Build the wheel directly in a temporary directory within the container
             TEMP_DIR=\$(mktemp -d)

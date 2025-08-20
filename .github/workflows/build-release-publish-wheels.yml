@@ -571,10 +571,11 @@ jobs:
           fi
         shell: bash
 
+        # https://stackoverflow.com/questions/79408101/what-is-the-correct-way-of-specifying-the-license-in-pyproject-toml-file-for-a-n
       - name: Install PyPI tools
         run: |
           python -m pip install --upgrade pip
-          pip install twine
+          pip install twine==6.0.1
         shell: bash
 
       - name: Publish to PyPI

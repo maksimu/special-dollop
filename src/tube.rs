@@ -160,6 +160,10 @@ impl Tube {
                         // Tube status update
                         *status_clone.write().await = TubeStatus::Active;
                         debug!(tube_id = %tube_id_log, "Tube connection state changed to Active");
+                        // Start keepalive mechanism to prevent NAT timeouts
+                        if let Err(e) = connection_for_signals.start_keepalive().await {
+                            warn!(target: "webrtc_keepalive", tube_id = %tube_id_log, error = %e, "Failed to start keepalive");
+                        }
                         // Send connection state changed signal to Python
                         info!(target: "webrtc_signal", tube_id = %tube_id_log, "Sending 'connected' signal to Python");
                         connection_for_signals.send_connection_state_changed("connected");
@@ -374,6 +378,7 @@ impl Tube {
         let callback_token_for_on_data_channel = callback_token.clone(); // Clone for on_data_channel
         let ksm_config_for_on_data_channel = ksm_config.clone(); // Clone for on_data_channel
         let tube_client_version_for_on_data_channel = self.client_version.clone(); // Clone for on_data_channel
+        let peer_connection_for_on_data_channel = connection_arc.clone(); // Clone peer connection for data channel handler
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
@@ -381,6 +386,7 @@ impl Tube {
             let callback_token_for_channel = callback_token_for_on_data_channel.clone();
             let ksm_config_for_channel = ksm_config_for_on_data_channel.clone();
             let client_version_arc_for_channel = tube_client_version_for_on_data_channel.clone();
+            let peer_connection_for_channel = peer_connection_for_on_data_channel.clone();
             let rtc_data_channel_label = rtc_data_channel.label().to_string(); // Get the label once for logging
             let rtc_data_channel_id = rtc_data_channel.id();
 
@@ -420,6 +426,7 @@ impl Tube {
                 debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: About to call setup_channel_for_data_channel.");
                 let channel_result = setup_channel_for_data_channel(
                     &data_channel,
+                    &peer_connection_for_channel,
                     rtc_data_channel_label.clone(),
                     None,
                     protocol_settings_for_channel_setup,
@@ -794,6 +801,11 @@ impl Tube {
             &token_value,
             None,
             client_version,
+            None, // description
+            None, // recording_duration
+            None, // closure_reason
+            None, // ai_overall_risk_level
+            None, // ai_overall_summary
         )
         .await
         {
@@ -835,6 +847,11 @@ impl Tube {
             &token_value,
             Some(true),
             client_version,
+            None, // description
+            None, // recording_duration
+            None, // closure_reason
+            None, // ai_overall_risk_level
+            None, // ai_overall_summary
         )
         .await
         {
@@ -879,8 +896,21 @@ impl Tube {
             }
         };
 
+        // Get peer connection for activity tracking
+        let peer_connection = {
+            let pc_guard = self.peer_connection.lock().await;
+            if let Some(pc) = &*pc_guard {
+                pc.clone()
+            } else {
+                return Err(anyhow!(
+                    "No peer connection available for activity tracking"
+                ));
+            }
+        };
+
         let setup_result = setup_channel_for_data_channel(
             data_channel,
+            &peer_connection,
             name.to_string(),
             timeouts,
             protocol_settings.clone(), // protocol_settings is already cloned if needed by the caller or passed as value
@@ -1417,6 +1447,11 @@ impl Tube {
                     &token_value,
                     None,
                     client_version,
+                    None, // description
+                    None, // recording_duration
+                    None, // closure_reason
+                    None, // ai_overall_risk_level
+                    None, // ai_overall_summary
                 )
                 .await
                 {
@@ -1444,6 +1479,32 @@ impl Tube {
 
     // Send connection_close callback for a specific channel
     pub async fn send_connection_close_callback(&self, channel_name: &str) -> Result<()> {
+        self.send_connection_close_callback_with_options(channel_name, false)
+            .await
+    }
+
+    // Send connection_close callback with option to skip for AI handling
+    pub async fn send_connection_close_callback_with_options(
+        &self,
+        channel_name: &str,
+        skip_for_ai_handling: bool,
+    ) -> Result<()> {
+        if skip_for_ai_handling {
+            debug!(tube_id = %self.id, channel_name = %channel_name, "Skipping Rust connection_close callback - will be handled by Python with AI metadata");
+            return Ok(());
+        }
+
+        // Check if this tube/connection is already closed/closing to prevent duplicate callbacks
+        let current_status = *self.status.read().await;
+        if matches!(
+            current_status,
+            TubeStatus::Closing | TubeStatus::Closed | TubeStatus::Failed
+        ) {
+            debug!(tube_id = %self.id, channel_name = %channel_name, status = ?current_status,
+                   "Skipping connection_close callback - tube already closed/closing/failed");
+            return Ok(());
+        }
+
         if self.is_server_mode_context {
             return Ok(());
         }
@@ -1469,6 +1530,11 @@ impl Tube {
                     &token_value,
                     Some(true),
                     client_version,
+                    None, // description
+                    None, // recording_duration
+                    None, // closure_reason
+                    None, // ai_overall_risk_level
+                    None, // ai_overall_summary
                 )
                 .await
                 {
@@ -1490,6 +1556,65 @@ impl Tube {
             Ok(())
         }
     }
+
+    // ICE restart method for connection recovery
+    pub async fn restart_ice(&self) -> Result<String, String> {
+        let pc_guard = self.peer_connection.lock().await;
+        if let Some(ref pc) = *pc_guard {
+            pc.restart_ice().await
+        } else {
+            Err("No peer connection available for ICE restart".to_string())
+        }
+    }
+
+    // Get connection statistics
+    pub async fn get_connection_stats(&self) -> Result<ConnectionStats, String> {
+        let pc_guard = self.peer_connection.lock().await;
+        if let Some(ref pc) = *pc_guard {
+            // Get WebRTC stats if available
+            let reports = pc.peer_connection.get_stats().await;
+            let mut stats = ConnectionStats::default();
+
+            // Parse WebRTC stats reports for relevant metrics
+            for (_id, report) in reports.reports.iter() {
+                match report {
+                    webrtc::stats::StatsReportType::InboundRTP(inbound) => {
+                        stats.bytes_received += inbound.bytes_received;
+                    }
+                    webrtc::stats::StatsReportType::OutboundRTP(outbound) => {
+                        stats.bytes_sent += outbound.bytes_sent;
+                    }
+                    webrtc::stats::StatsReportType::RemoteInboundRTP(remote_inbound) => {
+                        // Use remote inbound stats for packet loss (more accurate)
+                        stats.packet_loss_rate = remote_inbound.fraction_lost;
+                        if let Some(rtt) = remote_inbound.round_trip_time {
+                            stats.rtt_ms = Some(rtt * 1000.0); // Convert to milliseconds
+                        }
+                    }
+                    webrtc::stats::StatsReportType::CandidatePair(pair) => {
+                        if pair.nominated {
+                            stats.rtt_ms = Some(pair.current_round_trip_time * 1000.0);
+                            // Convert to milliseconds
+                        }
+                    }
+                    _ => {} // Ignore other stat types
+                }
+            }
+
+            Ok(stats)
+        } else {
+            Err("No peer connection available for stats".to_string())
+        }
+    }
+}
+
+// Connection statistics structure
+#[derive(Debug, Default, Clone)]
+pub struct ConnectionStats {
+    pub packet_loss_rate: f64,
+    pub rtt_ms: Option<f64>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 impl Drop for Tube {

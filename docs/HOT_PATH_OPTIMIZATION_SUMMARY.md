@@ -264,90 +264,26 @@ graph TB
 - **ARM64**: Graceful fallback to scalar operations (tested)
 - **Other**: Standard performance (still highly optimized)
 
-## 📊 **Performance Testing & Verification**
+## 📊 **Measured Performance Results**
 
-### **Benchmark Test Results:**
-```rust
-// Comprehensive performance test results (latest with UTF-8 optimizations):
-🧪 Testing: Ping/Control (0 bytes)
-  📊 Parse only:    398ns/frame  2,512,563 frames/sec
-  📊 Encode only:   479ns/frame  2,087,683 frames/sec  
-  📊 Round-trip:    906ns/frame  1,103,753 frames/sec
-
-🧪 Testing: Small packet (64 bytes)
-  📊 Parse only:    402ns/frame  2,487,562 frames/sec
-  📊 Encode only:   477ns/frame  2,096,436 frames/sec  
-  📊 Round-trip:    911ns/frame  1,097,695 frames/sec
-
-🧪 Testing: Ethernet frame (1500 bytes)
-  📊 Parse only:    430ns/frame  2,325,581 frames/sec
-  📊 Encode only:   490ns/frame  2,040,816 frames/sec
-  📊 Round-trip:    966ns/frame  1,035,197 frames/sec
-
-🧪 Testing: Large transfer (8192 bytes)  
-  📊 Parse only:    513ns/frame  1,949,318 frames/sec
-  📊 Encode only:   580ns/frame  1,724,138 frames/sec
-  📊 Round-trip:   1121ns/frame    892,061 frames/sec
-
-🧪 Testing: Max UDP (65507 bytes)
-  📊 Parse only:   1428ns/frame    700,280 frames/sec
-  📊 Encode only:  2213ns/frame    451,875 frames/sec
-  📊 Round-trip:  11063ns/frame     90,391 frames/sec
-
-🌍 UTF-8 Character Set Performance:
-  📊 ASCII:       371ns per instruction
-  📊 French:      630ns per instruction  
-  📊 German:      623ns per instruction
-  📊 Japanese:    599ns per instruction
-  📊 Chinese:     490ns per instruction (fastest UTF-8!)
-  📊 Mixed UTF-8: 603ns per instruction
-```
-
-### **Performance Test Commands:**
-```bash
-# Run comprehensive performance benchmarks
-cargo test test_realistic_frame_processing_performance --no-default-features -- --nocapture
-
-# Run UTF-8 character set performance tests
-cargo test performance --no-default-features -- --nocapture
-
-# Run specific UTF-8 character set validation
-cargo test test_problematic_character_sets_from_logs --no-default-features -- --nocapture
-
-# Run SIMD UTF-8 optimization tests
-cargo test test_simd_performance_characteristics --no-default-features -- --nocapture
-
-# Verify compilation and basic functionality
-cargo check && cargo test
-
-# Production build with maximum optimization
-cargo build --release
-```
-
-### **Code Quality Commands:**
-```bash
-# Basic compilation check (fast)
-cargo check
-
-# Full build verification (without Python bindings to avoid linking issues)
-cargo build --no-default-features
-
-# Full build with Python bindings (requires Python dev environment)
-cargo build
-
-# Check for code quality issues and warnings
-cargo clippy -- -D warnings
-
-# Format all code according to Rust standards
-cargo fmt --all
-
-# Comprehensive quality check sequence (recommended for development)
-cargo check && cargo build --no-default-features && cargo clippy -- -D warnings && cargo fmt --all
-
-# CI/Development workflow (no Python dependencies)
-cargo check && cargo build --no-default-features && cargo clippy -- -D warnings && cargo fmt --all && cargo test --no-default-features
+### **Latest Benchmark Results:**
+The system achieves enterprise-grade performance across all frame types and character sets:
 
 ```
+Frame Processing Results:
+  • Small frames (0-64B): 398-477ns parse/encode → 2.5M frames/sec
+  • Medium frames (1.5KB): 430-490ns parse/encode → 2.3M frames/sec  
+  • Large frames (8KB): 513-580ns parse/encode → 1.9M frames/sec
+  • Max UDP (64KB): 1428-2213ns parse/encode → 700K frames/sec
+
+UTF-8 Character Processing Results:
+  • ASCII: 371ns per instruction (baseline)
+  • European languages: 623-630ns per instruction
+  • CJK languages: 490-599ns per instruction  
+  • Mixed UTF-8: 603ns per instruction
+```
+
+**➡️ For detailed benchmarking commands and performance validation, see [PERFORMANCE_BENCHMARKS.md](PERFORMANCE_BENCHMARKS.md)**
 
 ## 🔮 **Future Enhancement Opportunities**
 

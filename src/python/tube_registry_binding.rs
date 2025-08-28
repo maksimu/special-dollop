@@ -652,7 +652,18 @@ impl PyTubeRegistry {
                         .collect()
                 );
 
-                post_connection_state(&ksm_config_from_python, "open_connections", &tokens_json, None, &client_version).await
+                post_connection_state(
+                    &ksm_config_from_python,
+                    "open_connections", 
+                    &tokens_json,
+                    None,
+                    &client_version,
+                    None, // description
+                    None, // recording_duration
+                    None, // closure_reason
+                    None, // ai_overall_risk_level
+                    None, // ai_overall_summary
+                ).await
                     .map_err(|e| PyRuntimeError::new_err(format!("Failed to refresh connections on router: {e}")))
             })
         })
@@ -1207,6 +1218,60 @@ impl PyTubeRegistry {
         formatted_output.push("=".repeat(80));
 
         Ok(formatted_output.join("\n"))
+    }
+
+    /// Restart ICE for a specific tube
+    fn restart_ice(&self, py: Python<'_>, tube_id: &str) -> PyResult<()> {
+        let tube_id_owned = tube_id.to_string();
+        let master_runtime = get_runtime();
+
+        py.allow_threads(|| {
+            master_runtime.block_on(async move {
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                    tube.restart_ice()
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("ICE restart failed: {}", e)))
+                } else {
+                    Err(PyRuntimeError::new_err(format!(
+                        "Tube not found: {}",
+                        tube_id_owned
+                    )))
+                }
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Get connection statistics for a specific tube
+    fn get_connection_stats(&self, py: Python<'_>, tube_id: &str) -> PyResult<PyObject> {
+        let tube_id_owned = tube_id.to_string();
+        let master_runtime = get_runtime();
+
+        let stats_result = py.allow_threads(|| {
+            master_runtime.block_on(async move {
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                    tube.get_connection_stats()
+                        .await
+                        .map_err(|e| format!("Failed to get stats: {}", e))
+                } else {
+                    Err(format!("Tube not found: {}", tube_id_owned))
+                }
+            })
+        });
+
+        match stats_result {
+            Ok(stats) => {
+                let dict = PyDict::new(py);
+                dict.set_item("packet_loss_rate", stats.packet_loss_rate)?;
+                dict.set_item("rtt_ms", stats.rtt_ms)?;
+                dict.set_item("bytes_sent", stats.bytes_sent)?;
+                dict.set_item("bytes_received", stats.bytes_received)?;
+                Ok(dict.into())
+            }
+            Err(e) => Err(PyRuntimeError::new_err(e)),
+        }
     }
 }
 

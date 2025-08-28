@@ -35,6 +35,12 @@ pub struct ResourceLimits {
     pub rtcp_mux_policy: Option<String>,      // "negotiate", "require"
     pub ice_connection_receiving_timeout: Option<Duration>,
     pub ice_backup_candidate_pair_ping_interval: Option<Duration>,
+    // Session keepalive settings to prevent timeouts
+    pub ice_keepalive_enabled: bool,
+    pub ice_keepalive_interval: Duration,
+    pub session_timeout: Duration,
+    pub turn_credential_refresh_interval: Duration,
+    pub connection_health_check_interval: Duration,
 }
 
 impl Default for ResourceLimits {
@@ -54,6 +60,12 @@ impl Default for ResourceLimits {
             rtcp_mux_policy: Some("require".to_string()), // Reduce port usage
             ice_connection_receiving_timeout: Some(Duration::from_secs(30)),
             ice_backup_candidate_pair_ping_interval: Some(Duration::from_secs(25)),
+            // Session keepalive defaults to prevent NAT timeouts
+            ice_keepalive_enabled: true,
+            ice_keepalive_interval: Duration::from_secs(300), // 5 minutes - well below NAT timeout
+            session_timeout: Duration::from_secs(3600),       // 1 hour - longer than NAT timeout
+            turn_credential_refresh_interval: Duration::from_secs(600), // 10 minutes
+            connection_health_check_interval: Duration::from_secs(120), // 2 minutes
         }
     }
 }
@@ -245,6 +257,10 @@ impl ResourceManager {
         info!(
             "Updated resource limits: max_sockets={}, max_ice_agents={}",
             limits.max_concurrent_sockets, limits.max_concurrent_ice_agents
+        );
+        warn!(
+            "WARNING: Resource limit changes only affect reported limits, not actual semaphore capacity. \
+            Semaphores are fixed at initialization time. For testing, increase default limits instead."
         );
     }
 

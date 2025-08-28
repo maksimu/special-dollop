@@ -37,6 +37,8 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
     def create_tracked_registry(self):
         """Create a registry and track it for cleanup"""
         registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        # Configure higher resource limits for testing
+        self.configure_test_resource_limits(registry)
         self.created_registries.append(registry)
         return registry
 

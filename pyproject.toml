@@ -28,3 +28,9 @@ classifiers = [
 [tool.maturin]
 module-name = "keeper_pam_webrtc_rs"
 exclude = ["LICENSE*", "*.md", "README*"]
+python-source = "src/python"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:coroutine 'TunnelConnectionManager._execute_ice_restart' was never awaited:RuntimeWarning",
+]

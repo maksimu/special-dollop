@@ -41,6 +41,7 @@ impl std::fmt::Display for TubeStatus {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn setup_channel_for_data_channel(
     data_channel: &WebRTCDataChannel,
+    peer_connection: &crate::webrtc_core::WebRTCPeerConnection,
     label: String,
     timeouts: Option<TunnelTimeouts>,
     protocol_settings: HashMap<String, serde_json::Value>,
@@ -74,6 +75,7 @@ pub(crate) async fn setup_channel_for_data_channel(
     ));
 
     // Tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
+    let peer_connection_clone = peer_connection.clone();
     data_channel_ref.on_message(Box::new(move |msg| {
         trace_hot_path!(
             target: "on_message",
@@ -83,8 +85,11 @@ pub(crate) async fn setup_channel_for_data_channel(
         let tx_clone = tx.clone(); // Clone tx for the async block
         let buffer_pool_clone = buffer_pool.clone();
         let label_clone = label.clone(); // Clone label for the async block
+        let pc_clone = peer_connection_clone.clone();
 
         Box::pin(async move {
+            // Update activity timestamp when receiving data
+            pc_clone.update_activity();
             let data = &msg.data;
             let message_bytes = buffer_pool_clone.create_bytes(data);
             let message_len = message_bytes.len();

@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2021"
 description = "Keeper PAM WebRTC for Python - A secure, stable, and high-performance Tube API for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations."
 license = "MIT"
@@ -34,7 +34,7 @@ bytes = "1.10.1"
 chrono = "0.4.41"
 dashmap = "6.1.0"
 futures = "0.3.31"
-heapless = "0.8"
+heapless = "0.9.1"
 hex = "0.4.3"
 hkdf = "0.12.4"
 ipnet = "2.8"
@@ -45,17 +45,17 @@ pyo3 = { version = "0.25.1", features = ["extension-module", "abi3-py37"], optio
 pyo3-log = { version = "0.12.4", optional = true }
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.142"
+serde_json = "1.0.143"
 sha2 = "0.10.9"
 smallvec = "1.15.1"
 socket2 = "0.6.0"
 # Not directly used - included to enforce a minimum version for security (CVE fixes in 0.17.12+)
 # Dependency comes through webrtc crate
 ring = "0.17.14"
-thiserror = "2.0.14"
+thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full", "rt-multi-thread"] }
 tracing = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
-uuid = { version = "1.18.0", features = ["v4"] }
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter", "json"] }
+uuid = { version = "1.18.1", features = ["v4"] }
 webrtc = "0.13.0"
 

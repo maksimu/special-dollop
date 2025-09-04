@@ -66,6 +66,8 @@ class TestThreadMonitoring(BaseWebRTCTest, unittest.TestCase):
     def create_tracked_registry(self):
         """Create a registry and track it for cleanup"""
         registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        # Configure higher resource limits for testing
+        self.configure_test_resource_limits(registry)
         self.created_registries.append(registry)
         return registry
 
@@ -333,24 +335,24 @@ class TestThreadMonitoring(BaseWebRTCTest, unittest.TestCase):
         logging.info(f"Registry creation thread change: {registry_change}")
         
         if registry_change == 0:
-            logging.info("✅ CONFIRMED: PyTubeRegistry creation adds no threads")
+            logging.info("[PASS] CONFIRMED: PyTubeRegistry creation adds no threads")
             logging.info("   This suggests threads are created during logger init, not registry creation")
         else:
-            logging.info(f"❌ UNEXPECTED: PyTubeRegistry created {registry_change} threads")
+            logging.info(f"[FAIL] UNEXPECTED: PyTubeRegistry created {registry_change} threads")
         
         # Cleanup
         registry.cleanup_all()
         
         # The smoking gun evidence
         logging.info("")
-        logging.info("🔍 CONCLUSION:")
+        logging.info("CONCLUSION:")
         logging.info("   Your Windows service hangs because:")
         logging.info("   1. initialize_rust_logger() creates global Tokio runtime threads")
         logging.info("   2. These threads are created early in service startup")  
         logging.info("   3. On Windows, these threads don't terminate properly during service shutdown")
         logging.info("   4. This causes the 'CLI thread waiting' hang you observed")
         logging.info("")
-        logging.info("💡 SOLUTION:")
+        logging.info("SOLUTION:")
         logging.info("   Add explicit Rust runtime shutdown in your service stop sequence")
 
 

@@ -1,4 +1,10 @@
 // Main test module that imports and re-exports the other test modules
+//
+// Test Organization:
+// - Rust unit tests (below): Fast, deterministic, CI-friendly
+// - Python stress tests: ../tests/manual_stress_tests.py (manual only, not CI)
+// - Performance benchmarks: See docs/HOT_PATH_OPTIMIZATION_SUMMARY.md
+//
 #[cfg(test)]
 mod channel_tests;
 #[cfg(test)]
@@ -21,3 +27,5 @@ mod tube_registry_tests;
 mod tube_tests;
 #[cfg(test)]
 mod webrtc_basic_tests;
+#[cfg(test)]
+mod webrtc_core_tests;

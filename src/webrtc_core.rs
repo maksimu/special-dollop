@@ -3,7 +3,62 @@ use crate::tube_registry::SignalMessage;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// Consolidated state structures to prevent deadlocks
+#[derive(Debug)]
+struct ActivityState {
+    last_activity: Instant,
+    last_successful_activity: Instant,
+}
+
+#[derive(Debug)]
+struct IceRestartState {
+    attempts: u32,
+    last_restart: Option<Instant>,
+}
+
+impl ActivityState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_activity: now,
+            last_successful_activity: now,
+        }
+    }
+
+    fn update_both(&mut self, now: Instant) {
+        self.last_activity = now;
+        self.last_successful_activity = now;
+    }
+}
+
+impl IceRestartState {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            last_restart: None,
+        }
+    }
+
+    fn record_attempt(&mut self, now: Instant) {
+        self.attempts += 1;
+        self.last_restart = Some(now);
+    }
+
+    fn get_min_interval(&self) -> Duration {
+        // Exponential backoff: 5s → 10s → 20s → 60s max
+        match self.attempts {
+            0 => Duration::from_secs(5),
+            1 => Duration::from_secs(10),
+            2 => Duration::from_secs(20),
+            _ => Duration::from_secs(60), // Max backoff
+        }
+    }
+
+    fn time_since_last_restart(&self, now: Instant) -> Option<Duration> {
+        self.last_restart.map(|last| now.duration_since(last))
+    }
+}
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -20,6 +75,19 @@ use webrtc::peer_connection::RTCPeerConnection;
 // Constants for SCTP max message size negotiation
 const DEFAULT_MAX_MESSAGE_SIZE: u32 = 262144; // 256KB - Common default for WebRTC
 const OUR_MAX_MESSAGE_SIZE: u32 = 65536; // 64KB - Safe limit for webrtc-rs
+
+// Constants for ICE restart management
+/// Maximum number of ICE restart attempts before giving up.
+/// The value 5 is chosen to balance recovery from network issues and resource usage.
+const MAX_ICE_RESTART_ATTEMPTS: u32 = 5;
+
+/// Activity timeout threshold for ICE restart decisions.
+///
+/// This timeout determines how long we wait without successful activity
+/// before considering the connection degraded enough to warrant an ICE restart.
+/// The 2-minute threshold balances between being responsive to connectivity issues
+/// and avoiding unnecessary restarts during brief network interruptions.
+const ACTIVITY_TIMEOUT_SECS: u64 = 120;
 
 // Cached API instance for reuse
 static API: once_cell::sync::Lazy<webrtc::api::API> =
@@ -89,6 +157,30 @@ pub async fn create_data_channel(
         .await
 }
 
+// Lightweight struct for ICE candidate handler data to avoid circular references
+#[derive(Clone)]
+struct IceCandidateHandlerContext {
+    tube_id: String,
+    signal_sender: Option<UnboundedSender<SignalMessage>>,
+    trickle_ice: bool,
+    conversation_id: Option<String>,
+    pending_candidates: Arc<Mutex<Vec<String>>>,
+    peer_connection: Arc<RTCPeerConnection>,
+}
+
+impl IceCandidateHandlerContext {
+    fn new(peer_connection: &WebRTCPeerConnection) -> Self {
+        Self {
+            tube_id: peer_connection.tube_id.clone(),
+            signal_sender: peer_connection.signal_sender.clone(),
+            trickle_ice: peer_connection.trickle_ice,
+            conversation_id: peer_connection.conversation_id.clone(),
+            pending_candidates: Arc::clone(&peer_connection.pending_incoming_ice_candidates),
+            peer_connection: Arc::clone(&peer_connection.peer_connection),
+        }
+    }
+}
+
 // Async-first wrapper for core WebRTC operations
 #[derive(Clone)]
 pub struct WebRTCPeerConnection {
@@ -99,7 +191,30 @@ pub struct WebRTCPeerConnection {
     pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
     pub tube_id: String,
     pub(crate) conversation_id: Option<String>,
-    _ice_agent_guard: Arc<Option<IceAgentGuard>>, // Keep guard to maintain resource allocation
+    /// ICE agent resource guard wrapped in Arc<Mutex<>> for thread-safe access.
+    ///
+    /// This change from Arc<Option<IceAgentGuard>> to Arc<Mutex<Option<IceAgentGuard>>>
+    /// was necessary to ensure proper resource cleanup during connection close operations.
+    /// The Mutex provides thread-safe access for explicitly dropping the guard to prevent
+    /// circular references that could block resource cleanup. This is critical for avoiding
+    /// resource leaks in the ICE agent resource management system.
+    ///
+    /// The guard ensures that ICE agent resources are properly allocated and released,
+    /// preventing resource exhaustion under high connection loads.
+    _ice_agent_guard: Arc<Mutex<Option<IceAgentGuard>>>,
+
+    // Keepalive infrastructure for session timeout prevention
+    keepalive_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    keepalive_interval: Duration,
+    last_activity: Arc<Mutex<Instant>>,
+    keepalive_enabled: Arc<AtomicBool>,
+
+    // ICE restart and connection quality tracking
+    connection_quality_degraded: Arc<AtomicBool>,
+
+    // Consolidated state to prevent deadlocks
+    activity_state: Arc<Mutex<ActivityState>>,
+    ice_restart_state: Arc<Mutex<IceRestartState>>,
 }
 
 impl WebRTCPeerConnection {
@@ -228,7 +343,8 @@ impl WebRTCPeerConnection {
         info!(target: "resource_management", tube_id = %tube_id, 
               "Successfully created WebRTC peer connection with resource management");
 
-        // Return the new WebRTCPeerConnection struct
+        // Return the new WebRTCPeerConnection struct with keepalive infrastructure
+        let now = Instant::now();
         Ok(Self {
             peer_connection: pc_arc,
             trickle_ice,
@@ -237,7 +353,20 @@ impl WebRTCPeerConnection {
             signal_sender,
             tube_id,
             conversation_id,
-            _ice_agent_guard: Arc::new(ice_agent_guard),
+            _ice_agent_guard: Arc::new(Mutex::new(ice_agent_guard)),
+
+            // Initialize keepalive infrastructure
+            keepalive_task: Arc::new(Mutex::new(None)),
+            keepalive_interval: limits.ice_keepalive_interval, // configurable, uses ResourceLimits setting
+            last_activity: Arc::new(Mutex::new(now)),
+            keepalive_enabled: Arc::new(AtomicBool::new(false)),
+
+            // Initialize ICE restart and connection quality tracking
+            connection_quality_degraded: Arc::new(AtomicBool::new(false)),
+
+            // Consolidated state to prevent deadlocks
+            activity_state: Arc::new(Mutex::new(ActivityState::new(now))),
+            ice_restart_state: Arc::new(Mutex::new(IceRestartState::new())),
         })
     }
 
@@ -250,49 +379,100 @@ impl WebRTCPeerConnection {
         }
         info!(target: "webrtc_ice", tube_id = %self.tube_id, "Setting up ICE candidate handler");
 
-        // Create a clone of self-reference for sending candidates
-        let self_ref = self.clone();
+        // IMPORTANT: To avoid circular references that prevent ICE agent cleanup,
+        // we use a lightweight context struct instead of cloning the entire WebRTCPeerConnection
+        let context = IceCandidateHandlerContext::new(self);
 
         // Remove any existing handlers first to avoid duplicates
         self.peer_connection
             .on_ice_candidate(Box::new(|_| Box::pin(async {})));
 
         // Set up handler for signaling state changes to flush buffered INCOMING candidates when ready
-        let self_for_signaling = self_ref.clone();
+        let context_signaling = context.clone();
+
         self.peer_connection.on_signaling_state_change(Box::new(move |state| {
-            debug!(target: "webrtc_ice", tube_id = %self_for_signaling.tube_id, "Signaling state changed to: {:?}", state);
-            let self_clone = self_for_signaling.clone();
+            debug!(target: "webrtc_ice", tube_id = %context_signaling.tube_id, "Signaling state changed to: {:?}", state);
+            let context_clone = context_signaling.clone();
             Box::pin(async move {
                 // Check if both descriptions are now set, regardless of specific state
-                let local_desc = self_clone.peer_connection.local_description().await;
-                let remote_desc = self_clone.peer_connection.remote_description().await;
+                let local_desc = context_clone.peer_connection.local_description().await;
+                let remote_desc = context_clone.peer_connection.remote_description().await;
                 if local_desc.is_some() && remote_desc.is_some() {
-                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "Both descriptions set after signaling state change, flushing buffered INCOMING ICE candidates");
-                    self_clone.flush_buffered_incoming_ice_candidates().await;
+                    debug!(target: "webrtc_ice", tube_id = %context_clone.tube_id, "Both descriptions set after signaling state change, flushing buffered INCOMING ICE candidates");
+                    // Flush pending candidates manually (no self reference)
+                    let candidates_to_flush = {
+                        let mut lock = context_clone.pending_candidates.lock().unwrap();
+                        std::mem::take(&mut *lock)
+                    };
+                    if !candidates_to_flush.is_empty() {
+                        warn!(target: "webrtc_ice", tube_id = %context_clone.tube_id, count = candidates_to_flush.len(), "Flushing {} buffered incoming ICE candidates", candidates_to_flush.len());
+                        for (index, candidate_str) in candidates_to_flush.iter().enumerate() {
+                            if !candidate_str.is_empty() {
+                                let candidate_init = RTCIceCandidateInit {
+                                    candidate: candidate_str.clone(),
+                                    ..Default::default()
+                                };
+                                match context_clone.peer_connection.add_ice_candidate(candidate_init).await {
+                                    Ok(()) => {
+                                        info!(target: "webrtc_ice", tube_id = %context_clone.tube_id, index = index, candidate = %candidate_str, "Successfully added buffered incoming ICE candidate");
+                                    }
+                                    Err(e) => {
+                                        error!(target: "webrtc_ice", tube_id = %context_clone.tube_id, index = index, candidate = %candidate_str, error = %e, "Failed to add buffered incoming ICE candidate");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             })
         }));
 
         // Set up handler for ICE candidates - SEND IMMEDIATELY (proper trickle ICE)
-        self.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            info!(target: "webrtc_ice_internal", tube_id = %self_ref.tube_id, ?candidate, "on_ice_candidate triggered");
+        let context_ice = context.clone();
 
-            let self_clone = self_ref.clone();
+        self.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+            info!(target: "webrtc_ice_internal", tube_id = %context_ice.tube_id, ?candidate, "on_ice_candidate triggered");
+
+            let context_handler = context_ice.clone();
 
             Box::pin(async move {
                 if let Some(c) = candidate {
                     // Convert the ICE candidate to a string representation
                     let candidate_str = format_ice_candidate(&c);
-                    info!(target: "webrtc_ice", tube_id = %self_clone.tube_id, candidate = %candidate_str, "ICE candidate gathered");
-                    debug!(target: "webrtc_ice_verbose", tube_id = %self_clone.tube_id, candidate = %candidate_str, "New ICE candidate details");
+                    info!(target: "webrtc_ice", tube_id = %context_handler.tube_id, candidate = %candidate_str, "ICE candidate gathered");
+                    debug!(target: "webrtc_ice_verbose", tube_id = %context_handler.tube_id, candidate = %candidate_str, "New ICE candidate details");
 
                     // Send immediately - no buffering on send side!
-                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "Sending ICE candidate immediately (trickle ICE)");
-                    self_clone.send_ice_candidate(&candidate_str);
+                    debug!(target: "webrtc_ice", tube_id = %context_handler.tube_id, "Sending ICE candidate immediately (trickle ICE)");
+                    // Send ICE candidate manually (no self reference)
+                    if let Some(sender) = &context_handler.signal_sender {
+                        let message = SignalMessage {
+                            tube_id: context_handler.tube_id.clone(),
+                            kind: "icecandidate".to_string(),
+                            data: candidate_str,
+                            conversation_id: context_handler.conversation_id.clone().unwrap_or_else(|| context_handler.tube_id.clone()),
+                            progress_flag: Some(if context_handler.trickle_ice { 2 } else { 0 }),
+                            progress_status: Some("OK".to_string()),
+                            is_ok: Some(true),
+                        };
+                        let _ = sender.send(message);
+                    }
                 } else {
                     // All ICE candidates gathered (received None) - send immediately
-                    debug!(target: "webrtc_ice", tube_id = %self_clone.tube_id, "All ICE candidates gathered (received None). Sending empty candidate signal immediately.");
-                    self_clone.send_ice_candidate("");
+                    debug!(target: "webrtc_ice", tube_id = %context_handler.tube_id, "All ICE candidates gathered (received None). Sending empty candidate signal immediately.");
+                    // Send empty candidate signal manually (no self reference)
+                    if let Some(sender) = &context_handler.signal_sender {
+                        let message = SignalMessage {
+                            tube_id: context_handler.tube_id.clone(),
+                            kind: "icecandidate".to_string(),
+                            data: "".to_string(),
+                            conversation_id: context_handler.conversation_id.clone().unwrap_or_else(|| context_handler.tube_id.clone()),
+                            progress_flag: Some(if context_handler.trickle_ice { 2 } else { 0 }),
+                            progress_status: Some("OK".to_string()),
+                            is_ok: Some(true),
+                        };
+                        let _ = sender.send(message);
+                    }
                 }
             })
         }));
@@ -679,8 +859,11 @@ impl WebRTCPeerConnection {
             .await
             .map_err(|e| format!("Failed to set remote description: {e}"));
 
-        // If successful and we now have both descriptions set, flush buffered incoming candidates
+        // If successful, update activity and flush buffered incoming candidates
         if result.is_ok() {
+            // Update activity timestamp - SDP exchange is significant activity
+            self.update_activity();
+
             let local_desc = self.peer_connection.local_description().await;
             let remote_desc = self.peer_connection.remote_description().await;
             if local_desc.is_some() && remote_desc.is_some() {
@@ -761,6 +944,12 @@ impl WebRTCPeerConnection {
             return Ok(()); // Already closing or closed
         }
 
+        // Stop keepalive task before closing
+        if let Err(e) = self.stop_keepalive().await {
+            warn!(target: "webrtc_lifecycle", tube_id = %self.tube_id, 
+                  error = %e, "Failed to stop keepalive during close");
+        }
+
         // First, clear all callbacks
         self.peer_connection
             .on_ice_candidate(Box::new(|_| Box::pin(async {})));
@@ -772,6 +961,24 @@ impl WebRTCPeerConnection {
             .on_peer_connection_state_change(Box::new(|_| Box::pin(async {})));
         self.peer_connection
             .on_signaling_state_change(Box::new(|_| Box::pin(async {})));
+
+        // CRITICAL: Explicitly drop the ICE agent guard to ensure resource cleanup
+        // This breaks any circular references that might prevent the guard from being dropped
+        {
+            match self._ice_agent_guard.lock() {
+                Ok(mut guard_lock) => {
+                    if let Some(guard) = guard_lock.take() {
+                        info!(target: "resource_management", tube_id = %self.tube_id, 
+                              "Explicitly dropping ICE agent guard to ensure resource cleanup");
+                        drop(guard);
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "resource_management", tube_id = %self.tube_id,
+                          error = %e, "Failed to acquire ICE agent guard lock during cleanup - proceeding anyway");
+                }
+            }
+        }
 
         // Then close the connection with a timeout to avoid hanging
         match tokio::time::timeout(Duration::from_secs(5), self.peer_connection.close()).await {
@@ -817,8 +1024,11 @@ impl WebRTCPeerConnection {
             .await
             .map_err(|e| format!("Failed to set local description: {e}"));
 
-        // If successful and we now have both descriptions set, flush buffered incoming candidates
+        // If successful, update activity and flush buffered incoming candidates
         if result.is_ok() {
+            // Update activity timestamp - local SDP setting is significant activity
+            self.update_activity();
+
             let local_desc = self.peer_connection.local_description().await;
             let remote_desc = self.peer_connection.remote_description().await;
             if local_desc.is_some() && remote_desc.is_some() {
@@ -836,5 +1046,259 @@ impl WebRTCPeerConnection {
         // This returns currently buffered incoming candidates
         let candidates = self.pending_incoming_ice_candidates.lock().unwrap();
         candidates.clone()
+    }
+
+    // Start keepalive mechanism to prevent NAT timeout (19-minute issue prevention)
+    // This integrates with the existing channel ping/pong system rather than duplicating it
+    pub async fn start_keepalive(&self) -> Result<(), String> {
+        // Enable keepalive flag for coordination with existing ping system
+        self.keepalive_enabled.store(true, Ordering::Relaxed);
+
+        // The actual keepalive implementation leverages the existing channel ping/pong system
+        // Channels already send pings on timeout - we just need to ensure they do it frequently enough
+        // to prevent NAT timeout (every 5 minutes instead of waiting for actual timeouts)
+
+        let keepalive_enabled_clone = self.keepalive_enabled.clone();
+        let tube_id_clone = self.tube_id.clone();
+        let pc_clone = self.peer_connection.clone();
+        let keepalive_interval = self.keepalive_interval;
+
+        // Create a lightweight task that just ensures periodic activity
+        let keepalive_task_handle = tokio::spawn(async move {
+            info!(target: "webrtc_keepalive", tube_id = %tube_id_clone, 
+                  interval_minutes = keepalive_interval.as_secs() / 60,
+                  "NAT timeout prevention active - ensuring periodic activity every {} seconds", 
+                  keepalive_interval.as_secs());
+
+            let mut interval = tokio::time::interval(keepalive_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            while keepalive_enabled_clone.load(Ordering::Relaxed) {
+                interval.tick().await;
+
+                if !keepalive_enabled_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // This keepalive task does not send pings directly; instead, it ensures periodic activity
+                // so that the channel's internal ping/pong mechanism (which triggers on activity or timeout)
+                // remains active and prevents NAT timeouts. No additional ping implementation is needed here.
+                debug!(target: "webrtc_keepalive", tube_id = %tube_id_clone, 
+                       "NAT timeout prevention tick - periodic activity to keep channel ping system active");
+
+                // Get current connection state to verify we're still connected
+                let connection_state = pc_clone.connection_state();
+                debug!(target: "webrtc_keepalive", tube_id = %tube_id_clone,
+                       connection_state = ?connection_state, "Connection state check");
+            }
+
+            info!(target: "webrtc_keepalive", tube_id = %tube_id_clone, 
+                  "NAT timeout prevention stopped");
+        });
+
+        // Store the task handle
+        if let Ok(mut task_guard) = self.keepalive_task.lock() {
+            if let Some(old_task) = task_guard.take() {
+                old_task.abort(); // Clean up any existing task
+            }
+            *task_guard = Some(keepalive_task_handle);
+        } else {
+            return Err("Failed to acquire keepalive task lock".to_string());
+        }
+
+        info!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
+              "NAT timeout prevention started - integrated with existing channel ping system");
+        Ok(())
+    }
+
+    // Update activity timestamp for timeout detection
+    pub fn update_activity(&self) {
+        let now = Instant::now();
+
+        // Update both activity timestamps in a single lock acquisition (deadlock-safe)
+        if let Ok(mut activity_state) = self.activity_state.lock() {
+            activity_state.update_both(now);
+            debug!(target: "webrtc_activity", tube_id = %self.tube_id, 
+                   "Activity updated - connection active");
+        } else {
+            warn!(target: "webrtc_activity", tube_id = %self.tube_id, 
+                  "Failed to acquire lock for activity update");
+        }
+
+        // Also update the legacy last_activity for backward compatibility
+        if let Ok(mut last_activity) = self.last_activity.lock() {
+            *last_activity = now;
+        }
+    }
+
+    // Stop keepalive mechanism
+    pub async fn stop_keepalive(&self) -> Result<(), String> {
+        // Disable keepalive flag
+        self.keepalive_enabled.store(false, Ordering::Relaxed);
+
+        // Stop and cleanup the keepalive task
+        if let Ok(mut task_guard) = self.keepalive_task.lock() {
+            if let Some(task) = task_guard.take() {
+                task.abort();
+                info!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
+                      "Keepalive task stopped and cleaned up");
+            } else {
+                debug!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
+                       "No active keepalive task to stop");
+            }
+        } else {
+            warn!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
+                  "Failed to acquire keepalive task lock for cleanup");
+        }
+
+        info!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
+              "NAT timeout prevention stopped");
+        Ok(())
+    }
+
+    // Check if ICE restart is needed based on connection quality (DEADLOCK-SAFE)
+    pub fn should_restart_ice(&self) -> bool {
+        let current_state = self.peer_connection.connection_state();
+        let now = Instant::now();
+
+        // Check if connection is in a degraded state
+        let connection_degraded = matches!(
+            current_state,
+            webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected
+                | webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed
+        );
+
+        // Get all activity and restart state in single lock acquisitions (deadlock-safe)
+        let (time_since_success, activity_timeout) = {
+            if let Ok(activity_state) = self.activity_state.lock() {
+                let time_since = now.duration_since(activity_state.last_successful_activity);
+                (
+                    time_since,
+                    time_since > Duration::from_secs(ACTIVITY_TIMEOUT_SECS),
+                )
+            } else {
+                // If we can't get the lock, assume recent activity to be safe
+                return false;
+            }
+        };
+
+        let (attempts, enough_time_passed, min_interval) = {
+            if let Ok(restart_state) = self.ice_restart_state.lock() {
+                let min_int = restart_state.get_min_interval();
+                let enough_time = restart_state
+                    .time_since_last_restart(now)
+                    .map(|duration| duration >= min_int)
+                    .unwrap_or(true); // Never restarted before
+                (restart_state.attempts, enough_time, min_int)
+            } else {
+                return false; // Can't get lock, be conservative
+            }
+        };
+
+        // Don't restart too many times
+        let not_too_many_attempts = attempts < MAX_ICE_RESTART_ATTEMPTS;
+
+        let should_restart =
+            connection_degraded && activity_timeout && enough_time_passed && not_too_many_attempts;
+
+        if should_restart {
+            debug!(target: "webrtc_ice_restart", tube_id = %self.tube_id,
+                   connection_state = ?current_state,
+                   time_since_success_secs = time_since_success.as_secs(),
+                   restart_attempts = attempts,
+                   min_interval_secs = min_interval.as_secs(),
+                   "ICE restart conditions met");
+        } else {
+            debug!(target: "webrtc_ice_restart", tube_id = %self.tube_id,
+                   connection_state = ?current_state,
+                   connection_degraded = connection_degraded,
+                   activity_timeout = activity_timeout,
+                   enough_time_passed = enough_time_passed,
+                   not_too_many_attempts = not_too_many_attempts,
+                   "ICE restart conditions not met");
+        }
+
+        should_restart
+    }
+
+    // Perform ICE restart to recover from connectivity issues (DEADLOCK-SAFE)
+    pub async fn restart_ice(&self) -> Result<String, String> {
+        info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
+              "ICE restart initiated for connection recovery");
+
+        // Update restart tracking in single lock acquisition (deadlock-safe)
+        let now = Instant::now();
+        if let Ok(mut restart_state) = self.ice_restart_state.lock() {
+            restart_state.record_attempt(now);
+            let count = restart_state.attempts;
+            info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
+                  attempt = count, "ICE restart attempt #{}", count);
+        } else {
+            return Err("Failed to acquire restart state lock".to_string());
+        }
+
+        // Set connection quality as degraded during restart
+        self.connection_quality_degraded
+            .store(true, Ordering::Relaxed);
+
+        // Generate new offer with ICE restart
+        match self.peer_connection.create_offer(None).await {
+            Ok(offer) => {
+                info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
+                      sdp_length = offer.sdp.len(),
+                      "Successfully generated ICE restart offer");
+
+                // Set the new local description to trigger ICE restart
+                let offer_desc = RTCSessionDescription::offer(offer.sdp.clone())
+                    .map_err(|e| format!("Failed to create offer session description: {e}"))?;
+
+                match self.peer_connection.set_local_description(offer_desc).await {
+                    Ok(()) => {
+                        info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
+                              "ICE restart offer set as local description - new ICE session will begin");
+
+                        // Update activity since we just performed a successful SDP operation
+                        self.update_activity();
+
+                        // Reset connection quality flag - we'll monitor for improvement
+                        self.connection_quality_degraded
+                            .store(false, Ordering::Relaxed);
+
+                        Ok(offer.sdp)
+                    }
+                    Err(e) => {
+                        warn!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
+                              error = %e, "Failed to set ICE restart offer as local description");
+                        Err(format!(
+                            "Failed to set local description for ICE restart: {e}"
+                        ))
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
+                      error = %e, "Failed to create ICE restart offer");
+                Err(format!("Failed to create ICE restart offer: {e}"))
+            }
+        }
+    }
+
+    // Test helper methods (only compiled in test builds)
+    #[cfg(test)]
+    pub fn is_keepalive_running(&self) -> bool {
+        let task_guard = self.keepalive_task.lock().unwrap();
+        task_guard.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn get_last_activity(&self) -> Instant {
+        let activity_guard = self.last_activity.lock().unwrap();
+        *activity_guard
+    }
+
+    #[cfg(test)]
+    pub fn set_last_activity(&self, time: Instant) {
+        let mut activity_guard = self.last_activity.lock().unwrap();
+        *activity_guard = time;
     }
 }

@@ -45,6 +45,20 @@ struct ConnectionStateBody {
     tokens: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "recordingDuration")]
+    recording_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "closureReason")]
+    closure_reason: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "aiOverallRiskLevel")]
+    ai_overall_risk_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "aiOverallSummary")]
+    ai_overall_summary: Option<String>,
 }
 
 // Constants
@@ -460,12 +474,18 @@ pub async fn get_relay_access_creds(
 }
 
 // Function to post connection state
+#[allow(clippy::too_many_arguments)]
 pub async fn post_connection_state(
     ksm_config: &str,
     connection_state: &str,
     token: &serde_json::Value,
     is_terminated: Option<bool>,
     client_version: &str,
+    description: Option<String>,
+    recording_duration: Option<u64>,
+    closure_reason: Option<u32>,
+    ai_overall_risk_level: Option<String>,
+    ai_overall_summary: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
     // Special handling for test mode
     if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
@@ -497,6 +517,11 @@ pub async fn post_connection_state(
             token: Some(token_str.clone()),
             tokens: None,
             terminated: is_terminated,
+            description: description.clone(),
+            recording_duration,
+            closure_reason,
+            ai_overall_risk_level: ai_overall_risk_level.clone(),
+            ai_overall_summary: ai_overall_summary.clone(),
         },
         serde_json::Value::Array(token_list) => {
             // Convert the array of values to strings
@@ -516,6 +541,11 @@ pub async fn post_connection_state(
                 token: None,
                 tokens: Some(tokens),
                 terminated: is_terminated,
+                description: description.clone(),
+                recording_duration,
+                closure_reason,
+                ai_overall_risk_level: ai_overall_risk_level.clone(),
+                ai_overall_summary: ai_overall_summary.clone(),
             }
         }
         _ => {

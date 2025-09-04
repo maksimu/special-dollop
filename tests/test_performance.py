@@ -20,6 +20,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        # Configure higher resource limits for testing
+        self.configure_test_resource_limits(self.tube_registry)
         self.tube_states = {}  # Stores current state of each tube_id
         self.tube_connection_events = {} # tube_id -> threading.Event for connected state
         self._lock = threading.Lock() # To protect access to shared tube_states and events
@@ -455,6 +457,8 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
     def setUp(self):
         super().setUp() 
         self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        # Configure higher resource limits for testing
+        self.configure_test_resource_limits(self.tube_registry)
         self.tube_states = {}  # Stores current state of each tube_id
         self.tube_connection_events = {} # tube_id -> threading.Event for connected state
         self._lock = threading.Lock() # To protect access to shared tube_states and events

@@ -262,6 +262,14 @@ impl Channel {
                                         })
                                         .collect();
                                     debug!(target: "channel_setup", channel_id = %channel_id, ?temp_initial_guacd_params_map, "Populated guacd_params map directly from JSON Value.");
+
+                                    // Override protocol name with correct guacd protocol name from ConversationType
+                                    let guacd_protocol_name = parsed_conversation_type.to_string();
+                                    temp_initial_guacd_params_map.insert(
+                                        "protocol".to_string(),
+                                        guacd_protocol_name.clone(),
+                                    );
+                                    debug!(target: "channel_setup", channel_id = %channel_id, guacd_protocol_name = %guacd_protocol_name, "Set guacd protocol name from ConversationType");
                                 } else {
                                     error!(target: "channel_setup", channel_id = %channel_id, "guacd_params was not a JSON object. Value: {:?}", guacd_params_json_val);
                                 }

@@ -42,6 +42,23 @@ class BaseWebRTCTest:
         self.connection_established = threading.Event()
         logging.info(f"{self.__class__.__name__} setup completed")
 
+    def configure_test_resource_limits(self, registry):
+        """Configure higher resource limits on the given registry for testing purposes.
+        Logs a warning and continues if configuration fails."""
+        test_config = {
+            "max_concurrent_ice_agents": 128,  # Increased from 32 for tests
+            "max_concurrent_sockets": 256,     # Increased from 64 for tests
+            "max_interfaces_per_agent": 16,    # Increased from 8 for tests
+            "max_turn_connections_per_server": 8  # Increased from 4 for tests
+        }
+        
+        try:
+            registry.configure_resource_limits(test_config)
+            logging.info(f"Configured test resource limits: {test_config}")
+        except Exception as e:
+            logging.warning(f"Failed to configure test resource limits: {e}")
+            # Continue with default limits
+
     def on_ice_candidate1(self, candidate):
         if candidate:
             logging.info(f"Peer1 ICE candidate: {candidate}")

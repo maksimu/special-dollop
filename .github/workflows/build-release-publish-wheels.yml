@@ -59,7 +59,7 @@ jobs:
 
       - name: Setup test environment
         run: |
-          pip install virtualenv pytest
+          pip install virtualenv pytest pytest-asyncio
           python -m virtualenv venv
           echo "VIRTUAL_ENV=${{ github.workspace }}/venv" >> $GITHUB_ENV
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
@@ -175,7 +175,7 @@ jobs:
           . venv/bin/activate
           
           # Install pytest first
-          pip install pytest
+          pip install pytest pytest-asyncio
           
           # Find and install the wheel
           WHEEL=$(find target/wheels -name "*.whl" | head -1)
@@ -303,7 +303,7 @@ jobs:
 
       - name: Setup test environment
         run: |
-          pip install virtualenv pytest
+          pip install virtualenv pytest pytest-asyncio
           python -m virtualenv venv
           echo "VIRTUAL_ENV=${{ github.workspace }}\venv" >> $GITHUB_ENV
           echo "${{ github.workspace }}\venv\Scripts" >> $GITHUB_PATH
@@ -312,7 +312,7 @@ jobs:
       - name: Run tests
         run: |
           . venv/Scripts/activate
-          pip install pytest
+          pip install pytest pytest-asyncio
           pip install (Get-ChildItem -Path "target/wheels/*.whl" | Select-Object -First 1).FullName
           python -c "import keeper_pam_webrtc_rs; print('Import successful')"
           cd tests && python -m pytest -v
@@ -447,7 +447,7 @@ jobs:
             python -c 'import keeper_pam_webrtc_rs; print(\"Import successful\")'
           
             # Install test dependencies
-            pip install pytest
+            pip install pytest pytest-asyncio
           
             # Run tests
             cd /io/tests && python -m pytest -v

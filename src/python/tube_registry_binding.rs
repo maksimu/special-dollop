@@ -1273,6 +1273,77 @@ impl PyTubeRegistry {
             Err(e) => Err(PyRuntimeError::new_err(e)),
         }
     }
+
+    /// Post connection state to the router
+    #[pyo3(signature = (
+        ksm_config,
+        connection_state,
+        token,
+        is_terminated = None,
+        client_version = "unknown",
+        description = None,
+        recording_duration = None,
+        closure_reason = None,
+        ai_overall_risk_level = None,
+        ai_overall_summary = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn post_connection_state(
+        &self,
+        py: Python<'_>,
+        ksm_config: &str,
+        connection_state: &str,
+        token: PyObject,
+        is_terminated: Option<bool>,
+        client_version: &str,
+        description: Option<String>,
+        recording_duration: Option<u64>,
+        closure_reason: Option<u32>,
+        ai_overall_risk_level: Option<String>,
+        ai_overall_summary: Option<String>,
+    ) -> PyResult<()> {
+        let master_runtime = get_runtime();
+        let ksm_config_owned = ksm_config.to_string();
+        let connection_state_owned = connection_state.to_string();
+        let client_version_owned = client_version.to_string();
+
+        // Convert Python token to JSON Value
+        let token_json = if let Ok(token_str) = token.extract::<String>(py) {
+            serde_json::Value::String(token_str)
+        } else if let Ok(token_list) = token.extract::<Vec<String>>(py) {
+            serde_json::Value::Array(
+                token_list
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "Token must be a string or list of strings",
+            ));
+        };
+
+        py.allow_threads(|| {
+            master_runtime.block_on(async move {
+                post_connection_state(
+                    &ksm_config_owned,
+                    &connection_state_owned,
+                    &token_json,
+                    is_terminated,
+                    &client_version_owned,
+                    description,
+                    recording_duration,
+                    closure_reason,
+                    ai_overall_risk_level,
+                    ai_overall_summary,
+                )
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to post connection state: {}", e))
+                })
+            })
+        })
+    }
 }
 
 // Implement Drop trait for PyTubeRegistry as a safety net

@@ -628,8 +628,8 @@ impl Channel {
 
         // Connection 0 is a special control connection that doesn't need to exist in the connection's map
         if conn_no != 0 {
-            // Check if the non-control connection exists
-            if !self.conns.contains_key(&conn_no) {
+            // Validate non-control connection exists with single lookup
+            if self.conns.get(&conn_no).is_none() {
                 error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for Ping", conn_no);
                 return Ok(());
             }

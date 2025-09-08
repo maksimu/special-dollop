@@ -158,9 +158,10 @@ impl TubeRegistry {
         tube_id: &str,
         conversation_id: &str,
     ) -> Result<()> {
-        if !self.tubes_by_id.contains_key(tube_id) {
-            return Err(anyhow!("Tube not found: {}", tube_id));
-        }
+        // Validate tube exists with single lookup instead of contains_key + potential second lookup
+        self.tubes_by_id
+            .get(tube_id)
+            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
 
         self.conversation_mappings
             .insert(conversation_id.to_string(), tube_id.to_string());

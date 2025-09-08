@@ -28,6 +28,7 @@ use tracing::{debug, error, info, trace, warn};
 
 // Import from sibling modules
 use super::frame_handling::handle_incoming_frame;
+use super::guacd_parser::{GuacdInstruction, GuacdParser};
 use super::utils::handle_ping_timeout;
 
 // --- Protocol-specific state definitions ---
@@ -710,6 +711,14 @@ impl Channel {
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
         if !should_delay_removal {
+            // Send Guacd disconnect message with specific reason before removing connection
+            if let Err(e) = self
+                .send_guacd_disconnect_message(conn_no, &reason.to_message())
+                .await
+            {
+                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send Guacd disconnect message during immediate close");
+            }
+
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
                 // Shutdown the connection gracefully (closes channels and waits for tasks)
@@ -759,6 +768,83 @@ impl Channel {
         Ok(())
     }
 
+    /// Send Guacd disconnect message to both server and client before closing connection
+    async fn send_guacd_disconnect_message(&self, conn_no: u32, reason: &str) -> Result<()> {
+        // Only send disconnect for Guacd connections
+        if self.active_protocol != ActiveProtocol::Guacd {
+            return Ok(());
+        }
+
+        // Check if this is the primary Guacd connection
+        let is_primary = {
+            let primary_opt = self.primary_guacd_conn_no.lock().await;
+            *primary_opt == Some(conn_no)
+        };
+
+        if !is_primary {
+            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Not primary Guacd connection, skipping disconnect message");
+            return Ok(());
+        }
+
+        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, reason = %reason, "Sending Guacd log and disconnect message to server and client");
+
+        // Create the log instruction first: log message for debugging
+        let log_instruction = GuacdInstruction::new("log".to_string(), vec![reason.to_string()]);
+        let log_bytes = GuacdParser::guacd_encode_instruction(&log_instruction);
+
+        // Create the disconnect instruction: "10.disconnect;"
+        let disconnect_instruction = GuacdInstruction::new("disconnect".to_string(), vec![]);
+        let disconnect_bytes = GuacdParser::guacd_encode_instruction(&disconnect_instruction);
+
+        // Send log message to server (backend) first
+        if let Some(conn_ref) = self.conns.get(&conn_no) {
+            if !conn_ref.data_tx.is_closed() {
+                let log_server_message = crate::models::ConnectionMessage::Data(log_bytes.clone());
+                if let Err(e) = conn_ref.data_tx.send(log_server_message) {
+                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send log message to server");
+                } else {
+                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, reason = %reason, "Successfully sent log message to Guacd server");
+                }
+
+                // Then send disconnect message to server
+                let disconnect_server_message =
+                    crate::models::ConnectionMessage::Data(disconnect_bytes.clone());
+                if let Err(e) = conn_ref.data_tx.send(disconnect_server_message) {
+                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send disconnect message to server");
+                } else {
+                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully sent disconnect message to Guacd server");
+                }
+            }
+        }
+
+        // Send log message to client (via WebRTC) first
+        let log_data_frame = Frame::new_data_with_pool(conn_no, &log_bytes, &self.buffer_pool);
+        let log_encoded_frame = log_data_frame.encode_with_pool(&self.buffer_pool);
+
+        if let Err(e) = self.webrtc.send(log_encoded_frame).await {
+            if !e.contains("Channel is closing") {
+                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send log message to client");
+            }
+        } else {
+            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, reason = %reason, "Successfully sent log message to client");
+        }
+
+        // Then send disconnect message to client (via WebRTC)
+        let disconnect_data_frame =
+            Frame::new_data_with_pool(conn_no, &disconnect_bytes, &self.buffer_pool);
+        let disconnect_encoded_frame = disconnect_data_frame.encode_with_pool(&self.buffer_pool);
+
+        if let Err(e) = self.webrtc.send(disconnect_encoded_frame).await {
+            if !e.contains("Channel is closing") {
+                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send disconnect message to client");
+            }
+        } else {
+            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully sent disconnect message to client");
+        }
+
+        Ok(())
+    }
+
     /// Internal method for closing connections without sending a CloseConnection message
     /// This is used when handling received CloseConnection messages to prevent feedback loops
     pub(crate) async fn internal_close_backend_no_message(
@@ -781,6 +867,14 @@ impl Channel {
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
         if !should_delay_removal {
+            // Send Guacd disconnect message with specific reason before removing connection
+            if let Err(e) = self
+                .send_guacd_disconnect_message(conn_no, &reason.to_message())
+                .await
+            {
+                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send Guacd disconnect message during immediate close (no message)");
+            }
+
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
                 // Shutdown the connection gracefully (closes channels and waits for tasks)

@@ -535,23 +535,12 @@ impl PyTubeRegistry {
             let tube_arc = {
                 let registry = REGISTRY.read().await;
 
-                // Look up the tube ID from the connection ID
-                let tube_id_owned =
-                    match registry.tube_id_from_conversation_id(&connection_id_owned) {
-                        Some(tube_id) => tube_id.clone(),
-                        None => {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "Rust: No tube found for connection ID: {connection_id_owned}"
-                            )));
-                        }
-                    };
-
-                // Get tube reference before releasing the lock
-                match registry.get_by_tube_id(&tube_id_owned) {
+                // Single atomic lookup: conversation_id -> tube (eliminates race condition between lookups)
+                match registry.get_by_conversation_id(&connection_id_owned) {
                     Some(tube) => tube.clone(), // Clone the Arc to keep reference
                     None => {
                         return Err(PyRuntimeError::new_err(format!(
-                            "Rust: Tube not found {tube_id_owned} during close_connection for connection {connection_id_owned}"
+                            "Rust: No tube found for connection ID: {connection_id_owned}"
                         )));
                     }
                 }
@@ -658,7 +647,6 @@ impl PyTubeRegistry {
                     &tokens_json,
                     None,
                     &client_version,
-                    None, // description
                     None, // recording_duration
                     None, // closure_reason
                     None, // ai_overall_risk_level
@@ -1281,7 +1269,6 @@ impl PyTubeRegistry {
         token,
         is_terminated = None,
         client_version = "unknown",
-        description = None,
         recording_duration = None,
         closure_reason = None,
         ai_overall_risk_level = None,
@@ -1296,7 +1283,6 @@ impl PyTubeRegistry {
         token: PyObject,
         is_terminated: Option<bool>,
         client_version: &str,
-        description: Option<String>,
         recording_duration: Option<u64>,
         closure_reason: Option<u32>,
         ai_overall_risk_level: Option<String>,
@@ -1331,7 +1317,6 @@ impl PyTubeRegistry {
                     &token_json,
                     is_terminated,
                     &client_version_owned,
-                    description,
                     recording_duration,
                     closure_reason,
                     ai_overall_risk_level,

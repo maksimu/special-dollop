@@ -208,6 +208,34 @@ impl CloseConnectionReason {
                 | CloseConnectionReason::ServerRefuse
         )
     }
+
+    /// Convert CloseConnectionReason to a human-readable message for Guacd log
+    pub fn to_message(self) -> String {
+        match self {
+            CloseConnectionReason::Normal => "connection closed normally".to_string(),
+            CloseConnectionReason::Error => "connection error".to_string(),
+            CloseConnectionReason::Timeout => "connection timeout".to_string(),
+            CloseConnectionReason::ServerRefuse => "server refused connection".to_string(),
+            CloseConnectionReason::Client => "client closed connection".to_string(),
+            CloseConnectionReason::Unknown => "unknown error".to_string(),
+            CloseConnectionReason::InvalidInstruction => "invalid instruction".to_string(),
+            CloseConnectionReason::GuacdRefuse => "guacd refused connection".to_string(),
+            CloseConnectionReason::ConnectionLost => "connection lost".to_string(),
+            CloseConnectionReason::ConnectionFailed => "connection failed".to_string(),
+            CloseConnectionReason::TunnelClosed => "tunnel closed".to_string(),
+            CloseConnectionReason::AdminClosed => "administrator closed connection".to_string(),
+            CloseConnectionReason::ErrorRecording => "error recording session".to_string(),
+            CloseConnectionReason::GuacdError => "guacd protocol error".to_string(),
+            CloseConnectionReason::AIClosed => "AI closed connection".to_string(),
+            CloseConnectionReason::AddressResolutionFailed => {
+                "address resolution failed".to_string()
+            }
+            CloseConnectionReason::DecryptionFailed => "decryption failed".to_string(),
+            CloseConnectionReason::ConfigurationError => "configuration error".to_string(),
+            CloseConnectionReason::ProtocolError => "protocol error".to_string(),
+            CloseConnectionReason::UpstreamClosed => "upstream connection closed".to_string(),
+        }
+    }
 }
 
 impl TryFrom<u16> for CloseConnectionReason {

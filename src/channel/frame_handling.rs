@@ -229,65 +229,48 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     }
     // For conn_no > 1: Short-lived connections, skip prefetch to avoid cache pollution
 
-    // **BRANCH PREDICTION**: Connection exists is the most likely case
-    let connection_exists = {
-        // **OPTIMIZATION**: For 2-connection pattern, optimize lookups
-        if likely(conn_no <= 1) {
-            // **FAST PATH**: Connections 0 and 1 are persistent, very likely to exist
-            likely(channel.conns.contains_key(&conn_no))
-        } else {
-            // **VARIABLE PATH**: Short-lived connections, existence is less predictable
-            channel.conns.contains_key(&conn_no)
-        }
-    };
-
-    if connection_exists {
+    // **HOT PATH OPTIMIZATION**: Single lookup eliminates race conditions and improves performance
+    // **FAST PATH**: Connections 0 and 1 are persistent, very likely to exist
+    let send_result = if likely(conn_no <= 1) {
+        // Use likely() hint for branch prediction on persistent connections
+        channel.conns.get(&conn_no)
+    } else {
+        // **VARIABLE PATH**: Short-lived connections, no branch prediction hint needed
+        channel.conns.get(&conn_no)
+    }
+    .map(|conn_ref| {
         // **HOT PATH**: Connection exists - most common case
-        let send_result = if let Some(conn_ref) = channel.conns.get(&conn_no) {
-            // Send data to the connection's dedicated task (lock-free!)
-            match conn_ref
-                .data_tx
-                .send(crate::models::ConnectionMessage::Data(payload))
-            {
-                Ok(_) => {
-                    debug_hot_path!(
-                        channel_id = %channel.channel_id,
-                        conn_no = conn_no,
-                        payload_len = payload_len,
-                        "Successfully queued bytes for backend task"
-                    );
-                    Some(Ok(()))
-                }
-                Err(_) => {
-                    // **COLD PATH**: Channel closed - rare error case
-                    warn_hot_path!(
-                        channel_id = %channel.channel_id,
-                        conn_no = conn_no,
-                        "Backend task is dead, closing connection"
-                    );
-                    Some(Err(anyhow!(
-                        "Backend task for connection {} is dead",
-                        conn_no
-                    )))
-                }
-            }
-        } else {
-            None
-        };
+        // Send data to the connection's dedicated task (lock-free!)
+        conn_ref
+            .data_tx
+            .send(crate::models::ConnectionMessage::Data(payload))
+    });
 
-        // Handle the result after dropping all DashMap references
-        match send_result {
-            Some(Ok(())) => return Ok(()),
-            Some(Err(e)) => {
-                // Now we can safely call close_backend without borrow issues
-                channel
-                    .close_backend(conn_no, CloseConnectionReason::ConnectionLost)
-                    .await?;
-                return Err(e);
-            }
-            None => {
-                // Connection disappeared between contains_key and get
-            }
+    match send_result {
+        Some(Ok(_)) => {
+            debug_hot_path!(
+                channel_id = %channel.channel_id,
+                conn_no = conn_no,
+                payload_len = payload_len,
+                "Successfully queued bytes for backend task"
+            );
+            return Ok(());
+        }
+        Some(Err(_)) => {
+            // **COLD PATH**: Channel closed - rare error case
+            warn_hot_path!(
+                channel_id = %channel.channel_id,
+                conn_no = conn_no,
+                "Backend task is dead, closing connection"
+            );
+            // Connection reference is dropped, safe to call close_backend
+            channel
+                .close_backend(conn_no, CloseConnectionReason::ConnectionLost)
+                .await?;
+            return Err(anyhow!("Backend task for connection {} is dead", conn_no));
+        }
+        None => {
+            // **COLD PATH**: Connection not found - fall through to logging
         }
     }
 

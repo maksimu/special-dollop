@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-pam-webrtc-rs"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "aes-gcm",
  "anyhow",

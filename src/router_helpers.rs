@@ -35,7 +35,7 @@ struct KsmConfig {
 }
 
 // Define a struct for the body of post_connection_state
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct ConnectionStateBody {
     #[serde(rename = "type")]
     connection_type: String,
@@ -46,12 +46,10 @@ struct ConnectionStateBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     terminated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "recordingDuration")]
     recording_duration: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "closureReason")]
+    #[serde(rename = "closeConnectionReason")]
     closure_reason: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "aiOverallRiskLevel")]
@@ -481,7 +479,6 @@ pub async fn post_connection_state(
     token: &serde_json::Value,
     is_terminated: Option<bool>,
     client_version: &str,
-    description: Option<String>,
     recording_duration: Option<u64>,
     closure_reason: Option<u32>,
     ai_overall_risk_level: Option<String>,
@@ -517,7 +514,6 @@ pub async fn post_connection_state(
             token: Some(token_str.clone()),
             tokens: None,
             terminated: is_terminated,
-            description: description.clone(),
             recording_duration,
             closure_reason,
             ai_overall_risk_level: ai_overall_risk_level.clone(),
@@ -541,7 +537,6 @@ pub async fn post_connection_state(
                 token: None,
                 tokens: Some(tokens),
                 terminated: is_terminated,
-                description: description.clone(),
                 recording_duration,
                 closure_reason,
                 ai_overall_risk_level: ai_overall_risk_level.clone(),

@@ -26,6 +26,7 @@ pub struct ChannelMetadata {
     pub callback_token: Option<String>,
     pub ksm_config: Option<String>,
     pub client_version: String,
+    pub recordings_enabled: bool,
 }
 
 // A single tube holding a WebRTC peer connection and channels
@@ -419,6 +420,14 @@ impl Tube {
                     debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, "on_data_channel: Set as control channel.");
                 }
 
+                // Extract recordings_enabled before protocol_settings gets moved
+                let recordings_enabled = protocol_settings_for_channel_setup
+                    .get("guacd_params")
+                    .and_then(|v| v.as_object())
+                    .and_then(|params| params.get("recordingenabled"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
                 // Determine server_mode for the new channel based on the Tube's context
                 let current_server_mode = tube.is_server_mode_context;
                 debug!(tube_id = %tube.id, channel_label = %rtc_data_channel_label, server_mode = current_server_mode, "on_data_channel: Determined server_mode for channel setup.");
@@ -452,6 +461,7 @@ impl Tube {
                     callback_token: owned_channel.callback_token.clone(),
                     ksm_config: owned_channel.ksm_config.clone(),
                     client_version: owned_channel.client_version.clone(),
+                    recordings_enabled,
                 };
                 if let Err(e) = tube.register_channel_metadata(rtc_data_channel_label.clone(), metadata).await {
                     error!("Tube {}: Failed to register channel metadata '{}': {}", tube.id, rtc_data_channel_label, e);
@@ -801,7 +811,6 @@ impl Tube {
             &token_value,
             None,
             client_version,
-            None, // description
             None, // recording_duration
             None, // closure_reason
             None, // ai_overall_risk_level
@@ -847,7 +856,6 @@ impl Tube {
             &token_value,
             Some(true),
             client_version,
-            None, // description
             None, // recording_duration
             None, // closure_reason
             None, // ai_overall_risk_level
@@ -937,6 +945,12 @@ impl Tube {
             callback_token: owned_channel.callback_token.clone(),
             ksm_config: owned_channel.ksm_config.clone(),
             client_version: owned_channel.client_version.clone(),
+            recordings_enabled: protocol_settings
+                .get("guacd_params")
+                .and_then(|v| v.as_object())
+                .and_then(|params| params.get("recordingenabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         };
         if let Err(e) = self
             .register_channel_metadata(name.to_string(), metadata)
@@ -1447,7 +1461,6 @@ impl Tube {
                     &token_value,
                     None,
                     client_version,
-                    None, // description
                     None, // recording_duration
                     None, // closure_reason
                     None, // ai_overall_risk_level
@@ -1479,18 +1492,18 @@ impl Tube {
 
     // Send connection_close callback for a specific channel
     pub async fn send_connection_close_callback(&self, channel_name: &str) -> Result<()> {
-        self.send_connection_close_callback_with_options(channel_name, false)
-            .await
-    }
+        // Check if recordings are enabled for this channel - skip if recordings are enabled
+        let should_skip = {
+            let channels_guard = self.active_channels.read().await;
+            if let Some(metadata) = channels_guard.get(channel_name) {
+                metadata.recordings_enabled
+            } else {
+                false // If channel not found, don't skip
+            }
+        };
 
-    // Send connection_close callback with option to skip for AI handling
-    pub async fn send_connection_close_callback_with_options(
-        &self,
-        channel_name: &str,
-        skip_for_ai_handling: bool,
-    ) -> Result<()> {
-        if skip_for_ai_handling {
-            debug!(tube_id = %self.id, channel_name = %channel_name, "Skipping Rust connection_close callback - will be handled by Python with AI metadata");
+        if should_skip {
+            debug!(tube_id = %self.id, channel_name = %channel_name, "Skipping connection_close callback - recordings are enabled for this channel");
             return Ok(());
         }
 
@@ -1530,7 +1543,6 @@ impl Tube {
                     &token_value,
                     Some(true),
                     client_version,
-                    None, // description
                     None, // recording_duration
                     None, // closure_reason
                     None, // ai_overall_risk_level

@@ -1089,10 +1089,16 @@ where
     if let Some(protocol) = guacd_params_locked.get("protocol") {
         if protocol.eq_ignore_ascii_case("rdp") {
             if let Some(username) = guacd_params_locked.get("username").cloned() {
-                if let Some(pos) = username.find('\\') {
+                // Only split on backslash if it's NOT Azure AD format
+                if username.starts_with("AzureAD\\") || username.starts_with(".\\AzureAD\\") {
+                    debug!(target: "guac_protocol", channel_id=%channel_id, conn_no,
+                          username=&username, "Azure AD format detected - setting security to aad");
+                    guacd_params_locked.insert("security".to_string(), "aad".to_string());
+                } else if let Some(pos) = username.find('\\') {
                     let domain = &username[..pos];
                     let user = &username[pos + 1..];
-                    info!(target: "guac_protocol",  channel_id=%channel_id, conn_no, domain=&domain, username=&user, "Domain found in username");
+                    debug!(target: "guac_protocol", channel_id=%channel_id, conn_no,
+                          domain=&domain, username=&user, "Traditional domain found - splitting");
                     guacd_params_locked.insert("username".to_string(), user.to_string());
                     guacd_params_locked.insert("domain".to_string(), domain.to_string());
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "0.2.22"
+version = "0.2.23"
 edition = "2021"
 description = "Keeper PAM WebRTC for Python - A secure, stable, and high-performance Tube API for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations."
 license = "MIT"
@@ -14,17 +14,8 @@ default = ["python"]
 python = ["pyo3", "pyo3-log"]
 profiling = []
 
-# **SIMPLIFIED CONTROLS** - All performance optimizations are now always-on
 production_debug = []           # Enable debug logs in production builds
 disable_hot_path_logging = []   # Nuclear option: completely remove hot path logging
-
-# **ALL OPTIMIZATIONS ALWAYS ENABLED:**
-# ✅ SIMD optimizations (auto-detected)
-# ✅ Lock-free thread-local buffer pools  
-# ✅ Event-driven backpressure
-# ✅ Memory prefetching & branch prediction
-# ✅ Two-connection pattern optimization
-# ✅ Ultra-fast runtime logging checks
 
 [dependencies]
 aes-gcm = "0.10.3"

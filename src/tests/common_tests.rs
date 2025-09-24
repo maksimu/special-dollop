@@ -2,12 +2,12 @@
 #![cfg(test)]
 use crate::webrtc_core::format_ice_candidate;
 use crate::webrtc_data_channel::WebRTCDataChannel;
+use log::debug;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
-use tracing::debug;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;

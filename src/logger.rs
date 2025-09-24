@@ -1,7 +1,9 @@
+use log::Level;
 use std::fmt;
-use tracing::Level;
-use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing_subscriber::EnvFilter;
+
+#[cfg(not(feature = "python"))]
+use tracing_subscriber::{fmt::format::FmtSpan, FmtSubscriber};
 
 #[cfg(feature = "python")]
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
@@ -45,124 +47,63 @@ pub fn initialize_logger(
 ) -> Result<(), InitializeLoggerError> {
     let rust_level = convert_py_level_to_tracing_level(level, verbose.unwrap_or(false));
 
+    // Let Python handle all filtering - just set a permissive filter in Rust
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Define all logging targets once
-        let common_targets = [
-            // Application logs
-            "keeper_pam_webrtc_rs",
-            "keeper_pam_webrtc_rs_webrtc",
-            "connection_lifecycle",
-            "guac_protocol",
-            "guac_opcode_debug",
-            "guac_opcode_dispatch",
-            "guac_special_opcodes",
-            "guac_size_instruction_outbound",
-            "guac_size_instruction_handshake",
-            "guac_error_handling",
-            "guac_disconnect",
-            "signal_handler",
-            "webrtc_lifecycle",
-            // Channel and protocol logs
-            "channel_setup",
-            "channel_flow",
-            "channel_health",
-            "protocol_parse",
-            "protocol_event",
-            "registry",
-            "ice_config",
-            "tube_lifecycle",
-            "python_bindings",
-            "lifecycle",
-        ];
-
-        // WebRTC specific targets (using actual target names from WebRTC library)
-        let webrtc_targets = [
-            // Actual targets from logs (no dots, use underscores)
-            "webrtc_ice",
-            "webrtc_ice_connection",
-            "webrtc_ice_gathering",
-            "webrtc_sdp",
-            "webrtc_state",
-            "webrtc_state_report",
-            "webrtc_sctp",
-            "webrtc",
-            "webrtc_lifecycle",
-        ];
-
         if verbose.unwrap_or(false) {
-            // When verbose is true, use trace level for everything
-            let mut filter = EnvFilter::new(format!(
-                "{},lifecycle=trace",
-                rust_level.to_string().to_lowercase()
-            ));
-
-            // Add all targets at trace level
-            for target in common_targets.iter().chain(webrtc_targets.iter()) {
-                let directive = format!("{}={}", target, "trace");
-                if let Ok(d) = directive.parse() {
-                    filter = filter.add_directive(d);
-                }
-            }
-
-            filter
+            // When verbose, pass everything through at TRACE level
+            EnvFilter::new("trace")
         } else {
-            // When verbose is false, use rust_level for normal logs and error for WebRTC
-            let mut filter = EnvFilter::new(rust_level.to_string().to_lowercase());
-
-            // Add normal targets at rust_level
-            for target in common_targets.iter() {
-                let directive = format!("{}={}", target, rust_level.to_string().to_lowercase());
-                if let Ok(d) = directive.parse() {
-                    filter = filter.add_directive(d);
-                }
-            }
-
-            // Add WebRTC targets at error level to suppress warnings
-            for target in webrtc_targets.iter() {
-                let directive = format!("{}={}", target, "error");
-                if let Ok(d) = directive.parse() {
-                    filter = filter.add_directive(d);
-                }
-            }
-
-            filter
+            // Use the requested level as the baseline, let Python do the rest
+            EnvFilter::new(rust_level.to_string().to_lowercase())
         }
     });
 
     // Get the filter's string representation for logging *before* it's consumed
     let filter_str = filter.to_string();
 
-    let subscriber_builder = FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_span_events(FmtSpan::CLOSE)
-        .with_target(true)
-        .with_level(true)
-        .compact();
-
-    #[cfg(not(feature = "python"))]
-    let subscriber = subscriber_builder.pretty().finish();
-
-    #[cfg(feature = "python")]
-    let subscriber = subscriber_builder.finish();
-
     #[cfg(feature = "python")]
     {
-        pyo3_log::try_init().map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?;
+        // Initialize pyo3_log bridge (log crate -> Python)
+        match pyo3_log::try_init() {
+            Ok(_handle) => {
+                log::info!("pyo3_log bridge initialized successfully");
+            }
+            Err(e) => {
+                if e.to_string().contains("already initialized") {
+                    log::info!("pyo3_log bridge already initialized");
+                } else {
+                    return Err(InitializeLoggerError::Pyo3LogError(e.to_string()));
+                }
+            }
+        }
+
+        // Since we've converted all tracing! macros to log! macros, we no longer need LogTracer
+
+        log::info!("Logging bridge setup complete");
     }
 
-    tracing::subscriber::set_global_default(subscriber).map_err(|e| {
-        let msg = format!("Logger already initialized or failed to set: {e}");
-        tracing::debug!("{}", msg);
-        InitializeLoggerError::SetGlobalDefaultError(e.to_string())
-    })?;
+    #[cfg(not(feature = "python"))]
+    {
+        let subscriber = FmtSubscriber::builder()
+            .with_env_filter(filter)
+            .with_span_events(FmtSpan::CLOSE)
+            .with_target(true)
+            .with_level(true)
+            .compact()
+            .finish();
 
-    tracing::debug!(
-        module_path = module_path!(),
-        target = logger_name,
+        tracing::subscriber::set_global_default(subscriber).map_err(|e| {
+            let msg = format!("Logger already initialized or failed to set: {e}");
+            tracing::debug!("{}", msg);
+            InitializeLoggerError::SetGlobalDefaultError(e.to_string())
+        })?;
+    }
+
+    log::debug!(
         "Logger initialized for '{}' with level {:?} (effective filter: {})",
         logger_name,
         rust_level,
-        filter_str // Use the stored string representation
+        filter_str
     );
 
     Ok(())
@@ -171,13 +112,13 @@ pub fn initialize_logger(
 #[inline]
 fn convert_py_level_to_tracing_level(level: i32, verbose: bool) -> Level {
     if verbose {
-        return Level::TRACE;
+        return Level::Trace;
     }
     match level {
-        50 | 40 => Level::ERROR, // CRITICAL, ERROR
-        30 => Level::WARN,       // WARNING
-        20 => Level::INFO,       // INFO
-        10 => Level::DEBUG,      // DEBUG
-        _ => Level::TRACE,       // NOTSET or other values
+        50 | 40 => Level::Error, // CRITICAL, ERROR
+        30 => Level::Warn,       // WARNING
+        20 => Level::Info,       // INFO
+        10 => Level::Debug,      // DEBUG
+        _ => Level::Trace,       // NOTSET or other values
     }
 }

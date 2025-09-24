@@ -4,13 +4,13 @@ use crate::tube_protocol::{ControlMessage, Frame};
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
 use bytes::BufMut;
+use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, warn};
 
 use super::core::Channel;
 use super::socks5::{self, SOCKS5_AUTH_FAILED, SOCKS5_FAIL, SOCKS5_VERSION};
@@ -407,13 +407,27 @@ async fn handle_generic_server_connection(
                     let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
 
                     // Send it directly without checking the buffer amount
-                    match dc_clone.send(encoded_frame_bytes).await {
+                    let send_start = std::time::Instant::now();
+                    match dc_clone.send(encoded_frame_bytes.clone()).await {
                         Ok(_) => {
+                            let send_latency = send_start.elapsed();
+
+                            // Record metrics for message sent (using channel_id as conversation_id)
+                            crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                                &channel_id_clone,
+                                encoded_frame_bytes.len() as u64,
+                                Some(send_latency),
+                            );
+
                             if tracing::enabled!(tracing::Level::DEBUG) {
                                 debug!("Successfully sent data frame for conn_no {}", conn_no);
                             }
                         }
                         Err(e) => {
+                            // Record error metrics
+                            crate::metrics::METRICS_COLLECTOR
+                                .record_error(&channel_id_clone, "webrtc_send_failed");
+
                             if tracing::enabled!(tracing::Level::DEBUG) {
                                 debug!("Failed to send data frame for conn_no {}: {}", conn_no, e);
                             }

@@ -204,7 +204,21 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         connected = self.wait_for_tube_connection(server_id, client_id, 20) # Increased timeout to 20 s
         connection_time = time.time() - start_time
         
-        self.assertTrue(connected, "Failed to establish connection")
+        if not connected:
+            # Diagnose the connection failure
+            logging.error(f"WebRTC connection failed within {20}s timeout")
+
+            # Get final states for diagnosis
+            try:
+                server_state = self.tube_registry.get_connection_state(server_id)
+                client_state = self.tube_registry.get_connection_state(client_id)
+                logging.error(f"Final connection states: server={server_state}, client={client_state}")
+            except Exception as e:
+                logging.error(f"Could not get connection states: {e}")
+
+            # This is a critical integration test - fail with detailed information
+            self.fail("Data channel load test failed due to WebRTC connection failure. This indicates a fundamental integration issue.")
+
         logging.info(f"Connection established in {connection_time:.2f} seconds")
         
         channel_name = "performance-test-channel"
@@ -242,15 +256,31 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         start_time = time.time()
         state1 = "unknown" # Initialize states
         state2 = "unknown" # Initialize states
+        was_connecting = False  # Track if we ever saw a connecting state
+
         while time.time() - start_time < timeout:
             state1 = self.tube_registry.get_connection_state(tube_id1)
             state2 = self.tube_registry.get_connection_state(tube_id2)
             logging.debug(f"Poll: {tube_id1} state: {state1}, {tube_id2} state: {state2}")
+
+            # Track if we ever started connecting (indicates network attempt was made)
+            if state1.lower() in ["connecting", "connected"] or state2.lower() in ["connecting", "connected"]:
+                was_connecting = True
+
             if state1.lower() == "connected" and state2.lower() == "connected":
                 logging.info(f"Connection established between {tube_id1} and {tube_id2}")
                 return True
+
+            # If both connections failed after trying to connect, give up early
+            if was_connecting and (state1.lower() == "failed" and state2.lower() == "failed"):
+                logging.warning(f"Both connections failed after attempting to connect: {tube_id1}={state1}, {tube_id2}={state2}")
+                break
+
             time.sleep(0.1)
+
         logging.warning(f"Connection establishment timed out for {tube_id1} and {tube_id2}. Final states: {tube_id1}={state1}, {tube_id2}={state2}")
+        if not was_connecting:
+            logging.warning("Neither connection attempted to connect - possible configuration issue")
         return False
 
     @with_runtime
@@ -339,12 +369,18 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             with self._lock:
                 self.peer_map[server_tube_id] = client_tube_id
                 self.peer_map[client_tube_id] = server_tube_id
-                
+
+            logging.info(f"[E2E_Test] Peer map populated: {server_tube_id} <-> {client_tube_id}")
+
+            # 6. Flush any buffered ICE candidates and add brief delay for ICE negotiation to start
+            with self._lock:
                 # Flush any buffered ICE candidates now that peer mapping is available
                 self._try_flush_buffered_candidates_unlocked(server_tube_id)
                 self._try_flush_buffered_candidates_unlocked(client_tube_id)
-                
-            logging.info(f"[E2E_Test] Peer map populated: {server_tube_id} <-> {client_tube_id}")
+
+            # Give ICE candidates time to be exchanged
+            import time
+            time.sleep(0.5)
 
             # 6. Signaling: Set remote description
             # The Rust test has a more elaborate ICE exchange via signal channels.
@@ -359,7 +395,28 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             # 7. Wait for connection
             logging.info(f"[E2E_Test] Waiting for WebRTC connection between {server_tube_id} and {client_tube_id}...")
             connected = self.wait_for_tube_connection(server_tube_id, client_tube_id, timeout=20) # Increased timeout for E2E
-            self.assertTrue(connected, f"WebRTC connection failed between {server_tube_id} and {client_tube_id}")
+            if not connected:
+                # Diagnose why the connection failed
+                logging.error(f"[E2E_Test] WebRTC connection failed between {server_tube_id} and {client_tube_id}")
+
+                # Get final states for diagnosis
+                try:
+                    server_state = self.tube_registry.get_connection_state(server_tube_id)
+                    client_state = self.tube_registry.get_connection_state(client_tube_id)
+                    logging.error(f"Final states: server={server_state}, client={client_state}")
+                except Exception as e:
+                    logging.error(f"Could not get final connection states: {e}")
+
+                # Check if ICE candidates were exchanged
+                ice_exchange_info = ""
+                if hasattr(self, '_buffered_ice_candidates'):
+                    server_candidates = len(self._buffered_ice_candidates.get(server_tube_id, []))
+                    client_candidates = len(self._buffered_ice_candidates.get(client_tube_id, []))
+                    ice_exchange_info = f" Buffered candidates: server={server_candidates}, client={client_candidates}"
+
+                # This is a critical integration test - fail with detailed information
+                self.fail(f"E2E WebRTC connection failed. This indicates a fundamental issue with WebRTC integration.{ice_exchange_info}")
+
             logging.info(f"[E2E_Test] WebRTC connection established.")
 
             # At this point, data channels should be ready if the library follows WebRTC standards.
@@ -552,7 +609,21 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         connected = self.wait_for_tube_connection(server_id, client_id, 15)
         connection_time = time.time() - start_time
         
-        self.assertTrue(connected, "Failed to establish connection")
+        if not connected:
+            # Diagnose the non-trickle connection failure
+            logging.error(f"Non-trickle WebRTC connection failed within {15}s timeout")
+
+            # Get final states for diagnosis
+            try:
+                server_state = self.tube_registry.get_connection_state(server_id)
+                client_state = self.tube_registry.get_connection_state(client_id)
+                logging.error(f"Final connection states: server={server_state}, client={client_state}")
+            except Exception as e:
+                logging.error(f"Could not get connection states: {e}")
+
+            # This is a critical integration test - fail with detailed information
+            self.fail("Data channel fragmentation test failed due to non-trickle WebRTC connection failure. This indicates a fundamental integration issue.")
+
         logging.info(f"Non-trickle ICE connection established in {connection_time:.2f} seconds")
 
         # TODO: send different sized messages through the tube and verify we got them

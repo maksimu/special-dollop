@@ -5,7 +5,7 @@ use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame, CTRL_NO
 use crate::{debug_hot_path, warn_hot_path};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use tracing::{debug, error}; // Import centralized hot path macros
+use log::{debug, error}; // Import centralized hot path macros
 
 // Memory prefetching optimizations
 #[cfg(target_arch = "x86_64")]
@@ -96,17 +96,23 @@ fn unlikely(condition: bool) -> bool {
 // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
 pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Result<()> {
     debug_hot_path!(
-        channel_id = %channel.channel_id,
-        conn_no = frame.connection_no,
-        payload_len = frame.payload.len(),
-        "handle_incoming_frame received frame"
+        "handle_incoming_frame received frame (channel_id: {}, conn_no: {}, payload_len: {})",
+        channel.channel_id,
+        frame.connection_no,
+        frame.payload.len()
     );
 
-    if tracing::enabled!(tracing::Level::DEBUG) && frame.payload.len() <= 100 {
-        debug!(channel_id = %channel.channel_id, payload = ?frame.payload, "Frame payload");
-    } else if tracing::enabled!(tracing::Level::DEBUG) && frame.payload.len() > 100 {
+    if log::log_enabled!(log::Level::Debug) && frame.payload.len() <= 100 {
+        debug!(
+            "Frame payload (channel_id: {}, payload: {:?})",
+            channel.channel_id, frame.payload
+        );
+    } else if log::log_enabled!(log::Level::Debug) && frame.payload.len() > 100 {
         let first_bytes = &frame.payload[..std::cmp::min(50, frame.payload.len())];
-        debug!(channel_id = %channel.channel_id, first_bytes = ?first_bytes, "Large frame first bytes");
+        debug!(
+            "Large frame first bytes (channel_id: {}, first_bytes: {:?})",
+            channel.channel_id, first_bytes
+        );
     }
 
     // **BRANCH PREDICTION OPTIMIZATION**: Connection 1 is ULTRA HOT PATH (90%+ of data)
@@ -114,9 +120,9 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
         // **ULTRA HOT PATH**: Connection 1 - main data traffic (most optimized)
         let conn_no = frame.connection_no;
         debug_hot_path!(
-            channel_id = %channel.channel_id,
-            conn_no = conn_no,
-            "ULTRA HOT PATH: Connection 1 main traffic"
+            "ULTRA HOT PATH: Connection 1 main traffic (channel_id: {}, conn_no: {})",
+            channel.channel_id,
+            conn_no
         );
 
         // **HYPER-OPTIMIZED**: Inline everything for Connection 1
@@ -131,15 +137,18 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
         forward_connection1_ultra_fast(channel, frame.payload).await?;
     } else if frame.connection_no == 0 {
         // **CONTROL PATH**: Connection 0 - control messages
-        debug_hot_path!(channel_id = %channel.channel_id, "Handling control frame");
+        debug_hot_path!(
+            "Handling control frame (channel_id: {})",
+            channel.channel_id
+        );
         handle_control(channel, frame).await?;
     } else if frame.connection_no > 1 {
         // **WARM PATH**: Other connections - short-lived traffic
         let conn_no = frame.connection_no;
         debug_hot_path!(
-            channel_id = %channel.channel_id,
-            conn_no = conn_no,
-            "Routing short-lived connection frame"
+            "Routing short-lived connection frame (channel_id: {}, conn_no: {})",
+            channel.channel_id,
+            conn_no
         );
 
         // **OPTIMIZED**: Regular data path for other connections
@@ -168,27 +177,25 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
 
     // Log the control message for debugging
     debug_hot_path!(
-        channel_id = %channel.channel_id,
-        message_type = ?cmd,
-        "Processing control message"
+        "Processing control message (channel_id: {}, message_type: {:?})",
+        channel.channel_id,
+        cmd
     );
 
     // Use the channel's control message handling methods
     match channel.process_control_message(cmd, &data_bytes).await {
         Ok(_) => {
             debug_hot_path!(
-                channel_id = %channel.channel_id,
-                message_type = ?cmd,
-                "Successfully processed control message"
+                "Successfully processed control message (channel_id: {}, message_type: {:?})",
+                channel.channel_id,
+                cmd
             );
             Ok(())
         }
         Err(e) => {
             error!(
-                channel_id = %channel.channel_id,
-                message_type = ?cmd,
-                error = %e,
-                "Error processing control message"
+                "Error processing control message (channel_id: {}, message_type: {:?}, error: {})",
+                channel.channel_id, cmd, e
             );
             Err(e)
         }
@@ -203,17 +210,23 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     let payload_len = payload.len(); // Store length before moving
 
     debug_hot_path!(
-        channel_id = %channel.channel_id,
-        conn_no = conn_no,
-        payload_len = payload_len,
-        "Forwarding bytes via lock-free channel"
+        "Forwarding bytes via lock-free channel (channel_id: {}, conn_no: {}, payload_len: {})",
+        channel.channel_id,
+        conn_no,
+        payload_len
     );
 
-    if tracing::enabled!(tracing::Level::DEBUG) && payload_len > 0 && payload_len <= 100 {
-        debug!(channel_id = %channel.channel_id, payload = ?payload, "Payload for backend");
-    } else if tracing::enabled!(tracing::Level::DEBUG) && payload_len > 100 {
+    if log::log_enabled!(log::Level::Debug) && payload_len > 0 && payload_len <= 100 {
+        debug!(
+            "Payload for backend (channel_id: {}, payload: {:?})",
+            channel.channel_id, payload
+        );
+    } else if log::log_enabled!(log::Level::Debug) && payload_len > 100 {
         let first_bytes = payload.slice(..std::cmp::min(50, payload_len));
-        debug!(channel_id = %channel.channel_id, first_bytes = ?first_bytes, "Large payload first bytes");
+        debug!(
+            "Large payload first bytes (channel_id: {}, first_bytes: {:?})",
+            channel.channel_id, first_bytes
+        );
     }
 
     // Skip inbound special instruction detection - user only wants outbound and handshake sizes
@@ -249,19 +262,19 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     match send_result {
         Some(Ok(_)) => {
             debug_hot_path!(
-                channel_id = %channel.channel_id,
-                conn_no = conn_no,
-                payload_len = payload_len,
-                "Successfully queued bytes for backend task"
+                "Successfully queued bytes for backend task (channel_id: {}, conn_no: {}, payload_len: {})",
+                channel.channel_id,
+                conn_no,
+                payload_len
             );
             return Ok(());
         }
         Some(Err(_)) => {
             // **COLD PATH**: Channel closed - rare error case
             warn_hot_path!(
-                channel_id = %channel.channel_id,
-                conn_no = conn_no,
-                "Backend task is dead, closing connection"
+                "Backend task is dead, closing connection (channel_id: {}, conn_no: {})",
+                channel.channel_id,
+                conn_no
             );
             // Connection reference is dropped, safe to call close_backend
             channel
@@ -278,9 +291,9 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     #[cold]
     fn log_connection_not_found(channel_id: &str, conn_no: u32) {
         warn_hot_path!(
-            channel_id = %channel_id,
-            conn_no = conn_no,
-            "Connection not found for forwarding data, data lost"
+            "Connection not found for forwarding data, data lost (channel_id: {}, conn_no: {})",
+            channel_id,
+            conn_no
         );
     }
 

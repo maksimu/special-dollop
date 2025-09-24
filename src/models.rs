@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -15,13 +16,12 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
 
 /// Dual-stack socket binding utilities for IPv6/IPv4 compatibility
 pub mod dual_stack {
     use anyhow::{anyhow, Result};
+    use log::debug;
     use tokio::net::UdpSocket;
-    use tracing::debug;
 
     /// Creates a dual-stack UDP socket, preferring IPv6 but falling back to IPv4
     /// Binds to \[::]:port first, then 0.0.0.0:port if IPv6 fails
@@ -183,8 +183,7 @@ impl Conn {
 
         // Create placeholder for the to_webrtc task (backend->WebRTC handled by setup_outbound_task)
         let to_webrtc = tokio::spawn(async move {
-            debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
-                   "to_webrtc task started (backend->WebRTC handled by setup_outbound_task)");
+            debug!("to_webrtc task started (backend->WebRTC handled by setup_outbound_task) (channel_id: {}, conn_no: {})", channel_id, conn_no);
         });
 
         Self {
@@ -202,13 +201,19 @@ impl Conn {
         // Wait for tasks to complete
         if let Err(e) = self.backend_task.await {
             if !e.is_cancelled() {
-                warn!(target: "connection_lifecycle", error=%e, "Backend task ended with error during shutdown");
+                warn!(
+                    "Backend task ended with error during shutdown (error: {})",
+                    e
+                );
             }
         }
 
         if let Err(e) = self.to_webrtc.await {
             if !e.is_cancelled() {
-                warn!(target: "connection_lifecycle", error=%e, "to_webrtc task ended with error during shutdown");
+                warn!(
+                    "to_webrtc task ended with error during shutdown (error: {})",
+                    e
+                );
             }
         }
 
@@ -223,8 +228,10 @@ async fn backend_task_runner(
     conn_no: u32,
     channel_id: String,
 ) {
-    debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
-           "Backend task started");
+    debug!(
+        "Backend task started (channel_id: {}, conn_no: {})",
+        channel_id, conn_no
+    );
 
     while let Some(message) = data_rx.recv().await {
         match message {
@@ -233,29 +240,14 @@ async fn backend_task_runner(
                 match backend.write_all(payload.as_ref()).await {
                     Ok(_) => {
                         if let Err(flush_err) = backend.flush().await {
-                            warn!(
-                                channel_id = %channel_id,
-                                conn_no = conn_no,
-                                error = %flush_err,
-                                "Backend flush error, client disconnected"
-                            );
+                            warn!("Backend flush error, client disconnected (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, flush_err);
                             break; // Exit the task on flush error
                         }
 
-                        debug!(
-                            channel_id = %channel_id,
-                            conn_no = conn_no,
-                            bytes_written = payload.len(),
-                            "Backend write successful"
-                        );
+                        debug!("Backend write successful (channel_id: {}, conn_no: {}, bytes_written: {})", channel_id, conn_no, payload.len());
                     }
                     Err(write_err) => {
-                        warn!(
-                            channel_id = %channel_id,
-                            conn_no = conn_no,
-                            error = %write_err,
-                            "Backend write error, client disconnected"
-                        );
+                        warn!("Backend write error, client disconnected (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, write_err);
                         break; // Exit the task on writing error
                     }
                 }
@@ -263,11 +255,9 @@ async fn backend_task_runner(
             ConnectionMessage::Eof => {
                 // Handle EOF - call real TCP shutdown
                 if let Err(e) = AsyncReadWrite::shutdown(&mut backend).await {
-                    warn!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, error=%e,
-                          "Failed to shutdown backend on EOF");
+                    warn!("Failed to shutdown backend on EOF (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, e);
                 } else {
-                    info!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
-                          "Backend shutdown on EOF (connection remains alive for RDP patterns)");
+                    info!("Backend shutdown on EOF (connection remains alive for RDP patterns) (channel_id: {}, conn_no: {})", channel_id, conn_no);
                 }
                 // Note: We don't break here - connection stays alive after EOF for RDP
             }
@@ -276,12 +266,16 @@ async fn backend_task_runner(
 
     // Shutdown backend on task exit
     if let Err(e) = AsyncReadWrite::shutdown(&mut backend).await {
-        debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no, error=%e,
-               "Error shutting down backend in task cleanup");
+        debug!(
+            "Error shutting down backend in task cleanup (channel_id: {}, conn_no: {}, error: {})",
+            channel_id, conn_no, e
+        );
     }
 
-    debug!(target: "connection_lifecycle", channel_id=%channel_id, conn_no,
-           "Backend task exited");
+    debug!(
+        "Backend task exited (channel_id: {}, conn_no: {})",
+        channel_id, conn_no
+    );
 }
 
 /// Tunnel timeout configuration

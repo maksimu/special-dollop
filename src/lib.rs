@@ -9,6 +9,7 @@ mod buffer_pool;
 mod channel;
 mod error;
 pub mod hot_path_macros;
+mod metrics;
 mod models;
 #[cfg(feature = "python")]
 mod python;

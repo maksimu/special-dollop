@@ -5,6 +5,7 @@ use crate::router_helpers::post_connection_state;
 use crate::runtime::{get_runtime, shutdown_runtime_from_python};
 use crate::tube_protocol::CloseConnectionReason;
 use crate::tube_registry::REGISTRY;
+use log::{debug, error, trace, warn};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -12,7 +13,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::{debug, error, trace, warn};
 
 /// Python bindings for the Rust TubeRegistry.
 ///
@@ -74,26 +74,35 @@ impl PyTubeRegistry {
         self.explicit_cleanup_called.store(true, Ordering::SeqCst);
 
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let mut registry = REGISTRY.write().await;
                 let tube_ids: Vec<String> = registry.tubes_by_id.keys().cloned().collect();
-                debug!(target: "python_bindings", tube_count = tube_ids.len(), "Starting explicit cleanup of all tubes");
+                debug!(
+                    "Starting explicit cleanup of all tubes (tube_count: {})",
+                    tube_ids.len()
+                );
                 // Close all tubes (this will also clean up their signal channels)
                 for tube_id in tube_ids {
-                    if let Err(e) = registry.close_tube(&tube_id, Some(CloseConnectionReason::Normal)).await {
-                        error!(target: "python_bindings", tube_id = %tube_id, "Failed to close tube during cleanup: {}", e);
+                    if let Err(e) = registry
+                        .close_tube(&tube_id, Some(CloseConnectionReason::Normal))
+                        .await
+                    {
+                        error!(
+                            "Failed to close tube during cleanup: {} (tube_id: {})",
+                            e, tube_id
+                        );
                     }
                 }
                 // Clear any remaining mappings (should be empty after close_tube calls)
                 registry.conversation_mappings.clear();
                 registry.signal_channels.clear();
-                debug!(target: "python_bindings", "Registry cleanup complete");
+                debug!("Registry cleanup complete");
             })
         });
 
         // Now shutdown the runtime - this ensures all async tasks are properly terminated
-        debug!(target: "python_bindings", "Shutting down runtime after tube cleanup");
+        debug!("Shutting down runtime after tube cleanup");
         crate::runtime::shutdown_runtime_from_python();
 
         Ok(())
@@ -102,13 +111,22 @@ impl PyTubeRegistry {
     /// Clean up specific tubes by ID
     fn cleanup_tubes(&self, py: Python<'_>, tube_ids: Vec<String>) -> PyResult<()> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let mut registry = REGISTRY.write().await;
-                debug!(target: "python_bindings", tube_count = tube_ids.len(), "Starting cleanup of specific tubes");
+                debug!(
+                    "Starting cleanup of specific tubes (tube_count: {})",
+                    tube_ids.len()
+                );
                 for tube_id in tube_ids {
-                    if let Err(e) = registry.close_tube(&tube_id, Some(CloseConnectionReason::Normal)).await {
-                        error!(target: "python_bindings", tube_id = %tube_id, "Failed to close tube during selective cleanup: {}", e);
+                    if let Err(e) = registry
+                        .close_tube(&tube_id, Some(CloseConnectionReason::Normal))
+                        .await
+                    {
+                        error!(
+                            "Failed to close tube during selective cleanup: {} (tube_id: {})",
+                            e, tube_id
+                        );
                     }
                 }
                 Ok(())
@@ -119,48 +137,44 @@ impl PyTubeRegistry {
     /// Python destructor - safety net cleanup
     fn __del__(&self, py: Python<'_>) {
         if !self.explicit_cleanup_called.load(Ordering::SeqCst) {
-            warn!(target: "python_bindings", 
-                "PyTubeRegistry.__del__ called without explicit cleanup! Consider using cleanup_all() explicitly or using a context manager.");
+            warn!("PyTubeRegistry.__del__ called without explicit cleanup! Consider using cleanup_all() explicitly or using a context manager.");
 
             // Attempt force cleanup - ignore errors since we're in destructor
             let _ = self.do_force_cleanup(py);
         } else {
-            debug!(target: "python_bindings", "PyTubeRegistry.__del__ called after explicit cleanup - OK");
+            debug!("PyTubeRegistry.__del__ called after explicit cleanup - OK");
         }
     }
 
     /// Internal Force cleanup for __del__ - more permissive error handling
     fn do_force_cleanup(&self, py: Python<'_>) -> PyResult<()> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 match REGISTRY.try_write() {
                     Ok(mut registry) => {
                         let tube_ids: Vec<String> = registry.tubes_by_id.keys().cloned().collect();
-                        warn!(target: "python_bindings", tube_count = tube_ids.len(), 
-                            "Force cleanup in __del__ - {} tubes to close", tube_ids.len());
+                        warn!("Force cleanup in __del__ - {} tubes to close", tube_ids.len());
                         // Close all tubes - ignore individual errors in force cleanup
                         for tube_id in tube_ids {
                             if let Err(e) = registry.close_tube(&tube_id, Some(CloseConnectionReason::Unknown)).await {
-                                error!(target: "python_bindings", tube_id = %tube_id, 
-                                    "Failed to close tube during force cleanup: {}", e);
+                                error!("Failed to close tube during force cleanup: {} (tube_id: {})", e, tube_id);
                             }
                         }
                         // Clear mappings
                         registry.conversation_mappings.clear();
                         registry.signal_channels.clear();
-                        debug!(target: "python_bindings", "Force cleanup complete");
+                        debug!("Force cleanup complete");
                     }
                     Err(_) => {
-                        warn!(target: "python_bindings", 
-                            "Could not acquire registry lock for Force cleanup - registry may be in use");
+                        warn!("Could not acquire registry lock for Force cleanup - registry may be in use");
                     }
                 }
             })
         });
 
         // Force shutdown the runtime - this is the safety net for thread cleanup
-        warn!(target: "python_bindings", "Force shutting down runtime in __del__");
+        warn!("Force shutting down runtime in __del__");
         crate::runtime::shutdown_runtime_from_python();
 
         Ok(())
@@ -168,7 +182,7 @@ impl PyTubeRegistry {
 
     /// Shutdown the runtime - useful for clean process termination
     fn shutdown_runtime(&self, _py: Python<'_>) -> PyResult<()> {
-        debug!(target: "python_bindings", "Python requested runtime shutdown");
+        debug!("Python requested runtime shutdown");
         shutdown_runtime_from_python();
         Ok(())
     }
@@ -195,16 +209,16 @@ impl PyTubeRegistry {
         &self,
         py: Python<'_>,
         conversation_id: &str,
-        settings: PyObject,
+        settings: Py<PyAny>,
         trickle_ice: bool,
         callback_token: &str,
         krelay_server: &str,
         client_version: Option<&str>,
         ksm_config: Option<&str>,
         offer: Option<&str>,
-        signal_callback: Option<PyObject>,
+        signal_callback: Option<Py<PyAny>>,
         tube_id: Option<&str>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let master_runtime = get_runtime();
 
         // Validate that client_version is provided
@@ -229,11 +243,11 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.map(String::from);
 
         // This outer block_on will handle the call to the registry's create_tube and setup signal handler
-        let creation_result_map = py.allow_threads(|| {
+        let creation_result_map = Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                trace!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: Acquiring REGISTRY write lock for create_tube.");
+                trace!("PyBind: Acquiring REGISTRY write lock for create_tube. (conversation_id: {})", conversation_id);
                 let mut registry = REGISTRY.write().await;
-                trace!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: REGISTRY write lock acquired.");
+                trace!("PyBind: REGISTRY write lock acquired. (conversation_id: {})", conversation_id);
 
                 // Delegate to the main TubeRegistry::create_tube method
                 // This method now encapsulates Tube creation, ICE config, peer connection setup, and offer/answer generation.
@@ -250,13 +264,13 @@ impl PyTubeRegistry {
                     tube_id_owned,
                 ).await
                  .map_err(|e| {
-                    error!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube CRITICAL FAILURE: {e}");
+                    error!("PyBind: TubeRegistry::create_tube CRITICAL FAILURE: {e} (conversation_id: {})", conversation_id);
                     PyRuntimeError::new_err(format!("Failed to create tube via registry: {e}"))
                  })
             })
         })?; // Propagate errors from block_on or create_tube
 
-        trace!(target: "lifecycle", conversation_id = %conversation_id, "PyBind: TubeRegistry::create_tube call complete. Result map has {} keys.", creation_result_map.len());
+        trace!("PyBind: TubeRegistry::create_tube call complete. Result map has {} keys. (conversation_id: {})", creation_result_map.len(), conversation_id);
 
         // Extract tube_id for signal handler setup (it must be in the map)
         let final_tube_id = creation_result_map
@@ -287,7 +301,7 @@ impl PyTubeRegistry {
     fn create_offer(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
@@ -307,7 +321,7 @@ impl PyTubeRegistry {
     fn create_answer(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
@@ -337,7 +351,7 @@ impl PyTubeRegistry {
         is_answer: bool,
     ) -> PyResult<Option<String>> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry
@@ -358,8 +372,14 @@ impl PyTubeRegistry {
 
         master_runtime.spawn(async move {
             let registry = REGISTRY.read().await;
-            if let Err(e) = registry.add_external_ice_candidate(&tube_id_owned, &candidate_owned).await {
-                warn!(target: "python_bindings", "Error adding ICE candidate for tube {}: {}", tube_id_owned, e);
+            if let Err(e) = registry
+                .add_external_ice_candidate(&tube_id_owned, &candidate_owned)
+                .await
+            {
+                warn!(
+                    "Error adding ICE candidate for tube {}: {}",
+                    tube_id_owned, e
+                );
             }
         });
 
@@ -370,7 +390,7 @@ impl PyTubeRegistry {
     fn get_connection_state(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry
@@ -390,7 +410,7 @@ impl PyTubeRegistry {
     /// Check if there are any active tubes
     fn has_active_tubes(&self, py: Python<'_>) -> bool {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 !registry.tubes_by_id.is_empty()
@@ -401,7 +421,7 @@ impl PyTubeRegistry {
     /// Get count of active tubes
     fn active_tube_count(&self, py: Python<'_>) -> usize {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry.tubes_by_id.len()
@@ -412,7 +432,7 @@ impl PyTubeRegistry {
     /// Set server mode in the registry
     fn set_server_mode(&self, py: Python<'_>, server_mode: bool) -> PyResult<()> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let mut registry = REGISTRY.write().await;
                 registry.set_server_mode(server_mode);
@@ -424,7 +444,7 @@ impl PyTubeRegistry {
     /// Check if the registry is in server mode
     fn is_server_mode(&self, py: Python<'_>) -> bool {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry.is_server_mode()
@@ -442,7 +462,7 @@ impl PyTubeRegistry {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
         let connection_id_owned = connection_id.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let mut registry = REGISTRY.write().await;
                 registry
@@ -458,7 +478,7 @@ impl PyTubeRegistry {
     fn tube_found(&self, py: Python<'_>, tube_id: &str) -> bool {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry.get_by_tube_id(&tube_id_owned).is_some()
@@ -469,7 +489,7 @@ impl PyTubeRegistry {
     /// Get all tube IDs
     fn all_tube_ids(&self, py: Python<'_>) -> Vec<String> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry.all_tube_ids_sync()
@@ -481,7 +501,7 @@ impl PyTubeRegistry {
     fn get_conversation_ids_by_tube_id(&self, py: Python<'_>, tube_id: &str) -> Vec<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 registry
@@ -508,7 +528,7 @@ impl PyTubeRegistry {
     fn find_tubes(&self, py: Python<'_>, search_term: &str) -> PyResult<Vec<String>> {
         let master_runtime = get_runtime();
         let search_term_owned = search_term.to_string();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
                 let tubes = registry.find_tubes(&search_term_owned);
@@ -614,7 +634,7 @@ impl PyTubeRegistry {
         client_version: String,
     ) -> PyResult<()> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
 
@@ -629,10 +649,7 @@ impl PyTubeRegistry {
                 // The post_connection_state function handles TEST_MODE_KSM_CONFIG internally.
                 // It will also error out if ksm_config_from_python is empty and not a test string.
                 debug!(
-                    target: "python_bindings",
-                    token_count = callback_tokens.len(),
-                    ksm_source = "python_direct_arg",
-                    "Preparing to send refresh_connections (open_connections) callback with KSM config from Python."
+                    "Preparing to send refresh_connections (open_connections) connection count {} with KSM config from Python. python_direct_arg", callback_tokens.len()
                 );
 
                 let tokens_json = serde_json::Value::Array(
@@ -643,7 +660,7 @@ impl PyTubeRegistry {
 
                 post_connection_state(
                     &ksm_config_from_python,
-                    "open_connections", 
+                    "open_connections",
                     &tokens_json,
                     None,
                     &client_version,
@@ -660,7 +677,7 @@ impl PyTubeRegistry {
     /// Print all existing tubes with their connections for debugging
     fn print_tubes_with_connections(&self, py: Python<'_>) -> PyResult<()> {
         let master_runtime = get_runtime();
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 let registry = REGISTRY.read().await;
 
@@ -725,7 +742,7 @@ impl PyTubeRegistry {
         &self,
         py: Python<'_>,
         config: &Bound<PyDict>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         use crate::resource_manager::RESOURCE_MANAGER;
 
         let mut limits = RESOURCE_MANAGER.get_limits();
@@ -827,7 +844,7 @@ impl PyTubeRegistry {
     }
 
     /// Get current resource management status and statistics
-    fn get_resource_status(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get_resource_status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         use crate::resource_manager::RESOURCE_MANAGER;
 
         let stats = RESOURCE_MANAGER.get_resource_status();
@@ -926,13 +943,13 @@ impl PyTubeRegistry {
         &self,
         py: Python<'_>,
         krelay_server: &str,
-        settings: Option<PyObject>,
+        settings: Option<Py<PyAny>>,
         timeout_seconds: Option<u64>,
         ksm_config: Option<&str>,
         client_version: Option<&str>,
         username: Option<&str>,
         password: Option<&str>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let master_runtime = get_runtime();
         let krelay_server_owned = krelay_server.to_string();
         let timeout = timeout_seconds.unwrap_or(30);
@@ -948,7 +965,7 @@ impl PyTubeRegistry {
             default_settings
         };
 
-        let result = py.allow_threads(|| {
+        let result = Python::detach(py, || {
             master_runtime.clone().block_on(async move {
                 test_webrtc_connectivity_internal(
                     &krelay_server_owned,
@@ -1023,13 +1040,13 @@ impl PyTubeRegistry {
     fn format_connectivity_results(
         &self,
         py: Python<'_>,
-        results: PyObject,
+        results: Py<PyAny>,
         detailed: Option<bool>,
     ) -> PyResult<String> {
         let _detailed = detailed.unwrap_or(false);
 
         // Convert Python results back to JSON for processing
-        let results_dict = results.extract::<HashMap<String, PyObject>>(py)?;
+        let results_dict = results.extract::<HashMap<String, Py<PyAny>>>(py)?;
         let mut formatted_output = Vec::new();
 
         // Header
@@ -1058,7 +1075,7 @@ impl PyTubeRegistry {
 
         // Settings
         if let Some(settings_obj) = results_dict.get("settings") {
-            if let Ok(settings) = settings_obj.extract::<HashMap<String, PyObject>>(py) {
+            if let Ok(settings) = settings_obj.extract::<HashMap<String, Py<PyAny>>>(py) {
                 formatted_output.push("Test Settings:".to_string());
                 for (key, value) in settings.iter() {
                     if let Ok(value_str) = value.extract::<String>(py) {
@@ -1086,7 +1103,7 @@ impl PyTubeRegistry {
 
         for test_name in test_order {
             if let Some(test_result_obj) = results_dict.get(test_name) {
-                if let Ok(test_result) = test_result_obj.extract::<HashMap<String, PyObject>>(py) {
+                if let Ok(test_result) = test_result_obj.extract::<HashMap<String, Py<PyAny>>>(py) {
                     let success = test_result
                         .get("success")
                         .and_then(|v| v.extract::<bool>(py).ok())
@@ -1133,7 +1150,7 @@ impl PyTubeRegistry {
 
         // Overall result
         if let Some(overall_obj) = results_dict.get("overall_result") {
-            if let Ok(overall) = overall_obj.extract::<HashMap<String, PyObject>>(py) {
+            if let Ok(overall) = overall_obj.extract::<HashMap<String, Py<PyAny>>>(py) {
                 let success = overall
                     .get("success")
                     .and_then(|v| v.extract::<bool>(py).ok())
@@ -1213,7 +1230,7 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.to_string();
         let master_runtime = get_runtime();
 
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.block_on(async move {
                 let registry = REGISTRY.read().await;
                 if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
@@ -1232,11 +1249,11 @@ impl PyTubeRegistry {
     }
 
     /// Get connection statistics for a specific tube
-    fn get_connection_stats(&self, py: Python<'_>, tube_id: &str) -> PyResult<PyObject> {
+    fn get_connection_stats(&self, py: Python<'_>, tube_id: &str) -> PyResult<Py<PyAny>> {
         let tube_id_owned = tube_id.to_string();
         let master_runtime = get_runtime();
 
-        let stats_result = py.allow_threads(|| {
+        let stats_result = Python::detach(py, || {
             master_runtime.block_on(async move {
                 let registry = REGISTRY.read().await;
                 if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
@@ -1280,7 +1297,7 @@ impl PyTubeRegistry {
         py: Python<'_>,
         ksm_config: &str,
         connection_state: &str,
-        token: PyObject,
+        token: Py<PyAny>,
         is_terminated: Option<bool>,
         client_version: &str,
         recording_duration: Option<u64>,
@@ -1309,7 +1326,7 @@ impl PyTubeRegistry {
             ));
         };
 
-        py.allow_threads(|| {
+        Python::detach(py, || {
             master_runtime.block_on(async move {
                 post_connection_state(
                     &ksm_config_owned,
@@ -1329,6 +1346,251 @@ impl PyTubeRegistry {
             })
         })
     }
+
+    // =============================================================================
+    // METRICS AND PERFORMANCE MONITORING
+    // =============================================================================
+
+    /// Get live performance statistics for a specific connection
+    fn get_live_stats(&self, py: Python<'_>, conversation_id: &str) -> PyResult<Option<Py<PyAny>>> {
+        let conversation_id_owned = conversation_id.to_string();
+
+        // Get metrics from the metrics collector (non-blocking)
+        if let Some(metrics) =
+            crate::metrics::METRICS_COLLECTOR.get_live_stats(&conversation_id_owned)
+        {
+            // Convert metrics to Python dictionary
+            let dict = PyDict::new(py);
+
+            // Connection identifiers
+            dict.set_item("conversation_id", &metrics.conversation_id)?;
+            dict.set_item("tube_id", &metrics.tube_id)?;
+            dict.set_item("established_at", metrics.established_at.to_rfc3339())?;
+
+            // Message flow metrics
+            dict.set_item("messages_sent", metrics.messages_sent)?;
+            dict.set_item("messages_received", metrics.messages_received)?;
+            dict.set_item("total_bytes_sent", metrics.total_bytes_sent)?;
+            dict.set_item("total_bytes_received", metrics.total_bytes_received)?;
+
+            // Latency metrics (convert to milliseconds)
+            dict.set_item("avg_rtt_ms", metrics.avg_rtt.as_millis() as f64)?;
+            dict.set_item("p95_latency_ms", metrics.p95_latency.as_millis() as f64)?;
+            dict.set_item("p99_latency_ms", metrics.p99_latency.as_millis() as f64)?;
+
+            if let Some(current_latency) = metrics.current_message_latency {
+                dict.set_item(
+                    "current_message_latency_ms",
+                    current_latency.as_millis() as f64,
+                )?;
+            }
+
+            // WebRTC metrics
+            let webrtc_dict = PyDict::new(py);
+            if let Some(rtt_ms) = metrics.webrtc_metrics.rtc_stats.rtt_ms {
+                webrtc_dict.set_item("rtt_ms", rtt_ms)?;
+            }
+            webrtc_dict.set_item("jitter_ms", metrics.webrtc_metrics.rtc_stats.jitter_ms)?;
+            webrtc_dict.set_item(
+                "packet_loss_rate",
+                metrics.webrtc_metrics.rtc_stats.packet_loss_rate,
+            )?;
+            webrtc_dict.set_item(
+                "current_bitrate",
+                metrics.webrtc_metrics.rtc_stats.current_bitrate,
+            )?;
+            webrtc_dict.set_item(
+                "ice_connection_state",
+                &metrics.webrtc_metrics.rtc_stats.ice_connection_state,
+            )?;
+            webrtc_dict.set_item("dtls_ready", metrics.webrtc_metrics.rtc_stats.dtls_ready)?;
+            webrtc_dict.set_item(
+                "active_data_channels",
+                metrics.webrtc_metrics.rtc_stats.active_data_channels,
+            )?;
+
+            dict.set_item("webrtc_stats", webrtc_dict)?;
+
+            // Connection quality and health
+            let quality_str = match metrics.connection_quality {
+                crate::metrics::ConnectionQuality::Excellent => "excellent",
+                crate::metrics::ConnectionQuality::Good => "good",
+                crate::metrics::ConnectionQuality::Fair => "fair",
+                crate::metrics::ConnectionQuality::Poor => "poor",
+            };
+            dict.set_item("connection_quality", quality_str)?;
+            dict.set_item("active_alert_count", metrics.active_alert_count)?;
+
+            // Performance metrics
+            dict.set_item("error_rate", metrics.error_rate)?;
+            dict.set_item("total_errors", metrics.total_errors)?;
+            dict.set_item("retry_count", metrics.retry_count)?;
+            dict.set_item("message_throughput", metrics.message_throughput())?;
+            dict.set_item("bandwidth_utilization", metrics.bandwidth_utilization())?;
+
+            Ok(Some(dict.into()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get connection health summary for a specific tube
+    fn get_connection_health(&self, py: Python<'_>, tube_id: &str) -> PyResult<Option<Py<PyAny>>> {
+        let tube_id_owned = tube_id.to_string();
+
+        if let Some(metrics) =
+            crate::metrics::METRICS_COLLECTOR.get_connection_health(&tube_id_owned)
+        {
+            // Create simplified health summary
+            let dict = PyDict::new(py);
+
+            dict.set_item("tube_id", &metrics.tube_id)?;
+            dict.set_item("conversation_id", &metrics.conversation_id)?;
+
+            let quality_str = match metrics.connection_quality {
+                crate::metrics::ConnectionQuality::Excellent => "excellent",
+                crate::metrics::ConnectionQuality::Good => "good",
+                crate::metrics::ConnectionQuality::Fair => "fair",
+                crate::metrics::ConnectionQuality::Poor => "poor",
+            };
+            dict.set_item("quality", quality_str)?;
+
+            // Key health indicators
+            if let Some(rtt_ms) = metrics.webrtc_metrics.rtc_stats.rtt_ms {
+                dict.set_item("rtt_ms", rtt_ms)?;
+            }
+            dict.set_item(
+                "packet_loss_rate",
+                metrics.webrtc_metrics.rtc_stats.packet_loss_rate,
+            )?;
+            dict.set_item("active_alerts", metrics.active_alert_count)?;
+            dict.set_item("error_rate", metrics.error_rate)?;
+            dict.set_item(
+                "ice_connection_state",
+                &metrics.webrtc_metrics.rtc_stats.ice_connection_state,
+            )?;
+
+            Ok(Some(dict.into()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Export all metrics data as JSON string for dashboard consumption
+    fn export_metrics_json(&self, _py: Python<'_>) -> PyResult<String> {
+        crate::metrics::METRICS_COLLECTOR
+            .export_metrics_json()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to export metrics: {}", e)))
+    }
+
+    /// Get aggregated system-wide metrics
+    fn get_aggregated_metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let aggregated = crate::metrics::METRICS_COLLECTOR.get_aggregated_metrics();
+
+        let dict = PyDict::new(py);
+
+        dict.set_item("timestamp", aggregated.timestamp.to_rfc3339())?;
+        dict.set_item("active_connections", aggregated.active_connections)?;
+        dict.set_item("active_tubes", aggregated.active_tubes)?;
+
+        // System averages
+        dict.set_item(
+            "avg_system_rtt_ms",
+            aggregated.avg_system_rtt.as_millis() as f64,
+        )?;
+        dict.set_item("avg_packet_loss", aggregated.avg_packet_loss)?;
+        dict.set_item(
+            "total_message_throughput",
+            aggregated.total_message_throughput,
+        )?;
+        dict.set_item("total_bandwidth", aggregated.total_bandwidth)?;
+
+        // Quality distribution
+        dict.set_item("excellent_connections", aggregated.excellent_connections)?;
+        dict.set_item("good_connections", aggregated.good_connections)?;
+        dict.set_item("fair_connections", aggregated.fair_connections)?;
+        dict.set_item("poor_connections", aggregated.poor_connections)?;
+
+        // Alert summary
+        dict.set_item("total_alerts", aggregated.total_alerts)?;
+        dict.set_item("critical_alerts", aggregated.critical_alerts)?;
+        dict.set_item("warning_alerts", aggregated.warning_alerts)?;
+
+        // Resource utilization
+        dict.set_item("memory_usage_bytes", aggregated.memory_usage_bytes)?;
+        dict.set_item("cpu_utilization", aggregated.cpu_utilization)?;
+        dict.set_item("network_utilization", aggregated.network_utilization)?;
+
+        Ok(dict.into())
+    }
+
+    /// Get active performance alerts
+    fn get_active_alerts<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyList>> {
+        let collector = &crate::metrics::METRICS_COLLECTOR;
+        let snapshot = collector.create_snapshot();
+
+        let py_list = PyList::empty(py);
+
+        for alert in snapshot.alerts {
+            let alert_dict = PyDict::new(py);
+
+            alert_dict.set_item("id", &alert.id)?;
+            alert_dict.set_item("alert_type", format!("{:?}", alert.alert_type))?;
+            alert_dict.set_item("severity", format!("{:?}", alert.severity))?;
+            alert_dict.set_item("triggered_at", alert.triggered_at.to_rfc3339())?;
+            alert_dict.set_item("last_updated", alert.last_updated.to_rfc3339())?;
+            alert_dict.set_item("message", &alert.message)?;
+            alert_dict.set_item("active", alert.active)?;
+            alert_dict.set_item("occurrence_count", alert.occurrence_count)?;
+
+            if let Some(conv_id) = &alert.conversation_id {
+                alert_dict.set_item("conversation_id", conv_id)?;
+            }
+            if let Some(tube_id) = &alert.tube_id {
+                alert_dict.set_item("tube_id", tube_id)?;
+            }
+
+            // Add details
+            let details_dict = PyDict::new(py);
+            for (key, value) in &alert.details {
+                details_dict.set_item(key, value)?;
+            }
+            alert_dict.set_item("details", details_dict)?;
+
+            py_list.append(alert_dict)?;
+        }
+
+        Ok(py_list)
+    }
+
+    /// Get system uptime and basic stats
+    fn get_system_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let collector = &crate::metrics::METRICS_COLLECTOR;
+
+        let dict = PyDict::new(py);
+
+        dict.set_item("uptime_seconds", collector.get_uptime().as_secs())?;
+        dict.set_item(
+            "active_connection_count",
+            collector.active_connection_count(),
+        )?;
+
+        // Get tube count from registry
+        let master_runtime = get_runtime();
+        let tube_count = master_runtime.block_on(async {
+            let registry = REGISTRY.read().await;
+            registry.tubes_by_id.len()
+        });
+        dict.set_item("active_tube_count", tube_count)?;
+
+        Ok(dict.into())
+    }
+
+    /// Clear all connections from metrics tracking (for testing purposes)
+    fn clear_metrics_connections(&self, _py: Python<'_>) -> PyResult<()> {
+        crate::metrics::METRICS_COLLECTOR.clear_all_connections();
+        Ok(())
+    }
 }
 
 // Implement Drop trait for PyTubeRegistry as a safety net
@@ -1344,13 +1606,22 @@ impl Drop for PyTubeRegistry {
                     if tube_count > 0 {
                         eprintln!("FORCE CLOSE: Clearing {tube_count} tubes immediately");
 
-                        // 1. Immediately drop all signal channels (stops background tasks)
+                        // 1. Clean up metrics for all conversations before clearing tubes
+                        for tube_id in registry.tubes_by_id.keys() {
+                            let conversation_ids = registry.conversation_ids_by_tube_id(tube_id);
+                            for conversation_id in &conversation_ids {
+                                crate::metrics::METRICS_COLLECTOR
+                                    .unregister_connection(conversation_id);
+                            }
+                        }
+
+                        // 2. Immediately drop all signal channels (stops background tasks)
                         registry.signal_channels.clear();
 
-                        // 2. Clear all conversation mappings
+                        // 3. Clear all conversation mappings
                         registry.conversation_mappings.clear();
 
-                        // 3. Drop all tube references (this will trigger their Drop)
+                        // 4. Drop all tube references (this will trigger their Drop)
                         registry.tubes_by_id.clear();
 
                         eprintln!("FORCE CLOSE: Registry cleaned up successfully");

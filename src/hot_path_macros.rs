@@ -12,9 +12,9 @@ macro_rules! debug_hot_path {
             #[cold]
             fn cold_debug() {}
 
-            let enabled = tracing::enabled!(tracing::Level::DEBUG);
+            let enabled = log::log_enabled!(log::Level::Debug);
             if enabled {
-                tracing::debug!($($arg)*);
+                log::debug!($($arg)*);
             } else {
                 cold_debug(); // Mark the false case as cold for better prediction
             }
@@ -33,9 +33,9 @@ macro_rules! trace_hot_path {
             #[cold]
             fn cold_trace() {}
 
-            let enabled = tracing::enabled!(tracing::Level::TRACE);
+            let enabled = log::log_enabled!(log::Level::Trace);
             if enabled {
-                tracing::trace!($($arg)*);
+                log::trace!($($arg)*);
             } else {
                 cold_trace(); // Mark the false case as cold for better prediction
             }
@@ -50,8 +50,8 @@ macro_rules! warn_hot_path {
     ($($arg:tt)*) => {
         #[cfg(not(feature = "disable_hot_path_logging"))]
         {
-            if tracing::enabled!(tracing::Level::WARN) {
-                tracing::warn!($($arg)*);
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!($($arg)*);
             }
         }
     };
@@ -64,8 +64,8 @@ macro_rules! info_hot_path {
     ($($arg:tt)*) => {
         #[cfg(not(feature = "disable_hot_path_logging"))]
         {
-            if tracing::enabled!(tracing::Level::INFO) {
-                tracing::info!($($arg)*);
+            if log::log_enabled!(log::Level::Info) {
+                log::info!($($arg)*);
             }
         }
     };
@@ -83,9 +83,9 @@ macro_rules! trace_ultra_hot_path {
                 #[cold]
                 fn cold_ultra_trace() {}
 
-                let enabled = tracing::enabled!(tracing::Level::TRACE);
+                let enabled = log::log_enabled!(log::Level::Trace);
                 if enabled {
-                    tracing::trace!($($arg)*);
+                    log::trace!($($arg)*);
                 } else {
                     cold_ultra_trace(); // Mark the false case as cold
                 }
@@ -99,8 +99,8 @@ macro_rules! trace_ultra_hot_path {
 #[macro_export]
 macro_rules! error_hot_path {
     ($($arg:tt)*) => {
-        if tracing::enabled!(tracing::Level::ERROR) {
-            tracing::error!($($arg)*);
+        if log::log_enabled!(log::Level::Error) {
+            log::error!($($arg)*);
         }
     };
 }
@@ -114,9 +114,9 @@ macro_rules! production_debug {
             #[cold]
             fn cold_production_debug() {}
 
-            let enabled = tracing::enabled!(tracing::Level::DEBUG);
+            let enabled = log::log_enabled!(log::Level::Debug);
             if enabled {
-                tracing::debug!($($arg)*);
+                log::debug!($($arg)*);
             } else {
                 cold_production_debug(); // Mark the false case as cold
             }

@@ -56,15 +56,22 @@ This SOCKS5 implementation runs over a **WebRTC data channel tunnel** instead of
 
 Custom control messages are exchanged over the WebRTC data channel:
 
-```rust
-pub enum ControlMessageType {
-    OpenConnection = 14,       // Request to open new connection
-    CloseConnection = 15,      // Close existing connection  
+```rustpub enum ControlMessage {
+    Ping = 1,                  // Keepalive ping
+    Pong = 2,                  // Keepalive pong response
+    OpenConnection = 101,      // Request to open new connection
+    CloseConnection = 102,     // Close existing connection
+    ConnectionOpened = 103,    // Connection opened confirmation
     SendEOF = 104,            // Send EOF to connection
+    // UDP ASSOCIATE support
     UdpAssociate = 201,       // Request UDP association
     UdpAssociateOpened = 202, // UDP association ready
     UdpPacket = 203,          // UDP packet forwarding
     UdpAssociateClosed = 204, // UDP association closed
+    // Metrics support
+    MetricsRequest = 301,     // Request metrics data
+    MetricsResponse = 302,    // Respond with metrics data
+    MetricsConfig = 303,      // Configure metrics collection
 }
 ```
 
@@ -73,21 +80,58 @@ pub enum ControlMessageType {
 [MSG_TYPE:1] [RESERVED:2] [CONN_ID:4] [RESERVED:4] [HOST_LEN:1] [HOST:VAR] [PORT:2]
 ```
 
-#### UdpPacket Message Format  
+#### UdpPacket Message Format
 ```
 [MSG_TYPE:1] [RESERVED:2] [CONN_ID:4] [SOCKS5_UDP_HEADER:VAR] [UDP_DATA:VAR]
+```
+
+#### Metrics Message Formats
+
+**MetricsRequest (301):**
+```
+[MSG_TYPE:1] [RESERVED:2] [CONN_ID:4] [REQUEST_TYPE:1] [REQUEST_DATA:VAR]
+```
+Request types:
+- `0`: Get aggregated metrics (JSON response)
+- `1`: Get live stats for connection ID (next 4 bytes = connection ID)
+- `2`: Get system stats (uptime, connection count)
+
+**MetricsResponse (302):**
+```
+[MSG_TYPE:1] [RESERVED:2] [CONN_ID:4] [JSON_DATA:VAR]
+```
+Response contains JSON with requested metrics data.
+
+**MetricsConfig (303):**
+```
+[MSG_TYPE:1] [RESERVED:2] [CONN_ID:4] [JSON_CONFIG:VAR]
+```
+Configuration JSON format:
+```json
+{
+  "enable_collection": true,
+  "collection_interval_ms": 10000
+}
 ```
 
 ## 🚀 What Was Implemented
 
 ### **Core UDP ASSOCIATE Functionality**
-✅ **New Protocol Messages**: Added 4 UDP control message types (201-204)  
-✅ **Server-Side UDP Handling**: Parses SOCKS5 UDP requests, creates local UDP sockets, forwards packets  
-✅ **Client-Side UDP Processing**: Network access control, DNS resolution, packet forwarding  
-✅ **SOCKS5 UDP Packet Format**: Full parsing of the standard SOCKS5 UDP packet structure  
-✅ **Security Integration**: Uses your existing `NetworkAccessChecker` for host/port validation  
-✅ **Persistent UDP Associations**: Long-lived sockets for response handling  
-✅ **Response Packet Forwarding**: Complete bidirectional UDP communication  
+✅ **New Protocol Messages**: Added 4 UDP control message types (201-204)
+✅ **Server-Side UDP Handling**: Parses SOCKS5 UDP requests, creates local UDP sockets, forwards packets
+✅ **Client-Side UDP Processing**: Network access control, DNS resolution, packet forwarding
+✅ **SOCKS5 UDP Packet Format**: Full parsing of the standard SOCKS5 UDP packet structure
+✅ **Security Integration**: Uses your existing `NetworkAccessChecker` for host/port validation
+✅ **Persistent UDP Associations**: Long-lived sockets for response handling
+✅ **Response Packet Forwarding**: Complete bidirectional UDP communication
+
+### **Core Metrics & Monitoring Functionality**
+✅ **New Protocol Messages**: Added 3 metrics control message types (301-303)
+✅ **Real-time Metrics Collection**: Aggregated metrics, live connection stats, system uptime
+✅ **JSON-based Communication**: Structured metrics data exchange via control messages
+✅ **Performance Monitoring**: DEBUG level heartbeat logging every 10 seconds
+✅ **Hot Path Optimized**: Uses `debug_hot_path!` macros with ~1ns overhead when disabled
+✅ **Request/Response Pattern**: Supports metrics requests, responses, and configuration updates  
 
 ### **Critical Corporate Features Now Working**
 
@@ -337,13 +381,19 @@ If implementing the WebRTC tunnel integration, handle these control messages:
 #### Message Types
 ```rust
 // Control message types
-const OPEN_CONNECTION: u8 = 14;
-const CLOSE_CONNECTION: u8 = 15;
+const PING: u8 = 1;
+const PONG: u8 = 2;
+const OPEN_CONNECTION: u8 = 101;
+const CLOSE_CONNECTION: u8 = 102;
+const CONNECTION_OPENED: u8 = 103;
 const SEND_EOF: u8 = 104;
 const UDP_ASSOCIATE: u8 = 201;
 const UDP_ASSOCIATE_OPENED: u8 = 202;
 const UDP_PACKET: u8 = 203;
 const UDP_ASSOCIATE_CLOSED: u8 = 204;
+const METRICS_REQUEST: u8 = 301;
+const METRICS_RESPONSE: u8 = 302;
+const METRICS_CONFIG: u8 = 303;
 ```
 
 #### OpenConnection Message

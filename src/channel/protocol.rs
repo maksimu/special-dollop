@@ -1,8 +1,9 @@
+use crate::debug_hot_path;
 use crate::runtime::get_runtime;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
+use log::{debug, error, info, trace, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, trace, warn};
 
 use super::core::Channel;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, CONN_NO_LEN, PORT_LENGTH};
@@ -46,7 +47,10 @@ impl Channel {
             let channel_id_log = channel_id_for_open.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send("Open".to_string()).await {
-                    warn!(target: "protocol_event", channel_id=%channel_id_log, error=%e, "Failed to send open state notification");
+                    warn!(
+                        "Failed to send open state notification (channel_id: {}, error: {})",
+                        channel_id_log, e
+                    );
                 }
             });
             Box::pin(async {})
@@ -59,7 +63,10 @@ impl Channel {
             let channel_id_log = channel_id_for_close.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send("Closed".to_string()).await {
-                    warn!(target: "protocol_event", channel_id=%channel_id_log, error=%e, "Failed to send close state notification");
+                    warn!(
+                        "Failed to send close state notification (channel_id: {}, error: {})",
+                        channel_id_log, e
+                    );
                 }
             });
             Box::pin(async {})
@@ -73,7 +80,10 @@ impl Channel {
             let channel_id_log = channel_id_for_error.clone(); // Clone for async block
             tokio::spawn(async move {
                 if let Err(e) = tx.send(err_str).await {
-                    warn!(target: "protocol_event", channel_id=%channel_id_log, error=%e, "Failed to send error state notification");
+                    warn!(
+                        "Failed to send error state notification (channel_id: {}, error: {})",
+                        channel_id_log, e
+                    );
                 }
             });
             Box::pin(async {})
@@ -86,18 +96,21 @@ impl Channel {
             let channel_id_log = channel_id_for_runtime_spawn.clone(); // Clone for use in loop
             while let Some(current_state) = state_rx.recv().await {
                 if current_state != last_state_in_task {
-                    info!(target: "protocol_event", channel_id=%channel_id_log, "Endpoint WebRTC state changed: {} -> {}", last_state_in_task, current_state);
+                    info!("Endpoint WebRTC state changed: {} -> {} (channel_id: {})", last_state_in_task, current_state, channel_id_log);
                     last_state_in_task = current_state.clone();
                 }
 
                 let lower_current_state = current_state.to_lowercase();
                 if lower_current_state == "closed" || lower_current_state.starts_with("error") {
-                    debug!(target: "protocol_event", channel_id=%channel_id_log, state = %current_state, "Endpoint WebRTC state, stopping state monitoring task.");
+                    debug!("Endpoint WebRTC state, stopping state monitoring task. (channel_id: {}, state: {})", channel_id_log, current_state);
                     break;
                 }
             }
         });
-        debug!(target: "protocol_event", channel_id=%channel_id_base, "Channel WebRTC state change monitoring set up.");
+        debug!(
+            "Channel WebRTC state change monitoring set up. (channel_id: {})",
+            channel_id_base
+        );
     }
 
     /// Process a control message received from the data channel
@@ -108,13 +121,12 @@ impl Channel {
         message_type: ControlMessage,
         data: &[u8],
     ) -> Result<()> {
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if log::log_enabled!(log::Level::Debug) {
             let active_connections = self.conns.len();
             let connection_list = self.get_connection_ids();
 
-            debug!(target: "protocol_event", channel_id=%self.channel_id,
-                   ?message_type, active_connections, ?connection_list,
-                   "Processing control message - Channel stats");
+            debug!("Processing control message - Channel stats (channel_id: {}, message_type: {:?}, active_connections: {}, connection_list: {:?})",
+                   self.channel_id, message_type, active_connections, connection_list);
         }
 
         match message_type {
@@ -150,6 +162,15 @@ impl Channel {
             ControlMessage::UdpAssociateClosed => {
                 self.handle_udp_associate_closed(data).await?;
             }
+            ControlMessage::MetricsRequest => {
+                self.handle_metrics_request(data).await?;
+            }
+            ControlMessage::MetricsResponse => {
+                self.handle_metrics_response(data).await?;
+            }
+            ControlMessage::MetricsConfig => {
+                self.handle_metrics_config(data).await?;
+            }
         }
 
         Ok(())
@@ -172,7 +193,10 @@ impl Channel {
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Closing connection {} (reason: {:?})", target_connection_no, reason);
+            debug!(
+                "Endpoint Closing connection {} (reason: {:?}) (channel_id: {})",
+                target_connection_no, reason, self.channel_id
+            );
         }
 
         // Special case for connection 0 (control connection)
@@ -212,7 +236,7 @@ impl Channel {
         let target_connection_no = cursor.get_u32(); // Consumes first 4 bytes
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = target_connection_no, payload_len = cursor.remaining(), server_mode = self.server_mode, active_protocol = ?self.active_protocol, "Endpoint Received OpenConnection request");
+            debug!("Endpoint Received OpenConnection request (channel_id: {}, conn_no: {}, payload_len: {}, server_mode: {}, active_protocol: {:?})", self.channel_id, target_connection_no, cursor.remaining(), self.server_mode, self.active_protocol);
         }
 
         // Initialize effective host/port with channel defaults
@@ -380,18 +404,12 @@ impl Channel {
         let guacd_params_for_log = format!("{:?}", *guacd_params_locked);
         drop(guacd_params_locked);
 
-        trace!(target: "protocol_event",
-            channel_id = %self.channel_id,
-            conn_no = target_connection_no,
-            effective_guacd_host = ?effective_guacd_host,
-            effective_guacd_port = ?effective_guacd_port,
-            connect_as_settings = ?self.connect_as_settings,
-            guacd_params_map = %guacd_params_for_log,
-            "Channel state for OpenConnection (after potential ConnectAs)"
+        trace!("Channel state for OpenConnection (after potential ConnectAs) (channel_id: {}, conn_no: {}, effective_guacd_host: {:?}, effective_guacd_port: {:?}, connect_as_settings: {:?}, guacd_params_map: {})",
+            self.channel_id, target_connection_no, effective_guacd_host, effective_guacd_port, self.connect_as_settings, guacd_params_for_log
         );
 
         if self.server_mode && self.active_protocol == super::types::ActiveProtocol::PortForward {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened.", target_connection_no);
+            debug!("Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened. (channel_id: {})", target_connection_no, self.channel_id);
             self.send_control_message(
                 ControlMessage::ConnectionOpened,
                 &target_connection_no.to_be_bytes(),
@@ -401,7 +419,7 @@ impl Channel {
         }
 
         if self.conns.contains_key(&target_connection_no) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened.", target_connection_no);
+            debug!("Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened. (channel_id: {})", target_connection_no, self.channel_id);
             self.send_control_message(
                 ControlMessage::ConnectionOpened,
                 &target_connection_no.to_be_bytes(),
@@ -514,16 +532,20 @@ impl Channel {
                                     Some(resolved_ips) => {
                                         // Host is allowed and resolved, check port
                                         if !checker.is_port_allowed(target_port) {
-                                            error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 port {} not allowed", target_port);
+                                            error!(
+                                                "SOCKS5 port {} not allowed (channel_id: {})",
+                                                target_port, self.channel_id
+                                            );
                                             return Err(anyhow!(
                                                 "SOCKS5 port {} not allowed",
                                                 target_port
                                             ));
                                         }
 
-                                        debug!(target: "protocol_event",
-                                            channel_id=%self.channel_id,
-                                            "SOCKS5 connection allowed to {}:{}", target_host, target_port);
+                                        debug!(
+                                            "SOCKS5 connection allowed to {}:{} (channel_id: {})",
+                                            target_host, target_port, self.channel_id
+                                        );
 
                                         // **ZERO-ALLOCATION**: Use first resolved IP directly (no second DNS lookup)
                                         if let Some(&first_ip) = resolved_ips.first() {
@@ -545,7 +567,7 @@ impl Channel {
                                     }
                                     None => {
                                         // Host was not allowed or DNS resolution failed
-                                        error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 destination {} not allowed or unresolvable", target_host);
+                                        error!("SOCKS5 destination {} not allowed or unresolvable (channel_id: {})", target_host, self.channel_id);
                                         Err(anyhow!(
                                             "SOCKS5 destination {} not allowed or unresolvable",
                                             target_host
@@ -556,17 +578,22 @@ impl Channel {
                                 Err(anyhow!("SOCKS5 network checker not configured"))
                             }
                         } else {
-                            error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 payload too short for host and port data");
+                            error!(
+                                "SOCKS5 payload too short for host and port data (channel_id: {})",
+                                self.channel_id
+                            );
                             Err(anyhow!("SOCKS5 payload too short for host and port data"))
                         }
                     } else {
-                        error!(target: "protocol_event", channel_id=%self.channel_id, "SOCKS5 payload missing host length");
+                        error!(
+                            "SOCKS5 payload missing host length (channel_id: {})",
+                            self.channel_id
+                        );
                         Err(anyhow!("SOCKS5 payload missing host length"))
                     }
                 } else {
                     // Server mode or no network checker - not supported in client mode
-                    warn!(target: "protocol_event", channel_id=%self.channel_id, 
-                        "SOCKS5 OpenConnection received but not in client mode with network checker");
+                    warn!(            "SOCKS5 OpenConnection received but not in client mode with network checker (channel_id: {})", self.channel_id);
                     Err(anyhow!("SOCKS5 OpenConnection not supported in this mode"))
                 }
             }
@@ -613,7 +640,10 @@ impl Channel {
         if data.len() < CONN_NO_LEN {
             // Basic ping without connection info
             if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic Ping request");
+                debug!(
+                    "Endpoint Received basic Ping request (channel_id: {})",
+                    self.channel_id
+                );
             }
             self.send_control_message(
                 ControlMessage::Pong,
@@ -630,7 +660,10 @@ impl Channel {
         if conn_no != 0 {
             // Validate non-control connection exists with single lookup
             if self.conns.get(&conn_no).is_none() {
-                error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for Ping", conn_no);
+                error!(
+                    "Endpoint Connection {} not found for Ping (channel_id: {})",
+                    conn_no, self.channel_id
+                );
                 return Ok(());
             }
         }
@@ -645,10 +678,16 @@ impl Channel {
         if data.len() > CONN_NO_LEN {
             response.extend_from_slice(&data[CONN_NO_LEN..]);
             if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request with timing data for {}", conn_no);
+                debug!(
+                    "Endpoint Received ACK request with timing data for {} (channel_id: {})",
+                    conn_no, self.channel_id
+                );
             }
         } else if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK request for {}", conn_no);
+            debug!(
+                "Endpoint Received ACK request for {} (channel_id: {})",
+                conn_no, self.channel_id
+            );
         }
 
         // Send response - using buffer pool data
@@ -663,7 +702,10 @@ impl Channel {
     async fn handle_pong(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received basic pong");
+                debug!(
+                    "Endpoint Received basic pong (channel_id: {})",
+                    self.channel_id
+                );
             }
             self.ping_attempt = 0;
             return Ok(());
@@ -676,13 +718,19 @@ impl Channel {
         if let Some(_conn_ref) = self.conns.get(&conn_no) {
             if conn_no == 0 {
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong");
+                    debug!("Endpoint Received pong (channel_id: {})", self.channel_id);
                 }
             } else if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ACK response for {}", conn_no);
+                debug!(
+                    "Endpoint Received ACK response for {} (channel_id: {})",
+                    conn_no, self.channel_id
+                );
             }
         } else if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received pong for unknown connection {}", conn_no);
+            debug!(
+                "Endpoint Received pong for unknown connection {} (channel_id: {})",
+                conn_no, self.channel_id
+            );
         }
 
         // Reset ping attempt counter
@@ -703,7 +751,7 @@ impl Channel {
         // Check if the connection exists and handle EOF
         if let Some(conn_ref) = self.conns.get(&conn_no) {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received EOF from remote for connection {}, signaling backend to shutdown write side", conn_no);
+                debug!("Endpoint Received EOF from remote for connection {}, signaling backend to shutdown write side (channel_id: {})", conn_no, self.channel_id);
             }
 
             // SendEOF means the remote side closed their writing end
@@ -711,18 +759,21 @@ impl Channel {
             match conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
                 Ok(_) => {
                     if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Successfully sent EOF signal to backend for conn {}", conn_no);
+                        debug!("Endpoint Successfully sent EOF signal to backend for conn {} (channel_id: {})", conn_no, self.channel_id);
                     }
                 }
                 Err(_) => {
                     // Channel is closed, connection is already dead
                     if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint EOF signal failed, connection {} already closed", conn_no);
+                        debug!("Endpoint EOF signal failed, connection {} already closed (channel_id: {})", conn_no, self.channel_id);
                     }
                 }
             }
         } else {
-            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection for EOF {} not found", conn_no);
+            error!(
+                "Endpoint Connection for EOF {} not found (channel_id: {})",
+                conn_no, self.channel_id
+            );
         }
 
         Ok(())
@@ -734,7 +785,10 @@ impl Channel {
         // In server_mode, this completes the connection setup
         if !self.server_mode {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Received ConnectionOpened in client mode (ignoring)");
+                debug!(
+                    "Endpoint Received ConnectionOpened in client mode (ignoring) (channel_id: {})",
+                    self.channel_id
+                );
             }
             return Ok(());
         }
@@ -745,7 +799,10 @@ impl Channel {
 
         let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Starting reader for connection {}", connection_no);
+            debug!(
+                "Endpoint Starting reader for connection {} (channel_id: {})",
+                connection_no, self.channel_id
+            );
         }
 
         // Get the connection
@@ -753,11 +810,14 @@ impl Channel {
             // If it's a SOCKS5 connection, send a success response to the client
             if self.active_protocol == super::types::ActiveProtocol::Socks5 {
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "SOCKS5 Connection opened");
+                    debug!(
+                        "SOCKS5 Connection opened (channel_id: {}, conn_no: {})",
+                        self.channel_id, connection_no
+                    );
                 }
 
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Sending SOCKS5 success response to connection {}", connection_no);
+                    debug!("Endpoint Sending SOCKS5 success response to connection {} (channel_id: {})", connection_no, self.channel_id);
                 }
 
                 // Send SOCKS5 response via the connection's data channel using zero-allocation constant
@@ -768,11 +828,14 @@ impl Channel {
                 {
                     Ok(_) => {
                         if tracing::enabled!(tracing::Level::DEBUG) {
-                            debug!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint SOCKS5 success response queued for connection {}", connection_no);
+                            debug!("Endpoint SOCKS5 success response queued for connection {} (channel_id: {})", connection_no, self.channel_id);
                         }
                     }
                     Err(e) => {
-                        error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Failed to queue SOCKS5 success response: {}", e);
+                        error!(
+                            "Endpoint Failed to queue SOCKS5 success response: {} (channel_id: {})",
+                            e, self.channel_id
+                        );
                     }
                 }
             }
@@ -780,13 +843,172 @@ impl Channel {
             // The conn.to_webrtc and backend tasks are already set up by the connection creation
             // to handle reading from the backend and sending to WebRTC. No need to spawn more tasks here.
             if conn_ref.to_webrtc.is_finished() {
-                warn!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "In ConnectionOpened, to_webrtc task was already finished. This is unexpected.");
+                warn!("In ConnectionOpened, to_webrtc task was already finished. This is unexpected. (channel_id: {}, conn_no: {})", self.channel_id, connection_no);
             }
 
-            info!(target: "protocol_event", channel_id=%self.channel_id, conn_no = %connection_no, "Connection fully opened and ready.");
+            info!(
+                "Connection fully opened and ready. (channel_id: {}, conn_no: {})",
+                self.channel_id, connection_no
+            );
         } else {
-            error!(target: "protocol_event", channel_id=%self.channel_id, "Endpoint Connection {} not found for ConnectionOpened", connection_no);
+            error!(
+                "Endpoint Connection {} not found for ConnectionOpened (channel_id: {})",
+                connection_no, self.channel_id
+            );
             return Ok(());
+        }
+
+        Ok(())
+    }
+
+    /// Handle a MetricsRequest control message
+    async fn handle_metrics_request(&mut self, data: &[u8]) -> Result<()> {
+        debug_hot_path!(
+            "Processing metrics request (channel_id: {})",
+            self.channel_id
+        );
+
+        // Extract request type from data (if any)
+        let request_type = if !data.is_empty() { data[0] } else { 0 };
+
+        // Generate appropriate metrics response based on request type
+        let response_data = match request_type {
+            0 => {
+                // Request for aggregated metrics
+                let metrics = crate::metrics::METRICS_COLLECTOR.get_aggregated_metrics();
+                serde_json::to_vec(&metrics).unwrap_or_default()
+            }
+            1 => {
+                // Request for live stats (if connection ID provided)
+                if data.len() >= 5 {
+                    let conn_id_bytes = &data[1..5];
+                    let conn_id = u32::from_be_bytes([
+                        conn_id_bytes[0],
+                        conn_id_bytes[1],
+                        conn_id_bytes[2],
+                        conn_id_bytes[3],
+                    ]);
+                    let conn_id_str = format!("{}-{}", self.channel_id, conn_id);
+
+                    if let Some(stats) =
+                        crate::metrics::METRICS_COLLECTOR.get_live_stats(&conn_id_str)
+                    {
+                        serde_json::to_vec(&stats).unwrap_or_default()
+                    } else {
+                        b"null".to_vec()
+                    }
+                } else {
+                    b"null".to_vec()
+                }
+            }
+            2 => {
+                // Request for system stats
+                let uptime = crate::metrics::METRICS_COLLECTOR.get_uptime();
+                let connection_count = crate::metrics::METRICS_COLLECTOR.active_connection_count();
+                let system_stats = serde_json::json!({
+                    "uptime_seconds": uptime.as_secs(),
+                    "active_connection_count": connection_count,
+                    "channel_id": self.channel_id
+                });
+                serde_json::to_vec(&system_stats).unwrap_or_default()
+            }
+            _ => {
+                // Unknown request type
+                b"error: unknown request type".to_vec()
+            }
+        };
+
+        // Send metrics response
+        self.send_control_message(ControlMessage::MetricsResponse, &response_data)
+            .await?;
+
+        debug_hot_path!(
+            "Sent metrics response (channel_id: {}, response_bytes: {})",
+            self.channel_id,
+            response_data.len()
+        );
+
+        Ok(())
+    }
+
+    /// Handle a MetricsResponse control message
+    async fn handle_metrics_response(&mut self, data: &[u8]) -> Result<()> {
+        debug_hot_path!(
+            "Received metrics response (channel_id: {}, response_bytes: {})",
+            self.channel_id,
+            data.len()
+        );
+
+        // Parse and process metrics response
+        if !data.is_empty() {
+            match serde_json::from_slice::<serde_json::Value>(data) {
+                Ok(metrics) => {
+                    debug!(
+                        "Parsed metrics response (channel_id: {}, metrics: {:?})",
+                        self.channel_id, metrics
+                    );
+
+                    // Could store or forward metrics here
+                    // For now, just log that we received them
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to parse metrics response (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a MetricsConfig control message
+    async fn handle_metrics_config(&mut self, data: &[u8]) -> Result<()> {
+        debug_hot_path!(
+            "Processing metrics config (channel_id: {}, config_bytes: {})",
+            self.channel_id,
+            data.len()
+        );
+
+        // Parse metrics configuration
+        if !data.is_empty() {
+            match serde_json::from_slice::<serde_json::Value>(data) {
+                Ok(config) => {
+                    debug!(
+                        "Received metrics configuration (channel_id: {}, config: {:?})",
+                        self.channel_id, config
+                    );
+
+                    // Process configuration settings
+                    if let Some(enable_collection) = config.get("enable_collection") {
+                        if let Some(enabled) = enable_collection.as_bool() {
+                            debug!(
+                                "Metrics collection setting (channel_id: {}, enabled: {})",
+                                self.channel_id, enabled
+                            );
+                        }
+                    }
+
+                    if let Some(collection_interval) = config.get("collection_interval_ms") {
+                        if let Some(interval) = collection_interval.as_u64() {
+                            debug!(
+                                "Metrics collection interval (channel_id: {}, interval_ms: {})",
+                                self.channel_id, interval
+                            );
+                        }
+                    }
+
+                    // Could update metrics collection settings here
+                    // For now, just acknowledge we received the config
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to parse metrics config (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
+                }
+            }
         }
 
         Ok(())

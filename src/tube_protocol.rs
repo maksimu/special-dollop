@@ -9,8 +9,8 @@
 use crate::buffer_pool::BufferPool;
 use crate::likely; // Import branch prediction macros
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use log::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
 
 pub(crate) const CONN_NO_LEN: usize = 4;
 pub(crate) const CTRL_NO_LEN: usize = 2;
@@ -94,6 +94,10 @@ pub enum ControlMessage {
     UdpAssociateOpened = 202,
     UdpPacket = 203,
     UdpAssociateClosed = 204,
+    // Metrics support
+    MetricsRequest = 301,
+    MetricsResponse = 302,
+    MetricsConfig = 303,
 }
 impl std::fmt::Display for ControlMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,6 +112,9 @@ impl std::fmt::Display for ControlMessage {
             ControlMessage::UdpAssociateOpened => write!(f, "UdpAssociateOpened"),
             ControlMessage::UdpPacket => write!(f, "UdpPacket"),
             ControlMessage::UdpAssociateClosed => write!(f, "UdpAssociateClosed"),
+            ControlMessage::MetricsRequest => write!(f, "MetricsRequest"),
+            ControlMessage::MetricsResponse => write!(f, "MetricsResponse"),
+            ControlMessage::MetricsConfig => write!(f, "MetricsConfig"),
         }
     }
 }
@@ -127,6 +134,9 @@ impl TryFrom<u16> for ControlMessage {
             202 => Ok(UdpAssociateOpened),
             203 => Ok(UdpPacket),
             204 => Ok(UdpAssociateClosed),
+            301 => Ok(MetricsRequest),
+            302 => Ok(MetricsResponse),
+            303 => Ok(MetricsConfig),
             _ => Err(anyhow::anyhow!("Unknown control message: {}", raw)),
         }
     }
@@ -391,7 +401,7 @@ impl Frame {
 #[cold]
 fn unlikely_parse_failure(msg: &str) {
     // Cold function for error cases - rarely executed
-    warn!(target: "protocol_parse", "Parse failure: {}", msg);
+    warn!("Parse failure: {}", msg);
 }
 
 /// Try to parse the first complete frame from `buf` with SIMD optimizations.
@@ -446,11 +456,10 @@ pub(crate) fn try_parse_frame(buf: &mut BytesMut) -> Option<Frame> {
         // **COLD PATH**: Corrupt frame (very rare)
         unlikely_parse_failure("Corrupt stream, terminator mismatch or misposition");
         warn!(
-            target: "protocol_parse",
-            expected_terminator = ?TERMINATOR,
-            expected_pos = term_expected_pos,
-            actual_bytes = ?&buf[term_expected_pos..std::cmp::min(buf.len(), term_expected_pos+2+5)],
-            "try_parse_frame: Corrupt stream, terminator mismatch or misposition"
+            "try_parse_frame: Corrupt stream, terminator mismatch or misposition (expected_terminator: {:?}, expected_pos: {}, actual_bytes: {:?})",
+            TERMINATOR,
+            term_expected_pos,
+            &buf[term_expected_pos..std::cmp::min(buf.len(), term_expected_pos+2+5)]
         );
         // Consume the entire buffer to prevent reprocessing the bad data
         buf.advance(buf.len());

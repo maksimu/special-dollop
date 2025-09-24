@@ -1,8 +1,8 @@
 use crate::router_helpers::get_relay_access_creds;
+use log::{debug, info, warn};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
 
 /// Internal implementation of WebRTC connectivity test
 /// Performs comprehensive diagnostics similar to turnutils but for IT personnel
@@ -18,7 +18,10 @@ pub async fn test_webrtc_connectivity_internal(
     let start_time = Instant::now();
     let mut results = HashMap::new();
 
-    info!(target: "connectivity_test", "Starting WebRTC connectivity test for server: {}", krelay_server);
+    info!(
+        "Starting WebRTC connectivity test for server: {}",
+        krelay_server
+    );
 
     // Basic test information
     results.insert("server".to_string(), json!(krelay_server));
@@ -33,7 +36,7 @@ pub async fn test_webrtc_connectivity_internal(
     );
 
     // Step 1: DNS Resolution
-    info!(target: "connectivity_test", "Step 1: Testing DNS resolution for {}", krelay_server);
+    info!("Step 1: Testing DNS resolution for {}", krelay_server);
     let dns_start = Instant::now();
     match tokio::time::timeout(
         Duration::from_secs(5),
@@ -91,7 +94,7 @@ pub async fn test_webrtc_connectivity_internal(
     };
 
     // Step 2: AWS Infrastructure connectivity test
-    info!(target: "connectivity_test", "Step 2: Testing AWS infrastructure connectivity");
+    info!("Step 2: Testing AWS infrastructure connectivity");
     let aws_start = Instant::now();
     let mut aws_issues = Vec::new();
     let mut aws_success = true;
@@ -159,7 +162,7 @@ pub async fn test_webrtc_connectivity_internal(
     );
 
     // Step 3: Basic TCP connectivity test (port 3478)
-    info!(target: "connectivity_test", "Step 3: Testing TCP connectivity to {}:3478", krelay_server);
+    info!("Step 3: Testing TCP connectivity to {}:3478", krelay_server);
     let tcp_start = Instant::now();
     match tokio::time::timeout(
         Duration::from_secs(5),
@@ -225,7 +228,7 @@ pub async fn test_webrtc_connectivity_internal(
     };
 
     // Step 4: UDP socket binding test (to ensure we can send UDP)
-    info!(target: "connectivity_test", "Step 4: Testing UDP socket binding");
+    info!("Step 4: Testing UDP socket binding");
     let udp_start = Instant::now();
     match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
         Ok(socket) => {
@@ -267,7 +270,7 @@ pub async fn test_webrtc_connectivity_internal(
     };
 
     // Step 5: WebRTC ICE configuration validation
-    info!(target: "connectivity_test", "Step 5: Testing WebRTC ICE configuration");
+    info!("Step 5: Testing WebRTC ICE configuration");
     let ice_start = Instant::now();
 
     // Extract settings for ICE server configuration
@@ -307,7 +310,7 @@ pub async fn test_webrtc_connectivity_internal(
     );
 
     // Step 6: Simple WebRTC Peer Connection creation test
-    info!(target: "connectivity_test", "Step 6: Testing WebRTC peer connection creation");
+    info!("Step 6: Testing WebRTC peer connection creation");
     let webrtc_start = Instant::now();
 
     // Build the RTCConfiguration
@@ -332,17 +335,17 @@ pub async fn test_webrtc_connectivity_internal(
         // Priority 1: Try to get credentials from ksm_config if provided
         if let (Some(ksm_cfg), Some(client_ver)) = (ksm_config, client_version) {
             if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
-                debug!(target: "connectivity_test", "Fetching TURN credentials from KSM router");
+                debug!("Fetching TURN credentials from KSM router");
                 match get_relay_access_creds(ksm_cfg, None, client_ver).await {
                     Ok(creds) => {
-                        debug!(target: "connectivity_test", "Successfully fetched TURN credentials from router");
+                        debug!("Successfully fetched TURN credentials from router");
 
                         // Extract username and password from credentials
                         if let (Some(router_username), Some(router_password)) = (
                             creds.get("username").and_then(|v| v.as_str()),
                             creds.get("password").and_then(|v| v.as_str()),
                         ) {
-                            debug!(target: "connectivity_test", "Using router TURN credentials for test");
+                            debug!("Using router TURN credentials for test");
                             using_real_credentials = true;
                             webrtc_ice_servers.push(RTCIceServer {
                                 urls: vec![format!("turn:{}:3478", krelay_server)],
@@ -350,12 +353,15 @@ pub async fn test_webrtc_connectivity_internal(
                                 credential: router_password.to_string(),
                             });
                         } else {
-                            warn!(target: "connectivity_test", "Invalid router credentials format, checking for passed credentials");
+                            warn!("Invalid router credentials format, checking for passed credentials");
                             // Fall through to check passed credentials
                         }
                     }
                     Err(e) => {
-                        warn!(target: "connectivity_test", "Failed to get router credentials: {}, checking for passed credentials", e);
+                        warn!(
+                            "Failed to get router credentials: {}, checking for passed credentials",
+                            e
+                        );
                         // Fall through to check passed credentials
                     }
                 }
@@ -365,7 +371,7 @@ pub async fn test_webrtc_connectivity_internal(
         // Priority 2: Use passed username/password if we don't have router credentials
         if !using_real_credentials {
             if let (Some(user), Some(pass)) = (username, password) {
-                debug!(target: "connectivity_test", "Using passed TURN credentials for test");
+                debug!("Using passed TURN credentials for test");
                 using_real_credentials = true;
                 webrtc_ice_servers.push(RTCIceServer {
                     urls: vec![format!("turn:{}:3478", krelay_server)],
@@ -388,7 +394,9 @@ pub async fn test_webrtc_connectivity_internal(
         ..Default::default()
     };
 
-    match crate::webrtc_core::create_peer_connection(Some(config)).await {
+    // Create isolated WebRTC API for connectivity test
+    let test_api = crate::webrtc_core::IsolatedWebRTCAPI::new("connectivity-test".to_string());
+    match crate::webrtc_core::create_peer_connection_isolated(&test_api, Some(config)).await {
         Ok(pc) => {
             let mut webrtc_success = true;
             let webrtc_message: String;
@@ -404,26 +412,34 @@ pub async fn test_webrtc_connectivity_internal(
                         Ok(offer) => {
                             match pc.set_local_description(offer).await {
                                 Ok(_) => {
-                                    debug!(target: "connectivity_test", "Set local description, starting ICE candidate gathering");
+                                    debug!(
+                                        "Set local description, starting ICE candidate gathering"
+                                    );
                                     webrtc_details.insert("offer_created".to_string(), json!(true));
 
                                     // Wait for ICE gathering to complete or timeout
                                     let ice_timeout = Duration::from_secs(10);
                                     let ice_gathering_start = Instant::now();
 
-                                    let gathering_result = tokio::time::timeout(ice_timeout, async {
-                                        let mut last_state = pc.ice_gathering_state();
-                                        debug!(target: "connectivity_test", "Initial ICE gathering state: {:?}", last_state);
-                                        while last_state != RTCIceGatheringState::Complete {
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
-                                            let current_state = pc.ice_gathering_state();
-                                            if current_state != last_state {
-                                                debug!(target: "connectivity_test", "ICE gathering state changed: {:?} -> {:?}", last_state, current_state);
-                                                last_state = current_state;
+                                    let gathering_result =
+                                        tokio::time::timeout(ice_timeout, async {
+                                            let mut last_state = pc.ice_gathering_state();
+                                            debug!("Initial ICE gathering state: {:?}", last_state);
+                                            while last_state != RTCIceGatheringState::Complete {
+                                                tokio::time::sleep(Duration::from_millis(100))
+                                                    .await;
+                                                let current_state = pc.ice_gathering_state();
+                                                if current_state != last_state {
+                                                    debug!(
+                                                        "ICE gathering state changed: {:?} -> {:?}",
+                                                        last_state, current_state
+                                                    );
+                                                    last_state = current_state;
+                                                }
                                             }
-                                        }
-                                        debug!(target: "connectivity_test", "ICE gathering completed");
-                                    }).await;
+                                            debug!("ICE gathering completed");
+                                        })
+                                        .await;
 
                                     let ice_gathering_duration = ice_gathering_start.elapsed();
                                     webrtc_details.insert(
@@ -433,7 +449,7 @@ pub async fn test_webrtc_connectivity_internal(
 
                                     match gathering_result {
                                         Ok(_) => {
-                                            debug!(target: "connectivity_test", "ICE gathering completed successfully");
+                                            debug!("ICE gathering completed successfully");
                                             webrtc_details.insert(
                                                 "ice_gathering_completed".to_string(),
                                                 json!(true),
@@ -486,7 +502,10 @@ pub async fn test_webrtc_connectivity_internal(
                                             }
                                         }
                                         Err(_) => {
-                                            warn!(target: "connectivity_test", "ICE gathering timed out after {}ms", ice_timeout.as_millis());
+                                            warn!(
+                                                "ICE gathering timed out after {}ms",
+                                                ice_timeout.as_millis()
+                                            );
                                             webrtc_details.insert(
                                                 "ice_gathering_completed".to_string(),
                                                 json!(false),
@@ -667,8 +686,11 @@ async fn generate_test_summary(
     )
     .await;
 
-    info!(target: "connectivity_test", "WebRTC connectivity test completed in {}ms - Success: {}", 
-          total_duration.as_millis(), overall_success);
+    info!(
+        "WebRTC connectivity test completed in {}ms - Success: {}",
+        total_duration.as_millis(),
+        overall_success
+    );
 
     Ok(results)
 }
@@ -814,7 +836,7 @@ pub fn analyze_ice_candidates(
 
     let mut candidate_details = Vec::new();
 
-    debug!(target: "connectivity_test", "Analyzing SDP for ICE candidates");
+    debug!("Analyzing SDP for ICE candidates");
 
     // Parse SDP for a= lines containing candidates
     for line in sdp.lines() {
@@ -875,9 +897,10 @@ pub fn analyze_ice_candidates(
         }
     }
 
-    debug!(target: "connectivity_test", 
-        "ICE candidate analysis: total={}, host={}, srflx={}, relay={}", 
-        total_candidates, host_candidates, srflx_candidates, relay_candidates);
+    debug!(
+        "ICE candidate analysis: total={}, host={}, srflx={}, relay={}",
+        total_candidates, host_candidates, srflx_candidates, relay_candidates
+    );
 
     // Add counts to analysis
     analysis.insert(

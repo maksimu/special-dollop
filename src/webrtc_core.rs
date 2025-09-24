@@ -1,5 +1,6 @@
 use crate::resource_manager::{IceAgentGuard, ResourceError, RESOURCE_MANAGER};
 use crate::tube_registry::SignalMessage;
+use crate::webrtc_errors::{WebRTCError, WebRTCResult};
 use futures::FutureExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1032,19 +1033,29 @@ impl WebRTCPeerConnection {
     }
 
     // Create an offer (returns SDP string)
-    pub async fn create_offer(&self) -> Result<String, String> {
-        self.create_description_with_checks(true).await
+    pub async fn create_offer(&self) -> WebRTCResult<String> {
+        self.create_description_with_checks(true)
+            .await
+            .map_err(|e| {
+                WebRTCError::from_string_with_context(self.tube_id.clone(), e, "create_offer")
+            })
     }
 
     // Create an answer (returns SDP string)
-    pub async fn create_answer(&self) -> Result<String, String> {
-        self.create_description_with_checks(false).await
+    pub async fn create_answer(&self) -> WebRTCResult<String> {
+        self.create_description_with_checks(false)
+            .await
+            .map_err(|e| {
+                WebRTCError::from_string_with_context(self.tube_id.clone(), e, "create_answer")
+            })
     }
 
-    pub async fn set_remote_description(&self, sdp: String, is_answer: bool) -> Result<(), String> {
+    pub async fn set_remote_description(&self, sdp: String, is_answer: bool) -> WebRTCResult<()> {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
-            return Err("Connection is closing".to_string());
+            return Err(WebRTCError::ConnectionClosing {
+                tube_id: self.tube_id.clone(),
+            });
         }
 
         debug!(
@@ -1082,7 +1093,10 @@ impl WebRTCPeerConnection {
             .peer_connection
             .set_remote_description(desc)
             .await
-            .map_err(|e| format!("Failed to set remote description: {e}"));
+            .map_err(|e| WebRTCError::RemoteDescriptionFailed {
+                tube_id: self.tube_id.clone(),
+                reason: format!("Failed to set remote description: {e}"),
+            });
 
         // If successful, update activity and flush buffered incoming candidates
         if result.is_ok() {
@@ -1438,7 +1452,7 @@ impl WebRTCPeerConnection {
     }
 
     // CIRCUIT BREAKER: Execute ICE restart with circuit breaker protection
-    pub async fn restart_ice_protected(&self) -> Result<String, String> {
+    pub async fn restart_ice_protected(&self) -> WebRTCResult<String> {
         info!(
             "ICE restart with circuit breaker protection for tube {}",
             self.tube_id
@@ -1457,10 +1471,15 @@ impl WebRTCPeerConnection {
             }
             Err(e) => {
                 error!("Protected ICE restart failed for tube {}: {}", tube_id, e);
-                Err(format!(
-                    "Circuit breaker protected ICE restart failed: {}",
-                    e
-                ))
+
+                // Get actual failure count from circuit breaker metrics
+                let (_, _, failed_requests, _, _, _) = self.circuit_breaker.get_metrics();
+
+                Err(WebRTCError::CircuitBreakerOpen {
+                    tube_id,
+                    breaker_type: "ICE restart".to_string(),
+                    failure_count: failed_requests as u32,
+                })
             }
         }
     }
@@ -1591,7 +1610,7 @@ impl WebRTCPeerConnection {
     }
 
     // Perform ICE restart to recover from connectivity issues (CIRCUIT BREAKER PROTECTED)
-    pub async fn restart_ice(&self) -> Result<String, String> {
+    pub async fn restart_ice(&self) -> WebRTCResult<String> {
         // All ICE restarts are now protected by circuit breaker for isolation
         self.restart_ice_protected().await
     }

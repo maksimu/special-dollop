@@ -1628,9 +1628,17 @@ impl Tube {
 
     // ICE restart method for connection recovery
     pub async fn restart_ice(&self) -> Result<String, String> {
+        use crate::webrtc_errors::WebRTCError;
+
         let pc_guard = self.peer_connection.lock().await;
         if let Some(ref pc) = *pc_guard {
-            pc.restart_ice().await
+            pc.restart_ice().await.map_err(|e| match e {
+                WebRTCError::IceRestartFailed { reason, .. } => reason,
+                WebRTCError::CircuitBreakerOpen { .. } => {
+                    "ICE restart circuit breaker is open".to_string()
+                }
+                _ => e.to_string(),
+            })
         } else {
             Err("No peer connection available for ICE restart".to_string())
         }

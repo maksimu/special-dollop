@@ -90,7 +90,6 @@ pub fn initialize_logger(
             .with_target(true)
             .with_level(true)
             .compact()
-            .pretty()
             .finish();
 
         tracing::subscriber::set_global_default(subscriber).map_err(|e| {

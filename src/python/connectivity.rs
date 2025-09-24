@@ -394,7 +394,9 @@ pub async fn test_webrtc_connectivity_internal(
         ..Default::default()
     };
 
-    match crate::webrtc_core::create_peer_connection(Some(config)).await {
+    // Create isolated WebRTC API for connectivity test
+    let test_api = crate::webrtc_core::IsolatedWebRTCAPI::new("connectivity-test".to_string());
+    match crate::webrtc_core::create_peer_connection_isolated(&test_api, Some(config)).await {
         Ok(pc) => {
             let mut webrtc_success = true;
             let webrtc_message: String;

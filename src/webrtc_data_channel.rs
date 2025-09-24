@@ -1,11 +1,11 @@
 use bytes::Bytes;
 #[cfg(test)]
 use futures::future::BoxFuture;
+use log::{debug, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{debug, warn};
 use webrtc::data_channel::RTCDataChannel;
 
 /// Standard buffer threshold for optimal WebRTC performance.

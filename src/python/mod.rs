@@ -31,6 +31,13 @@ pub fn keeper_pam_webrtc_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     // Add runtime shutdown function for Python cleanup
     m.add_function(wrap_pyfunction!(shutdown_runtime_from_python, py)?)?;
 
+    // Add test logging function for debugging
+    #[cfg(feature = "python")]
+    {
+        use crate::test_rust_logging;
+        m.add_function(wrap_pyfunction!(test_rust_logging, py)?)?;
+    }
+
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

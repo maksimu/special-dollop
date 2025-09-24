@@ -1,3 +1,4 @@
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -5,7 +6,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum ResourceError {
@@ -287,15 +287,15 @@ impl ResourceManager {
             match operation().await {
                 Ok(result) => {
                     if attempts > 0 {
-                        info!(target: "resource_recovery", tube_id = %tube_id, attempts = attempts, 
-                              "ICE gathering succeeded after {} retries", attempts);
+                        info!(
+                            "ICE gathering succeeded after {} retries (tube_id: {}, attempts: {})",
+                            attempts, tube_id, attempts
+                        );
                     }
                     return Ok(result);
                 }
                 Err(err) if attempts < max_attempts && self.is_resource_exhaustion_error(&err) => {
-                    warn!(target: "resource_recovery", tube_id = %tube_id, attempts = attempts, 
-                          delay_ms = delay.as_millis(), error = %err,
-                          "ICE gathering failed due to resource exhaustion, retrying in {}ms", delay.as_millis());
+                    warn!("ICE gathering failed due to resource exhaustion, retrying in {}ms (tube_id: {}, attempts: {}, delay_ms: {}, error: {})", delay.as_millis(), tube_id, attempts, delay.as_millis(), err);
 
                     // Wait with exponential backoff
                     sleep(delay).await;
@@ -303,8 +303,7 @@ impl ResourceManager {
                     attempts += 1;
                 }
                 Err(err) => {
-                    error!(target: "resource_recovery", tube_id = %tube_id, attempts = attempts, 
-                           error = %err, "ICE gathering failed permanently after {} attempts", attempts);
+                    error!("ICE gathering failed permanently after {} attempts (tube_id: {}, attempts: {}, error: {})", attempts, tube_id, attempts, err);
                     return Err(ResourceError::AllocationFailed { reason: err });
                 }
             }
@@ -330,14 +329,12 @@ impl ResourceManager {
             match operation().await {
                 Ok(result) => {
                     if attempts > 0 {
-                        info!(target: "resource_recovery", resource = %resource_name, attempts = attempts,
-                              "Resource acquisition succeeded after {} retries", attempts);
+                        info!("Resource acquisition succeeded after {} retries (resource: {}, attempts: {})", attempts, resource_name, attempts);
                     }
                     return Ok(result);
                 }
                 Err(ResourceError::Exhausted { .. }) if attempts < max_attempts => {
-                    warn!(target: "resource_recovery", resource = %resource_name, attempts = attempts,
-                          delay_ms = delay.as_millis(), "Resource exhausted, retrying in {}ms", delay.as_millis());
+                    warn!("Resource exhausted, retrying in {}ms (resource: {}, attempts: {}, delay_ms: {})", delay.as_millis(), resource_name, attempts, delay.as_millis());
 
                     // Wait with exponential backoff
                     sleep(delay).await;
@@ -345,8 +342,7 @@ impl ResourceManager {
                     attempts += 1;
                 }
                 Err(err) => {
-                    error!(target: "resource_recovery", resource = %resource_name, attempts = attempts,
-                           "Resource acquisition failed permanently: {:?}", err);
+                    error!("Resource acquisition failed permanently: {:?} (resource: {}, attempts: {})", err, resource_name, attempts);
                     return Err(err);
                 }
             }
@@ -364,7 +360,10 @@ impl ResourceManager {
         // Apply ICE candidate pool size limit
         if let Some(pool_size) = limits.ice_candidate_pool_size {
             config.ice_candidate_pool_size = pool_size;
-            debug!(target: "rtc_config", tube_id = %tube_id, pool_size = pool_size, "Applied ICE candidate pool size limit");
+            debug!(
+                "Applied ICE candidate pool size limit (tube_id: {}, pool_size: {})",
+                tube_id, pool_size
+            );
         }
 
         // Apply ICE transport policy for resource management
@@ -372,9 +371,12 @@ impl ResourceManager {
             match policy.as_str() {
                 "relay" => config.ice_transport_policy = webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::Relay,
                 "all" => config.ice_transport_policy = webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
-                _ => warn!(target: "rtc_config", tube_id = %tube_id, policy = %policy, "Unknown ICE transport policy, using default"),
+                _ => warn!("Unknown ICE transport policy, using default (tube_id: {}, policy: {})", tube_id, policy),
             }
-            debug!(target: "rtc_config", tube_id = %tube_id, policy = %policy, "Applied ICE transport policy");
+            debug!(
+                "Applied ICE transport policy (tube_id: {}, policy: {})",
+                tube_id, policy
+            );
         }
 
         // Apply bundle policy for resource optimization
@@ -393,10 +395,16 @@ impl ResourceManager {
                         webrtc::peer_connection::policy::bundle_policy::RTCBundlePolicy::MaxBundle
                 }
                 _ => {
-                    warn!(target: "rtc_config", tube_id = %tube_id, policy = %policy, "Unknown bundle policy, using default")
+                    warn!(
+                        "Unknown bundle policy, using default (tube_id: {}, policy: {})",
+                        tube_id, policy
+                    );
                 }
             }
-            debug!(target: "rtc_config", tube_id = %tube_id, policy = %policy, "Applied bundle policy");
+            debug!(
+                "Applied bundle policy (tube_id: {}, policy: {})",
+                tube_id, policy
+            );
         }
 
         // Apply RTCP mux policy for port reduction
@@ -409,23 +417,32 @@ impl ResourceManager {
                         webrtc::peer_connection::policy::rtcp_mux_policy::RTCRtcpMuxPolicy::Require
                 }
                 _ => {
-                    warn!(target: "rtc_config", tube_id = %tube_id, policy = %policy, "Unknown RTCP mux policy, using default")
+                    warn!(
+                        "Unknown RTCP mux policy, using default (tube_id: {}, policy: {})",
+                        tube_id, policy
+                    );
                 }
             }
-            debug!(target: "rtc_config", tube_id = %tube_id, policy = %policy, "Applied RTCP mux policy");
+            debug!(
+                "Applied RTCP mux policy (tube_id: {}, policy: {})",
+                tube_id, policy
+            );
         }
 
         // Note: ICE connection receiving timeout and backup candidate pair ping interval
         // are not available in this WebRTC library version, but are tracked for future use
         if let Some(_timeout) = limits.ice_connection_receiving_timeout {
-            debug!(target: "rtc_config", tube_id = %tube_id, "ICE connection receiving timeout configured but not applied (not supported by WebRTC library)");
+            debug!("ICE connection receiving timeout configured but not applied (not supported by WebRTC library) (tube_id: {})", tube_id);
         }
 
         if let Some(_interval) = limits.ice_backup_candidate_pair_ping_interval {
-            debug!(target: "rtc_config", tube_id = %tube_id, "ICE backup candidate pair ping interval configured but not applied (not supported by WebRTC library)");
+            debug!("ICE backup candidate pair ping interval configured but not applied (not supported by WebRTC library) (tube_id: {})", tube_id);
         }
 
-        info!(target: "rtc_config", tube_id = %tube_id, "Applied resource-conscious RTCConfiguration tuning");
+        info!(
+            "Applied resource-conscious RTCConfiguration tuning (tube_id: {})",
+            tube_id
+        );
         config
     }
 

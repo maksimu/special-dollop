@@ -1,9 +1,9 @@
 use crate::runtime::get_runtime;
+use log::warn;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyString};
 use std::collections::HashMap;
-use tracing::warn;
 
 /// Helper function to safely execute async code from Python bindings
 pub fn safe_python_async_execute<F, R>(py: Python<'_>, future: F) -> R
@@ -11,7 +11,7 @@ where
     F: std::future::Future<Output = R> + Send + 'static,
     R: Send + 'static,
 {
-    py.allow_threads(|| {
+    Python::detach(py, || {
         // Check if we're already in a runtime context
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // We're in a runtime context, spawn the task and wait for it
@@ -86,7 +86,7 @@ pub fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value
         Ok(serde_json::Value::Null)
     } else {
         let type_name = py_obj.get_type().name()?;
-        warn!(target: "python_bindings", "py_any_to_json_value: Unhandled Python type '{}', falling back to string conversion for value: {:?}", type_name, py_obj);
+        warn!("py_any_to_json_value: Unhandled Python type '{}', falling back to string conversion for value: {:?}", type_name, py_obj);
         let str_val = py_obj.str()?.extract::<String>()?;
         Ok(serde_json::Value::String(str_val))
     }
@@ -95,7 +95,7 @@ pub fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value
 /// Convert a Python dictionary (PyObject) to HashMap<String, serde_json::Value>
 pub fn pyobj_to_json_hashmap(
     py: Python<'_>,
-    dict_obj: &PyObject,
+    dict_obj: &Py<PyAny>,
 ) -> PyResult<HashMap<String, serde_json::Value>> {
     let bound_settings_obj = dict_obj.bind(py);
 

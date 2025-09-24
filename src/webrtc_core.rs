@@ -59,9 +59,9 @@ impl IceRestartState {
         self.last_restart.map(|last| now.duration_since(last))
     }
 }
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
@@ -292,15 +292,19 @@ impl WebRTCPeerConnection {
         let ice_agent_guard = match RESOURCE_MANAGER.acquire_ice_agent_permit().await {
             Ok(guard) => Some(guard),
             Err(ResourceError::Exhausted { resource, limit }) => {
-                warn!(target: "resource_management", tube_id = %tube_id, 
-                      "ICE agent resource exhausted: {} limit ({}) exceeded", resource, limit);
+                warn!(
+                    "ICE agent resource exhausted: {} limit ({}) exceeded (tube_id: {})",
+                    resource, limit, tube_id
+                );
                 return Err(format!(
                     "Resource exhausted: {resource} limit ({limit}) exceeded"
                 ));
             }
             Err(e) => {
-                error!(target: "resource_management", tube_id = %tube_id, 
-                       "Failed to acquire ICE agent permit: {}", e);
+                error!(
+                    "Failed to acquire ICE agent permit: {} (tube_id: {})",
+                    e, tube_id
+                );
                 return Err(format!("Failed to acquire ICE agent permit: {e}"));
             }
         };
@@ -340,8 +344,10 @@ impl WebRTCPeerConnection {
         // No longer setting up ICE candidate handler here - this will be done in setup_ice_candidate_handler
         // to avoid duplicate handlers
 
-        info!(target: "resource_management", tube_id = %tube_id, 
-              "Successfully created WebRTC peer connection with resource management");
+        info!(
+            "Successfully created WebRTC peer connection with resource management (tube_id: {})",
+            tube_id
+        );
 
         // Return the new WebRTCPeerConnection struct with keepalive infrastructure
         let now = Instant::now();
@@ -374,10 +380,16 @@ impl WebRTCPeerConnection {
     pub fn setup_ice_candidate_handler(&self) {
         // Handle ICE candidates only when using trickle ICE
         if !self.trickle_ice {
-            debug!(target: "webrtc_ice", tube_id = %self.tube_id, "Not setting up ICE candidate handler - trickle ICE is disabled");
+            debug!(
+                "Not setting up ICE candidate handler - trickle ICE is disabled (tube_id: {})",
+                self.tube_id
+            );
             return;
         }
-        info!(target: "webrtc_ice", tube_id = %self.tube_id, "Setting up ICE candidate handler");
+        info!(
+            "Setting up ICE candidate handler (tube_id: {})",
+            self.tube_id
+        );
 
         // IMPORTANT: To avoid circular references that prevent ICE agent cleanup,
         // we use a lightweight context struct instead of cloning the entire WebRTCPeerConnection
@@ -391,21 +403,21 @@ impl WebRTCPeerConnection {
         let context_signaling = context.clone();
 
         self.peer_connection.on_signaling_state_change(Box::new(move |state| {
-            debug!(target: "webrtc_ice", tube_id = %context_signaling.tube_id, "Signaling state changed to: {:?}", state);
+            debug!("Signaling state changed to: {:?} (tube_id: {})", state, context_signaling.tube_id);
             let context_clone = context_signaling.clone();
             Box::pin(async move {
                 // Check if both descriptions are now set, regardless of specific state
                 let local_desc = context_clone.peer_connection.local_description().await;
                 let remote_desc = context_clone.peer_connection.remote_description().await;
                 if local_desc.is_some() && remote_desc.is_some() {
-                    debug!(target: "webrtc_ice", tube_id = %context_clone.tube_id, "Both descriptions set after signaling state change, flushing buffered INCOMING ICE candidates");
+                    debug!("Both descriptions set after signaling state change, flushing buffered INCOMING ICE candidates (tube_id: {})", context_clone.tube_id);
                     // Flush pending candidates manually (no self reference)
                     let candidates_to_flush = {
                         let mut lock = context_clone.pending_candidates.lock().unwrap();
                         std::mem::take(&mut *lock)
                     };
                     if !candidates_to_flush.is_empty() {
-                        warn!(target: "webrtc_ice", tube_id = %context_clone.tube_id, count = candidates_to_flush.len(), "Flushing {} buffered incoming ICE candidates", candidates_to_flush.len());
+                        warn!("Flushing {} buffered incoming ICE candidates (tube_id: {}, count: {})", candidates_to_flush.len(), context_clone.tube_id, candidates_to_flush.len());
                         for (index, candidate_str) in candidates_to_flush.iter().enumerate() {
                             if !candidate_str.is_empty() {
                                 let candidate_init = RTCIceCandidateInit {
@@ -414,10 +426,10 @@ impl WebRTCPeerConnection {
                                 };
                                 match context_clone.peer_connection.add_ice_candidate(candidate_init).await {
                                     Ok(()) => {
-                                        info!(target: "webrtc_ice", tube_id = %context_clone.tube_id, index = index, candidate = %candidate_str, "Successfully added buffered incoming ICE candidate");
+                                        info!("Successfully added buffered incoming ICE candidate (tube_id: {}, candidate: {}, index: {})", context_clone.tube_id, candidate_str, index);
                                     }
                                     Err(e) => {
-                                        error!(target: "webrtc_ice", tube_id = %context_clone.tube_id, index = index, candidate = %candidate_str, error = %e, "Failed to add buffered incoming ICE candidate");
+                                        error!("Failed to add buffered incoming ICE candidate (tube_id: {}, candidate: {}, error: {}, index: {})", context_clone.tube_id, candidate_str, e, index);
                                     }
                                 }
                             }
@@ -431,7 +443,7 @@ impl WebRTCPeerConnection {
         let context_ice = context.clone();
 
         self.peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            info!(target: "webrtc_ice_internal", tube_id = %context_ice.tube_id, ?candidate, "on_ice_candidate triggered");
+            info!("on_ice_candidate triggered (tube_id: {})", context_ice.tube_id);
 
             let context_handler = context_ice.clone();
 
@@ -439,11 +451,11 @@ impl WebRTCPeerConnection {
                 if let Some(c) = candidate {
                     // Convert the ICE candidate to a string representation
                     let candidate_str = format_ice_candidate(&c);
-                    info!(target: "webrtc_ice", tube_id = %context_handler.tube_id, candidate = %candidate_str, "ICE candidate gathered");
-                    debug!(target: "webrtc_ice_verbose", tube_id = %context_handler.tube_id, candidate = %candidate_str, "New ICE candidate details");
+                    info!("ICE candidate gathered (tube_id: {}, candidate: {})", context_handler.tube_id, candidate_str);
+                    debug!("New ICE candidate details (tube_id: {}, candidate: {})", context_handler.tube_id, candidate_str);
 
                     // Send immediately - no buffering on send side!
-                    debug!(target: "webrtc_ice", tube_id = %context_handler.tube_id, "Sending ICE candidate immediately (trickle ICE)");
+                    debug!("Sending ICE candidate immediately (trickle ICE) (tube_id: {})", context_handler.tube_id);
                     // Send ICE candidate manually (no self reference)
                     if let Some(sender) = &context_handler.signal_sender {
                         let message = SignalMessage {
@@ -459,7 +471,7 @@ impl WebRTCPeerConnection {
                     }
                 } else {
                     // All ICE candidates gathered (received None) - send immediately
-                    debug!(target: "webrtc_ice", tube_id = %context_handler.tube_id, "All ICE candidates gathered (received None). Sending empty candidate signal immediately.");
+                    debug!("All ICE candidates gathered (received None). Sending empty candidate signal immediately. (tube_id: {})", context_handler.tube_id);
                     // Send empty candidate signal manually (no self reference)
                     if let Some(sender) = &context_handler.signal_sender {
                         let message = SignalMessage {
@@ -480,7 +492,10 @@ impl WebRTCPeerConnection {
 
     // Method to flush buffered INCOMING ICE candidates (receive-side buffering)
     async fn flush_buffered_incoming_ice_candidates(&self) {
-        info!(target: "webrtc_ice", tube_id = %self.tube_id, "flush_buffered_incoming_ice_candidates called");
+        info!(
+            "flush_buffered_incoming_ice_candidates called (tube_id: {})",
+            self.tube_id
+        );
 
         // Take the buffered candidates with a single lock operation
         let pending_candidates = {
@@ -490,7 +505,12 @@ impl WebRTCPeerConnection {
 
         // Add any buffered incoming candidates to the peer connection
         if !pending_candidates.is_empty() {
-            warn!(target: "webrtc_ice", tube_id = %self.tube_id, count = pending_candidates.len(), "Flushing {} buffered incoming ICE candidates", pending_candidates.len());
+            warn!(
+                "Flushing {} buffered incoming ICE candidates (tube_id: {}, count: {})",
+                pending_candidates.len(),
+                self.tube_id,
+                pending_candidates.len()
+            );
             for (index, candidate_str) in pending_candidates.iter().enumerate() {
                 if !candidate_str.is_empty() {
                     let candidate_init = RTCIceCandidateInit {
@@ -500,18 +520,24 @@ impl WebRTCPeerConnection {
 
                     match self.peer_connection.add_ice_candidate(candidate_init).await {
                         Ok(()) => {
-                            info!(target: "webrtc_ice", tube_id = %self.tube_id, index = index, candidate = %candidate_str, "Successfully added buffered incoming ICE candidate");
+                            info!("Successfully added buffered incoming ICE candidate (tube_id: {}, candidate: {}, index: {})", self.tube_id, candidate_str, index);
                         }
                         Err(e) => {
-                            error!(target: "webrtc_ice", tube_id = %self.tube_id, index = index, candidate = %candidate_str, error = %e, "Failed to add buffered incoming ICE candidate");
+                            error!("Failed to add buffered incoming ICE candidate (tube_id: {}, candidate: {}, error: {}, index: {})", self.tube_id, candidate_str, e, index);
                         }
                     }
                 } else {
-                    info!(target: "webrtc_ice", tube_id = %self.tube_id, index = index, "Processed buffered end-of-candidates signal");
+                    info!(
+                        "Processed buffered end-of-candidates signal (tube_id: {}, index: {})",
+                        self.tube_id, index
+                    );
                 }
             }
         } else {
-            debug!(target: "webrtc_ice", tube_id = %self.tube_id, "No buffered incoming ICE candidates to flush");
+            debug!(
+                "No buffered incoming ICE candidates to flush (tube_id: {})",
+                self.tube_id
+            );
         }
     }
 
@@ -544,10 +570,16 @@ impl WebRTCPeerConnection {
 
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send ICE candidate signal");
+                warn!(
+                    "Failed to send ICE candidate signal (tube_id: {}, error: {})",
+                    self.tube_id, e
+                );
             }
         } else {
-            warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for ICE candidate");
+            warn!(
+                "Signal sender not available for ICE candidate (tube_id: {})",
+                self.tube_id
+            );
         }
     }
 
@@ -573,10 +605,16 @@ impl WebRTCPeerConnection {
 
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send answer signal");
+                warn!(
+                    "Failed to send answer signal (tube_id: {}, error: {})",
+                    self.tube_id, e
+                );
             }
         } else {
-            warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for answer");
+            warn!(
+                "Signal sender not available for answer (tube_id: {})",
+                self.tube_id
+            );
         }
     }
 
@@ -602,12 +640,21 @@ impl WebRTCPeerConnection {
 
             // Try to send it, but don't fail if the channel is closed
             if let Err(e) = sender.send(message) {
-                warn!(target: "webrtc_signal", tube_id = %self.tube_id, error = %e, "Failed to send connection state changed signal");
+                warn!(
+                    "Failed to send connection state changed signal (tube_id: {}, error: {})",
+                    self.tube_id, e
+                );
             } else {
-                info!(target: "webrtc_signal", tube_id = %self.tube_id, state = %state, "Successfully sent connection state changed signal");
+                info!(
+                    "Successfully sent connection state changed signal (tube_id: {}, state: {})",
+                    self.tube_id, state
+                );
             }
         } else {
-            warn!(target: "webrtc_signal", tube_id = %self.tube_id, "Signal sender not available for connection state change");
+            warn!(
+                "Signal sender not available for connection state change (tube_id: {})",
+                self.tube_id
+            );
         }
     }
 
@@ -621,7 +668,10 @@ impl WebRTCPeerConnection {
 
         let current_state = self.peer_connection.signaling_state();
         let sdp_type_str = if is_offer { "offer" } else { "answer" };
-        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, state = ?current_state, "Current signaling state before create_{}", sdp_type_str);
+        debug!(
+            "Current signaling state before create_{} (tube_id: {}, state: {:?})",
+            sdp_type_str, self.tube_id, current_state
+        );
 
         if is_offer {
             // Offer-specific signaling state validation
@@ -630,7 +680,7 @@ impl WebRTCPeerConnection {
             {
                 return if !self.trickle_ice {
                     if let Some(desc) = self.peer_connection.local_description().await {
-                        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Already have local offer and non-trickle, returning existing SDP");
+                        debug!("Already have local offer and non-trickle, returning existing SDP (tube_id: {})", self.tube_id);
                         Ok(desc.sdp)
                     } else {
                         Err("Cannot create offer: already have local offer but failed to retrieve it (non-trickle)".to_string())
@@ -674,7 +724,10 @@ impl WebRTCPeerConnection {
         };
 
         if !self.trickle_ice {
-            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Non-trickle ICE: gathering candidates before returning {}.", sdp_type_str);
+            debug!(
+                "Non-trickle ICE: gathering candidates before returning {} (tube_id: {})",
+                sdp_type_str, self.tube_id
+            );
 
             let initial_desc = if is_offer {
                 RTCSessionDescription::offer(sdp_obj.sdp.clone())
@@ -708,7 +761,7 @@ impl WebRTCPeerConnection {
                 let tube_id_log = tube_id_clone.clone();
                 let sdp_type_log = sdp_type_str_clone.clone(); // Clone for async block logging
                 Box::pin(async move {
-                    debug!(target: "webrtc_ice", tube_id = %tube_id_log, new_state = ?state, "ICE gathering state changed (non-trickle {})", sdp_type_log);
+                    debug!("ICE gathering state changed (non-trickle {}) (tube_id: {}, new_state: {:?})", sdp_type_log, tube_id_log, state);
                     if state == RTCIceGathererState::Complete {
                         if let Some(sender) = tx_for_handler.lock().unwrap().take() { // Use the Arc<Mutex<Option<Sender>>>
                             let _ = sender.send(());
@@ -721,19 +774,22 @@ impl WebRTCPeerConnection {
 
             match tokio::time::timeout(Duration::from_secs(15), rx).await {
                 Ok(Ok(_)) => {
-                    debug!(target: "webrtc_ice", tube_id = %self.tube_id, "ICE gathering complete for non-trickle {}.", sdp_type_str);
+                    debug!(
+                        "ICE gathering complete for non-trickle {} (tube_id: {})",
+                        sdp_type_str, self.tube_id
+                    );
                     if let Some(final_desc) = self.peer_connection.local_description().await {
                         let mut sdp_str = final_desc.sdp;
 
                         // Add max-message-size to answer SDP for non-trickle ICE only
                         if !is_offer && !sdp_str.contains("a=max-message-size") {
-                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Answer SDP missing max-message-size, attempting to add it");
+                            debug!("Answer SDP missing max-message-size, attempting to add it (tube_id: {})", self.tube_id);
 
                             // Extract max-message-size from the offer (remote description)
                             let max_message_size = if let Some(remote_desc) =
                                 self.peer_connection.remote_description().await
                             {
-                                debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Remote description found, searching for max-message-size");
+                                debug!("Remote description found, searching for max-message-size (tube_id: {})", self.tube_id);
 
                                 // Extract the max-message-size from the remote offer
                                 let offer_sdp = &remote_desc.sdp;
@@ -746,22 +802,25 @@ impl WebRTCPeerConnection {
                                         if let Ok(size) =
                                             offer_sdp[start..start + end].trim().parse::<u32>()
                                         {
-                                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Successfully extracted max-message-size from offer: {}", size);
+                                            debug!("Successfully extracted max-message-size from offer: {} (tube_id: {})", size, self.tube_id);
                                             size
                                         } else {
-                                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Failed to parse max-message-size value from offer");
+                                            debug!("Failed to parse max-message-size value from offer (tube_id: {})", self.tube_id);
                                             DEFAULT_MAX_MESSAGE_SIZE // Default if parsing fails
                                         }
                                     } else {
-                                        debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "No line ending found after max-message-size in offer");
+                                        debug!("No line ending found after max-message-size in offer (tube_id: {})", self.tube_id);
                                         DEFAULT_MAX_MESSAGE_SIZE // Default if no line ending
                                     }
                                 } else {
-                                    debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "No max-message-size found in remote offer SDP");
+                                    debug!("No max-message-size found in remote offer SDP (tube_id: {})", self.tube_id);
                                     DEFAULT_MAX_MESSAGE_SIZE // Default if isn't found in offer
                                 }
                             } else {
-                                debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "No remote description available");
+                                debug!(
+                                    "No remote description available (tube_id: {})",
+                                    self.tube_id
+                                );
                                 DEFAULT_MAX_MESSAGE_SIZE // Default if no remote description
                             };
 
@@ -769,23 +828,25 @@ impl WebRTCPeerConnection {
                             let our_max = OUR_MAX_MESSAGE_SIZE;
                             let negotiated_size = max_message_size.min(our_max);
 
-                            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Negotiating max-message-size: client_requested={} ({}KB), our_max={} ({}KB), negotiated={} ({}KB)",
-                                   max_message_size, max_message_size/1024, our_max, our_max/1024, negotiated_size, negotiated_size/1024);
+                            debug!("Negotiating max-message-size: client_requested={} ({}KB), our_max={} ({}KB), negotiated={} ({}KB) (tube_id: {})",
+                                   max_message_size, max_message_size/1024, our_max, our_max/1024, negotiated_size, negotiated_size/1024, self.tube_id);
 
                             // Find the position to insert after sctp-port
                             if let Some(sctp_pos) = sdp_str.find("a=sctp-port:") {
                                 // Find the end of the sctp-port line
                                 if let Some(line_end) = sdp_str[sctp_pos..].find('\n') {
                                     let insert_pos = sctp_pos + line_end + 1;
-                                    debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Found sctp-port at position {}", sctp_pos);
-                                    debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Inserting 'a=max-message-size:{}' at position {}", negotiated_size, insert_pos);
+                                    debug!(
+                                        "Found sctp-port at position {} (tube_id: {})",
+                                        sctp_pos, self.tube_id
+                                    );
+                                    debug!("Inserting 'a=max-message-size:{}' at position {} (tube_id: {})", negotiated_size, insert_pos, self.tube_id);
                                     sdp_str.insert_str(
                                         insert_pos,
                                         &format!("a=max-message-size:{negotiated_size}\r\n"),
                                     );
-                                    info!(target: "webrtc_sdp", tube_id = %self.tube_id,
-                                          "Successfully added max-message-size={} ({}KB) to answer SDP (client requested: {} ({}KB), our max: {} ({}KB))",
-                                          negotiated_size, negotiated_size/1024, max_message_size, max_message_size/1024, our_max, our_max/1024);
+                                    info!("Successfully added max-message-size={} ({}KB) to answer SDP (client requested: {} ({}KB), our max: {} ({}KB)) (tube_id: {})",
+                                          negotiated_size, negotiated_size/1024, max_message_size, max_message_size/1024, our_max, our_max/1024, self.tube_id);
                                 }
                             }
                         }
@@ -803,8 +864,14 @@ impl WebRTCPeerConnection {
         } else {
             // Trickle ICE: return the SDP immediately.
             // The calling Tube will set the local description if this is an offer/answer being created by self.
-            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Trickle ICE: returning {} immediately.", sdp_type_str);
-            debug!(target: "webrtc_sdp", tube_id = %self.tube_id, "Initial {} SDP", sdp_obj.sdp.clone());
+            debug!(
+                "Trickle ICE: returning {} immediately (tube_id: {})",
+                sdp_type_str, self.tube_id
+            );
+            debug!(
+                "Initial {} SDP (tube_id: {}, sdp: {})",
+                sdp_type_str, self.tube_id, sdp_obj.sdp
+            );
 
             // For trickle ICE, do not modify the SDP
             Ok(sdp_obj.sdp)
@@ -827,14 +894,19 @@ impl WebRTCPeerConnection {
             return Err("Connection is closing".to_string());
         }
 
-        debug!(target: "webrtc_sdp", tube_id = %self.tube_id,
-               "set_remote_description called with {} (length: {} bytes)",
-               if is_answer { "answer" } else { "offer" }, sdp.len());
+        debug!(
+            "set_remote_description called with {} (length: {} bytes) (tube_id: {})",
+            if is_answer { "answer" } else { "offer" },
+            sdp.len(),
+            self.tube_id
+        );
 
         // Check if the offer contains max-message-size
         if !is_answer && sdp.contains("a=max-message-size:") {
-            debug!(target: "webrtc_sdp", tube_id = %self.tube_id,
-                   "Incoming offer contains max-message-size attribute");
+            debug!(
+                "Incoming offer contains max-message-size attribute (tube_id: {})",
+                self.tube_id
+            );
         }
 
         // Create SessionDescription based on type
@@ -847,7 +919,7 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state before setting the remote description
         let current_state = self.peer_connection.signaling_state();
-        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before set_remote_description");
+        debug!("Current signaling state before set_remote_description");
 
         // Validate the signaling state transition
         Self::validate_signaling_state_transition(current_state, is_answer, false)?;
@@ -867,7 +939,7 @@ impl WebRTCPeerConnection {
             let local_desc = self.peer_connection.local_description().await;
             let remote_desc = self.peer_connection.remote_description().await;
             if local_desc.is_some() && remote_desc.is_some() {
-                debug!(target: "webrtc_ice", tube_id = %self.tube_id, "Both descriptions now set after remote description, flushing buffered incoming ICE candidates");
+                debug!("Both descriptions now set after remote description, flushing buffered incoming ICE candidates (tube_id: {})", self.tube_id);
                 self.flush_buffered_incoming_ice_candidates().await;
             }
         }
@@ -878,22 +950,31 @@ impl WebRTCPeerConnection {
     pub async fn add_ice_candidate(&self, candidate_str: String) -> Result<(), String> {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
-            warn!(target: "webrtc_ice", tube_id = %self.tube_id, "add_ice_candidate called but connection is closing");
+            warn!(
+                "add_ice_candidate called but connection is closing (tube_id: {})",
+                self.tube_id
+            );
             return Err("Connection is closing".to_string());
         }
 
-        info!(target: "webrtc_ice", tube_id = %self.tube_id, candidate = %candidate_str, "add_ice_candidate called");
+        info!(
+            "add_ice_candidate called (tube_id: {}, candidate: {})",
+            self.tube_id, candidate_str
+        );
 
         // Check if we can add candidates immediately (both descriptions must be set)
         let local_desc = self.peer_connection.local_description().await;
         let remote_desc = self.peer_connection.remote_description().await;
         let can_add_immediately = local_desc.is_some() && remote_desc.is_some();
 
-        info!(target: "webrtc_ice", tube_id = %self.tube_id, local_set = local_desc.is_some(), remote_set = remote_desc.is_some(), can_add_immediately = can_add_immediately, "Checking if can add ICE candidate immediately");
+        info!("Checking if can add ICE candidate immediately (tube_id: {}, local_set: {}, remote_set: {}, can_add_immediately: {})", self.tube_id, local_desc.is_some(), remote_desc.is_some(), can_add_immediately);
 
         if can_add_immediately {
             // Connection is ready, add the candidate immediately
-            info!(target: "webrtc_ice", tube_id = %self.tube_id, "Both descriptions set, adding incoming ICE candidate immediately");
+            info!(
+                "Both descriptions set, adding incoming ICE candidate immediately (tube_id: {})",
+                self.tube_id
+            );
 
             if !candidate_str.is_empty() {
                 let candidate_init = RTCIceCandidateInit {
@@ -903,17 +984,26 @@ impl WebRTCPeerConnection {
 
                 match self.peer_connection.add_ice_candidate(candidate_init).await {
                     Ok(()) => {
-                        info!(target: "webrtc_ice", tube_id = %self.tube_id, "Successfully added ICE candidate immediately");
+                        info!(
+                            "Successfully added ICE candidate immediately (tube_id: {})",
+                            self.tube_id
+                        );
                         Ok(())
                     }
                     Err(e) => {
-                        error!(target: "webrtc_ice", tube_id = %self.tube_id, error = %e, "Failed to add ICE candidate immediately");
+                        error!(
+                            "Failed to add ICE candidate immediately (tube_id: {}, error: {})",
+                            self.tube_id, e
+                        );
                         Err(format!("Failed to add ICE candidate: {e}"))
                     }
                 }
             } else {
                 // Empty candidate string means end-of-candidates, which is valid
-                info!(target: "webrtc_ice", tube_id = %self.tube_id, "Received end-of-candidates signal");
+                info!(
+                    "Received end-of-candidates signal (tube_id: {})",
+                    self.tube_id
+                );
                 Ok(())
             }
         } else {
@@ -923,8 +1013,8 @@ impl WebRTCPeerConnection {
             let buffered_count = candidates_lock.len();
             drop(candidates_lock);
 
-            warn!(target: "webrtc_ice", tube_id = %self.tube_id, candidate = %candidate_str, "Descriptions not ready (local: {}, remote: {}), buffering incoming ICE candidate (total buffered: {})", 
-                   local_desc.is_some(), remote_desc.is_some(), buffered_count);
+            warn!("Descriptions not ready (local: {}, remote: {}), buffering incoming ICE candidate (total buffered: {}) (tube_id: {}, candidate: {})",
+                   local_desc.is_some(), remote_desc.is_some(), buffered_count, self.tube_id, candidate_str);
             Ok(())
         }
     }
@@ -946,8 +1036,10 @@ impl WebRTCPeerConnection {
 
         // Stop keepalive task before closing
         if let Err(e) = self.stop_keepalive().await {
-            warn!(target: "webrtc_lifecycle", tube_id = %self.tube_id, 
-                  error = %e, "Failed to stop keepalive during close");
+            warn!(
+                "Failed to stop keepalive during close (tube_id: {}, error: {})",
+                self.tube_id, e
+            );
         }
 
         // First, clear all callbacks
@@ -968,14 +1060,12 @@ impl WebRTCPeerConnection {
             match self._ice_agent_guard.lock() {
                 Ok(mut guard_lock) => {
                     if let Some(guard) = guard_lock.take() {
-                        info!(target: "resource_management", tube_id = %self.tube_id, 
-                              "Explicitly dropping ICE agent guard to ensure resource cleanup");
+                        info!("Explicitly dropping ICE agent guard to ensure resource cleanup (tube_id: {})", self.tube_id);
                         drop(guard);
                     }
                 }
                 Err(e) => {
-                    warn!(target: "resource_management", tube_id = %self.tube_id,
-                          error = %e, "Failed to acquire ICE agent guard lock during cleanup - proceeding anyway");
+                    warn!("Failed to acquire ICE agent guard lock during cleanup - proceeding anyway (tube_id: {}, error: {})", self.tube_id, e);
                 }
             }
         }
@@ -985,7 +1075,7 @@ impl WebRTCPeerConnection {
             Ok(result) => result.map_err(|e| format!("Failed to close peer connection: {e}")),
             Err(_) => {
                 // The timeout elapsed.
-                warn!(target: "webrtc_lifecycle", tube_id = %self.tube_id, "Close operation timed out for peer connection. The underlying webrtc-rs close() did not complete in 5 seconds.");
+                warn!("Close operation timed out for peer connection. The underlying webrtc-rs close() did not complete in 5 seconds. (tube_id: {})", self.tube_id);
                 // Return an error instead of Ok(())
                 Err(format!(
                     "Peer connection close operation timed out for tube {}",
@@ -1012,7 +1102,7 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state before setting the local description
         let current_state = self.peer_connection.signaling_state();
-        debug!(target: "webrtc_sdp", ?current_state, "Current signaling state before set_local_description");
+        debug!("Current signaling state before set_local_description");
 
         // Validate the signaling state transition
         Self::validate_signaling_state_transition(current_state, is_answer, true)?;
@@ -1032,7 +1122,7 @@ impl WebRTCPeerConnection {
             let local_desc = self.peer_connection.local_description().await;
             let remote_desc = self.peer_connection.remote_description().await;
             if local_desc.is_some() && remote_desc.is_some() {
-                debug!(target: "webrtc_ice", tube_id = %self.tube_id, "Both descriptions now set after local description, flushing buffered incoming ICE candidates");
+                debug!("Both descriptions now set after local description, flushing buffered incoming ICE candidates (tube_id: {})", self.tube_id);
                 self.flush_buffered_incoming_ice_candidates().await;
             }
         }
@@ -1065,10 +1155,8 @@ impl WebRTCPeerConnection {
 
         // Create a lightweight task that just ensures periodic activity
         let keepalive_task_handle = tokio::spawn(async move {
-            info!(target: "webrtc_keepalive", tube_id = %tube_id_clone, 
-                  interval_minutes = keepalive_interval.as_secs() / 60,
-                  "NAT timeout prevention active - ensuring periodic activity every {} seconds", 
-                  keepalive_interval.as_secs());
+            info!("NAT timeout prevention active - ensuring periodic activity every {} seconds (tube_id: {}, interval_minutes: {})",
+                  keepalive_interval.as_secs(), tube_id_clone, keepalive_interval.as_secs() / 60);
 
             let mut interval = tokio::time::interval(keepalive_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1083,17 +1171,20 @@ impl WebRTCPeerConnection {
                 // This keepalive task does not send pings directly; instead, it ensures periodic activity
                 // so that the channel's internal ping/pong mechanism (which triggers on activity or timeout)
                 // remains active and prevents NAT timeouts. No additional ping implementation is needed here.
-                debug!(target: "webrtc_keepalive", tube_id = %tube_id_clone, 
-                       "NAT timeout prevention tick - periodic activity to keep channel ping system active");
+                debug!("NAT timeout prevention tick - periodic activity to keep channel ping system active (tube_id: {})", tube_id_clone);
 
                 // Get current connection state to verify we're still connected
                 let connection_state = pc_clone.connection_state();
-                debug!(target: "webrtc_keepalive", tube_id = %tube_id_clone,
-                       connection_state = ?connection_state, "Connection state check");
+                debug!(
+                    "Connection state check (tube_id: {}, connection_state: {:?})",
+                    tube_id_clone, connection_state
+                );
             }
 
-            info!(target: "webrtc_keepalive", tube_id = %tube_id_clone, 
-                  "NAT timeout prevention stopped");
+            info!(
+                "NAT timeout prevention stopped (tube_id: {})",
+                tube_id_clone
+            );
         });
 
         // Store the task handle
@@ -1106,8 +1197,7 @@ impl WebRTCPeerConnection {
             return Err("Failed to acquire keepalive task lock".to_string());
         }
 
-        info!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
-              "NAT timeout prevention started - integrated with existing channel ping system");
+        info!("NAT timeout prevention started - integrated with existing channel ping system (tube_id: {})", self.tube_id);
         Ok(())
     }
 
@@ -1118,11 +1208,15 @@ impl WebRTCPeerConnection {
         // Update both activity timestamps in a single lock acquisition (deadlock-safe)
         if let Ok(mut activity_state) = self.activity_state.lock() {
             activity_state.update_both(now);
-            debug!(target: "webrtc_activity", tube_id = %self.tube_id, 
-                   "Activity updated - connection active");
+            debug!(
+                "Activity updated - connection active (tube_id: {})",
+                self.tube_id
+            );
         } else {
-            warn!(target: "webrtc_activity", tube_id = %self.tube_id, 
-                  "Failed to acquire lock for activity update");
+            warn!(
+                "Failed to acquire lock for activity update (tube_id: {})",
+                self.tube_id
+            );
         }
 
         // Also update the legacy last_activity for backward compatibility
@@ -1140,19 +1234,24 @@ impl WebRTCPeerConnection {
         if let Ok(mut task_guard) = self.keepalive_task.lock() {
             if let Some(task) = task_guard.take() {
                 task.abort();
-                info!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
-                      "Keepalive task stopped and cleaned up");
+                info!(
+                    "Keepalive task stopped and cleaned up (tube_id: {})",
+                    self.tube_id
+                );
             } else {
-                debug!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
-                       "No active keepalive task to stop");
+                debug!(
+                    "No active keepalive task to stop (tube_id: {})",
+                    self.tube_id
+                );
             }
         } else {
-            warn!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
-                  "Failed to acquire keepalive task lock for cleanup");
+            warn!(
+                "Failed to acquire keepalive task lock for cleanup (tube_id: {})",
+                self.tube_id
+            );
         }
 
-        info!(target: "webrtc_keepalive", tube_id = %self.tube_id, 
-              "NAT timeout prevention stopped");
+        info!("NAT timeout prevention stopped (tube_id: {})", self.tube_id);
         Ok(())
     }
 
@@ -1202,20 +1301,11 @@ impl WebRTCPeerConnection {
             connection_degraded && activity_timeout && enough_time_passed && not_too_many_attempts;
 
         if should_restart {
-            debug!(target: "webrtc_ice_restart", tube_id = %self.tube_id,
-                   connection_state = ?current_state,
-                   time_since_success_secs = time_since_success.as_secs(),
-                   restart_attempts = attempts,
-                   min_interval_secs = min_interval.as_secs(),
-                   "ICE restart conditions met");
+            debug!("ICE restart conditions met (tube_id: {}, connection_state: {:?}, time_since_success_secs: {}, restart_attempts: {}, min_interval_secs: {})",
+                   self.tube_id, current_state, time_since_success.as_secs(), attempts, min_interval.as_secs());
         } else {
-            debug!(target: "webrtc_ice_restart", tube_id = %self.tube_id,
-                   connection_state = ?current_state,
-                   connection_degraded = connection_degraded,
-                   activity_timeout = activity_timeout,
-                   enough_time_passed = enough_time_passed,
-                   not_too_many_attempts = not_too_many_attempts,
-                   "ICE restart conditions not met");
+            debug!("ICE restart conditions not met (tube_id: {}, connection_state: {:?}, connection_degraded: {}, activity_timeout: {}, enough_time_passed: {}, not_too_many_attempts: {})",
+                   self.tube_id, current_state, connection_degraded, activity_timeout, enough_time_passed, not_too_many_attempts);
         }
 
         should_restart
@@ -1223,16 +1313,20 @@ impl WebRTCPeerConnection {
 
     // Perform ICE restart to recover from connectivity issues (DEADLOCK-SAFE)
     pub async fn restart_ice(&self) -> Result<String, String> {
-        info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
-              "ICE restart initiated for connection recovery");
+        info!(
+            "ICE restart initiated for connection recovery (tube_id: {})",
+            self.tube_id
+        );
 
         // Update restart tracking in single lock acquisition (deadlock-safe)
         let now = Instant::now();
         if let Ok(mut restart_state) = self.ice_restart_state.lock() {
             restart_state.record_attempt(now);
             let count = restart_state.attempts;
-            info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
-                  attempt = count, "ICE restart attempt #{}", count);
+            info!(
+                "ICE restart attempt #{} (tube_id: {}, attempt: {})",
+                count, self.tube_id, count
+            );
         } else {
             return Err("Failed to acquire restart state lock".to_string());
         }
@@ -1244,9 +1338,11 @@ impl WebRTCPeerConnection {
         // Generate new offer with ICE restart
         match self.peer_connection.create_offer(None).await {
             Ok(offer) => {
-                info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
-                      sdp_length = offer.sdp.len(),
-                      "Successfully generated ICE restart offer");
+                info!(
+                    "Successfully generated ICE restart offer (tube_id: {}, sdp_length: {})",
+                    self.tube_id,
+                    offer.sdp.len()
+                );
 
                 // Set the new local description to trigger ICE restart
                 let offer_desc = RTCSessionDescription::offer(offer.sdp.clone())
@@ -1254,8 +1350,7 @@ impl WebRTCPeerConnection {
 
                 match self.peer_connection.set_local_description(offer_desc).await {
                     Ok(()) => {
-                        info!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
-                              "ICE restart offer set as local description - new ICE session will begin");
+                        info!("ICE restart offer set as local description - new ICE session will begin (tube_id: {})", self.tube_id);
 
                         // Update activity since we just performed a successful SDP operation
                         self.update_activity();
@@ -1267,8 +1362,7 @@ impl WebRTCPeerConnection {
                         Ok(offer.sdp)
                     }
                     Err(e) => {
-                        warn!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
-                              error = %e, "Failed to set ICE restart offer as local description");
+                        warn!("Failed to set ICE restart offer as local description (tube_id: {}, error: {})", self.tube_id, e);
                         Err(format!(
                             "Failed to set local description for ICE restart: {e}"
                         ))
@@ -1276,8 +1370,10 @@ impl WebRTCPeerConnection {
                 }
             }
             Err(e) => {
-                warn!(target: "webrtc_ice_restart", tube_id = %self.tube_id, 
-                      error = %e, "Failed to create ICE restart offer");
+                warn!(
+                    "Failed to create ICE restart offer (tube_id: {}, error: {})",
+                    self.tube_id, e
+                );
                 Err(format!("Failed to create ICE restart offer: {e}"))
             }
         }

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
+use log::error;
 use smallvec::SmallVec;
 use std::str;
-use tracing::error;
 
 // Guacamole protocol constants
 pub const INST_TERM: u8 = b';';

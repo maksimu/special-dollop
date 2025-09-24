@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use tracing::{debug, error, info, warn};
+use log::{debug, error, info, warn};
 
 use super::core::Channel;
 use crate::tube_protocol::{ControlMessage, CONN_NO_LEN};
@@ -38,9 +38,10 @@ impl Channel {
         let conn_no = cursor.get_u32();
         let relay_port = cursor.get_u16();
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id, 
-               "Client received UdpAssociate for connection {} with relay port {}", 
-               conn_no, relay_port);
+        debug!(
+            "Client received UdpAssociate for connection {} with relay port {} (channel_id: {})",
+            conn_no, relay_port, self.channel_id
+        );
 
         // Create UDP socket for this association using dual-stack binding
         let udp_socket = crate::models::dual_stack::bind_udp_localhost(0).await?;
@@ -130,9 +131,8 @@ impl Channel {
         let conn_no = cursor.get_u32();
         let client_port = cursor.get_u16();
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id,
-               "Server received UdpAssociateOpened for connection {} with client port {}",
-               conn_no, client_port);
+        debug!("Server received UdpAssociateOpened for connection {} with client port {} (channel_id: {})",
+               conn_no, client_port, self.channel_id);
 
         // In server mode, this confirms the UDP association is ready
         // We might need to notify the SOCKS5 client that UDP relay is ready
@@ -207,17 +207,18 @@ impl Channel {
         // Remaining data is the UDP payload
         let payload = &data[cursor.position() as usize..];
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id,
-               "Processing UDP packet for connection {}: client={}, dest={}:{}, payload={} bytes",
-               conn_no, client_socket_addr, dest_host, dest_port, payload.len());
+        debug!("Processing UDP packet for connection {}: client={}, dest={}:{}, payload={} bytes (channel_id: {})",
+               conn_no, client_socket_addr, dest_host, dest_port, payload.len(), self.channel_id);
 
         // Network access check if configured
         if let Some(ref checker) = self.network_checker {
             match checker.resolve_if_allowed(&dest_host).await {
                 Some(resolved_ips) => {
                     if !checker.is_port_allowed(dest_port) {
-                        error!(target: "protocol_event", channel_id=%self.channel_id,
-                               "UDP packet to {}:{} port not allowed", dest_host, dest_port);
+                        error!(
+                            "UDP packet to {}:{} port not allowed (channel_id: {})",
+                            dest_host, dest_port, self.channel_id
+                        );
                         return Ok(()); // Drop the packet silently
                     }
 
@@ -250,8 +251,10 @@ impl Channel {
                     }
                 }
                 None => {
-                    error!(target: "protocol_event", channel_id=%self.channel_id,
-                           "UDP packet to {} not allowed or unresolvable", dest_host);
+                    error!(
+                        "UDP packet to {} not allowed or unresolvable (channel_id: {})",
+                        dest_host, self.channel_id
+                    );
                 }
             }
         } else {
@@ -303,8 +306,10 @@ impl Channel {
         let mut cursor = std::io::Cursor::new(data);
         let conn_no = cursor.get_u32();
 
-        debug!(target: "protocol_event", channel_id=%self.channel_id,
-               "UDP association {} closed", conn_no);
+        debug!(
+            "UDP association {} closed (channel_id: {})",
+            conn_no, self.channel_id
+        );
 
         // Clean up UDP associations related to this connection
         self.cleanup_udp_associations_for_connection(conn_no)

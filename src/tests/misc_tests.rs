@@ -1,7 +1,7 @@
 //! Miscellaneous tests
 use crate::logger;
 use crate::logger::InitializeLoggerError;
-use tracing::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 
 #[test]
 fn test_logger_enhancements() {

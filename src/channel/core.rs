@@ -7,7 +7,6 @@ use crate::models::{
     is_guacd_session, Conn, ConversationType, NetworkAccessChecker, StreamHalf, TunnelTimeouts,
 };
 use crate::runtime::get_runtime;
-use crate::trace_ultra_hot_path;
 use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
 use crate::tube_protocol::{try_parse_frame, CloseConnectionReason, ControlMessage, Frame};
 use crate::webrtc_data_channel::{WebRTCDataChannel, STANDARD_BUFFER_THRESHOLD};
@@ -15,6 +14,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
+use log::{debug, error, info, trace, warn};
 use serde::Deserialize;
 use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
 use std::collections::HashMap;
@@ -23,7 +23,6 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn};
 // Add this
 
 // Import from sibling modules
@@ -163,8 +162,11 @@ impl Channel {
             ksm_config,
             client_version,
         } = params;
-        debug!(target: "channel_lifecycle", channel_id = %channel_id, server_mode, "Channel::new called");
-        trace!(target: "channel_setup", channel_id = %channel_id, ?protocol_settings, "Initial protocol_settings received by Channel::new");
+        debug!("Channel::new called (channel_id: {})", channel_id);
+        trace!(
+            "Initial protocol_settings received by Channel::new (channel_id: {})",
+            channel_id
+        );
 
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
         let (conn_closed_tx, conn_closed_rx) = mpsc::unbounded_channel::<(u32, String)>();
@@ -188,7 +190,7 @@ impl Channel {
                 match protocol_name_str.parse::<ConversationType>() {
                     Ok(parsed_conversation_type) => {
                         if is_guacd_session(&parsed_conversation_type) {
-                            debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for GuacD protocol");
+                            debug!("Configuring for GuacD protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                             determined_protocol = ActiveProtocol::Guacd;
                             initial_protocol_state =
                                 ProtocolLogicState::Guacd(ChannelGuacdState::default());
@@ -196,7 +198,7 @@ impl Channel {
                             if let Some(guacd_dedicated_settings_val) =
                                 protocol_settings.get("guacd")
                             {
-                                trace!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd' block in protocol_settings: {:?}", guacd_dedicated_settings_val);
+                                trace!("Found 'guacd' block in protocol_settings: {:?} (channel_id: {})", guacd_dedicated_settings_val, channel_id);
                                 if let JsonValue::Object(guacd_map) = guacd_dedicated_settings_val {
                                     guacd_host_setting = guacd_map
                                         .get("guacd_host")
@@ -206,19 +208,25 @@ impl Channel {
                                         .get("guacd_port")
                                         .and_then(|v| v.as_u64())
                                         .map(|p| p as u16);
-                                    debug!(target: "channel_setup", channel_id = %channel_id, ?guacd_host_setting, ?guacd_port_setting, "Parsed from dedicated 'guacd' settings block.");
+                                    debug!("Parsed from dedicated 'guacd' settings block. (channel_id: {})", channel_id);
                                 } else {
-                                    warn!(target: "channel_setup", channel_id = %channel_id, "'guacd' block was not a JSON Object.");
+                                    warn!(
+                                        "'guacd' block was not a JSON Object. (channel_id: {})",
+                                        channel_id
+                                    );
                                 }
                             } else {
-                                trace!(target: "channel_setup", channel_id = %channel_id, "No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults.");
+                                trace!("No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults. (channel_id: {})", channel_id);
                             }
 
                             if let Some(guacd_params_json_val) =
                                 protocol_settings.get("guacd_params")
                             {
-                                debug!(target: "channel_setup", channel_id = %channel_id, "Found 'guacd_params' in protocol_settings.");
-                                trace!(target: "channel_setup", channel_id = %channel_id, guacd_params_value = ?guacd_params_json_val, "Raw guacd_params value for direct processing.");
+                                debug!(
+                                    "Found 'guacd_params' in protocol_settings. (channel_id: {})",
+                                    channel_id
+                                );
+                                trace!("Raw guacd_params value for direct processing. (channel_id: {}, guacd_params_value: {:?})", channel_id, guacd_params_json_val);
 
                                 if let JsonValue::Object(map) = guacd_params_json_val {
                                     temp_initial_guacd_params_map = map
@@ -262,7 +270,7 @@ impl Channel {
                                             }
                                         })
                                         .collect();
-                                    debug!(target: "channel_setup", channel_id = %channel_id, ?temp_initial_guacd_params_map, "Populated guacd_params map directly from JSON Value.");
+                                    debug!("Populated guacd_params map directly from JSON Value. (channel_id: {})", channel_id);
 
                                     // Override protocol name with correct guacd protocol name from ConversationType
                                     let guacd_protocol_name = parsed_conversation_type.to_string();
@@ -270,12 +278,12 @@ impl Channel {
                                         "protocol".to_string(),
                                         guacd_protocol_name.clone(),
                                     );
-                                    debug!(target: "channel_setup", channel_id = %channel_id, guacd_protocol_name = %guacd_protocol_name, "Set guacd protocol name from ConversationType");
+                                    debug!("Set guacd protocol name from ConversationType (channel_id: {}, guacd_protocol_name: {})", channel_id, guacd_protocol_name);
                                 } else {
-                                    error!(target: "channel_setup", channel_id = %channel_id, "guacd_params was not a JSON object. Value: {:?}", guacd_params_json_val);
+                                    error!("guacd_params was not a JSON object. Value: {:?} (channel_id: {})", guacd_params_json_val, channel_id);
                                 }
                             } else {
-                                warn!(target: "channel_setup", channel_id = %channel_id, "'guacd_params' key not found in protocol_settings.");
+                                warn!("'guacd_params' key not found in protocol_settings. (channel_id: {})", channel_id);
                             }
                         } else {
                             // Handle non-Guacd types like Tunnel or SOCKS5 if network rules are present
@@ -289,13 +297,13 @@ impl Channel {
                                             .unwrap_or(false);
 
                                     if should_use_socks5 {
-                                        debug!(target:"channel_setup", channel_id = %channel_id, server_mode, "Configuring for SOCKS5 protocol (Tunnel type with network rules or socks_mode)");
+                                        debug!("Configuring for SOCKS5 protocol (Tunnel type with network rules or socks_mode) (channel_id: {})", channel_id);
                                         determined_protocol = ActiveProtocol::Socks5;
                                         initial_protocol_state = ProtocolLogicState::Socks5(
                                             ChannelSocks5State::default(),
                                         );
                                     } else {
-                                        debug!(target:"channel_setup", channel_id = %channel_id, server_mode, "Configuring for PortForward protocol (Tunnel type)");
+                                        debug!("Configuring for PortForward protocol (Tunnel type) (channel_id: {})", channel_id);
                                         determined_protocol = ActiveProtocol::PortForward;
                                         if server_mode {
                                             initial_protocol_state =
@@ -355,13 +363,13 @@ impl Channel {
                                 _ => {
                                     // Other non-Guacd types
                                     if network_checker.is_some() {
-                                        debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for SOCKS5 protocol (network rules present)");
+                                        debug!("Configuring for SOCKS5 protocol (network rules present) (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                                         determined_protocol = ActiveProtocol::Socks5;
                                         initial_protocol_state = ProtocolLogicState::Socks5(
                                             ChannelSocks5State::default(),
                                         );
                                     } else {
-                                        debug!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Configuring for PortForward protocol (defaulting)");
+                                        debug!("Configuring for PortForward protocol (defaulting) (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                                         determined_protocol = ActiveProtocol::PortForward;
                                         let mut dest_host = protocol_settings
                                             .get("target_host")
@@ -393,7 +401,7 @@ impl Channel {
                         }
                     }
                     Err(_) => {
-                        error!(target:"channel_setup", channel_id = %channel_id, protocol_type = %protocol_name_str, "Invalid conversationType string. Erroring out.");
+                        error!("Invalid conversationType string. Erroring out. (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                         return Err(anyhow::anyhow!(
                             "Invalid conversationType string: {}",
                             protocol_name_str
@@ -402,12 +410,15 @@ impl Channel {
                 }
             } else {
                 // protocol_name_val is not a string
-                error!(target:"channel_setup", channel_id = %channel_id, "conversationType is not a string. Erroring out.");
+                error!(
+                    "conversationType is not a string. Erroring out. (channel_id: {})",
+                    channel_id
+                );
                 return Err(anyhow::anyhow!("conversationType is not a string"));
             }
         } else {
             // "conversationType" not found
-            error!(target:"channel_setup", channel_id = %channel_id, "No specific protocol defined (conversationType missing). Erroring out.");
+            error!("No specific protocol defined (conversationType missing). Erroring out. (channel_id: {})", channel_id);
             return Err(anyhow::anyhow!(
                 "No specific protocol defined (conversationType missing)"
             ));
@@ -415,22 +426,29 @@ impl Channel {
 
         let mut final_connect_as_settings = ConnectAsSettings::default();
         if let Some(connect_as_settings_val) = protocol_settings.get("connect_as_settings") {
-            debug!(target: "channel_setup", channel_id = %channel_id, "Found 'connect_as_settings' in protocol_settings.");
-            trace!(target: "channel_setup", channel_id = %channel_id, cas_value = ?connect_as_settings_val, "Raw connect_as_settings value.");
+            debug!(
+                "Found 'connect_as_settings' in protocol_settings. (channel_id: {})",
+                channel_id
+            );
+            trace!(
+                "Raw connect_as_settings value. (channel_id: {}, cas_value: {:?})",
+                channel_id,
+                connect_as_settings_val
+            );
             match serde_json::from_value::<ConnectAsSettings>(connect_as_settings_val.clone()) {
                 Ok(parsed_settings) => {
                     final_connect_as_settings = parsed_settings;
-                    debug!(target: "channel_setup", channel_id = %channel_id, "Successfully deserialized connect_as_settings into ConnectAsSettings struct.");
-                    trace!(target: "channel_setup", channel_id = %channel_id, ?final_connect_as_settings);
+                    debug!("Successfully deserialized connect_as_settings into ConnectAsSettings struct. (channel_id: {})", channel_id);
+                    trace!("Final connect_as_settings. (channel_id: {}, final_connect_as_settings: {:?})", channel_id, final_connect_as_settings);
                 }
                 Err(e) => {
-                    error!(target: "channel_setup", channel_id = %channel_id, "CRITICAL: Failed to deserialize connect_as_settings: {}. Value was: {:?}", e, connect_as_settings_val);
+                    error!("CRITICAL: Failed to deserialize connect_as_settings: {}. Value was: {:?} (channel_id: {})", e, connect_as_settings_val, channel_id);
                     // Returning an error here if connect_as_settings are vital
                     return Err(anyhow!("Failed to deserialize connect_as_settings: {}", e));
                 }
             }
         } else {
-            warn!(target: "channel_setup", channel_id = %channel_id, "'connect_as_settings' key not found in protocol_settings. Using default.");
+            warn!("'connect_as_settings' key not found in protocol_settings. Using default. (channel_id: {})", channel_id);
         }
 
         let new_channel = Self {
@@ -471,7 +489,10 @@ impl Channel {
             client_version,
         };
 
-        info!(target: "channel_lifecycle", channel_id = %new_channel.channel_id, server_mode = new_channel.server_mode, "Channel initialized");
+        info!(
+            "Channel initialized (channel_id: {}, server_mode: {})",
+            new_channel.channel_id, new_channel.server_mode
+        );
 
         Ok(new_channel)
     }
@@ -486,7 +507,7 @@ impl Channel {
 
         // Take ownership of conn_closed_rx for the select loop
         let mut local_conn_closed_rx = self.conn_closed_rx.take().ok_or_else(|| {
-            error!(target: "channel_lifecycle", channel_id = %self.channel_id, "conn_closed_rx was already taken or None. Channel cannot monitor connection closures.");
+            error!("conn_closed_rx was already taken or None. Channel cannot monitor connection closures. (channel_id: {})", self.channel_id);
             ChannelError::Internal("conn_closed_rx missing at start of run".to_string())
         })?;
 
@@ -495,11 +516,14 @@ impl Channel {
             // Process any complete frames in the buffer
             while let Some(frame) = try_parse_frame(&mut buf) {
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(target: "channel_flow", channel_id = %self.channel_id, connection_no = frame.connection_no, payload_size = frame.payload.len(), "Received frame from WebRTC");
+                    debug!("Received frame from WebRTC (channel_id: {}, connection_no: {}, payload_size: {})", self.channel_id, frame.connection_no, frame.payload.len());
                 }
 
                 if let Err(e) = handle_incoming_frame(&mut self, frame).await {
-                    error!(target: "channel_flow", channel_id = %self.channel_id, error = %e, "Error handling frame");
+                    error!(
+                        "Error handling frame (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
                 }
             }
 
@@ -510,7 +534,7 @@ impl Channel {
                 maybe_conn = async { server_conn_rx.as_mut()?.recv().await }, if server_conn_rx.is_some() => {
                     if let Some((conn_no, writer, task)) = maybe_conn {
                         if tracing::enabled!(tracing::Level::DEBUG) {
-                            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Registering connection from server");
+                            debug!("Registering connection from server (channel_id: {})", self.channel_id);
                         }
 
                         // Create a stream half
@@ -540,23 +564,23 @@ impl Channel {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!(target: "channel_flow", channel_id = %self.channel_id, bytes_received = chunk.len(), "Received data from WebRTC");
+                                debug!("Received data from WebRTC (channel_id: {}, bytes_received: {})", self.channel_id, chunk.len());
 
                                 if !chunk.is_empty() {
-                                    trace_ultra_hot_path!(target: "channel_flow", channel_id = %self.channel_id, first_bytes = ?&chunk[..std::cmp::min(20, chunk.len())], "First few bytes of received data");
+                                    trace!("First few bytes of received data (channel_id: {}, first_bytes: {:?})", self.channel_id, &chunk[..std::cmp::min(20, chunk.len())]);
                                 }
                             }
 
                             buf.extend_from_slice(&chunk);
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!(target: "channel_flow", channel_id = %self.channel_id, buffer_size = buf.len(), "Buffer size after adding chunk");
+                                debug!("Buffer size after adding chunk (channel_id: {}, buffer_size: {})", self.channel_id, buf.len());
                             }
 
                             // Process pending messages might be triggered by buffer low,
                             // but also good to try after receiving new data if not recently triggered.
                         }
                         Ok(None) => {
-                            info!(target: "channel_lifecycle", channel_id = %self.channel_id, "WebRTC data channel closed or sender dropped.");
+                            info!("WebRTC data channel closed or sender dropped. (channel_id: {})", self.channel_id);
                             break;
                         }
                         Err(_) => { // Timeout on rx_from_dc.recv()
@@ -568,14 +592,14 @@ impl Channel {
                 // Listen for connection closure signals
                 maybe_closed_conn_info = local_conn_closed_rx.recv() => {
                     if let Some((closed_conn_no, closed_channel_id)) = maybe_closed_conn_info {
-                        info!(target: "connection_lifecycle", channel_id = %closed_channel_id, conn_no = closed_conn_no, "Connection task reported exit to Channel run loop.");
+                        info!("Connection task reported exit to Channel run loop. (channel_id: {}, conn_no: {})", closed_channel_id, closed_conn_no);
 
                         let mut is_critical_closure = false;
                         if self.active_protocol == ActiveProtocol::Guacd {
                             let primary_opt = self.primary_guacd_conn_no.lock().await;
                             if let Some(primary_conn_no) = *primary_opt {
                                 if primary_conn_no == closed_conn_no {
-                                    warn!(target: "channel_lifecycle", channel_id = %self.channel_id, conn_no = closed_conn_no, "Critical Guacd data connection has closed. Initiating channel shutdown.");
+                                    warn!("Critical Guacd data connection has closed. Initiating channel shutdown. (channel_id: {}, conn_no: {})", self.channel_id, closed_conn_no);
                                     is_critical_closure = true;
                                 }
                             }
@@ -586,9 +610,9 @@ impl Channel {
                             // Attempt to gracefully close the control connection (conn_no 0) as well, if not already closing.
                             // This sends a CloseConnection message to the client for the channel itself.
                             if closed_conn_no != 0 { // Avoid self-triggering if conn_no 0 was what closed to signal this.
-                                info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Shutting down control connection (0) due to critical upstream closure.");
+                                info!("Shutting down control connection (0) due to critical upstream closure. (channel_id: {})", self.channel_id);
                                 if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed).await {
-                                    debug!(target: "channel_lifecycle", channel_id = %self.channel_id, error = %e, "Error explicitly closing control connection (0) during critical shutdown.");
+                                    debug!("Error explicitly closing control connection (0) during critical shutdown. (channel_id: {}, error: {})", self.channel_id, e);
                                 }
                             }
                             // Instead of just breaking, return the specific error to indicate why the channel is stopping.
@@ -603,7 +627,7 @@ impl Channel {
                     } else {
                         // Conn_closed_tx was dropped, meaning all senders are gone.
                         // This might happen if the channel is already shutting down and tasks are aborting.
-                        info!(target: "channel_lifecycle", channel_id = %self.channel_id, "Connection closure signal channel (conn_closed_rx) closed.");
+                        info!("Connection closure signal channel (conn_closed_rx) closed. (channel_id: {})", self.channel_id);
                         // If this is unexpected, it might warrant setting should_exit to true.
                     }
                 }
@@ -621,7 +645,10 @@ impl Channel {
         // Stop the server if it's running
         if self.server_mode && self.local_client_server_task.is_some() {
             if let Err(e) = self.stop_server().await {
-                warn!(target: "channel_lifecycle", channel_id = %self.channel_id, error = %e, "Failed to stop server during cleanup");
+                warn!(
+                    "Failed to stop server during cleanup (channel_id: {}, error: {})",
+                    self.channel_id, e
+                );
             }
         }
 
@@ -673,7 +700,10 @@ impl Channel {
         let buffered_amount = self.webrtc.buffered_amount().await;
         if buffered_amount >= STANDARD_BUFFER_THRESHOLD && tracing::enabled!(tracing::Level::DEBUG)
         {
-            debug!(target: "channel_flow", channel_id = %self.channel_id, buffered_amount, ?message, "Control message buffer full, but sending control message anyway");
+            debug!(
+                "Control message buffer full, but sending control message anyway (channel_id: {})",
+                self.channel_id
+            );
         }
         self.webrtc
             .send(encoded)
@@ -690,10 +720,8 @@ impl Channel {
         let total_connections = self.conns.len();
         let remaining_connections = self.get_connection_ids_except(conn_no);
 
-        debug!(target: "connection_lifecycle",
-              channel_id = %self.channel_id, conn_no, ?reason,
-              total_connections, ?remaining_connections,
-              "Closing connection - Connection summary");
+        debug!("Closing connection - Connection summary (channel_id: {}, conn_no: {}, reason: {:?}, total_connections: {}, remaining_connections: {:?})",
+              self.channel_id, conn_no, reason, total_connections, remaining_connections);
 
         let mut buffer = self.buffer_pool.acquire();
         buffer.clear();
@@ -716,16 +744,22 @@ impl Channel {
                 .send_guacd_disconnect_message(conn_no, &reason.to_message())
                 .await
             {
-                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send Guacd disconnect message during immediate close");
+                warn!("Failed to send Guacd disconnect message during immediate close (channel_id: {}, error: {})", self.channel_id, e);
             }
 
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
                 // Shutdown the connection gracefully (closes channels and waits for tasks)
                 if let Err(e) = conn.shutdown().await {
-                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Error during connection shutdown");
+                    warn!(
+                        "Error during connection shutdown (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
                 } else {
-                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed connection and tasks");
+                    debug!(
+                        "Successfully closed connection and tasks (channel_id: {})",
+                        self.channel_id
+                    );
                 }
             }
         } else {
@@ -734,7 +768,10 @@ impl Channel {
                 // Signal the connection to close its data channel
                 // (dropping the sender will cause the backend task to exit)
                 if !conn_ref.data_tx.is_closed() {
-                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Signaling connection to close data channel");
+                    debug!(
+                        "Signaling connection to close data channel (channel_id: {})",
+                        self.channel_id
+                    );
                 }
             }
 
@@ -747,15 +784,24 @@ impl Channel {
                 // Wait a bit to allow in-flight messages to be processed
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-                debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
+                debug!(
+                    "Grace period elapsed, removing connection from maps (channel_id: {})",
+                    channel_id_clone
+                );
 
                 // Now remove from maps
                 if let Some((_, conn)) = conns_arc.remove(&conn_no) {
                     // Shutdown the connection gracefully
                     if let Err(e) = conn.shutdown().await {
-                        warn!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, error = %e, "Error during delayed connection shutdown");
+                        warn!(
+                            "Error during delayed connection shutdown (channel_id: {}, error: {})",
+                            channel_id_clone, e
+                        );
                     } else {
-                        debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed connection after grace period");
+                        debug!(
+                            "Successfully closed connection after grace period (channel_id: {})",
+                            channel_id_clone
+                        );
                     }
                 }
             });
@@ -782,11 +828,14 @@ impl Channel {
         };
 
         if !is_primary {
-            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Not primary Guacd connection, skipping disconnect message");
+            debug!(
+                "Not primary Guacd connection, skipping disconnect message (channel_id: {})",
+                self.channel_id
+            );
             return Ok(());
         }
 
-        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, reason = %reason, "Sending Guacd log and disconnect message to server and client");
+        debug!("Sending Guacd log and disconnect message to server and client (channel_id: {}, reason: {})", self.channel_id, reason);
 
         // Create the log instruction first: log message for debugging
         let log_instruction = GuacdInstruction::new("log".to_string(), vec![reason.to_string()]);
@@ -801,18 +850,27 @@ impl Channel {
             if !conn_ref.data_tx.is_closed() {
                 let log_server_message = crate::models::ConnectionMessage::Data(log_bytes.clone());
                 if let Err(e) = conn_ref.data_tx.send(log_server_message) {
-                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send log message to server");
+                    warn!(
+                        "Failed to send log message to server (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
                 } else {
-                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, reason = %reason, "Successfully sent log message to Guacd server");
+                    debug!("Successfully sent log message to Guacd server (channel_id: {}, reason: {})", self.channel_id, reason);
                 }
 
                 // Then send disconnect message to server
                 let disconnect_server_message =
                     crate::models::ConnectionMessage::Data(disconnect_bytes.clone());
                 if let Err(e) = conn_ref.data_tx.send(disconnect_server_message) {
-                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send disconnect message to server");
+                    warn!(
+                        "Failed to send disconnect message to server (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
                 } else {
-                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully sent disconnect message to Guacd server");
+                    debug!(
+                        "Successfully sent disconnect message to Guacd server (channel_id: {})",
+                        self.channel_id
+                    );
                 }
             }
         }
@@ -823,10 +881,16 @@ impl Channel {
 
         if let Err(e) = self.webrtc.send(log_encoded_frame).await {
             if !e.contains("Channel is closing") {
-                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send log message to client");
+                warn!(
+                    "Failed to send log message to client (channel_id: {}, error: {})",
+                    self.channel_id, e
+                );
             }
         } else {
-            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, reason = %reason, "Successfully sent log message to client");
+            debug!(
+                "Successfully sent log message to client (channel_id: {}, reason: {})",
+                self.channel_id, reason
+            );
         }
 
         // Then send disconnect message to client (via WebRTC)
@@ -834,12 +898,30 @@ impl Channel {
             Frame::new_data_with_pool(conn_no, &disconnect_bytes, &self.buffer_pool);
         let disconnect_encoded_frame = disconnect_data_frame.encode_with_pool(&self.buffer_pool);
 
-        if let Err(e) = self.webrtc.send(disconnect_encoded_frame).await {
-            if !e.contains("Channel is closing") {
-                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send disconnect message to client");
+        let send_start = std::time::Instant::now();
+        match self.webrtc.send(disconnect_encoded_frame.clone()).await {
+            Ok(_) => {
+                let send_latency = send_start.elapsed();
+                crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                    &self.channel_id,
+                    disconnect_encoded_frame.len() as u64,
+                    Some(send_latency),
+                );
+                debug!(
+                    "Successfully sent disconnect message to client (channel_id: {})",
+                    self.channel_id
+                );
             }
-        } else {
-            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully sent disconnect message to client");
+            Err(e) => {
+                if !e.contains("Channel is closing") {
+                    warn!(
+                        "Failed to send disconnect message to client (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
+                    crate::metrics::METRICS_COLLECTOR
+                        .record_error(&self.channel_id, "disconnect_message_send_failed");
+                }
+            }
         }
 
         Ok(())
@@ -855,10 +937,8 @@ impl Channel {
         let total_connections = self.conns.len();
         let remaining_connections = self.get_connection_ids_except(conn_no);
 
-        debug!(target: "connection_lifecycle",
-              channel_id = %self.channel_id, conn_no, ?reason,
-              total_connections, ?remaining_connections,
-              "Closing connection (no message) - Connection summary");
+        debug!("Closing connection (no message) - Connection summary (channel_id: {}, conn_no: {}, reason: {:?}, total_connections: {}, remaining_connections: {:?})",
+              self.channel_id, conn_no, reason, total_connections, remaining_connections);
 
         self.internal_handle_connection_close(conn_no, reason)
             .await?;
@@ -872,16 +952,22 @@ impl Channel {
                 .send_guacd_disconnect_message(conn_no, &reason.to_message())
                 .await
             {
-                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Failed to send Guacd disconnect message during immediate close (no message)");
+                warn!("Failed to send Guacd disconnect message during immediate close (no message) (channel_id: {}, error: {})", self.channel_id, e);
             }
 
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
                 // Shutdown the connection gracefully (closes channels and waits for tasks)
                 if let Err(e) = conn.shutdown().await {
-                    warn!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, error = %e, "Error during connection shutdown");
+                    warn!(
+                        "Error during connection shutdown (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
                 } else {
-                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Successfully closed connection and tasks");
+                    debug!(
+                        "Successfully closed connection and tasks (channel_id: {})",
+                        self.channel_id
+                    );
                 }
             }
         } else {
@@ -890,7 +976,10 @@ impl Channel {
                 // Signal the connection to close its data channel
                 // (dropping the sender will cause the backend task to exit)
                 if !conn_ref.data_tx.is_closed() {
-                    debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Signaling connection to close data channel");
+                    debug!(
+                        "Signaling connection to close data channel (channel_id: {})",
+                        self.channel_id
+                    );
                 }
             }
 
@@ -903,15 +992,24 @@ impl Channel {
                 // Wait a bit to allow in-flight messages to be processed
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-                debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Grace period elapsed, removing connection from maps");
+                debug!(
+                    "Grace period elapsed, removing connection from maps (channel_id: {})",
+                    channel_id_clone
+                );
 
                 // Now remove from maps
                 if let Some((_, conn)) = conns_arc.remove(&conn_no) {
                     // Shutdown the connection gracefully
                     if let Err(e) = conn.shutdown().await {
-                        warn!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, error = %e, "Error during delayed connection shutdown");
+                        warn!(
+                            "Error during delayed connection shutdown (channel_id: {}, error: {})",
+                            channel_id_clone, e
+                        );
                     } else {
-                        debug!(target: "connection_lifecycle", channel_id = %channel_id_clone, conn_no, "Successfully closed connection after grace period");
+                        debug!(
+                            "Successfully closed connection after grace period (channel_id: {})",
+                            channel_id_clone
+                        );
                     }
                 }
             });
@@ -929,7 +1027,10 @@ impl Channel {
         conn_no: u32,
         reason: CloseConnectionReason,
     ) -> Result<()> {
-        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, ?reason, "internal_handle_connection_close");
+        debug!(
+            "internal_handle_connection_close (channel_id: {})",
+            self.channel_id
+        );
 
         // If this is the control connection (conn_no 0) or we're shutting down due to an error,
         // and we're in server mode, stop the server to prevent new connections
@@ -941,9 +1042,15 @@ impl Channel {
                 ))
             && self.local_client_server_task.is_some()
         {
-            debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Stopping server due to critical connection closure");
+            debug!(
+                "Stopping server due to critical connection closure (channel_id: {})",
+                self.channel_id
+            );
             if let Err(e) = self.stop_server().await {
-                warn!(target: "connection_lifecycle", channel_id = %self.channel_id, error = %e, "Failed to stop server during connection close");
+                warn!(
+                    "Failed to stop server during connection close (channel_id: {}, error: {})",
+                    self.channel_id, e
+                );
             }
         }
 
@@ -955,7 +1062,7 @@ impl Channel {
                 // Check if this was the primary data connection
                 if let Some(primary_conn_no) = *self.primary_guacd_conn_no.lock().await {
                     if primary_conn_no == conn_no {
-                        debug!(target: "connection_lifecycle", channel_id = %self.channel_id, conn_no, "Primary GuacD data connection closed, clearing reference");
+                        debug!("Primary GuacD data connection closed, clearing reference (channel_id: {})", self.channel_id);
                         *self.primary_guacd_conn_no.lock().await = None;
                     }
                 }
@@ -1009,9 +1116,10 @@ impl Channel {
                         .and_then(|v| v.as_u64())
                         .map(|p| p as u16);
                 }
-                debug!(target:"channel_setup", channel_id = %channel_id,
-                       "Extracted target from guacd field ({}): host={:?}, port={:?}",
-                       context, dest_host, dest_port);
+                debug!(
+                    "Extracted target from guacd field ({}): host={:?}, port={:?} (channel_id: {})",
+                    context, dest_host, dest_port, channel_id
+                );
             }
         }
         (dest_host, dest_port)
@@ -1024,12 +1132,8 @@ impl Channel {
         let connection_ids = self.get_connection_ids();
         let buffered_amount = self.webrtc.buffered_amount().await;
 
-        info!(target: "channel_summary",
-              channel_id=%self.channel_id, total_connections, ?connection_ids,
-              server_mode=self.server_mode, buffered_amount,
-              ?self.active_protocol,
-              "Channel '{}' closing - Final stats: {} connections: {:?}, {} bytes buffered",
-              self.channel_id, total_connections, connection_ids, buffered_amount);
+        info!("Channel '{}' closing - Final stats: {} connections: {:?}, {} bytes buffered (channel_id: {}, server_mode: {}, active_protocol: {:?})",
+              self.channel_id, total_connections, connection_ids, buffered_amount, self.channel_id, self.server_mode, self.active_protocol);
 
         // Note: Full WebRTC native stats (bytes sent/received, round-trip time,
         // packet loss, bandwidth usage, connection quality, etc.) are available
@@ -1069,7 +1173,7 @@ impl Drop for Channel {
                 let encoded = close_frame.encode_with_pool(&buffer_pool_clone);
                 if let Err(e) = webrtc.send(encoded).await {
                     if !e.contains("Channel is closing") {
-                        warn!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error sending close frame in drop for connection");
+                        warn!("Error sending close frame in drop for connection (channel_id: {}, error: {})", channel_id, e);
                     }
                 }
                 buffer_pool_clone.release(close_buffer);
@@ -1077,11 +1181,11 @@ impl Drop for Channel {
                 // Shutdown the connection gracefully
                 if let Some((_, conn)) = conns_clone.remove(&conn_no) {
                     if let Err(e) = conn.shutdown().await {
-                        debug!(target: "channel_cleanup", channel_id = %channel_id, conn_no, error = %e, "Error shutting down connection in drop");
+                        debug!("Error shutting down connection in drop (channel_id: {}, error: {})", channel_id, e);
                     }
                 }
             }
-            info!(target: "channel_lifecycle", channel_id = %channel_id, "Channel cleanup completed");
+            info!("Channel cleanup completed (channel_id: {})", channel_id);
         });
     }
 }

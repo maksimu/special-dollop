@@ -3,7 +3,7 @@
 use crate::error::ChannelError;
 use crate::tube_protocol::{ControlMessage, Frame};
 use anyhow::Result;
-use tracing::{debug, error};
+use log::{debug, error};
 
 use super::core::Channel;
 
@@ -12,10 +12,8 @@ pub(crate) async fn handle_ping_timeout(channel: &mut Channel) -> Result<(), Cha
     channel.ping_attempt += 1;
     if channel.ping_attempt > 10 {
         error!(
-            target: "channel_health",
-            channel_id = %channel.channel_id,
-            ping_attempts = channel.ping_attempt,
-            "Too many ping timeouts, closing channel"
+            "Too many ping timeouts, closing channel (channel_id: {}, ping_attempt: {})",
+            channel.channel_id, channel.ping_attempt
         );
         channel
             .close_backend(0, crate::tube_protocol::CloseConnectionReason::Timeout)
@@ -27,7 +25,10 @@ pub(crate) async fn handle_ping_timeout(channel: &mut Channel) -> Result<(), Cha
     }
 
     if channel.is_connected {
-        debug!(target: "channel_health", channel_id = %channel.channel_id, ping_attempt = channel.ping_attempt, "Send ping request");
+        debug!(
+            "Send ping request (channel_id: {}, ping_attempt: {})",
+            channel.channel_id, channel.ping_attempt
+        );
         let timestamp = crate::channel::protocol::now_ms();
         let timestamp_bytes = timestamp.to_be_bytes(); // Convert to big endian bytes
         let length = timestamp_bytes.len() as u32; // Get the length

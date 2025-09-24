@@ -5,13 +5,13 @@ use base64::{
 
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use log::{debug, error, trace};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use std::time::Duration;
-use tracing::{debug, error, trace};
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -70,10 +70,10 @@ mod challenge_response {
     use super::*;
     use anyhow::Result;
     use lazy_static::lazy_static;
+    use log::{debug, error};
     use p256::pkcs8::DecodePrivateKey;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tracing::{debug, error};
 
     const CHALLENGE_RESPONSE_TIMEOUT_SEC: u64 = 10; // Set to 10 seconds
     const WEBSOCKET_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -111,9 +111,8 @@ mod challenge_response {
                     && !data.signature.is_empty()
                 {
                     debug!(
-                        target: "challenge_response",
-                        age_seconds = latest_challenge_seconds as u64,
-                        "Using Keeper API challenge already received."
+                        "Using Keeper API challenge already received. (age_seconds: {})",
+                        latest_challenge_seconds as u64
                     );
                     return Ok((data.challenge.clone(), data.signature.clone()));
                 }
@@ -133,9 +132,8 @@ mod challenge_response {
                     if !resp.status().is_success() {
                         let status = resp.status();
                         error!(
-                            target: "challenge_response",
-                            status_code = %status,
-                            "HTTP error response code received fetching challenge string from Keeper"
+                            "HTTP error response code received fetching challenge string from Keeper (status_code: {})",
+                            status
                         );
                         return Err(Box::new(KRouterError(format!(
                             "HTTP error response code ({status})"
@@ -154,10 +152,8 @@ mod challenge_response {
                     let detailed_error_log = error_detail_parts.join("\n");
 
                     error!(
-                        target: "challenge_response",
-                        error_message = %e, // Original brief message
-                        detailed_error = %detailed_error_log,
-                        "HTTP error received fetching challenge string from Keeper"
+                        "HTTP error received fetching challenge string from Keeper (error_message: {}, detailed_error: {})",
+                        e, detailed_error_log
                     );
                     return Err(Box::new(e)); // Propagate the original error type
                 }
@@ -166,7 +162,7 @@ mod challenge_response {
             let challenge = response.text().await?;
             let signature = sign_client_id(ksm_config, &challenge)?;
 
-            debug!(target: "challenge_response", "Fetched new Keeper API challenge and generated response.");
+            debug!("Fetched new Keeper API challenge and generated response.");
 
             // Update the cache
             {
@@ -204,12 +200,12 @@ mod challenge_response {
             }
         };
 
-        debug!(target: "challenge_response", "Decoding client_id and private key");
+        debug!("Decoding client_id and private key");
 
         let private_key_der_bytes = match url_safe_str_to_bytes(private_key_der_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!(target: "challenge_response", error = %e, "Failed to decode private key");
+                error!("Failed to decode private key (error: {})", e);
                 return Err(e);
             }
         };
@@ -217,17 +213,17 @@ mod challenge_response {
         let mut client_id_bytes = match url_safe_str_to_bytes(client_id_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!(target: "challenge_response", error = %e, "Failed to decode client_id");
+                error!("Failed to decode client_id (error: {})", e);
                 return Err(e);
             }
         };
 
-        debug!(target: "challenge_response", "Adding challenge to the signature before connecting to the router");
+        debug!("Adding challenge to the signature before connecting to the router");
 
         let challenge_bytes = match url_safe_str_to_bytes(challenge) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!(target: "challenge_response", error = %e, "Failed to decode challenge");
+                error!("Failed to decode challenge (error: {})", e);
                 return Err(e);
             }
         };
@@ -242,7 +238,7 @@ mod challenge_response {
     // Convert URL safe string to bytes
     fn url_safe_str_to_bytes(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         // Add padding if needed
-        let padded = if s.len() % 4 == 0 {
+        let padded = if s.len().is_multiple_of(4) {
             s.to_string()
         } else {
             let padding = "=".repeat(4 - s.len() % 4);
@@ -324,7 +320,7 @@ fn is_base64(s: &str) -> bool {
     // URL-safe base64 uses A-Z, a-z, 0-9, -, _, and = for padding
 
     // Only check if the length is valid for base64 (multiple of 4 if padding is used)
-    if s.len() % 4 != 0 && !s.ends_with('=') {
+    if !s.len().is_multiple_of(4) && !s.ends_with('=') {
         return false;
     }
 
@@ -363,12 +359,11 @@ async fn router_request(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
     trace!(
-        target: "router_communication",
-        method = %http_method,
-        path = %url_path,
-        ?ksm_config,
-        client_version = %client_version,
-        "Router request"
+        "Router request (method: {}, path: {}, ksm_config: {:?}, client_version: {})",
+        http_method,
+        url_path,
+        ksm_config,
+        client_version
     );
 
     let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
@@ -488,10 +483,8 @@ pub async fn post_connection_state(
     if ksm_config.starts_with("TEST_MODE_KSM_CONFIG") {
         // Just return OK for tests without making an actual request
         debug!(
-            target: "router_communication",
-            connection_state = %connection_state,
-            ksm_config_prefix = %ksm_config.split('_').next().unwrap_or("TEST_MODE_KSM_CONFIG"),
-            "TEST MODE: Skipping post_connection_state"
+                "TEST MODE: Skipping post_connection_state (connection_state: {}, ksm_config_prefix: {})",
+            connection_state, ksm_config.split('_').next().unwrap_or("TEST_MODE_KSM_CONFIG")
         );
         return Ok(());
     }
@@ -499,9 +492,8 @@ pub async fn post_connection_state(
     // If not in test mode, a valid ksm_config is required.
     if ksm_config.is_empty() {
         error!(
-            target: "router_communication",
-            connection_state = %connection_state,
-            "post_connection_state called with empty ksm_config in non-test mode. This is not allowed."
+                "post_connection_state called with empty ksm_config in non-test mode. This is not allowed. (connection_state: {})",
+            connection_state
         );
         return Err(Box::new(KRouterError(
             "KSM config is empty and not in test mode. Cannot post connection state.".to_string(),
@@ -555,18 +547,17 @@ pub async fn post_connection_state(
     // that use real KSM configs but want to avoid network calls.
     if env::var("TEST_MODE_SKIP_POST_CONNECTION_STATE").is_ok() {
         debug!(
-            target: "router_communication",
-            connection_state = %body.connection_type,
-            "ENV VAR TEST_MODE: Skipping post_connection_state due to TEST_MODE_SKIP_POST_CONNECTION_STATE env var"
+                "ENV VAR TEST_MODE: Skipping post_connection_state due to TEST_MODE_SKIP_POST_CONNECTION_STATE env var (connection_state: {})",
+            body.connection_type
         );
         return Ok(());
     }
 
     let request_body = serde_json::to_value(body)?;
     trace!(
-        target: "router_communication",
-        request_body = %serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "failed to serialize".to_string()),
-        "Sending connection state to router"
+        "Sending connection state to router (request_body: {})",
+        serde_json::to_string_pretty(&request_body)
+            .unwrap_or_else(|_| "failed to serialize".to_string())
     );
 
     router_request(

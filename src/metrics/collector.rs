@@ -1,0 +1,706 @@
+//! Central metrics collector for WebRTC Gateway performance monitoring
+
+use super::alerts::{AlertConfig, AlertManager};
+use super::sliding_window::MultiWindow;
+use super::types::{
+    AggregatedMetrics, AtomicMetrics, ConnectionMetrics, MetricsSnapshot, RTCStats, SCTPStats,
+    WebRTCMetrics,
+};
+use chrono::Utc;
+use log::{debug, info, trace};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::time::interval;
+use webrtc::stats::StatsReportType;
+
+/// Configuration constants for metrics collection timing
+const METRICS_AGGREGATION_INTERVAL_SECS: u64 = 10;
+const METRICS_CLEANUP_INTERVAL_SECS: u64 = 300;
+const WEBRTC_STATS_COLLECTION_INTERVAL_SECS: u64 = 5;
+
+/// Global metrics collector instance
+pub static METRICS_COLLECTOR: Lazy<Arc<MetricsCollector>> = Lazy::new(|| {
+    debug!("Initializing global metrics collector");
+    let collector = Arc::new(MetricsCollector::new());
+    collector.clone().start_background_tasks();
+    collector
+});
+
+/// Connection-specific metrics state
+#[derive(Debug)]
+struct ConnectionState {
+    metrics: ConnectionMetrics,
+    atomic_counters: AtomicMetrics,
+    rtt_window: MultiWindow,
+    latency_window: MultiWindow,
+    throughput_window: MultiWindow,
+    error_window: MultiWindow,
+    last_webrtc_update: Instant,
+    last_alert_check: Instant,
+}
+
+impl ConnectionState {
+    #[allow(dead_code)]
+    fn new(conversation_id: String, tube_id: String) -> Self {
+        Self {
+            metrics: ConnectionMetrics::new(conversation_id, tube_id),
+            atomic_counters: AtomicMetrics::new(),
+            rtt_window: MultiWindow::new(),
+            latency_window: MultiWindow::new(),
+            throughput_window: MultiWindow::new(),
+            error_window: MultiWindow::new(),
+            last_webrtc_update: Instant::now(),
+            last_alert_check: Instant::now(),
+        }
+    }
+}
+
+/// Central metrics collection and management system
+#[derive(Debug)]
+pub struct MetricsCollector {
+    /// Per-connection metrics state
+    connection_states: Arc<RwLock<HashMap<String, ConnectionState>>>,
+    /// Alert manager for performance monitoring
+    alert_manager: Arc<AlertManager>,
+    /// Aggregated system metrics
+    aggregated_metrics: Arc<RwLock<AggregatedMetrics>>,
+    /// Metrics collection start time
+    #[allow(dead_code)] // Used in get_uptime() method
+    start_time: Instant,
+    /// Background task handle
+    background_task_running: Arc<RwLock<bool>>,
+}
+
+impl MetricsCollector {
+    /// Create a new metrics collector
+    pub fn new() -> Self {
+        Self {
+            connection_states: Arc::new(RwLock::new(HashMap::new())),
+            alert_manager: Arc::new(AlertManager::new(AlertConfig::default())),
+            aggregated_metrics: Arc::new(RwLock::new(AggregatedMetrics::default())),
+            start_time: Instant::now(),
+            background_task_running: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Start background tasks for metrics aggregation and cleanup
+    fn start_background_tasks(self: Arc<Self>) {
+        let task_running = self.background_task_running.clone();
+
+        // Check if already running
+        if let Ok(running) = task_running.read() {
+            if *running {
+                return;
+            }
+        }
+
+        // Check if there's a Tokio runtime available before spawning tasks
+        let runtime_handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                // No runtime available, skip background tasks
+                debug!("No Tokio runtime available, skipping background tasks");
+                return;
+            }
+        };
+
+        // Mark as running
+        if let Ok(mut running) = task_running.write() {
+            *running = true;
+        }
+
+        let collector_for_aggregation = self.clone();
+        runtime_handle.spawn(async move {
+            let mut interval = interval(Duration::from_secs(METRICS_AGGREGATION_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                collector_for_aggregation.aggregate_metrics().await;
+            }
+        });
+
+        let collector_for_cleanup = self.clone();
+        runtime_handle.spawn(async move {
+            let mut interval = interval(Duration::from_secs(METRICS_CLEANUP_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                collector_for_cleanup.cleanup_old_data().await;
+            }
+        });
+
+        let collector_for_stats = self.clone();
+        runtime_handle.spawn(async move {
+            let mut interval = interval(Duration::from_secs(WEBRTC_STATS_COLLECTION_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                collector_for_stats.collect_webrtc_stats().await;
+            }
+        });
+
+        info!("Background metrics tasks started");
+    }
+
+    /// Register a new connection for metrics tracking
+    #[allow(dead_code)]
+    pub fn register_connection(&self, conversation_id: String, tube_id: String) {
+        if let Ok(mut states) = self.connection_states.write() {
+            let state = ConnectionState::new(conversation_id.clone(), tube_id.clone());
+            states.insert(conversation_id.clone(), state);
+            info!(
+                "Registered connection for metrics tracking (conversation_id: {}, tube_id: {})",
+                conversation_id, tube_id
+            );
+        }
+    }
+
+    /// Unregister a connection from metrics tracking
+    #[allow(dead_code)]
+    pub fn unregister_connection(&self, conversation_id: &str) {
+        if let Ok(mut states) = self.connection_states.write() {
+            if states.remove(conversation_id).is_some() {
+                // Clear alerts for this connection
+                self.alert_manager
+                    .clear_conversation_alerts(conversation_id);
+                debug!(
+                    "Unregistered connection from metrics tracking (conversation_id: {})",
+                    conversation_id
+                );
+            }
+        }
+    }
+
+    /// Record a message sent
+    pub fn record_message_sent(
+        &self,
+        conversation_id: &str,
+        bytes: u64,
+        latency: Option<Duration>,
+    ) {
+        if let Ok(states) = self.connection_states.read() {
+            if let Some(state) = states.get(conversation_id) {
+                state.atomic_counters.increment_messages_sent();
+                state.atomic_counters.add_bytes_sent(bytes);
+
+                if let Some(latency_ms) = latency.map(|d| d.as_millis() as f64) {
+                    state.latency_window.add(latency_ms);
+                }
+
+                // Track throughput: bytes per second
+                state.throughput_window.add(bytes as f64);
+
+                // Show periodic activity at DEBUG level (every 100th message or large messages)
+                let msg_count = state.atomic_counters.snapshot().0;
+                if msg_count % 100 == 0 || bytes > 1024 {
+                    debug!(
+                        "Message sent activity (conversation_id: {}, bytes: {}, msg_count: {})",
+                        conversation_id, bytes, msg_count
+                    );
+                }
+
+                trace!(
+                    "Recorded message sent (conversation_id: {}, bytes: {})",
+                    conversation_id,
+                    bytes
+                );
+            }
+        }
+    }
+
+    /// Record a message received
+    pub fn record_message_received(
+        &self,
+        conversation_id: &str,
+        bytes: u64,
+        latency: Option<Duration>,
+    ) {
+        if let Ok(states) = self.connection_states.read() {
+            if let Some(state) = states.get(conversation_id) {
+                state.atomic_counters.increment_messages_received();
+                state.atomic_counters.add_bytes_received(bytes);
+
+                if let Some(latency_ms) = latency.map(|d| d.as_millis() as f64) {
+                    state.latency_window.add(latency_ms);
+                }
+
+                // Track throughput: bytes per second
+                state.throughput_window.add(bytes as f64);
+
+                trace!(
+                    "Recorded message received (conversation_id: {}, bytes: {})",
+                    conversation_id,
+                    bytes
+                );
+            }
+        }
+    }
+
+    /// Record an error
+    pub fn record_error(&self, conversation_id: &str, error_type: &str) {
+        if let Ok(states) = self.connection_states.read() {
+            if let Some(state) = states.get(conversation_id) {
+                state.atomic_counters.increment_errors();
+                state.error_window.add(1.0);
+                debug!(
+                    "Recorded error (conversation_id: {}, error_type: {})",
+                    conversation_id, error_type
+                );
+            }
+        }
+    }
+
+    /// Update WebRTC stats for a connection
+    pub fn update_webrtc_stats(
+        &self,
+        conversation_id: &str,
+        webrtc_stats: &std::collections::HashMap<String, StatsReportType>,
+    ) {
+        debug!(
+            "update_webrtc_stats called (conversation_id: {}, stats_count: {})",
+            conversation_id,
+            webrtc_stats.len()
+        );
+        if let Ok(mut states) = self.connection_states.write() {
+            if let Some(state) = states.get_mut(conversation_id) {
+                let now = Instant::now();
+
+                // Throttle WebRTC updates (expensive operation)
+                if now.duration_since(state.last_webrtc_update) < Duration::from_millis(500) {
+                    return;
+                }
+                state.last_webrtc_update = now;
+
+                // Extract relevant metrics from WebRTC stats
+                let mut rtc_stats = RTCStats::default();
+                let sctp_stats = SCTPStats::default();
+
+                // Parse WebRTC stats reports for relevant metrics
+                let stats_count = webrtc_stats.len();
+                trace!(
+                    "Processing WebRTC stats (conversation_id: {}, stats_count: {})",
+                    conversation_id,
+                    stats_count
+                );
+
+                for (_id, report) in webrtc_stats.iter() {
+                    match report {
+                        StatsReportType::InboundRTP(inbound) => {
+                            // Update bytes received for throughput calculation
+                            if inbound.bytes_received > 0 {
+                                rtc_stats.current_bitrate = inbound.bytes_received as f64 * 8.0;
+                                // Convert to bits
+                            }
+                        }
+                        StatsReportType::OutboundRTP(outbound) => {
+                            // Update bytes sent for throughput calculation
+                            if outbound.bytes_sent > 0 && rtc_stats.current_bitrate == 0.0 {
+                                rtc_stats.current_bitrate = outbound.bytes_sent as f64 * 8.0;
+                                // Convert to bits
+                            }
+                        }
+                        StatsReportType::RemoteInboundRTP(remote_inbound) => {
+                            // Use remote inbound stats for packet loss (more accurate)
+                            rtc_stats.packet_loss_rate = remote_inbound.fraction_lost;
+                            if let Some(rtt) = remote_inbound.round_trip_time {
+                                rtc_stats.rtt_ms = Some(rtt * 1000.0); // Convert to milliseconds
+                            }
+                        }
+                        StatsReportType::CandidatePair(pair) => {
+                            if pair.nominated {
+                                rtc_stats.rtt_ms = Some(pair.current_round_trip_time * 1000.0);
+                                // Convert to milliseconds
+                            }
+                        }
+                        StatsReportType::DataChannel(data_channel) => {
+                            // Track data channel message counts and bytes - record directly to avoid deadlock
+                            if data_channel.messages_sent > 0 || data_channel.bytes_sent > 0 {
+                                debug!("Recording data channel sent activity (conversation_id: {}, messages_sent: {}, bytes_sent: {})", conversation_id, data_channel.messages_sent, data_channel.bytes_sent);
+                                state.atomic_counters.increment_messages_sent();
+                                state
+                                    .atomic_counters
+                                    .add_bytes_sent(data_channel.bytes_sent as u64);
+                                state.throughput_window.add(data_channel.bytes_sent as f64);
+                            }
+                            if data_channel.messages_received > 0 || data_channel.bytes_received > 0
+                            {
+                                debug!("Recording data channel received activity (conversation_id: {}, messages_received: {}, bytes_received: {})", conversation_id, data_channel.messages_received, data_channel.bytes_received);
+                                state.atomic_counters.increment_messages_received();
+                                state
+                                    .atomic_counters
+                                    .add_bytes_received(data_channel.bytes_received as u64);
+                                state
+                                    .throughput_window
+                                    .add(data_channel.bytes_received as f64);
+                            }
+                        }
+                        StatsReportType::Transport(transport) => {
+                            // Transport stats for data channel metrics - record directly without recursive calls
+                            if transport.bytes_sent > 0 || transport.bytes_received > 0 {
+                                debug!("Recording transport-level data activity (conversation_id: {}, bytes_sent: {}, bytes_received: {})", conversation_id, transport.bytes_sent, transport.bytes_received);
+
+                                // Record transport-level data transfer directly (avoid recursive lock)
+                                if transport.bytes_sent > 0 {
+                                    state.atomic_counters.increment_messages_sent();
+                                    state
+                                        .atomic_counters
+                                        .add_bytes_sent(transport.bytes_sent as u64);
+                                    state.throughput_window.add(transport.bytes_sent as f64);
+                                }
+                                if transport.bytes_received > 0 {
+                                    state.atomic_counters.increment_messages_received();
+                                    state
+                                        .atomic_counters
+                                        .add_bytes_received(transport.bytes_received as u64);
+                                    state.throughput_window.add(transport.bytes_received as f64);
+                                }
+                            } else {
+                                trace!("Transport stats available but no data transferred yet (conversation_id: {})", conversation_id);
+                            }
+                        }
+                        _ => {
+                            // Log unhandled stat types for debugging (reduced verbosity)
+                            // Most of these are ICE candidates, certificates, etc. that don't contain metrics we need
+                        }
+                    }
+                }
+
+                // Add RTT data to sliding window if available
+                if let Some(rtt_ms) = rtc_stats.rtt_ms {
+                    state.rtt_window.add(rtt_ms);
+                    debug!(
+                        "Added RTT to sliding window (conversation_id: {}, rtt_ms: {})",
+                        conversation_id, rtt_ms
+                    );
+                } else {
+                    trace!(
+                        "No RTT data found in WebRTC stats (conversation_id: {})",
+                        conversation_id
+                    );
+                }
+
+                // Update metrics
+                state.metrics.webrtc_metrics = WebRTCMetrics {
+                    rtc_stats,
+                    sctp_stats,
+                    collected_at: Utc::now(),
+                };
+
+                // Update atomic counters snapshot
+                let (msgs_sent, msgs_received, bytes_sent, bytes_received, errors, retries) =
+                    state.atomic_counters.snapshot();
+
+                state.metrics.messages_sent = msgs_sent;
+                state.metrics.messages_received = msgs_received;
+                state.metrics.total_bytes_sent = bytes_sent;
+                state.metrics.total_bytes_received = bytes_received;
+                state.metrics.total_errors = errors;
+                state.metrics.retry_count = retries;
+
+                // Update sliding window averages
+                state.metrics.avg_rtt =
+                    Duration::from_millis(state.rtt_window.one_second.average() as u64);
+                state.metrics.p95_latency =
+                    Duration::from_millis(state.latency_window.one_second.p95() as u64);
+                state.metrics.p99_latency =
+                    Duration::from_millis(state.latency_window.one_second.p99() as u64);
+
+                // Update throughput metrics from sliding window
+                state.metrics.avg_throughput = state.throughput_window.one_second.average();
+                // Peak throughput is the maximum value in the 1-second window
+                state.metrics.peak_throughput = state.throughput_window.one_second.max();
+
+                // Calculate error rate
+                state.metrics.error_rate = state.error_window.one_second.rate();
+
+                // Update connection quality
+                state.metrics.update_quality();
+
+                // Check for alerts periodically
+                if now.duration_since(state.last_alert_check) > Duration::from_secs(30) {
+                    self.alert_manager.check_metrics(&state.metrics);
+                    state.last_alert_check = now;
+                }
+
+                trace!(
+                    "Updated WebRTC stats (conversation_id: {})",
+                    conversation_id
+                );
+            }
+        }
+    }
+
+    /// Get live stats for a specific connection
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn get_live_stats(&self, conversation_id: &str) -> Option<ConnectionMetrics> {
+        if let Ok(states) = self.connection_states.read() {
+            states
+                .get(conversation_id)
+                .map(|state| state.metrics.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get connection health summary
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn get_connection_health(&self, tube_id: &str) -> Option<ConnectionMetrics> {
+        if let Ok(states) = self.connection_states.read() {
+            states
+                .values()
+                .find(|state| state.metrics.tube_id == tube_id)
+                .map(|state| state.metrics.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Export current metrics as JSON
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn export_metrics_json(&self) -> Result<String, serde_json::Error> {
+        let snapshot = self.create_snapshot();
+        serde_json::to_string_pretty(&snapshot)
+    }
+
+    /// Create a metrics snapshot
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn create_snapshot(&self) -> MetricsSnapshot {
+        let mut snapshot = MetricsSnapshot::new();
+
+        // Collect per-connection metrics
+        if let Ok(states) = self.connection_states.read() {
+            for (conversation_id, state) in states.iter() {
+                snapshot
+                    .connections
+                    .insert(conversation_id.clone(), state.metrics.clone());
+            }
+        }
+
+        // Get aggregated metrics
+        if let Ok(aggregated) = self.aggregated_metrics.read() {
+            snapshot.aggregated = aggregated.clone();
+        }
+
+        // Get active alerts
+        snapshot.alerts = self.alert_manager.get_active_alerts();
+
+        snapshot
+    }
+
+    /// Get aggregated system metrics
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn get_aggregated_metrics(&self) -> AggregatedMetrics {
+        if let Ok(metrics) = self.aggregated_metrics.read() {
+            metrics.clone()
+        } else {
+            AggregatedMetrics::default()
+        }
+    }
+
+    /// Background task: Aggregate metrics from all connections
+    async fn aggregate_metrics(&self) {
+        let mut aggregated = AggregatedMetrics::default();
+
+        if let Ok(states) = self.connection_states.read() {
+            aggregated.active_connections = states.len() as u32;
+
+            let mut tube_ids = std::collections::HashSet::new();
+            let mut total_rtt_ms = 0.0;
+            let mut total_packet_loss = 0.0;
+            let mut total_p95_latency_ms = 0.0;
+            let mut total_p99_latency_ms = 0.0;
+            let mut total_throughput = 0.0;
+            let mut total_bandwidth = 0.0;
+            let mut rtt_count = 0;
+            let mut latency_count = 0;
+
+            for state in states.values() {
+                tube_ids.insert(state.metrics.tube_id.clone());
+
+                // RTT aggregation from sliding window average
+                let avg_rtt_ms = state.metrics.avg_rtt.as_millis() as f64;
+                if avg_rtt_ms > 0.0 {
+                    total_rtt_ms += avg_rtt_ms;
+                    rtt_count += 1;
+                }
+
+                // Latency aggregation
+                let p95_latency_ms = state.metrics.p95_latency.as_millis() as f64;
+                let p99_latency_ms = state.metrics.p99_latency.as_millis() as f64;
+                if p95_latency_ms > 0.0 || p99_latency_ms > 0.0 {
+                    total_p95_latency_ms += p95_latency_ms;
+                    total_p99_latency_ms += p99_latency_ms;
+                    latency_count += 1;
+                }
+
+                // Packet loss aggregation
+                total_packet_loss += state.metrics.webrtc_metrics.rtc_stats.packet_loss_rate;
+
+                // Throughput aggregation
+                total_throughput += state.metrics.message_throughput();
+                total_bandwidth += state.metrics.bandwidth_utilization();
+
+                // Quality distribution
+                match state.metrics.connection_quality {
+                    crate::metrics::ConnectionQuality::Excellent => {
+                        aggregated.excellent_connections += 1
+                    }
+                    crate::metrics::ConnectionQuality::Good => aggregated.good_connections += 1,
+                    crate::metrics::ConnectionQuality::Fair => aggregated.fair_connections += 1,
+                    crate::metrics::ConnectionQuality::Poor => aggregated.poor_connections += 1,
+                }
+            }
+
+            aggregated.active_tubes = tube_ids.len() as u32;
+
+            if rtt_count > 0 {
+                aggregated.avg_system_rtt =
+                    Duration::from_millis((total_rtt_ms / rtt_count as f64) as u64);
+            }
+
+            if latency_count > 0 {
+                aggregated.avg_p95_latency =
+                    Duration::from_millis((total_p95_latency_ms / latency_count as f64) as u64);
+                aggregated.avg_p99_latency =
+                    Duration::from_millis((total_p99_latency_ms / latency_count as f64) as u64);
+            }
+
+            if aggregated.active_connections > 0 {
+                aggregated.avg_packet_loss =
+                    total_packet_loss / aggregated.active_connections as f64;
+            }
+
+            aggregated.total_message_throughput = total_throughput;
+            aggregated.total_bandwidth = total_bandwidth;
+        }
+
+        // Get alert statistics
+        let (total_alerts, critical_alerts, warning_alerts) = self.alert_manager.get_alert_stats();
+        aggregated.total_alerts = total_alerts;
+        aggregated.critical_alerts = critical_alerts;
+        aggregated.warning_alerts = warning_alerts;
+
+        // Update aggregated metrics
+        if let Ok(mut metrics) = self.aggregated_metrics.write() {
+            *metrics = aggregated.clone();
+        }
+
+        // Heartbeat logging at TRACE level to show periodic stats
+        // Format explanation:
+        // - Connections: Active WebRTC connections being tracked
+        // - Tubes: Active communication channels (tubes)
+        // - Avg RTT: Average Round-Trip Time for network requests
+        // - Packet Loss: Percentage of lost packets (lower is better)
+        // - P95 Latency: 95th percentile message processing time
+        // - Throughput: Total data transfer rate in KB/s
+        // - Quality: Connection quality distribution (Excellent/Good/Fair/Poor)
+        // - Alerts: Number of active performance alerts
+        trace!(
+            "Metrics Heartbeat - Connections: {}, Tubes: {}, Avg RTT: {:.1}ms, Packet Loss: {:.2}%, P95 Latency: {:.1}ms, Throughput: {:.1}KB/s, Quality: {}/{}/{}/{}, Alerts: {}",
+            aggregated.active_connections,
+            aggregated.active_tubes,
+            aggregated.avg_system_rtt.as_millis() as f64,
+            aggregated.avg_packet_loss * 100.0,
+            aggregated.avg_p95_latency.as_millis() as f64,
+            aggregated.total_bandwidth / 1024.0, // Convert to KB/s
+            aggregated.excellent_connections,
+            aggregated.good_connections,
+            aggregated.fair_connections,
+            aggregated.poor_connections,
+            aggregated.total_alerts
+        );
+
+        trace!("Aggregated metrics updated");
+    }
+
+    /// Background task: Collect WebRTC stats from all registered connections
+    async fn collect_webrtc_stats(&self) {
+        let mut stats_collected = 0;
+
+        // Collect connection info without holding the lock across await points
+        let connections: Vec<(String, String)> = {
+            if let Ok(states) = self.connection_states.read() {
+                states
+                    .iter()
+                    .map(|(conversation_id, state)| {
+                        (conversation_id.clone(), state.metrics.tube_id.clone())
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Now process each connection without holding any locks
+        for (conversation_id, tube_id) in connections {
+            // Try to get the tube from the registry and collect stats
+            let registry = crate::tube_registry::REGISTRY.read().await;
+            if let Some(tube) = registry.get_by_tube_id(&tube_id) {
+                match tube.get_connection_stats().await {
+                    Ok(_) => {
+                        stats_collected += 1;
+                        debug!(
+                            "Collected WebRTC stats (conversation_id: {}, tube_id: {})",
+                            conversation_id, tube_id
+                        );
+                    }
+                    Err(e) => {
+                        trace!("Failed to collect WebRTC stats (conversation_id: {}, tube_id: {}, error: {})", conversation_id, tube_id, e);
+                    }
+                }
+            } else {
+                trace!(
+                    "Tube not found in registry (conversation_id: {}, tube_id: {})",
+                    conversation_id,
+                    tube_id
+                );
+            }
+        }
+
+        if stats_collected > 0 {
+            debug!(
+                "WebRTC stats collection completed (stats_collected: {})",
+                stats_collected
+            );
+        }
+    }
+
+    /// Background task: Clean up old metrics data
+    async fn cleanup_old_data(&self) {
+        // Clean up old alerts
+        self.alert_manager.cleanup_old_alerts();
+
+        debug!("Metrics cleanup completed");
+    }
+
+    /// Get system uptime
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn get_uptime(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Get number of active connections being tracked
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn active_connection_count(&self) -> usize {
+        if let Ok(states) = self.connection_states.read() {
+            states.len()
+        } else {
+            0
+        }
+    }
+
+    /// Clear all connections from metrics tracking (for testing purposes)
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn clear_all_connections(&self) {
+        if let Ok(mut states) = self.connection_states.write() {
+            let count = states.len();
+            states.clear();
+            debug!("Cleared all {} connections from metrics tracking", count);
+        }
+
+        // Also clear aggregated metrics
+        if let Ok(mut aggregated) = self.aggregated_metrics.write() {
+            *aggregated = AggregatedMetrics::default();
+            debug!("Cleared aggregated metrics");
+        }
+    }
+}

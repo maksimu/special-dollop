@@ -4,10 +4,10 @@ use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn};
 
 // Constants for SOCKS5 protocol
 pub(crate) const SOCKS5_VERSION: u8 = 0x05;
@@ -247,7 +247,21 @@ pub(crate) async fn handle_socks5_connection(
                         &buffer_pool_clone,
                     );
                     let encoded = eof_frame.encode_with_pool(&buffer_pool_clone);
-                    let _ = dc.send(encoded).await;
+                    let send_start = std::time::Instant::now();
+                    match dc.send(encoded.clone()).await {
+                        Ok(_) => {
+                            let send_latency = send_start.elapsed();
+                            crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                                &endpoint_name,
+                                encoded.len() as u64,
+                                Some(send_latency),
+                            );
+                        }
+                        Err(_) => {
+                            crate::metrics::METRICS_COLLECTOR
+                                .record_error(&endpoint_name, "socks5_eof_send_failed");
+                        }
+                    }
 
                     // Then close the connection
                     let mut close_buffer = buffer_pool_clone.acquire();
@@ -262,7 +276,21 @@ pub(crate) async fn handle_socks5_connection(
                     );
 
                     let encoded = close_frame.encode_with_pool(&buffer_pool_clone);
-                    let _ = dc.send(encoded).await;
+                    let send_start = std::time::Instant::now();
+                    match dc.send(encoded.clone()).await {
+                        Ok(_) => {
+                            let send_latency = send_start.elapsed();
+                            crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                                &endpoint_name,
+                                encoded.len() as u64,
+                                Some(send_latency),
+                            );
+                        }
+                        Err(_) => {
+                            crate::metrics::METRICS_COLLECTOR
+                                .record_error(&endpoint_name, "socks5_close_send_failed");
+                        }
+                    }
 
                     break;
                 }
@@ -281,12 +309,29 @@ pub(crate) async fn handle_socks5_connection(
                     let bytes_written = frame.encode_into(&mut encode_buffer);
                     let encoded = encode_buffer.split_to(bytes_written).freeze();
 
-                    if let Err(e) = dc.send(encoded).await {
-                        error!(
-                            "Channel({}): Failed to send data to tunnel: {}",
-                            endpoint_name, e
-                        );
-                        break;
+                    let send_start = std::time::Instant::now();
+                    match dc.send(encoded.clone()).await {
+                        Ok(_) => {
+                            let send_latency = send_start.elapsed();
+
+                            // Record metrics for message sent (using channel_id as conversation_id)
+                            crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                                &endpoint_name,
+                                encoded.len() as u64,
+                                Some(send_latency),
+                            );
+                        }
+                        Err(e) => {
+                            // Record error metrics
+                            crate::metrics::METRICS_COLLECTOR
+                                .record_error(&endpoint_name, "socks5_send_failed");
+
+                            error!(
+                                "Channel({}): Failed to send data to tunnel: {}",
+                                endpoint_name, e
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -525,6 +570,7 @@ pub(crate) async fn handle_socks5_udp_associate(
     });
 
     // Monitor TCP connection for close
+    let channel_id_for_tcp_task = channel_id.clone();
     let mut tcp_monitor_task = tokio::spawn(async move {
         let mut buf = [0u8; 1];
         loop {
@@ -532,7 +578,7 @@ pub(crate) async fn handle_socks5_udp_associate(
                 Ok(0) | Err(_) => {
                     debug!(
                         "Channel({}): TCP connection closed, terminating UDP association",
-                        channel_id
+                        channel_id_for_tcp_task
                     );
                     break;
                 }
@@ -560,7 +606,21 @@ pub(crate) async fn handle_socks5_udp_associate(
         &buffer_pool,
     );
     let encoded = close_frame.encode_with_pool(&buffer_pool);
-    let _ = webrtc.send(encoded).await;
+    let send_start = std::time::Instant::now();
+    match webrtc.send(encoded.clone()).await {
+        Ok(_) => {
+            let send_latency = send_start.elapsed();
+            crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                &channel_id,
+                encoded.len() as u64,
+                Some(send_latency),
+            );
+        }
+        Err(_) => {
+            crate::metrics::METRICS_COLLECTOR
+                .record_error(&channel_id, "udp_associate_close_send_failed");
+        }
+    }
 
     Ok(())
 }

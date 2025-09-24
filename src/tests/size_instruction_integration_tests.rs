@@ -4,10 +4,10 @@
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::channel::guacd_parser::{GuacdParser, OpcodeAction, SpecialOpcode};
 use bytes::BytesMut;
+use log::{debug, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
 
 // Mock message structure for testing the size instruction processing
 #[derive(Clone)]
@@ -21,10 +21,11 @@ async fn mock_process_size_instruction(
     channel_id: &str,
     instruction_buffer: &BytesMut,
 ) -> anyhow::Result<(String, i32, String)> {
-    debug!(target: "size_instruction_test", 
-           channel_id = %channel_id, 
-           buffer_len = instruction_buffer.len(),
-           "Processing size instruction in test");
+    debug!(
+        "Processing size instruction in test (channel_id: {}, buffer_len: {})",
+        channel_id,
+        instruction_buffer.len()
+    );
 
     // Parse the instruction from the buffer to extract layer and raw instruction
     if let Ok(peeked) = GuacdParser::peek_instruction(instruction_buffer) {
@@ -36,20 +37,17 @@ async fn mock_process_size_instruction(
                 .unwrap_or("")
                 .to_string();
 
-            info!(target: "size_instruction_test",
-                  channel_id = %channel_id,
-                  layer = layer,
-                  width = %width,
-                  height = %height,
-                  "Successfully processed size instruction");
+            info!(   "Successfully processed size instruction (channel_id: {}, layer: {}, width: {}, height: {})",
+                  channel_id, layer, width, height);
 
             return Ok((channel_id.to_string(), layer, raw_instruction));
         }
     }
 
-    warn!(target: "size_instruction_test", 
-          channel_id = %channel_id,
-          "Failed to parse as valid size instruction");
+    warn!(
+        "Failed to parse as valid size instruction (channel_id: {})",
+        channel_id
+    );
     Err(anyhow::anyhow!("Not a valid size instruction"))
 }
 
@@ -69,14 +67,15 @@ async fn test_expandable_size_instruction_detection() {
         b"4.copy,2.-1,1.0,1.0,3.100,3.100,1.0,1.0,2.50,2.50;" as &[u8],
     ];
 
-    info!(target: "size_instruction_test", "Testing expandable size instruction detection");
+    info!("Testing expandable size instruction detection");
 
     // Test size instruction detection using new expandable system
     for (i, instruction) in size_instructions.iter().enumerate() {
-        debug!(target: "size_instruction_test", 
-               instruction_num = i,
-               instruction = %std::str::from_utf8(instruction).unwrap_or("invalid_utf8"),
-               "Testing size instruction detection");
+        debug!(
+            "Testing size instruction detection (instruction_num: {}, instruction: {})",
+            i,
+            std::str::from_utf8(instruction).unwrap_or("invalid_utf8")
+        );
 
         match GuacdParser::validate_and_detect_special(instruction) {
             Ok((instruction_len, action)) => {
@@ -88,10 +87,10 @@ async fn test_expandable_size_instruction_detection() {
                     i
                 );
 
-                info!(target: "size_instruction_test",
-                      instruction_num = i,
-                      action = ?action,
-                      "Size instruction correctly detected");
+                info!(
+                    "Size instruction correctly detected (instruction_num: {}, action: {:?})",
+                    i, action
+                );
             }
             Err(e) => panic!("Size instruction {} detection failed: {:?}", i, e),
         }
@@ -99,10 +98,11 @@ async fn test_expandable_size_instruction_detection() {
 
     // Test non-size instruction detection
     for (i, instruction) in non_size_instructions.iter().enumerate() {
-        debug!(target: "size_instruction_test", 
-               instruction_num = i,
-               instruction = %std::str::from_utf8(instruction).unwrap_or("invalid_utf8"),
-               "Testing non-size instruction");
+        debug!(
+            "Testing non-size instruction (instruction_num: {}, instruction: {})",
+            i,
+            std::str::from_utf8(instruction).unwrap_or("invalid_utf8")
+        );
 
         match GuacdParser::validate_and_detect_special(instruction) {
             Ok((instruction_len, action)) => {
@@ -114,10 +114,10 @@ async fn test_expandable_size_instruction_detection() {
                     i
                 );
 
-                info!(target: "size_instruction_test",
-                      instruction_num = i,
-                      action = ?action,
-                      "Non-size instruction correctly classified");
+                info!(
+                    "Non-size instruction correctly classified (instruction_num: {}, action: {:?})",
+                    i, action
+                );
             }
             Err(e) => panic!("Non-size instruction {} validation failed: {:?}", i, e),
         }
@@ -128,7 +128,7 @@ async fn test_expandable_size_instruction_detection() {
 async fn test_size_instruction_background_processing_pipeline() {
     // Test the complete pipeline from detection to background processing
 
-    info!(target: "size_instruction_test", "Starting background processing pipeline test");
+    info!("Starting background processing pipeline test");
 
     let config = BufferPoolConfig::default();
     let buffer_pool = BufferPool::new(config);
@@ -137,19 +137,18 @@ async fn test_size_instruction_background_processing_pipeline() {
     // Create a bounded channel for size instruction processing
     let (size_tx, mut size_rx) = mpsc::channel::<MockSizeInstructionMessage>(10);
 
-    debug!(target: "size_instruction_test", 
-           channel_id = %channel_id,
-           channel_capacity = 10,
-           "Created bounded channel for size instruction processing");
+    debug!( "Created bounded channel for size instruction processing (channel_id: {}, channel_capacity: {})",
+           channel_id, 10);
 
     // Spawn background processor task
     let channel_id_clone = channel_id.to_string();
     let processor_handle = tokio::spawn(async move {
         let mut processed_instructions = Vec::new();
 
-        info!(target: "size_instruction_test", 
-              channel_id = %channel_id_clone,
-              "Background processor started");
+        info!(
+            "Background processor started (channel_id: {})",
+            channel_id_clone
+        );
 
         while let Some(size_msg) = size_rx.recv().await {
             let MockSizeInstructionMessage {
@@ -157,10 +156,8 @@ async fn test_size_instruction_background_processing_pipeline() {
                 buffer_pool,
             } = size_msg;
 
-            debug!(target: "size_instruction_test",
-                   channel_id = %channel_id_clone,
-                   buffer_len = buffer.len(),
-                   "Received size instruction in background processor");
+            debug!(    "Received size instruction in background processor (channel_id: {}, buffer_len: {})",
+                   channel_id_clone, buffer.len());
 
             // Process the size instruction
             match mock_process_size_instruction(&channel_id_clone, &buffer).await {
@@ -168,10 +165,10 @@ async fn test_size_instruction_background_processing_pipeline() {
                     processed_instructions.push((channel_id, layer, raw_instruction));
                 }
                 Err(e) => {
-                    warn!(target: "size_instruction_test",
-                          channel_id = %channel_id_clone,
-                          error = %e,
-                          "Failed to process size instruction");
+                    warn!(
+                        "Failed to process size instruction (channel_id: {}, error: {})",
+                        channel_id_clone, e
+                    );
                 }
             }
 
@@ -179,10 +176,11 @@ async fn test_size_instruction_background_processing_pipeline() {
             buffer_pool.release(buffer);
         }
 
-        info!(target: "size_instruction_test",
-              channel_id = %channel_id_clone,
-              processed_count = processed_instructions.len(),
-              "Background processor completed");
+        info!(
+            "Background processor completed (channel_id: {}, processed_count: {})",
+            channel_id_clone,
+            processed_instructions.len()
+        );
 
         processed_instructions
     });
@@ -195,10 +193,11 @@ async fn test_size_instruction_background_processing_pipeline() {
     ];
 
     for (instruction_bytes, expected_layer) in test_size_instructions.iter() {
-        debug!(target: "size_instruction_test",
-               instruction = %std::str::from_utf8(instruction_bytes).unwrap_or("invalid_utf8"),
-               expected_layer = expected_layer,
-               "Processing test size instruction in hot path");
+        debug!(
+            "Processing test size instruction in hot path (instruction: {}, expected_layer: {})",
+            std::str::from_utf8(instruction_bytes).unwrap_or("invalid_utf8"),
+            expected_layer
+        );
 
         // Simulate hot path: detect size instruction using new expandable system
         match GuacdParser::validate_and_detect_special(instruction_bytes) {
@@ -209,19 +208,20 @@ async fn test_size_instruction_background_processing_pipeline() {
                     "Should detect as size instruction action"
                 );
 
-                info!(target: "size_instruction_test",
-                      instruction_len = instruction_len,
-                      action = ?action,
-                      "Hot path detected size instruction");
+                info!(
+                    "Hot path detected size instruction (instruction_len: {}, action: {:?})",
+                    instruction_len, action
+                );
 
                 // Simulate buffer pool acquisition and copying (hot path)
                 let mut size_buffer = buffer_pool.acquire();
                 size_buffer.clear();
                 size_buffer.extend_from_slice(&instruction_bytes[..instruction_len]);
 
-                debug!(target: "size_instruction_test",
-                       buffer_len = size_buffer.len(),
-                       "Acquired buffer and copied instruction data");
+                debug!(
+                    "Acquired buffer and copied instruction data (buffer_len: {})",
+                    size_buffer.len()
+                );
 
                 // Send to background processor
                 let size_msg = MockSizeInstructionMessage {
@@ -234,7 +234,7 @@ async fn test_size_instruction_background_processing_pipeline() {
                     .await
                     .expect("Failed to send size instruction to background processor");
 
-                debug!(target: "size_instruction_test", "Sent instruction to background processor");
+                debug!("Sent instruction to background processor");
             }
             Err(e) => panic!("Size instruction detection failed: {:?}", e),
         }
@@ -242,7 +242,7 @@ async fn test_size_instruction_background_processing_pipeline() {
 
     // Close the sender to signal completion
     drop(size_tx);
-    info!(target: "size_instruction_test", "Closed sender, waiting for background processing to complete");
+    info!("Closed sender, waiting for background processing to complete");
 
     // Wait for background processing to complete
     let processed_instructions = timeout(Duration::from_secs(5), processor_handle)
@@ -281,21 +281,20 @@ async fn test_size_instruction_background_processing_pipeline() {
             i
         );
 
-        info!(target: "size_instruction_test",
-              instruction_num = i,
-              channel_id = %processed_channel_id,
-              layer = layer,
-              "Verified processed instruction");
+        info!(
+            "Verified processed instruction (instruction_num: {}, channel_id: {}, layer: {})",
+            i, processed_channel_id, layer
+        );
     }
 
-    info!(target: "size_instruction_test", "Background processing pipeline test completed successfully");
+    info!("Background processing pipeline test completed successfully");
 }
 
 #[tokio::test]
 async fn test_size_instruction_channel_backpressure() {
     // Test that the size instruction channel handles backpressure correctly
 
-    info!(target: "size_instruction_test", "Testing channel backpressure handling");
+    info!("Testing channel backpressure handling");
 
     let config = BufferPoolConfig::default();
     let buffer_pool = BufferPool::new(config);
@@ -303,9 +302,10 @@ async fn test_size_instruction_channel_backpressure() {
     // Create a very small channel to test backpressure
     let (size_tx, mut size_rx) = mpsc::channel::<MockSizeInstructionMessage>(1);
 
-    debug!(target: "size_instruction_test", 
-           channel_capacity = 1,
-           "Created small capacity channel for backpressure testing");
+    debug!(
+        "Created small capacity channel for backpressure testing (channel_capacity: {})",
+        1
+    );
 
     let size_instruction = b"4.size,1.0,4.1920,4.1080;";
 
@@ -324,7 +324,7 @@ async fn test_size_instruction_channel_backpressure() {
         .send(first_msg)
         .await
         .expect("First send should succeed");
-    info!(target: "size_instruction_test", "First message sent successfully");
+    info!("First message sent successfully");
 
     // Try to send another (should succeed with try_send or timeout with send)
     let mut second_buffer = buffer_pool.acquire();
@@ -343,16 +343,16 @@ async fn test_size_instruction_channel_backpressure() {
         "try_send should fail when channel is full"
     );
 
-    warn!(target: "size_instruction_test", "try_send correctly failed due to channel backpressure");
+    warn!("try_send correctly failed due to channel backpressure");
 
     // The buffer should be automatically released when the message is dropped
     // (This is tested implicitly - if there's a leak, other tests will show it)
 
     // Drain the channel to clean up
     let _first_received = size_rx.recv().await.expect("Should receive first message");
-    debug!(target: "size_instruction_test", "Drained channel for cleanup");
+    debug!("Drained channel for cleanup");
 
-    info!(target: "size_instruction_test", "Channel backpressure test completed successfully");
+    info!("Channel backpressure test completed successfully");
 }
 
 #[tokio::test]
@@ -360,7 +360,7 @@ async fn test_expandable_system_performance() {
     // Test that the new expandable system maintains performance characteristics
     use std::time::Instant;
 
-    info!(target: "size_instruction_test", "Testing expandable system performance");
+    info!("Testing expandable system performance");
 
     let size_instruction = b"4.size,1.0,4.1920,4.1080;";
     let normal_instruction = b"4.sync,4.1000;";
@@ -368,9 +368,10 @@ async fn test_expandable_system_performance() {
 
     let iterations = 10000; // Higher iteration count for performance testing
 
-    debug!(target: "size_instruction_test", 
-           iterations = iterations,
-           "Starting performance test with expandable opcode system");
+    debug!(
+        "Starting performance test with expandable opcode system (iterations: {})",
+        iterations
+    );
 
     let start = Instant::now();
     for i in 0..iterations {
@@ -405,20 +406,16 @@ async fn test_expandable_system_performance() {
 
     let per_instruction = duration / (iterations * 3);
 
-    info!(target: "size_instruction_test",
-          iterations = iterations * 3,
-          total_duration_micros = duration.as_micros(),
-          per_instruction_nanos = per_instruction.as_nanos(),
-          "Expandable validation performance results");
+    info!("Expandable validation performance results (iterations: {}, total_duration_micros: {}, per_instruction_nanos: {})",
+          iterations * 3, duration.as_micros(), per_instruction.as_nanos());
 
     // Performance should be sub-microsecond per instruction
     // This is a soft requirement - the test passes regardless, but prints timing info
     if per_instruction > Duration::from_micros(10) {
-        warn!(target: "size_instruction_test", 
-              per_instruction_micros = per_instruction.as_micros(),
-              "WARNING: Expandable opcode detection may be slower than expected");
+        warn!("WARNING: Expandable opcode detection may be slower than expected (per_instruction_micros: {})",
+              per_instruction.as_micros());
     } else {
-        info!(target: "size_instruction_test", "Performance within expected bounds");
+        info!("Performance within expected bounds");
     }
 }
 
@@ -426,7 +423,7 @@ async fn test_expandable_system_performance() {
 async fn test_realistic_guacamole_scenarios_with_expandable_system() {
     // Test with realistic Guacamole protocol scenarios using the new expandable system
 
-    info!(target: "size_instruction_test", "Testing realistic Guacamole scenarios with expandable system");
+    info!("Testing realistic Guacamole scenarios with expandable system");
 
     // Realistic size instructions that would come from an actual Guacamole session
     let realistic_scenarios = vec![
@@ -459,10 +456,11 @@ async fn test_realistic_guacamole_scenarios_with_expandable_system() {
     ];
 
     for (instruction_bytes, description) in realistic_scenarios {
-        debug!(target: "size_instruction_test",
-               scenario = %description,
-               instruction = %std::str::from_utf8(instruction_bytes).unwrap_or("invalid_utf8"),
-               "Testing realistic scenario");
+        debug!(
+            "Testing realistic scenario (scenario: {}, instruction: {})",
+            description,
+            std::str::from_utf8(instruction_bytes).unwrap_or("invalid_utf8")
+        );
 
         match GuacdParser::validate_and_detect_special(instruction_bytes) {
             Ok((instruction_len, action)) => {
@@ -523,12 +521,8 @@ async fn test_realistic_guacamole_scenarios_with_expandable_system() {
                         description
                     );
 
-                    info!(target: "size_instruction_test",
-                          scenario = %description,
-                          layer = layer.unwrap(),
-                          width = width,
-                          height = height,
-                          "Realistic scenario validated successfully");
+                    info!(    "Realistic scenario validated successfully (scenario: {}, layer: {}, width: {}, height: {})",
+                          description, layer.unwrap(), width, height);
                 } else {
                     panic!("Failed to peek instruction for: {}", description);
                 }
@@ -537,14 +531,14 @@ async fn test_realistic_guacamole_scenarios_with_expandable_system() {
         }
     }
 
-    info!(target: "size_instruction_test", "All realistic Guacamole scenarios passed with expandable system");
+    info!("All realistic Guacamole scenarios passed with expandable system");
 }
 
 #[tokio::test]
 async fn test_expandable_system_extensibility_demonstration() {
     // Demonstrate how easy it is to extend the system for new opcodes
 
-    info!(target: "size_instruction_test", "Demonstrating expandable system extensibility");
+    info!("Demonstrating expandable system extensibility");
 
     // Current opcodes we support
     let test_cases = vec![
@@ -571,10 +565,11 @@ async fn test_expandable_system_extensibility_demonstration() {
     ];
 
     for (instruction, expected_action, description) in test_cases {
-        debug!(target: "size_instruction_test",
-               test_case = %description,
-               instruction = %std::str::from_utf8(instruction).unwrap_or("invalid_utf8"),
-               "Testing opcode classification");
+        debug!(
+            "Testing opcode classification (test_case: {}, instruction: {})",
+            description,
+            std::str::from_utf8(instruction).unwrap_or("invalid_utf8")
+        );
 
         match GuacdParser::validate_and_detect_special(instruction) {
             Ok((_, action)) => {
@@ -583,17 +578,16 @@ async fn test_expandable_system_extensibility_demonstration() {
                     "Action mismatch for: {}",
                     description
                 );
-                info!(target: "size_instruction_test",
-                      test_case = %description,
-                      action = ?action,
-                      "Opcode correctly classified");
+                info!(
+                    "Opcode correctly classified (test_case: {}, action: {:?})",
+                    description, action
+                );
             }
             Err(e) => panic!("Failed to validate {}: {:?}", description, e),
         }
     }
 
-    info!(target: "size_instruction_test", 
-          "Extensibility demonstration completed - system correctly classifies all opcode types");
+    info!("Extensibility demonstration completed - system correctly classifies all opcode types");
 
     // Future opcodes can be added by:
     // 1. Adding to SpecialOpcode enum

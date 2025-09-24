@@ -153,10 +153,22 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
     def test_cleanup_all_includes_runtime_shutdown(self):
         """Test that cleanup_all() includes runtime shutdown"""
         logging.info("Testing that cleanup_all() includes runtime shutdown")
-        
+
         # Create a registry
         registry = self.create_tracked_registry()
-        
+
+        # Clean up any leftover tubes from previous tests first
+        initial_count = registry.active_tube_count()
+        if initial_count > 0:
+            logging.warning(f"Found {initial_count} leftover tubes from previous tests, cleaning up first")
+            registry.cleanup_all()
+            # Brief wait for cleanup to complete
+            time.sleep(0.1)
+
+        # Verify clean state
+        clean_count = registry.active_tube_count()
+        logging.info(f"Clean state: {clean_count} tubes active")
+
         # Create a tube
         settings = {"conversationType": "tunnel"}
         tube_info = registry.create_tube(
@@ -168,16 +180,26 @@ class TestRuntimeShutdown(BaseWebRTCTest, unittest.TestCase):
             client_version="ms16.5.0",
             ksm_config="TEST_MODE_KSM_CONFIG"
         )
-        
-        # Verify tube was created
-        self.assertEqual(registry.active_tube_count(), 1)
-        
+
+        # Verify tube was created (should be clean_count + 1)
+        expected_count = clean_count + 1
+        actual_count = registry.active_tube_count()
+        logging.info(f"After creating tube: expected {expected_count}, actual {actual_count}")
+        self.assertEqual(actual_count, expected_count,
+                        f"Expected {expected_count} tubes after creation, got {actual_count}")
+
         # cleanup_all() should now include runtime shutdown
         registry.cleanup_all()
-        
+
+        # Brief wait for cleanup to complete
+        time.sleep(0.1)
+
         # Verify cleanup
-        self.assertEqual(registry.active_tube_count(), 0)
-        
+        final_count = registry.active_tube_count()
+        logging.info(f"After cleanup: {final_count} tubes remain")
+        self.assertEqual(final_count, 0,
+                        f"Expected 0 tubes after cleanup, got {final_count}")
+
         logging.info("cleanup_all() with runtime shutdown completed")
 
     def test_thread_cleanup_after_shutdown(self):

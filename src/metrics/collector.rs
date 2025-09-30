@@ -6,8 +6,9 @@ use super::types::{
     AggregatedMetrics, AtomicMetrics, ConnectionMetrics, MetricsSnapshot, RTCStats, SCTPStats,
     WebRTCMetrics,
 };
+use crate::unlikely;
 use chrono::Utc;
-use log::{debug, info, trace};
+use log::debug;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -138,7 +139,7 @@ impl MetricsCollector {
             }
         });
 
-        info!("Background metrics tasks started");
+        debug!("Background metrics tasks started");
     }
 
     /// Register a new connection for metrics tracking
@@ -147,7 +148,7 @@ impl MetricsCollector {
         if let Ok(mut states) = self.connection_states.write() {
             let state = ConnectionState::new(conversation_id.clone(), tube_id.clone());
             states.insert(conversation_id.clone(), state);
-            info!(
+            debug!(
                 "Registered connection for metrics tracking (conversation_id: {}, tube_id: {})",
                 conversation_id, tube_id
             );
@@ -198,11 +199,12 @@ impl MetricsCollector {
                     );
                 }
 
-                trace!(
-                    "Recorded message sent (conversation_id: {}, bytes: {})",
-                    conversation_id,
-                    bytes
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Recorded message sent (conversation_id: {}, bytes: {})",
+                        conversation_id, bytes
+                    );
+                }
             }
         }
     }
@@ -226,11 +228,12 @@ impl MetricsCollector {
                 // Track throughput: bytes per second
                 state.throughput_window.add(bytes as f64);
 
-                trace!(
-                    "Recorded message received (conversation_id: {}, bytes: {})",
-                    conversation_id,
-                    bytes
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Recorded message received (conversation_id: {}, bytes: {})",
+                        conversation_id, bytes
+                    );
+                }
             }
         }
     }
@@ -244,6 +247,149 @@ impl MetricsCollector {
                 debug!(
                     "Recorded error (conversation_id: {}, error_type: {})",
                     conversation_id, error_type
+                );
+            }
+        }
+    }
+
+    /// Update ICE gathering start time
+    pub fn update_ice_gathering_start(&self, conversation_id: &str, timestamp_ms: f64) {
+        if let Ok(mut states) = self.connection_states.write() {
+            if let Some(state) = states.get_mut(conversation_id) {
+                // Mark first candidate time if not already set
+                if state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .first_candidate_time_ms
+                    .is_none()
+                {
+                    state
+                        .metrics
+                        .webrtc_metrics
+                        .rtc_stats
+                        .ice_stats
+                        .first_candidate_time_ms = Some(timestamp_ms);
+                }
+                debug!(
+                    "ICE gathering started (conversation_id: {}, timestamp: {})",
+                    conversation_id, timestamp_ms
+                );
+            }
+        }
+    }
+
+    /// Update ICE gathering completion time
+    pub fn update_ice_gathering_complete(&self, conversation_id: &str, timestamp_ms: f64) {
+        if let Ok(mut states) = self.connection_states.write() {
+            if let Some(state) = states.get_mut(conversation_id) {
+                state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .gathering_complete_time_ms = Some(timestamp_ms);
+
+                // Calculate gathering duration if we have start time
+                if let Some(start_time) = state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .first_candidate_time_ms
+                {
+                    let duration_ms = timestamp_ms - start_time;
+                    state
+                        .metrics
+                        .webrtc_metrics
+                        .connection_legs
+                        .ice_connection_establishment_ms = Some(duration_ms);
+                    debug!(
+                        "ICE gathering completed (conversation_id: {}, duration: {:.1}ms)",
+                        conversation_id, duration_ms
+                    );
+                } else {
+                    debug!(
+                        "ICE gathering completed (conversation_id: {}, timestamp: {})",
+                        conversation_id, timestamp_ms
+                    );
+                }
+            }
+        }
+    }
+
+    /// Record STUN server response time
+    #[allow(dead_code)]
+    pub fn record_stun_response_time(&self, conversation_id: &str, response_time_ms: f64) {
+        if let Ok(mut states) = self.connection_states.write() {
+            if let Some(state) = states.get_mut(conversation_id) {
+                state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .stun_response_times
+                    .push(response_time_ms);
+                state
+                    .metrics
+                    .webrtc_metrics
+                    .connection_legs
+                    .stun_response_time_ms = Some(response_time_ms);
+                debug!(
+                    "STUN response time recorded (conversation_id: {}, rtt: {:.1}ms)",
+                    conversation_id, response_time_ms
+                );
+            }
+        }
+    }
+
+    /// Record TURN allocation timing and success
+    pub fn record_turn_allocation(
+        &self,
+        conversation_id: &str,
+        allocation_time_ms: f64,
+        success: bool,
+    ) {
+        if let Ok(mut states) = self.connection_states.write() {
+            if let Some(state) = states.get_mut(conversation_id) {
+                state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .turn_allocation_time_ms = Some(allocation_time_ms);
+                state
+                    .metrics
+                    .webrtc_metrics
+                    .connection_legs
+                    .turn_allocation_latency_ms = Some(allocation_time_ms);
+
+                // Update success rate (simple running average for now)
+                let current_rate = state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .turn_allocation_success_rate;
+                state
+                    .metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .turn_allocation_success_rate = if current_rate == 0.0 {
+                    if success {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (current_rate + if success { 1.0 } else { 0.0 }) / 2.0
+                };
+
+                debug!(
+                    "TURN allocation recorded (conversation_id: {}, time: {:.1}ms, success: {})",
+                    conversation_id, allocation_time_ms, success
                 );
             }
         }
@@ -276,11 +422,12 @@ impl MetricsCollector {
 
                 // Parse WebRTC stats reports for relevant metrics
                 let stats_count = webrtc_stats.len();
-                trace!(
-                    "Processing WebRTC stats (conversation_id: {}, stats_count: {})",
-                    conversation_id,
-                    stats_count
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Processing WebRTC stats (conversation_id: {}, stats_count: {})",
+                        conversation_id, stats_count
+                    );
+                }
 
                 for (_id, report) in webrtc_stats.iter() {
                     match report {
@@ -299,7 +446,7 @@ impl MetricsCollector {
                             }
                         }
                         StatsReportType::RemoteInboundRTP(remote_inbound) => {
-                            // Use remote inbound stats for packet loss (more accurate)
+                            // Use remote inbound stats for packet loss
                             rtc_stats.packet_loss_rate = remote_inbound.fraction_lost;
                             if let Some(rtt) = remote_inbound.round_trip_time {
                                 rtc_stats.rtt_ms = Some(rtt * 1000.0); // Convert to milliseconds
@@ -308,7 +455,86 @@ impl MetricsCollector {
                         StatsReportType::CandidatePair(pair) => {
                             if pair.nominated {
                                 rtc_stats.rtt_ms = Some(pair.current_round_trip_time * 1000.0);
-                                // Convert to milliseconds
+
+                                // Always set E2E latency from nominated pair (even if RTT is 0)
+                                let connection_legs =
+                                    &mut state.metrics.webrtc_metrics.connection_legs;
+                                connection_legs.end_to_end_latency_ms =
+                                    Some(pair.current_round_trip_time * 1000.0);
+
+                                // Parse candidate types from IDs for better display
+                                // Candidate IDs contain type info, extract it for readable path
+                                let local_type = if pair.local_candidate_id.contains("relay") {
+                                    "relay"
+                                } else if pair.local_candidate_id.contains("srflx") {
+                                    "srflx"
+                                } else {
+                                    "host"
+                                };
+
+                                let remote_type = if pair.remote_candidate_id.contains("relay") {
+                                    "relay"
+                                } else if pair.remote_candidate_id.contains("srflx") {
+                                    "srflx"
+                                } else {
+                                    "host"
+                                };
+
+                                // Update ICE candidate pair stats with parsed types
+                                rtc_stats.ice_stats.selected_candidate_pair =
+                                    Some(crate::metrics::types::CandidatePairStats {
+                                        local_candidate_type: local_type.to_string(),
+                                        remote_candidate_type: remote_type.to_string(),
+                                        current_rtt_ms: pair.current_round_trip_time * 1000.0,
+                                        total_rtt_measurements: pair.responses_received,
+                                        connection_time_ms: None, // Not available in this stat
+                                        bytes_sent: pair.bytes_sent,
+                                        bytes_received: pair.bytes_received,
+                                        transport_protocol: "UDP".to_string(), // Default assumption
+                                    });
+
+                                // If using relay, use TURN allocation latency for Gateway↔KRelay
+                                if local_type == "relay" {
+                                    // Gateway is using TURN - use TURN allocation latency
+                                    connection_legs.krelay_to_gateway_latency_ms =
+                                        connection_legs.turn_allocation_latency_ms;
+                                }
+
+                                debug!("Updated selected candidate pair stats (conversation_id: {}, local: {}, remote: {}, rtt: {:.1}ms)",
+                                    conversation_id,
+                                    local_type,
+                                    remote_type,
+                                    pair.current_round_trip_time * 1000.0
+                                );
+                            }
+                        }
+                        StatsReportType::LocalCandidate(local_candidate) => {
+                            // Track candidate gathering progress
+                            rtc_stats.ice_stats.total_candidates += 1;
+
+                            // Use string representation for candidate type classification
+                            let candidate_type_str =
+                                format!("{:?}", local_candidate.candidate_type);
+                            if candidate_type_str.contains("Host") {
+                                rtc_stats.ice_stats.host_candidates += 1;
+                            } else if candidate_type_str.contains("ServerReflexive") {
+                                rtc_stats.ice_stats.srflx_candidates += 1;
+                            } else if candidate_type_str.contains("Relay") {
+                                rtc_stats.ice_stats.relay_candidates += 1;
+                            }
+
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("ICE candidate gathered (conversation_id: {}, candidate_type: {:?})",
+                                    conversation_id, local_candidate.candidate_type);
+                            }
+                        }
+                        StatsReportType::RemoteCandidate(_remote_candidate) => {
+                            // Track remote candidate information for connection analysis
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!(
+                                    "Remote ICE candidate processed (conversation_id: {})",
+                                    conversation_id
+                                );
                             }
                         }
                         StatsReportType::DataChannel(data_channel) => {
@@ -353,8 +579,8 @@ impl MetricsCollector {
                                         .add_bytes_received(transport.bytes_received as u64);
                                     state.throughput_window.add(transport.bytes_received as f64);
                                 }
-                            } else {
-                                trace!("Transport stats available but no data transferred yet (conversation_id: {})", conversation_id);
+                            } else if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("Transport stats available but no data transferred yet (conversation_id: {})", conversation_id);
                             }
                         }
                         _ => {
@@ -371,8 +597,8 @@ impl MetricsCollector {
                         "Added RTT to sliding window (conversation_id: {}, rtt_ms: {})",
                         conversation_id, rtt_ms
                     );
-                } else {
-                    trace!(
+                } else if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
                         "No RTT data found in WebRTC stats (conversation_id: {})",
                         conversation_id
                     );
@@ -382,6 +608,7 @@ impl MetricsCollector {
                 state.metrics.webrtc_metrics = WebRTCMetrics {
                     rtc_stats,
                     sctp_stats,
+                    connection_legs: state.metrics.webrtc_metrics.connection_legs.clone(),
                     collected_at: Utc::now(),
                 };
 
@@ -421,10 +648,12 @@ impl MetricsCollector {
                     state.last_alert_check = now;
                 }
 
-                trace!(
-                    "Updated WebRTC stats (conversation_id: {})",
-                    conversation_id
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Updated WebRTC stats (conversation_id: {})",
+                        conversation_id
+                    );
+                }
             }
         }
     }
@@ -594,22 +823,26 @@ impl MetricsCollector {
         // - Throughput: Total data transfer rate in KB/s
         // - Quality: Connection quality distribution (Excellent/Good/Fair/Poor)
         // - Alerts: Number of active performance alerts
-        trace!(
-            "Metrics Heartbeat - Connections: {}, Tubes: {}, Avg RTT: {:.1}ms, Packet Loss: {:.2}%, P95 Latency: {:.1}ms, Throughput: {:.1}KB/s, Quality: {}/{}/{}/{}, Alerts: {}",
-            aggregated.active_connections,
-            aggregated.active_tubes,
-            aggregated.avg_system_rtt.as_millis() as f64,
-            aggregated.avg_packet_loss * 100.0,
-            aggregated.avg_p95_latency.as_millis() as f64,
-            aggregated.total_bandwidth / 1024.0, // Convert to KB/s
-            aggregated.excellent_connections,
-            aggregated.good_connections,
-            aggregated.fair_connections,
-            aggregated.poor_connections,
-            aggregated.total_alerts
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Metrics Heartbeat - Connections: {}, Tubes: {}, Avg RTT: {:.1}ms, Packet Loss: {:.2}%, P95 Latency: {:.1}ms, Throughput: {:.1}KB/s, Quality: {}/{}/{}/{}, Alerts: {}",
+                aggregated.active_connections,
+                aggregated.active_tubes,
+                aggregated.avg_system_rtt.as_millis() as f64,
+                aggregated.avg_packet_loss * 100.0,
+                aggregated.avg_p95_latency.as_millis() as f64,
+                aggregated.total_bandwidth / 1024.0, // Convert to KB/s
+                aggregated.excellent_connections,
+                aggregated.good_connections,
+                aggregated.fair_connections,
+                aggregated.poor_connections,
+                aggregated.total_alerts
+            );
+        }
 
-        trace!("Aggregated metrics updated");
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("Aggregated metrics updated");
+        }
     }
 
     /// Background task: Collect WebRTC stats from all registered connections
@@ -630,8 +863,29 @@ impl MetricsCollector {
             }
         };
 
+        // Early exit if no connections to process
+        if connections.is_empty() {
+            return;
+        }
+
         // Now process each connection without holding any locks
         for (conversation_id, tube_id) in connections {
+            // Double-check that the connection is still registered before processing
+            let is_still_registered = {
+                if let Ok(states) = self.connection_states.read() {
+                    states.contains_key(&conversation_id)
+                } else {
+                    false
+                }
+            };
+
+            if !is_still_registered {
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("Skipping stats collection for unregistered connection (conversation_id: {}, tube_id: {})", conversation_id, tube_id);
+                }
+                continue;
+            }
+
             // Try to get the tube from the registry and collect stats
             let registry = crate::tube_registry::REGISTRY.read().await;
             if let Some(tube) = registry.get_by_tube_id(&tube_id) {
@@ -644,15 +898,20 @@ impl MetricsCollector {
                         );
                     }
                     Err(e) => {
-                        trace!("Failed to collect WebRTC stats (conversation_id: {}, tube_id: {}, error: {})", conversation_id, tube_id, e);
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!("Failed to collect WebRTC stats (conversation_id: {}, tube_id: {}, error: {})", conversation_id, tube_id, e);
+                        }
                     }
                 }
             } else {
-                trace!(
-                    "Tube not found in registry (conversation_id: {}, tube_id: {})",
+                // If tube is not found in registry, remove it from our metrics tracking
+                // to prevent persistent lookups
+                debug!(
+                    "Tube not found in registry, auto-unregistering from metrics (conversation_id: {}, tube_id: {})",
                     conversation_id,
                     tube_id
                 );
+                self.unregister_connection(&conversation_id);
             }
         }
 

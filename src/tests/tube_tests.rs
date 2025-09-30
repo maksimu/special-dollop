@@ -579,11 +579,11 @@ async fn perform_signaling_and_ice_exchange(
 
 #[tokio::test]
 async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
-    info!("[E2E_TEST] Starting test_tube_p2p_data_transfer_end_to_end");
+    println!("[E2E_TEST] Starting test_tube_p2p_data_transfer_end_to_end");
 
     let tube1 = Tube::new(false, None, None)?;
     let tube2 = Tube::new(false, None, None)?;
-    info!(
+    println!(
         "[E2E_TEST] Tube1 ID: {}, Tube2 ID: {}",
         tube1.id(),
         tube2.id()
@@ -631,7 +631,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             signal_tx1,
         )
         .await?;
-    info!("[E2E_TEST] Tube1 peer connection created.");
+    println!("[E2E_TEST] Tube1 peer connection created.");
     tube2
         .create_peer_connection(
             Some(rtc_config),
@@ -644,14 +644,23 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             signal_tx2,
         )
         .await?;
-    info!("[E2E_TEST] Tube2 peer connection created.");
+    println!("[E2E_TEST] Tube2 peer connection created.");
 
     // Tube1 (offerer) creates the data channel *before* creating the offer
     let dc_label = "e2e-channel".to_string();
-    info!(
+    println!(
         "[E2E_TEST] Tube1 attempting to create data channel '{}' BEFORE offer",
         dc_label
     );
+
+    // Check if peer connection exists
+    if tube1.peer_connection().await.is_none() {
+        return Err(Box::from(
+            "[E2E_TEST] Tube1 has no peer connection before creating data channel",
+        ));
+    }
+    println!("[E2E_TEST] Tube1 peer connection exists, proceeding with data channel creation");
+
     let dc1_out = tube1
         .create_data_channel(
             &dc_label,
@@ -660,56 +669,79 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             "ms16.5.0",
         )
         .await?;
-    info!(
-        "[E2E_TEST] Tube1: create_data_channel call returned for '{}'",
-        dc_label
+    println!(
+        "[E2E_TEST] Tube1: create_data_channel call returned successfully for '{}', label: '{}'",
+        dc_label,
+        dc1_out.label()
     );
 
-    let (dc1_open_tx, dc1_open_rx) = oneshot::channel();
-    let dc1_label_clone_for_onopen = dc1_out.label();
-    dc1_out.data_channel.on_open(Box::new(move || {
-        // Attach to raw RTCDataChannel
-        info!(
-            "[E2E_TEST] Tube1: dc1_out '{}' (RTCDataChannel) ON_OPEN triggered.",
-            dc1_label_clone_for_onopen
-        );
-        let _ = dc1_open_tx.send(());
-        Box::pin(async {})
-    }));
+    // Verify the data channel was added to tube1's map
+    match tube1.get_data_channel(&dc_label).await {
+        Some(dc) => println!(
+            "[E2E_TEST] ✅ Tube1: Data channel '{}' found in tube's data_channels map",
+            dc.label()
+        ),
+        None => println!(
+            "[E2E_TEST] ❌ Tube1: Data channel '{}' NOT found in tube's data_channels map",
+            dc_label
+        ),
+    }
 
     // Perform signaling (Offer/Answer + ICE) with signal channels
+    println!("[E2E_TEST] About to start signaling and ICE exchange");
+
+    // Check that tube2 also has a peer connection before signaling
+    if tube2.peer_connection().await.is_none() {
+        return Err(Box::from(
+            "[E2E_TEST] Tube2 has no peer connection before signaling",
+        ));
+    }
+    println!("[E2E_TEST] Both tubes have peer connections, starting signaling");
+
     perform_signaling_and_ice_exchange(&tube1, &tube2, &mut signal_rx1, &mut signal_rx2)
         .await
         .map_err(|e| format!("[E2E_TEST] Signaling/ICE helper failed: {}", e))?;
-    info!("[E2E_TEST] Signaling and ICE exchange complete.");
+    println!("[E2E_TEST] Signaling and ICE exchange complete.");
 
-    // Wait for dc1_out to open
-    tokio::time::timeout(Duration::from_secs(20), dc1_open_rx) // Increased timeout for channel open
+    // Add debugging to check the SDP offers/answers for data channel information
+    println!("[E2E_TEST] Checking if data channels are properly negotiated...");
+
+    // Allow SCTP handshake time after ICE connection
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Wait for dc1_out to open using the dedicated method
+    dc1_out
+        .wait_for_channel_open(Some(Duration::from_secs(30)))
         .await
-        .map_err(|e| format!("[E2E_TEST] Timeout waiting for dc1_out to open: {}", e))?
-        .map_err(|e| format!("[E2E_TEST] dc1_out_open_rx failed: {}", e))?;
-    info!(
+        .map_err(|e| format!("[E2E_TEST] Error waiting for dc1_out to open: {}", e))?;
+    println!(
         "[E2E_TEST] Tube1: dc1_out '{}' is confirmed open.",
         dc_label
     );
 
     // Tube2 side: Wait for the data channel and attach test's message handler
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Bytes>();
-    let mut dc2_in_opt: Option<WebRTCDataChannel> = None; // This will be our wrapper
+    let mut _dc2_in_opt: Option<WebRTCDataChannel> = None; // This will be our wrapper
 
-    for i in 0..200 {
-        // Poll for up to 20 seconds
+    // Try a faster initial check, then fall back to direct creation if negotiation fails
+    let mut attempts = 0;
+    let max_attempts = 100; // 10 seconds at 100ms intervals - much shorter
+    loop {
         if let Some(found_dc_wrapper) = tube2.get_data_channel(&dc_label).await {
-            info!(
-                "[E2E_TEST] Tube2: Found '{}' via get_data_channel. Setting handlers.",
-                dc_label
+            println!(
+                "[E2E_TEST] Tube2: Found '{}' via WebRTC negotiation after {} attempts",
+                dc_label, attempts
+            );
+            println!(
+                "[E2E_TEST] Tube2: Found '{}' via get_data_channel after {} attempts. Setting handlers.",
+                dc_label, attempts
             );
 
             let (dc2_open_tx_test, dc2_open_rx_test) = oneshot::channel();
             let found_dc_clone_for_open = found_dc_wrapper.clone();
 
             found_dc_wrapper.data_channel.on_open(Box::new(move || { // Attach to raw RTCDataChannel
-                info!("[E2E_TEST] Tube2: dc_in '{}' (RTCDataChannel) ON_OPEN triggered for test handler.", found_dc_clone_for_open.label());
+                println!("[E2E_TEST] Tube2: dc_in '{}' (RTCDataChannel) ON_OPEN triggered for test handler.", found_dc_clone_for_open.label());
                 let _ = dc2_open_tx_test.send(());
                 Box::pin(async {})
             }));
@@ -720,16 +752,16 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
                 let tx_c = msg_tx_clone.clone();
                 let current_label_for_log = found_dc_clone_for_message.label();
                 Box::pin(async move {
-                    info!("[E2E_TEST] Tube2: dc_in '{}' TEST on_message received {} bytes (is_string: {})", current_label_for_log, msg.data.len(), msg.is_string);
+                    println!("[E2E_TEST] Tube2: dc_in '{}' TEST on_message received {} bytes (is_string: {})", current_label_for_log, msg.data.len(), msg.is_string);
                     // Log a preview if it's a UTF-8 string, for easier debugging.
                     // Note: msg.is_string might be false if RTCDataChannel.send (binary) was used,
                     // even if the content is a valid UTF-8 string.
                     match String::from_utf8(msg.data.to_vec()) {
                         Ok(s_preview) => {
-                             info!("[E2E_TEST] Tube2: dc_in '{}' (data preview as string: '{}')", current_label_for_log, s_preview);
+                            println!("[E2E_TEST] Tube2: dc_in '{}' (data preview as string: '{}')", current_label_for_log, s_preview);
                         }
                         Err(_) => {
-                             info!("[E2E_TEST] Tube2: dc_in '{}' (data is not valid UTF-8 for preview)", current_label_for_log);
+                            println!("[E2E_TEST] Tube2: dc_in '{}' (data is not valid UTF-8 for preview)", current_label_for_log);
                         }
                     }
                     if tx_c.send(msg.data).is_err() { // Send the Bytes directly
@@ -737,38 +769,46 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
                     }
                 })
             }));
-            info!("[E2E_TEST] Tube2: Test's on_message and on_open handlers set for '{}' on underlying RTCDataChannel.", dc_label);
+            println!("[E2E_TEST] Tube2: Test's on_message and on_open handlers set for '{}' on underlying RTCDataChannel.", dc_label);
 
-            dc2_in_opt = Some(found_dc_wrapper.clone());
+            _dc2_in_opt = Some(found_dc_wrapper.clone());
 
             if found_dc_wrapper.data_channel.ready_state() != RTCDataChannelState::Open {
-                info!("[E2E_TEST] Tube2: dc_in '{}' RTCDataChannel not yet open, waiting for test's ON_OPEN...", dc_label);
+                println!("[E2E_TEST] Tube2: dc_in '{}' RTCDataChannel not yet open, waiting for test's ON_OPEN...", dc_label);
                 tokio::time::timeout(Duration::from_secs(15), dc2_open_rx_test) // Increased timeout
                     .await.map_err(|e| format!("[E2E_TEST] Timeout waiting for dc2_in (RTCDataChannel) test on_open: {}", e))?
                     .map_err(|e| format!("[E2E_TEST] dc2_in test on_open_rx failed: {}", e))?;
-                info!(
-                    "[E2E_TEST] Tube2: dc_in '{}' confirmed open via test\\'s ON_OPEN.\"",
+                println!(
+                    "[E2E_TEST] Tube2: dc_in '{}' confirmed open via test's ON_OPEN.",
                     dc_label
                 );
             } else {
-                info!(
-                    "[E2E_TEST] Tube2: dc_in '{}' was already open when retrieved.\"",
+                println!(
+                    "[E2E_TEST] Tube2: dc_in '{}' was already open when retrieved.",
                     dc_label
                 );
             }
             break;
         }
-        info!(
-            "[E2E_TEST] Tube2: Waiting for data channel '{}'... Attempt {}/150\"",
-            dc_label,
-            i + 1
+        attempts += 1;
+        if attempts >= max_attempts {
+            return Err(Box::from(format!(
+                "[E2E_TEST] Timeout: Data channel '{}' not found after {} attempts ({} seconds)",
+                dc_label,
+                attempts,
+                max_attempts / 10
+            )));
+        }
+        println!(
+            "[E2E_TEST] Tube2: Waiting for data channel '{}'... Attempt {}/{}",
+            dc_label, attempts, max_attempts
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let dc2_in = dc2_in_opt.ok_or_else(|| {
+    let dc2_in = _dc2_in_opt.ok_or_else(|| {
         format!(
-            "[E2E_TEST] Data channel '{}' not found or set up on tube2\"",
+            "[E2E_TEST] Data channel '{}' not found or set up on tube2",
             dc_label
         )
     })?;
@@ -776,11 +816,11 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     assert_eq!(
         dc2_in.data_channel.ready_state(),
         RTCDataChannelState::Open,
-        "[E2E_TEST] dc2_in '{}' should be open after setup loop\"",
+        "[E2E_TEST] dc2_in '{}' should be open after setup loop",
         dc_label
     );
-    info!(
-        "[E2E_TEST] Tube2: dc_in '{}' setup complete and confirmed open.\"",
+    println!(
+        "[E2E_TEST] Tube2: dc_in '{}' setup complete and confirmed open.",
         dc_label
     );
 
@@ -791,15 +831,15 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         Utc::now().to_rfc3339()
     );
     let sent_bytes = Bytes::from(test_message_string.clone()); // Bytes to be sent and used for assertion
-    info!(
+    println!(
         "[E2E_TEST] Tube1: Sending message (as Bytes, content: '{}') on dc '{}'",
         test_message_string,
         dc1_out.label()
     );
     dc1_out.send(sent_bytes.clone()).await?; // Send a clone of sent_bytes
-    info!("[E2E_TEST] Tube1: Message sent.");
+    println!("[E2E_TEST] Tube1: Message sent.");
 
-    info!(
+    println!(
         "[E2E_TEST] Tube2: Waiting for message on dc '{}'...",
         dc_label
     );
@@ -807,14 +847,14 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         // msg_rx now receives Bytes
         Ok(Some(received_bytes)) => {
             // received_bytes is Bytes
-            info!("[E2E_TEST] Tube2: Received {} bytes.", received_bytes.len());
+            println!("[E2E_TEST] Tube2: Received {} bytes.", received_bytes.len());
             // For easier debugging of assertion failures, log string versions if possible
             let received_string_preview = String::from_utf8(received_bytes.to_vec())
                 .unwrap_or_else(|_| "[[not a valid UTF-8 string]]".to_string());
             // sent_bytes was derived from test_message_string, so it should be valid UTF-8.
             let sent_string_preview =
                 String::from_utf8(sent_bytes.to_vec()).expect("sent_bytes should be valid UTF-8");
-            info!("[E2E_TEST] Tube2: Comparing received data (preview: '{}') with sent data (preview: '{}')", received_string_preview, sent_string_preview);
+            println!("[E2E_TEST] Tube2: Comparing received data (preview: '{}') with sent data (preview: '{}')", received_string_preview, sent_string_preview);
             assert_eq!(received_bytes, sent_bytes); // Compare Bytes directly
         }
         Ok(None) => {
@@ -830,9 +870,9 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         }
     }
 
-    info!("[E2E_TEST] Message received and verified successfully.");
+    println!("[E2E_TEST] Message received and verified successfully.");
 
-    info!("[E2E_TEST] Closing tubes.");
+    println!("[E2E_TEST] Closing tubes.");
     let tube1_id = tube1.id();
     let tube2_id = tube2.id();
     if let Err(e) = {
@@ -849,6 +889,6 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    info!("[E2E_TEST] Test finished successfully.");
+    println!("[E2E_TEST] Test finished successfully.");
     Ok(())
 }

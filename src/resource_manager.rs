@@ -51,7 +51,7 @@ impl Default for ResourceLimits {
             max_concurrent_ice_agents: 32,
             max_turn_connections_per_server: 4,
             socket_reuse_enabled: true,
-            ice_gather_timeout: Duration::from_secs(10),
+            ice_gather_timeout: Duration::from_secs(30), // Increased for trickle ICE + signaling latency
             enable_mdns_candidates: false,
             // Conservative defaults for RTCConfiguration tuning
             ice_candidate_pool_size: Some(4), // Limit ICE candidate pool
@@ -170,7 +170,7 @@ impl ResourceManager {
             stats.ice_agents_created += 1;
         }
 
-        info!("Acquired ICE agent permit, total: {}", count);
+        debug!("Acquired ICE agent permit, total: {}", count);
         Ok(IceAgentGuard::new(
             permit,
             self.current_ice_agents.clone(),
@@ -439,7 +439,7 @@ impl ResourceManager {
             debug!("ICE backup candidate pair ping interval configured but not applied (not supported by WebRTC library) (tube_id: {})", tube_id);
         }
 
-        info!(
+        debug!(
             "Applied resource-conscious RTCConfiguration tuning (tube_id: {})",
             tube_id
         );

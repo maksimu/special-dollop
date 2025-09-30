@@ -225,8 +225,17 @@ class TunnelConnectionManager:
                 logging.info(f"ICE restart offer generated for tube {self.tube_id}")
                 await self._send_restart_offer(restart_sdp)
                 
-                # Wait for restart to complete (or timeout)
-                await asyncio.sleep(10)  # Give time for restart to complete
+                # Wait for restart to complete with proper cancellation support
+                try:
+                    await asyncio.wait_for(
+                        self._wait_for_restart_completion(),
+                        timeout=2.0  # Much shorter, more reasonable timeout
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(f"ICE restart completion check timed out for tube {self.tube_id}")
+                except asyncio.CancelledError:
+                    logging.info(f"ICE restart workflow cancelled for tube {self.tube_id}")
+                    raise  # Re-raise to properly handle cancellation
                 
                 # Check if restart was successful
                 if await self._verify_restart_success():
@@ -290,6 +299,32 @@ class TunnelConnectionManager:
                 logging.error("Signal handler does not support ICE restart offers")
         except Exception as e:
             logging.error(f"Failed to send ICE restart offer: {e}")
+
+    async def _wait_for_restart_completion(self) -> None:
+        """Wait for ICE restart to complete using event-driven approach with cancellation support"""
+        # Poll connection state with short intervals and proper cancellation
+        check_interval = 0.1  # 100ms intervals
+        max_checks = 20  # Maximum 2 seconds (20 * 0.1s)
+
+        for _ in range(max_checks):
+            # Check if we should cancel
+            if asyncio.current_task().cancelled():
+                raise asyncio.CancelledError()
+
+            # Check if restart completed
+            if await self._verify_restart_success():
+                logging.debug(f"ICE restart completed successfully for tube {self.tube_id}")
+                return
+
+            # Short sleep with cancellation support
+            try:
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                logging.info(f"ICE restart wait cancelled for tube {self.tube_id}")
+                raise
+
+        # If we get here, restart didn't complete in time
+        logging.warning(f"ICE restart did not complete within {max_checks * check_interval}s for tube {self.tube_id}")
 
     async def _verify_restart_success(self) -> bool:
         """Verify that the ICE restart was successful"""

@@ -3,6 +3,7 @@ use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 
 /// Network interface information
@@ -13,6 +14,40 @@ pub struct NetworkInterface {
     pub is_active: bool,
     pub ip_address: Option<String>,
     pub last_seen: Instant,
+    /// Network quality metrics for this interface
+    pub quality_metrics: NetworkQualityMetrics,
+    /// Interface preference score (higher = more preferred)
+    pub preference_score: u8,
+}
+
+/// Network quality metrics for interface assessment
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkQualityMetrics {
+    /// Average latency in milliseconds
+    pub avg_latency_ms: f64,
+    /// Packet loss rate (0.0 to 1.0)
+    pub packet_loss_rate: f64,
+    /// Bandwidth estimate in bps
+    pub bandwidth_bps: u64,
+    /// Signal strength (0-100, higher is better)
+    pub signal_strength: u8,
+    /// Quality score (0-100, higher is better)
+    pub quality_score: u8,
+    /// Last measurement timestamp
+    pub last_measured: Instant,
+}
+
+impl Default for NetworkQualityMetrics {
+    fn default() -> Self {
+        Self {
+            avg_latency_ms: 50.0,
+            packet_loss_rate: 0.0,
+            bandwidth_bps: 1_000_000, // 1 Mbps default
+            signal_strength: 80,
+            quality_score: 80,
+            last_measured: Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,7 +56,7 @@ pub enum InterfaceType {
     WiFi,
     Cellular,
     Loopback,
-    VPN,
+    Vpn,
     Unknown,
 }
 
@@ -53,6 +88,40 @@ pub enum NetworkChangeEvent {
     ConnectivityLost,
     /// Network connectivity restored
     ConnectivityRestored,
+    /// Network migration completed
+    MigrationCompleted {
+        from_interface: String,
+        to_interface: String,
+        success: bool,
+        migration_time_ms: u64,
+    },
+    /// Network quality degradation detected
+    QualityDegraded {
+        interface_name: String,
+        quality_score: u8,
+    },
+}
+
+/// Predicted network events for proactive handling
+#[derive(Debug, Clone)]
+pub enum PredictedNetworkEvent {
+    /// Quality degradation prediction
+    QualityDegradation {
+        interface_name: String,
+        predicted_score: u8,
+        confidence: f64,
+    },
+    /// Possible disconnection prediction
+    PossibleDisconnection {
+        interface_name: String,
+        probability: f64,
+    },
+    /// Interface transition likelihood
+    InterfaceTransition {
+        from_interface: String,
+        to_interface: String,
+        probability: f64,
+    },
 }
 
 impl InterfaceType {
@@ -77,7 +146,7 @@ impl InterfaceType {
             || name_lower.contains("tun")
             || name_lower.contains("tap")
         {
-            InterfaceType::VPN
+            InterfaceType::Vpn
         } else {
             InterfaceType::Unknown
         }
@@ -103,6 +172,12 @@ pub struct NetworkMonitor {
     last_connectivity_check: Arc<Mutex<Option<bool>>>,
     /// Monitor task handle
     monitoring_active: Arc<Mutex<bool>>,
+    /// Connection migration manager
+    connection_migrator: Arc<ConnectionMigrator>,
+    /// Primary interface tracker
+    primary_interface: Arc<Mutex<Option<String>>>,
+    /// Quality history for predictive analysis
+    quality_history: Arc<Mutex<HashMap<String, Vec<NetworkQualityMetrics>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +194,12 @@ pub struct NetworkMonitorConfig {
     pub monitor_interface_changes: bool,
     /// Delay before triggering change events (debounce)
     pub change_debounce_delay: Duration,
+    /// Enable connection migration
+    pub enable_migration: bool,
+    /// Migration quality threshold (0-100, migrate if current interface drops below this)
+    pub migration_quality_threshold: u8,
+    /// Maximum migration time before considering it failed
+    pub migration_timeout: Duration,
 }
 
 impl Default for NetworkMonitorConfig {
@@ -134,15 +215,395 @@ impl Default for NetworkMonitorConfig {
             monitor_ip_changes: true,
             monitor_interface_changes: true,
             change_debounce_delay: Duration::from_millis(500),
+            enable_migration: true,
+            migration_quality_threshold: 60,
+            migration_timeout: Duration::from_secs(10),
         }
+    }
+}
+
+/// Connection migration manager
+#[derive(Debug)]
+pub struct ConnectionMigrator {
+    /// Active migrations in progress
+    active_migrations: Arc<Mutex<HashMap<String, MigrationState>>>,
+    /// Migration strategies
+    migration_strategies: Vec<MigrationStrategy>,
+    /// Configuration
+    config: NetworkMonitorConfig,
+}
+
+/// State of an active migration
+#[derive(Debug, Clone)]
+pub struct MigrationState {
+    pub from_interface: String,
+    pub to_interface: String,
+    pub start_time: Instant,
+    pub phase: MigrationPhase,
+    pub attempt_count: u32,
+}
+
+/// Migration phases
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrationPhase {
+    Preparing,
+    Testing,
+    Migrating,
+    Completing,
+    Failed(String),
+    Completed,
+}
+
+/// Migration strategy
+#[derive(Debug, Clone)]
+pub enum MigrationStrategy {
+    /// Make-before-break: establish new connection before closing old
+    MakeBeforeBreak,
+    /// Break-before-make: close old connection before establishing new
+    BreakBeforeMake,
+    /// Seamless: attempt to maintain both connections during transition
+    Seamless,
+}
+
+impl ConnectionMigrator {
+    pub fn new(config: NetworkMonitorConfig) -> Self {
+        Self {
+            active_migrations: Arc::new(Mutex::new(HashMap::new())),
+            migration_strategies: vec![
+                MigrationStrategy::Seamless,
+                MigrationStrategy::MakeBeforeBreak,
+                MigrationStrategy::BreakBeforeMake,
+            ],
+            config,
+        }
+    }
+
+    /// Start a connection migration from one interface to another
+    pub async fn start_migration(
+        &self,
+        tube_id: &str,
+        from_interface: String,
+        to_interface: String,
+    ) -> WebRTCResult<()> {
+        let migration_id = format!("{}:{}→{}", tube_id, from_interface, to_interface);
+
+        info!("Starting connection migration: {}", migration_id);
+
+        let migration_state = MigrationState {
+            from_interface: from_interface.clone(),
+            to_interface: to_interface.clone(),
+            start_time: Instant::now(),
+            phase: MigrationPhase::Preparing,
+            attempt_count: 1,
+        };
+
+        {
+            let mut migrations = self.active_migrations.lock().unwrap();
+            migrations.insert(migration_id.clone(), migration_state);
+        }
+
+        // Execute migration asynchronously
+        let migrator = self.clone();
+        let migration_id_clone = migration_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = migrator.execute_migration(&migration_id_clone).await {
+                error!("Migration failed for {}: {:?}", migration_id_clone, e);
+                migrator.mark_migration_failed(&migration_id_clone, &format!("{:?}", e));
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn execute_migration(&self, migration_id: &str) -> WebRTCResult<()> {
+        // Phase 1: Prepare migration
+        self.update_migration_phase(migration_id, MigrationPhase::Preparing);
+        self.prepare_migration(migration_id).await?;
+
+        // Phase 2: Test new connection
+        self.update_migration_phase(migration_id, MigrationPhase::Testing);
+        self.test_new_connection(migration_id).await?;
+
+        // Phase 3: Perform migration
+        self.update_migration_phase(migration_id, MigrationPhase::Migrating);
+        self.perform_migration(migration_id).await?;
+
+        // Phase 4: Complete migration
+        self.update_migration_phase(migration_id, MigrationPhase::Completing);
+        self.complete_migration(migration_id).await?;
+
+        self.update_migration_phase(migration_id, MigrationPhase::Completed);
+        info!("Migration completed successfully: {}", migration_id);
+
+        Ok(())
+    }
+
+    async fn prepare_migration(&self, migration_id: &str) -> WebRTCResult<()> {
+        // Get migration state to access target interface
+        let (to_interface, from_interface) = {
+            let migrations = self.active_migrations.lock().unwrap();
+            if let Some(state) = migrations.get(migration_id) {
+                (state.to_interface.clone(), state.from_interface.clone())
+            } else {
+                return Err(crate::WebRTCError::Unknown {
+                    tube_id: "".to_string(),
+                    reason: format!("Migration {} not found", migration_id),
+                });
+            }
+        };
+
+        // Note: In a real implementation, we would need access to the NetworkMonitor
+        // to verify the target interface exists and is active. However, ConnectionMigrator
+        // doesn't have a reference to NetworkMonitor to avoid circular dependencies.
+        // The caller (NetworkMonitor) should have already validated this before calling start_migration.
+
+        debug!(
+            "Migration preparation completed: {} ({}→{})",
+            migration_id, from_interface, to_interface
+        );
+        Ok(())
+    }
+
+    async fn test_new_connection(&self, migration_id: &str) -> WebRTCResult<()> {
+        // Test connectivity to STUN/TURN servers via new interface
+        let test_endpoints = vec![
+            "stun.l.google.com:19302",
+            "stun1.l.google.com:19302",
+            "stun2.l.google.com:19302",
+        ];
+
+        debug!("Testing new connection for migration: {}", migration_id);
+
+        for endpoint in &test_endpoints {
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect(endpoint),
+            )
+            .await
+            {
+                Ok(Ok(_stream)) => {
+                    debug!(
+                        "New connection tested successfully: {} via {}",
+                        migration_id, endpoint
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    debug!(
+                        "Connection test failed for {} to {}: {}",
+                        migration_id, endpoint, e
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    debug!(
+                        "Connection test timed out for {} to {}",
+                        migration_id, endpoint
+                    );
+                    continue;
+                }
+            }
+        }
+
+        Err(crate::WebRTCError::IceConnectionFailed {
+            tube_id: "".to_string(),
+            reason: format!(
+                "New connection test failed for all endpoints during migration: {}",
+                migration_id
+            ),
+        })
+    }
+
+    async fn perform_migration(&self, migration_id: &str) -> WebRTCResult<()> {
+        // The actual ICE restart is triggered by the WebRTCNetworkIntegration callbacks
+        // when it receives the network change event. This method just coordinates the timing.
+
+        debug!(
+            "Connection migration phase: performing handover for {}",
+            migration_id
+        );
+
+        // Wait for ICE restart to be initiated (this is done via callbacks in the integration layer)
+        // Give some time for the network change event to propagate and ICE restart to begin
+        sleep(Duration::from_millis(500)).await;
+
+        debug!("Connection migration handover initiated: {}", migration_id);
+        Ok(())
+    }
+
+    async fn complete_migration(&self, migration_id: &str) -> WebRTCResult<()> {
+        // Get migration timing and interfaces for completion event
+        let (from_interface, to_interface, migration_time_ms) = {
+            let migrations = self.active_migrations.lock().unwrap();
+            if let Some(state) = migrations.get(migration_id) {
+                let elapsed_ms = state.start_time.elapsed().as_millis() as u64;
+                (
+                    state.from_interface.clone(),
+                    state.to_interface.clone(),
+                    elapsed_ms,
+                )
+            } else {
+                return Err(crate::WebRTCError::Unknown {
+                    tube_id: "".to_string(),
+                    reason: format!("Migration {} not found during completion", migration_id),
+                });
+            }
+        };
+
+        debug!(
+            "Migration cleanup completed: {} ({}→{}, took {}ms)",
+            migration_id, from_interface, to_interface, migration_time_ms
+        );
+
+        // Note: The actual NetworkMonitor update and event triggering should be done
+        // by the caller (NetworkMonitor) since ConnectionMigrator doesn't have access to it.
+        // This is to avoid circular dependencies.
+
+        Ok(())
+    }
+
+    fn update_migration_phase(&self, migration_id: &str, phase: MigrationPhase) {
+        let mut migrations = self.active_migrations.lock().unwrap();
+        if let Some(migration) = migrations.get_mut(migration_id) {
+            migration.phase = phase;
+            debug!(
+                "Migration {} phase updated to {:?}",
+                migration_id, migration.phase
+            );
+        }
+    }
+
+    fn mark_migration_failed(&self, migration_id: &str, reason: &str) {
+        let mut migrations = self.active_migrations.lock().unwrap();
+        if let Some(migration) = migrations.get_mut(migration_id) {
+            migration.phase = MigrationPhase::Failed(reason.to_string());
+            warn!("Migration {} failed: {}", migration_id, reason);
+        }
+    }
+
+    pub fn get_migration_status(&self, migration_id: &str) -> Option<MigrationState> {
+        let migrations = self.active_migrations.lock().unwrap();
+        migrations.get(migration_id).cloned()
+    }
+
+    pub fn cleanup_completed_migrations(&self) {
+        let mut migrations = self.active_migrations.lock().unwrap();
+        let cutoff_time = Instant::now() - Duration::from_secs(300); // 5 minutes
+
+        migrations.retain(|_, migration| {
+            match migration.phase {
+                MigrationPhase::Completed | MigrationPhase::Failed(_) => {
+                    migration.start_time > cutoff_time
+                }
+                _ => true, // Keep active migrations
+            }
+        });
+    }
+}
+
+impl Clone for ConnectionMigrator {
+    fn clone(&self) -> Self {
+        Self {
+            active_migrations: Arc::clone(&self.active_migrations),
+            migration_strategies: self.migration_strategies.clone(),
+            config: self.config.clone(),
+        }
+    }
+}
+
+/// Network quality scorer for interface selection
+#[derive(Debug)]
+pub struct NetworkQualityScorer;
+
+impl NetworkQualityScorer {
+    /// Calculate comprehensive network quality score (0-100)
+    pub fn calculate_quality_score(interface: &NetworkInterface) -> u8 {
+        let metrics = &interface.quality_metrics;
+
+        // Latency score (0-35 points)
+        let latency_score = if metrics.avg_latency_ms < 20.0 {
+            35
+        } else if metrics.avg_latency_ms < 50.0 {
+            30
+        } else if metrics.avg_latency_ms < 100.0 {
+            25
+        } else if metrics.avg_latency_ms < 200.0 {
+            15
+        } else {
+            5
+        };
+
+        // Packet loss score (0-25 points)
+        let loss_score = if metrics.packet_loss_rate < 0.001 {
+            25
+        } else if metrics.packet_loss_rate < 0.01 {
+            20
+        } else if metrics.packet_loss_rate < 0.02 {
+            15
+        } else if metrics.packet_loss_rate < 0.05 {
+            10
+        } else {
+            0
+        };
+
+        // Bandwidth score (0-25 points)
+        let bandwidth_score = if metrics.bandwidth_bps > 10_000_000 {
+            25
+        } else if metrics.bandwidth_bps > 5_000_000 {
+            20
+        } else if metrics.bandwidth_bps > 1_000_000 {
+            15
+        } else if metrics.bandwidth_bps > 500_000 {
+            10
+        } else {
+            5
+        };
+
+        // Signal strength score (0-15 points)
+        let signal_score = (metrics.signal_strength as f32 * 0.15) as u8;
+
+        (latency_score + loss_score + bandwidth_score + signal_score).min(100)
+    }
+
+    /// Determine if an interface is suitable for migration target
+    pub fn is_suitable_for_migration(interface: &NetworkInterface, min_quality: u8) -> bool {
+        interface.is_active
+            && interface.quality_metrics.quality_score >= min_quality
+            && interface.interface_type != InterfaceType::Loopback
+    }
+
+    /// Find the best interface for migration
+    pub fn find_best_migration_target(
+        interfaces: &HashMap<String, NetworkInterface>,
+        current_interface: &str,
+        min_quality: u8,
+    ) -> Option<String> {
+        interfaces
+            .iter()
+            .filter(|(name, interface)| {
+                *name != current_interface
+                    && Self::is_suitable_for_migration(interface, min_quality)
+            })
+            .max_by_key(|(_, interface)| {
+                (
+                    interface.quality_metrics.quality_score,
+                    interface.preference_score,
+                )
+            })
+            .map(|(name, _)| name.clone())
     }
 }
 
 impl NetworkMonitor {
     pub fn new(config: NetworkMonitorConfig) -> Self {
+        let connection_migrator = Arc::new(ConnectionMigrator::new(config.clone()));
+
         Self {
             interfaces: Arc::new(Mutex::new(HashMap::new())),
             callbacks: Arc::new(Mutex::new(Vec::new())),
+            connection_migrator,
+            primary_interface: Arc::new(Mutex::new(None)),
+            quality_history: Arc::new(Mutex::new(HashMap::new())),
             config,
             last_connectivity_check: Arc::new(Mutex::new(None)),
             monitoring_active: Arc::new(Mutex::new(false)),
@@ -163,16 +624,27 @@ impl NetworkMonitor {
             *active = true;
         }
 
-        // Initial network scan
-        self.scan_network_interfaces().await?;
+        // SOLUTION: Start background monitoring task but defer initial scan until triggered
+        // Network scan will be triggered when WebRTC connection reaches "Connected" state
+        debug!("Starting network monitoring background task (initial scan deferred until WebRTC Connected)");
 
-        // Start background monitoring task
+        // Start background monitoring task without initial scan
         let monitor = self.clone_for_task();
+        let (error_tx, mut error_rx) = mpsc::unbounded_channel();
+
+        // Spawn background task
         tokio::spawn(async move {
-            monitor.monitoring_loop().await;
+            monitor.monitoring_loop_with_error_reporting(error_tx).await;
         });
 
-        info!("Network monitoring started");
+        // Spawn error handler task (runs in main context with Python logging)
+        tokio::spawn(async move {
+            while let Some(error_msg) = error_rx.recv().await {
+                error!("Network monitoring: {}", error_msg);
+            }
+        });
+
+        debug!("Network monitoring started");
         Ok(())
     }
 
@@ -181,7 +653,13 @@ impl NetworkMonitor {
         if let Ok(mut active) = self.monitoring_active.lock() {
             *active = false;
         }
-        info!("Network monitoring stopped");
+        debug!("Network monitoring stopped");
+    }
+
+    /// Trigger initial network scan (called when WebRTC connection is established)
+    pub async fn trigger_initial_scan(&self) -> WebRTCResult<()> {
+        debug!("Triggering initial network scan (WebRTC connection established)");
+        self.scan_network_interfaces().await
     }
 
     /// Register callback for network change events
@@ -207,6 +685,193 @@ impl NetworkMonitor {
         } else {
             HashMap::new()
         }
+    }
+
+    /// Handle network transition (connection migration)
+    pub async fn handle_network_transition(
+        &self,
+        tube_id: &str,
+        old_interface: &str,
+        new_interface: &str,
+    ) -> WebRTCResult<()> {
+        info!(
+            "Handling network transition for tube {} from {} to {}",
+            tube_id, old_interface, new_interface
+        );
+
+        if self.config.enable_migration {
+            self.connection_migrator
+                .start_migration(
+                    tube_id,
+                    old_interface.to_string(),
+                    new_interface.to_string(),
+                )
+                .await?;
+        } else {
+            info!("Connection migration disabled, triggering standard ICE restart");
+        }
+
+        Ok(())
+    }
+
+    /// Assess comprehensive network quality for an interface
+    pub async fn assess_network_quality(&self, interface_name: &str) -> Option<u8> {
+        let interfaces = self.interfaces.lock().unwrap();
+        if let Some(interface) = interfaces.get(interface_name) {
+            let quality_score = NetworkQualityScorer::calculate_quality_score(interface);
+            Some(quality_score)
+        } else {
+            None
+        }
+    }
+
+    /// Predict potential network changes based on quality trends
+    pub async fn predict_network_changes(&self) -> Vec<PredictedNetworkEvent> {
+        let mut predictions = Vec::new();
+
+        let quality_history = self.quality_history.lock().unwrap();
+        let interfaces = self.interfaces.lock().unwrap();
+
+        for (interface_name, interface) in interfaces.iter() {
+            if let Some(history) = quality_history.get(interface_name) {
+                if history.len() >= 5 {
+                    // Analyze trend over last 5 measurements
+                    let recent_scores: Vec<u8> = history
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .map(|m| m.quality_score)
+                        .collect();
+
+                    // Simple trend detection
+                    if let (Some(&latest), Some(&oldest)) =
+                        (recent_scores.first(), recent_scores.last())
+                    {
+                        let trend = latest as i16 - oldest as i16;
+
+                        if trend < -15 {
+                            predictions.push(PredictedNetworkEvent::QualityDegradation {
+                                interface_name: interface_name.clone(),
+                                predicted_score: latest.saturating_sub(10),
+                                confidence: 0.8,
+                            });
+                        } else if latest < self.config.migration_quality_threshold
+                            && interface.is_active
+                        {
+                            predictions.push(PredictedNetworkEvent::PossibleDisconnection {
+                                interface_name: interface_name.clone(),
+                                probability: (self.config.migration_quality_threshold - latest)
+                                    as f64
+                                    / 100.0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        predictions
+    }
+
+    /// Update quality metrics for an interface
+    pub async fn update_interface_quality(
+        &self,
+        interface_name: &str,
+        metrics: NetworkQualityMetrics,
+    ) {
+        // Update interface quality
+        {
+            let mut interfaces = self.interfaces.lock().unwrap();
+            if let Some(interface) = interfaces.get_mut(interface_name) {
+                interface.quality_metrics = metrics.clone();
+                interface.quality_metrics.quality_score =
+                    NetworkQualityScorer::calculate_quality_score(interface);
+            }
+        }
+
+        // Add to quality history
+        {
+            let mut history = self.quality_history.lock().unwrap();
+            let interface_history = history.entry(interface_name.to_string()).or_default();
+            interface_history.push(metrics.clone());
+
+            // Keep only last 100 measurements per interface
+            if interface_history.len() > 100 {
+                interface_history.remove(0);
+            }
+        }
+
+        // Check if quality degradation triggers migration
+        if self.config.enable_migration
+            && metrics.quality_score < self.config.migration_quality_threshold
+        {
+            if let Some(current_primary) = self.get_primary_interface().await {
+                if current_primary == interface_name {
+                    info!(
+                        "Primary interface {} quality degraded to {}, looking for migration target",
+                        interface_name, metrics.quality_score
+                    );
+
+                    if let Some(_target) = self.find_best_migration_target(&current_primary).await {
+                        self.trigger_event(NetworkChangeEvent::QualityDegraded {
+                            interface_name: interface_name.to_string(),
+                            quality_score: metrics.quality_score,
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get current primary interface
+    pub async fn get_primary_interface(&self) -> Option<String> {
+        let primary = self.primary_interface.lock().unwrap();
+        primary.clone()
+    }
+
+    /// Set primary interface
+    pub async fn set_primary_interface(&self, interface_name: String) {
+        let (old_interface, should_trigger) = {
+            let mut primary = self.primary_interface.lock().unwrap();
+            let old_interface = primary.clone();
+            *primary = Some(interface_name.clone());
+            let should_trigger = old_interface.as_ref() != Some(&interface_name);
+            (old_interface, should_trigger)
+        };
+
+        if should_trigger {
+            info!(
+                "Primary interface changed: {:?} -> {}",
+                old_interface, interface_name
+            );
+            self.trigger_event(NetworkChangeEvent::PrimaryInterfaceChanged {
+                old_interface,
+                new_interface: interface_name,
+            })
+            .await;
+        }
+    }
+
+    /// Find best migration target for current primary interface
+    async fn find_best_migration_target(&self, current_interface: &str) -> Option<String> {
+        let interfaces = self.interfaces.lock().unwrap();
+        NetworkQualityScorer::find_best_migration_target(
+            &interfaces,
+            current_interface,
+            self.config.migration_quality_threshold,
+        )
+    }
+
+    /// Get migration status for a tube
+    pub fn get_migration_status(
+        &self,
+        tube_id: &str,
+        from_interface: &str,
+        to_interface: &str,
+    ) -> Option<MigrationState> {
+        let migration_id = format!("{}:{}→{}", tube_id, from_interface, to_interface);
+        self.connection_migrator.get_migration_status(&migration_id)
     }
 
     /// Check if network connectivity is available
@@ -307,112 +972,119 @@ impl NetworkMonitor {
         Ok(())
     }
 
-    /// Get system network interfaces (simplified cross-platform implementation)
+    /// Get system network interfaces using cross-platform interface enumeration
     async fn get_system_interfaces(&self) -> WebRTCResult<HashMap<String, NetworkInterface>> {
         let mut interfaces = HashMap::new();
         let now = Instant::now();
 
-        // Simplified interface detection - in a real implementation, this would use
-        // platform-specific APIs (Windows: GetAdaptersAddresses, Linux: getifaddrs, macOS: System Configuration)
+        // Get all network interfaces from the system
+        match if_addrs::get_if_addrs() {
+            Ok(addrs) => {
+                for iface in addrs {
+                    // Skip if we've already seen this interface name
+                    if interfaces.contains_key(&iface.name) {
+                        continue;
+                    }
 
-        // For now, we simulate common interface detection patterns
-        #[cfg(target_os = "macos")]
-        {
-            // macOS common interfaces
-            if self.check_interface_exists("en0").await {
-                interfaces.insert(
-                    "en0".to_string(),
-                    NetworkInterface {
-                        name: "en0".to_string(),
-                        interface_type: InterfaceType::Ethernet,
-                        is_active: true,
-                        ip_address: Some("192.168.1.100".to_string()), // Simplified
-                        last_seen: now,
-                    },
-                );
+                    // Determine interface type based on name patterns
+                    let interface_type = Self::classify_interface_type(&iface.name);
+
+                    // Skip loopback interfaces (we handle them specially below)
+                    if interface_type == InterfaceType::Loopback {
+                        continue;
+                    }
+
+                    // Get IP address
+                    let ip_address = Some(iface.addr.ip().to_string());
+
+                    // Assign preference scores based on interface type
+                    let preference_score = match interface_type {
+                        InterfaceType::Ethernet => 90,
+                        InterfaceType::WiFi => 70,
+                        InterfaceType::Cellular => 50,
+                        InterfaceType::Vpn => 30,
+                        InterfaceType::Loopback => 10,
+                        InterfaceType::Unknown => 40,
+                    };
+
+                    interfaces.insert(
+                        iface.name.clone(),
+                        NetworkInterface {
+                            name: iface.name,
+                            interface_type,
+                            is_active: true,
+                            ip_address,
+                            last_seen: now,
+                            quality_metrics: NetworkQualityMetrics::default(),
+                            preference_score,
+                        },
+                    );
+                }
             }
-
-            if self.check_interface_exists("en1").await {
-                interfaces.insert(
-                    "en1".to_string(),
-                    NetworkInterface {
-                        name: "en1".to_string(),
-                        interface_type: InterfaceType::WiFi,
-                        is_active: true,
-                        ip_address: Some("192.168.1.101".to_string()), // Simplified
-                        last_seen: now,
-                    },
-                );
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            // Linux common interfaces
-            if self.check_interface_exists("eth0").await {
-                interfaces.insert(
-                    "eth0".to_string(),
-                    NetworkInterface {
-                        name: "eth0".to_string(),
-                        interface_type: InterfaceType::Ethernet,
-                        is_active: true,
-                        ip_address: Some("192.168.1.100".to_string()),
-                        last_seen: now,
-                    },
-                );
-            }
-
-            if self.check_interface_exists("wlan0").await {
-                interfaces.insert(
-                    "wlan0".to_string(),
-                    NetworkInterface {
-                        name: "wlan0".to_string(),
-                        interface_type: InterfaceType::WiFi,
-                        is_active: true,
-                        ip_address: Some("192.168.1.101".to_string()),
-                        last_seen: now,
-                    },
-                );
+            Err(e) => {
+                warn!("Failed to enumerate network interfaces: {}", e);
             }
         }
-
-        #[cfg(target_os = "windows")]
-        {
-            // Windows interfaces would be detected via Windows API
-            // For now, simulate common patterns
-            interfaces.insert(
-                "ethernet".to_string(),
-                NetworkInterface {
-                    name: "ethernet".to_string(),
-                    interface_type: InterfaceType::Ethernet,
-                    is_active: true,
-                    ip_address: Some("192.168.1.100".to_string()),
-                    last_seen: now,
-                },
-            );
-        }
-
-        // Always include loopback
-        interfaces.insert(
-            "lo".to_string(),
-            NetworkInterface {
-                name: "lo".to_string(),
-                interface_type: InterfaceType::Loopback,
-                is_active: true,
-                ip_address: Some("127.0.0.1".to_string()),
-                last_seen: now,
-            },
-        );
 
         debug!("Detected {} network interfaces", interfaces.len());
         Ok(interfaces)
     }
 
-    /// Check if a network interface exists (simplified)
-    async fn check_interface_exists(&self, _interface_name: &str) -> bool {
-        // In a real implementation, this would check if the interface actually exists
-        // For now, we assume they exist for demonstration
-        true
+    /// Classify interface type based on name patterns
+    fn classify_interface_type(name: &str) -> InterfaceType {
+        let lower_name = name.to_lowercase();
+
+        // Loopback
+        if lower_name == "lo" || lower_name == "lo0" || lower_name.starts_with("loopback") {
+            return InterfaceType::Loopback;
+        }
+
+        // Ethernet
+        if lower_name.starts_with("eth")
+            || lower_name.starts_with("en")
+            || lower_name.starts_with("eno")
+            || lower_name.starts_with("ens")
+            || lower_name.starts_with("enp")
+            || lower_name.contains("ethernet")
+        {
+            return InterfaceType::Ethernet;
+        }
+
+        // WiFi
+        if lower_name.starts_with("wlan")
+            || lower_name.starts_with("wlp")
+            || lower_name.starts_with("wifi")
+            || lower_name.starts_with("wi-fi")
+            || lower_name.contains("wireless")
+            || lower_name.contains("wi-fi")
+        {
+            return InterfaceType::WiFi;
+        }
+
+        // Cellular
+        if lower_name.starts_with("wwan")
+            || lower_name.starts_with("wwp")
+            || lower_name.contains("cellular")
+            || lower_name.contains("mobile")
+            || lower_name.contains("lte")
+            || lower_name.contains("5g")
+        {
+            return InterfaceType::Cellular;
+        }
+
+        // VPN
+        if lower_name.starts_with("tun")
+            || lower_name.starts_with("tap")
+            || lower_name.starts_with("vpn")
+            || lower_name.contains("utun")
+            || lower_name.contains("ipsec")
+            || lower_name.contains("wireguard")
+            || lower_name.contains("openvpn")
+        {
+            return InterfaceType::Vpn;
+        }
+
+        InterfaceType::Unknown
     }
 
     /// Test connectivity to a specific endpoint
@@ -423,8 +1095,14 @@ impl NetworkMonitor {
         )
         .await
         {
-            Ok(Ok(_)) => true,
-            Ok(Err(_)) | Err(_) => false,
+            Ok(Ok(_)) => {
+                debug!("Connectivity test passed for {}", endpoint);
+                true
+            }
+            Ok(Err(_)) | Err(_) => {
+                debug!("Connectivity test failed for {}", endpoint);
+                false
+            }
         }
     }
 
@@ -456,8 +1134,8 @@ struct NetworkMonitorForTask {
 }
 
 impl NetworkMonitorForTask {
-    /// Main monitoring loop
-    async fn monitoring_loop(&self) {
+    /// Main monitoring loop with error reporting
+    async fn monitoring_loop_with_error_reporting(&self, error_tx: mpsc::UnboundedSender<String>) {
         let mut interval = interval(self.config.check_interval);
 
         loop {
@@ -473,13 +1151,14 @@ impl NetworkMonitorForTask {
             };
 
             if !is_active {
-                debug!("Network monitoring loop terminated");
+                // debug!("Network monitoring loop terminated");
                 break;
             }
 
             // Perform network interface scan
             if let Err(e) = self.scan_network_interfaces().await {
-                error!("Network interface scan failed: {}", e);
+                // Send error to main thread for proper logging
+                let _ = error_tx.send(format!("Network interface scan failed: {}", e));
                 continue;
             }
 
@@ -514,7 +1193,7 @@ impl NetworkMonitorForTask {
     /// Scan network interfaces (delegated implementation)
     async fn scan_network_interfaces(&self) -> WebRTCResult<()> {
         // Simplified scan - in a real implementation this would be more comprehensive
-        debug!("Background network interface scan");
+        // debug!("Background network interface scan");
         Ok(())
     }
 
@@ -536,14 +1215,20 @@ impl NetworkMonitorForTask {
         )
         .await
         {
-            Ok(Ok(_)) => true,
-            Ok(Err(_)) | Err(_) => false,
+            Ok(Ok(_)) => {
+                // debug!("Background task: Connectivity test passed for {}", endpoint);
+                true
+            }
+            Ok(Err(_)) | Err(_) => {
+                // debug!("Background task: Connectivity test failed for {}", endpoint);
+                false
+            }
         }
     }
 
     /// Trigger network change event (delegated implementation)
     async fn trigger_event(&self, event: NetworkChangeEvent) {
-        debug!("Network change detected in background task: {:?}", event);
+        // debug!("Network change detected in background task: {:?}", event);
 
         sleep(self.config.change_debounce_delay).await;
 
@@ -591,7 +1276,7 @@ impl WebRTCNetworkIntegration {
     {
         if let Ok(mut callbacks) = self.tube_callbacks.lock() {
             callbacks.insert(tube_id.clone(), Box::new(ice_restart_callback));
-            info!(
+            debug!(
                 "Registered tube {} for network change notifications",
                 tube_id
             );
@@ -599,6 +1284,7 @@ impl WebRTCNetworkIntegration {
     }
 
     /// Unregister a tube from network change notifications
+    #[allow(dead_code)]
     pub fn unregister_tube(&self, tube_id: &str) {
         if let Ok(mut callbacks) = self.tube_callbacks.lock() {
             if callbacks.remove(tube_id).is_some() {
@@ -610,7 +1296,23 @@ impl WebRTCNetworkIntegration {
         }
     }
 
+    /// Trigger ICE restart for a specific tube (for connection state-based triggers)
+    pub fn trigger_ice_restart(&self, tube_id: &str, reason: &str) {
+        if let Ok(callbacks) = self.tube_callbacks.lock() {
+            if let Some(callback) = callbacks.get(tube_id) {
+                info!(
+                    "Triggering ICE restart for tube {} due to: {}",
+                    tube_id, reason
+                );
+                callback();
+            } else {
+                debug!("No ICE restart callback registered for tube {}", tube_id);
+            }
+        }
+    }
+
     /// Handle network change events
+    #[allow(dead_code)]
     async fn handle_network_change(
         callbacks: Arc<Mutex<HashMap<String, TubeCallback>>>,
         event: NetworkChangeEvent,
@@ -645,15 +1347,23 @@ impl WebRTCNetworkIntegration {
                 // Connectivity restoration requires ICE restart
                 true
             }
+            NetworkChangeEvent::MigrationCompleted { .. } => {
+                // Migration completed - might need ICE restart for cleanup
+                false
+            }
+            NetworkChangeEvent::QualityDegraded { .. } => {
+                // Quality degradation might benefit from ICE restart
+                true
+            }
         };
 
         if requires_ice_restart {
-            info!("Network change requires ICE restart: {:?}", event);
+            debug!("Network change requires ICE restart: {:?}", event);
 
             // Trigger ICE restart for all registered tubes
             if let Ok(callbacks) = callbacks.lock() {
                 for (tube_id, callback) in callbacks.iter() {
-                    info!(
+                    debug!(
                         "Triggering ICE restart for tube {} due to network change",
                         tube_id
                     );
@@ -671,7 +1381,13 @@ impl WebRTCNetworkIntegration {
     }
 
     /// Stop monitoring
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.monitor.stop_monitoring();
+    }
+
+    /// Trigger initial network scan (event-driven startup)
+    pub async fn trigger_initial_scan(&self) -> WebRTCResult<()> {
+        self.monitor.trigger_initial_scan().await
     }
 }

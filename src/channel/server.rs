@@ -67,7 +67,7 @@ impl Channel {
             .local_addr()
             .map_err(|e| anyhow!("Failed to get local address after bind: {}", e))?;
 
-        info!(
+        debug!(
             "Channel({}): Server listening on {}",
             self.channel_id, actual_addr
         );

@@ -5,10 +5,11 @@ use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::{setup_channel_for_data_channel, TubeStatus};
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
 use crate::tube_registry::SignalMessage;
+use crate::unlikely;
 use crate::webrtc_core::{create_data_channel, WebRTCPeerConnection};
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -110,11 +111,12 @@ impl Tube {
             "[TUBE_DEBUG] Tube {}: create_peer_connection called. trickle_ice: {}, turn_only: {}",
             self.id, trickle_ice, turn_only
         );
-        trace!(
-            "Create_peer_connection protocol_settings (tube_id: {}, protocol_settings: {:?})",
-            self.id,
-            protocol_settings
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Create_peer_connection protocol_settings (tube_id: {}, protocol_settings: {:?})",
+                self.id, protocol_settings
+            );
+        }
 
         // Store client_version in the tube
         {
@@ -124,7 +126,7 @@ impl Tube {
             }
         }
 
-        let connection = WebRTCPeerConnection::new(
+        let mut connection = WebRTCPeerConnection::new(
             config,
             trickle_ice,
             turn_only,
@@ -134,6 +136,9 @@ impl Tube {
         )
         .await
         .map_err(|e| anyhow!("{}", e))?;
+
+        // Set server mode for accurate logging
+        connection.set_server_mode(self.is_server_mode_context);
 
         let connection_arc = Arc::new(connection);
 
@@ -165,18 +170,39 @@ impl Tube {
                         // Tube status update
                         *status_clone.write().await = TubeStatus::Active;
                         debug!("Tube connection state changed to Active (tube_id: {})", tube_id_log);
+
+                        // Start monitoring and quality management
+                        if let Err(e) = connection_for_signals.start_monitoring().await {
+                            warn!("Failed to start monitoring (tube_id: {}, error: {})", tube_id_log, e);
+                        }
+
                         // Start keepalive mechanism to prevent NAT timeouts
                         if let Err(e) = connection_for_signals.start_keepalive().await {
                             warn!("Failed to start keepalive (tube_id: {}, error: {})", tube_id_log, e);
                         }
+
+                        // Report successful connection establishment
+                        if let Err(e) = connection_for_signals.report_success("ConnectionEstablished").await {
+                            debug!("Failed to report connection success (tube_id: {}, error: {})", tube_id_log, e);
+                        }
+
                         // Send connection state changed signal to Python
-                        info!("Sending 'connected' signal to Python (tube_id: {})", tube_id_log);
+                        debug!("Sending 'connected' signal to Python (tube_id: {})", tube_id_log);
                         connection_for_signals.send_connection_state_changed("connected");
                     },
                     RTCPeerConnectionState::Failed => {
                         // Update the closing flag (from comprehensive monitor)
                         is_closing_for_handler.store(true, std::sync::atomic::Ordering::Release);
                         debug!("Connection failed (tube_id: {}, state: {})", tube_id_log, state_str);
+
+                        // Report connection failure for adaptive learning
+                        let connection_error = crate::webrtc_errors::WebRTCError::IceConnectionFailed {
+                            tube_id: tube_id_log.clone(),
+                            reason: "Peer connection state failed".to_string(),
+                        };
+                        if let Err(e) = connection_for_signals.trigger_adaptive_recovery(&connection_error).await {
+                            warn!("Failed to trigger adaptive recovery (tube_id: {}, error: {})", tube_id_log, e);
+                        }
 
                         // Tube lifecycle management
                         let current_status = *status_clone.read().await;
@@ -280,7 +306,7 @@ impl Tube {
 
                 match state {
                     webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Connected => {
-                        info!("ICE connection established (tube_id: {})", tube_id_for_ice_log);
+                        debug!("ICE connection established (tube_id: {})", tube_id_for_ice_log);
 
                         // Enhanced candidate analysis at trace level for TURN detection
                         if tracing::enabled!(tracing::Level::TRACE) {
@@ -305,17 +331,19 @@ impl Tube {
                             if let (Some(local), Some(remote)) = (local_desc, remote_desc) {
                                 let local_type = parse_candidate_type_from_sdp(&local.sdp);
                                 let remote_type = parse_candidate_type_from_sdp(&remote.sdp);
-                                info!("ICE connection established (tube_id: {})", tube_id_for_ice_log);
+                                debug!("ICE connection established (tube_id: {})", tube_id_for_ice_log);
 
                                 match (local_type, remote_type) {
                                     (Some(local), Some(remote)) => {
                                         let using_turn = local == "relay" || remote == "relay";
 
-                                        trace!("ICE candidates: local_type={} remote_type={} {} (tube_id: {}, local_type: {}, remote_type: {}, using_turn: {})",
-                                            local, remote,
-                                            if using_turn { "(using TURN)" } else { "(no TURN)" },
-                                            tube_id_for_ice_log, local, remote, using_turn
-                                        );
+                                        if unlikely!(crate::logger::is_verbose_logging()) {
+                                            debug!("ICE candidates: local_type={} remote_type={} {} (tube_id: {}, local_type: {}, remote_type: {}, using_turn: {})",
+                                                local, remote,
+                                                if using_turn { "(using TURN)" } else { "(no TURN)" },
+                                                tube_id_for_ice_log, local, remote, using_turn
+                                            );
+                                        }
 
                                         // Always log connection type with TURN indicator
                                         info!("Connection type: local={} remote={}{} (tube_id: {})",
@@ -325,11 +353,13 @@ impl Tube {
                                         );
                                     },
                                     _ => {
-                                        trace!("ICE connection established but could not parse candidate types (tube_id: {})", tube_id_for_ice_log);
+                                        if unlikely!(crate::logger::is_verbose_logging()) {
+                                            debug!("ICE connection established but could not parse candidate types (tube_id: {})", tube_id_for_ice_log);
+                                        }
                                     }
                                 }
-                            } else {
-                                trace!("ICE connection established but SDP descriptions not available (tube_id: {})", tube_id_for_ice_log);
+                            } else if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("ICE connection established but SDP descriptions not available (tube_id: {})", tube_id_for_ice_log);
                             }
                         }
                     },
@@ -344,24 +374,47 @@ impl Tube {
             })
         }));
 
-        // Set up ICE gathering state monitoring
+        // Set up ICE gathering state monitoring with timing metrics
         let tube_id_for_gather = self.id.clone();
+        let conversation_id_for_gather = Some(self.id.clone());
         connection_arc
             .peer_connection
             .on_ice_gathering_state_change(Box::new(move |state| {
                 let tube_id_for_gather_log = tube_id_for_gather.clone();
+                let conversation_id_for_gather_log = conversation_id_for_gather.clone();
                 Box::pin(async move {
                     debug!(
                         "ICE gathering state changed (tube_id: {}, state: {:?})",
                         tube_id_for_gather_log, state
                     );
 
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as f64;
+
                     match state {
                     webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete => {
-                        info!("ICE gathering complete (tube_id: {})", tube_id_for_gather_log);
+                        debug!("ICE gathering complete (tube_id: {})", tube_id_for_gather_log);
+
+                        // Update ICE gathering completion time in metrics
+                        if let Some(conversation_id) = &conversation_id_for_gather_log {
+                            crate::metrics::METRICS_COLLECTOR.update_ice_gathering_complete(
+                                conversation_id,
+                                now_ms
+                            );
+                        }
                     },
                     webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Gathering => {
                         debug!("ICE gathering started (tube_id: {})", tube_id_for_gather_log);
+
+                        // Update ICE gathering start time in metrics
+                        if let Some(conversation_id) = &conversation_id_for_gather_log {
+                            crate::metrics::METRICS_COLLECTOR.update_ice_gathering_start(
+                                conversation_id,
+                                now_ms
+                            );
+                        }
                     },
                     _ => {}
                 }
@@ -369,6 +422,7 @@ impl Tube {
             }));
 
         // Set up a handler for incoming data channels
+        debug!("[DATA_CHANNEL_SETUP] Registering on_data_channel callback (tube_id: {}, is_server_mode: {})", self.id, self.is_server_mode_context);
         let tube_clone = self.clone();
         let protocol_settings_clone_for_on_data_channel = protocol_settings.clone(); // Clone for the outer closure
         let callback_token_for_on_data_channel = callback_token.clone(); // Clone for on_data_channel
@@ -376,6 +430,7 @@ impl Tube {
         let tube_client_version_for_on_data_channel = self.client_version.clone(); // Clone for on_data_channel
         let peer_connection_for_on_data_channel = connection_arc.clone(); // Clone peer connection for data channel handler
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
+            info!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), rtc_data_channel.label(), rtc_data_channel.id());
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
@@ -387,8 +442,11 @@ impl Tube {
             let rtc_data_channel_id = rtc_data_channel.id();
 
             Box::pin(async move {
-                debug!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
-                trace!("on_data_channel: Protocol settings for this channel. (tube_id: {}, channel_label: {}, protocol_settings_for_channel_setup: {:?})", tube.id, rtc_data_channel_label, protocol_settings_for_channel_setup);
+                println!("[TUBE_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {:?}", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+                info!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Protocol settings for this channel. (tube_id: {}, channel_label: {}, protocol_settings_for_channel_setup: {:?})", tube.id, rtc_data_channel_label, protocol_settings_for_channel_setup);
+                }
 
                 // Get client_version from the tube
                 let client_version = match client_version_arc_for_channel.read().await.clone() {
@@ -463,7 +521,9 @@ impl Tube {
                     return;
                 }
                 debug!("on_data_channel: Channel metadata registered with tube (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
-                trace!("on_data_channel: Channel details after setup. (tube_id: {}, channel_label: {}, active_protocol: {:?}, local_listen_addr: {:?})", tube.id, rtc_data_channel_label, owned_channel.active_protocol, owned_channel.local_listen_addr);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Channel details after setup. (tube_id: {}, channel_label: {}, active_protocol: {:?}, local_listen_addr: {:?})", tube.id, rtc_data_channel_label, owned_channel.active_protocol, owned_channel.local_listen_addr);
+                }
 
                 // Store the shutdown signal for this newly created channel
                 let shutdown_signal = Arc::clone(&owned_channel.should_exit);
@@ -476,10 +536,10 @@ impl Tube {
                         if !listen_addr_str.is_empty() &&
                            matches!(owned_channel.active_protocol, crate::channel::types::ActiveProtocol::PortForward | crate::channel::types::ActiveProtocol::Socks5 | crate::channel::types::ActiveProtocol::Guacd) // Assuming Guacamole might be server mode too
                         {
-                            info!("on_data_channel: Channel is server mode, attempting to start server. (tube_id: {}, channel_label: {}, protocol: {:?}, listen_addr: {})", tube.id, rtc_data_channel_label, owned_channel.active_protocol, listen_addr_str);
+                            debug!("on_data_channel: Channel is server mode, attempting to start server. (tube_id: {}, channel_label: {}, protocol: {:?}, listen_addr: {})", tube.id, rtc_data_channel_label, owned_channel.active_protocol, listen_addr_str);
                             match owned_channel.start_server(&listen_addr_str).await {
                                 Ok(socket_addr) => {
-                                    info!("on_data_channel: Server started successfully. (tube_id: {}, channel_label: {}, listen_port: {})", tube.id, rtc_data_channel_label, socket_addr.port());
+                                    debug!("on_data_channel: Server started successfully. (tube_id: {}, channel_label: {}, listen_port: {})", tube.id, rtc_data_channel_label, socket_addr.port());
                                 }
                                 Err(e) => {
                                     error!("on_data_channel: Failed to start server: {}. Channel will not run effectively. (tube_id: {}, channel_label: {}, listen_addr: {})", e, tube.id, rtc_data_channel_label, listen_addr_str);
@@ -892,11 +952,13 @@ impl Tube {
         ksm_config: Option<String>,
         client_version: Option<String>,
     ) -> Result<Option<u16>> {
-        info!(
+        debug!(
             "create_channel: Called. (tube_id: {}, channel_name: {})",
             self.id, name
         );
-        trace!("create_channel: Initial parameters. (tube_id: {}, channel_name: {}, timeout_seconds: {:?}, protocol_settings: {:?})", self.id, name, timeout_seconds, protocol_settings);
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("create_channel: Initial parameters. (tube_id: {}, channel_name: {}, timeout_seconds: {:?}, protocol_settings: {:?})", self.id, name, timeout_seconds, protocol_settings);
+        }
 
         // Register connection with metrics system
         crate::metrics::METRICS_COLLECTOR.register_connection(name.to_string(), self.id.clone());
@@ -909,14 +971,16 @@ impl Tube {
             read: Duration::from_secs_f64(timeout),
             guacd_handshake: Duration::from_secs_f64(timeout / 1.5),
         });
-        trace!(
-            "create_channel: Timeouts configured. (tube_id: {}, channel_name: {}, timeouts: {:?})",
-            self.id,
-            name,
-            timeouts
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "create_channel: Timeouts configured. (tube_id: {}, channel_name: {}, timeouts: {:?})",
+                self.id,
+                name,
+                timeouts
+            );
+        }
 
-        info!("create_channel: About to call setup_channel_for_data_channel. (tube_id: {}, channel_name: {})", self.id, name);
+        debug!("create_channel: About to call setup_channel_for_data_channel. (tube_id: {}, channel_name: {})", self.id, name);
         let client_version = match client_version {
             Some(version) => version,
             None => {
@@ -952,7 +1016,7 @@ impl Tube {
 
         let mut owned_channel = match setup_result {
             Ok(ch_instance) => {
-                info!("create_channel: setup_channel_for_data_channel successful. (tube_id: {}, channel_name: {})", self.id, name);
+                debug!("create_channel: setup_channel_for_data_channel successful. (tube_id: {}, channel_name: {})", self.id, name);
                 ch_instance
             }
             Err(e) => {
@@ -984,7 +1048,9 @@ impl Tube {
             "create_channel: Channel metadata registered with tube (tube_id: {}, channel_name: {})",
             self.id, name
         );
-        trace!("create_channel: Channel details after setup. (tube_id: {}, channel_name: {}, active_protocol: {:?}, local_listen_addr: {:?}, server_mode: {})", self.id, name, owned_channel.active_protocol, owned_channel.local_listen_addr, owned_channel.server_mode);
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("create_channel: Channel details after setup. (tube_id: {}, channel_name: {}, active_protocol: {:?}, local_listen_addr: {:?}, server_mode: {})", self.id, name, owned_channel.active_protocol, owned_channel.local_listen_addr, owned_channel.server_mode);
+        }
 
         // Store the shutdown signal for this channel
         let shutdown_signal = Arc::clone(&owned_channel.should_exit);
@@ -1010,11 +1076,11 @@ impl Tube {
                     )
                 // Assuming Guacamole might be server mode too
                 {
-                    info!("create_channel: Channel is server mode, attempting to start server. (tube_id: {}, channel_name: {}, protocol: {:?}, listen_addr: {})", self.id, name, owned_channel.active_protocol, listen_addr_str);
+                    debug!("create_channel: Channel is server mode, attempting to start server. (tube_id: {}, channel_name: {}, protocol: {:?}, listen_addr: {})", self.id, name, owned_channel.active_protocol, listen_addr_str);
                     match owned_channel.start_server(&listen_addr_str).await {
                         Ok(socket_addr) => {
                             actual_listening_port = Some(socket_addr.port());
-                            info!("create_channel: Server started successfully. (tube_id: {}, channel_name: {}, listen_port: {})", self.id, name, actual_listening_port.unwrap());
+                            debug!("create_channel: Server started successfully. (tube_id: {}, channel_name: {}, listen_port: {})", self.id, name, actual_listening_port.unwrap());
                         }
                         Err(e) => {
                             error!("create_channel: Failed to start server: {}. Channel will not listen. (tube_id: {}, channel_name: {}, listen_addr: {})", e, self.id, name, listen_addr_str);
@@ -1043,7 +1109,7 @@ impl Tube {
         let runtime_clone = self.runtime.clone();
         let tube_id_for_spawn = self.id.clone(); // Clone self.id here to make it 'static
         let peer_connection_for_spawn = Arc::clone(&self.peer_connection); // Clone peer_connection
-        info!(
+        debug!(
             "create_channel: Spawning channel.run() task. (tube_id: {}, channel_name: {})",
             self.id, name_clone
         );
@@ -1134,7 +1200,7 @@ impl Tube {
 
             debug!("create_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
         });
-        info!("create_channel: Successfully set up and spawned channel task. Returning listening port. (tube_id: {}, channel_name: {}, actual_listening_port: {:?})", self.id, name, actual_listening_port);
+        debug!("create_channel: Successfully set up and spawned channel task. Returning listening port. (tube_id: {}, channel_name: {}, actual_listening_port: {:?})", self.id, name, actual_listening_port);
         Ok(actual_listening_port)
     }
 
@@ -1245,6 +1311,16 @@ impl Tube {
         sdp: String,
         is_answer: bool,
     ) -> Result<(), String> {
+        debug!("[SDP_DEBUG] set_remote_description called (tube_id: {}, is_answer: {}, is_server_mode: {}, sdp_length: {})",
+            self.id, is_answer, self.is_server_mode_context, sdp.len());
+
+        // Check if SDP contains data channel information
+        if sdp.contains("m=application") {
+            debug!("[SDP_DEBUG] SDP contains data channel (m=application) - on_data_channel should fire (tube_id: {})", self.id);
+        } else {
+            warn!("[SDP_DEBUG] SDP does NOT contain data channel (m=application) - on_data_channel will not fire (tube_id: {})", self.id);
+        }
+
         let pc_guard = self.peer_connection.lock().await;
 
         if let Some(pc) = &*pc_guard {
@@ -1258,7 +1334,7 @@ impl Tube {
             }
             .map_err(|e| format!("Failed to create session description: {e}"))?;
 
-            // Set the remote description directly on the peer connection
+            // Set the remote description directly on the WebRTC library, bypassing wrapper
             pc.peer_connection
                 .set_remote_description(desc)
                 .await
@@ -1662,7 +1738,7 @@ impl Tube {
                         stats.bytes_sent += outbound.bytes_sent;
                     }
                     webrtc::stats::StatsReportType::RemoteInboundRTP(remote_inbound) => {
-                        // Use remote inbound stats for packet loss (more accurate)
+                        // Use remote inbound stats for packet loss)
                         stats.packet_loss_rate = remote_inbound.fraction_lost;
                         if let Some(rtt) = remote_inbound.round_trip_time {
                             stats.rtt_ms = Some(rtt * 1000.0); // Convert to milliseconds

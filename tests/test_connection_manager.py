@@ -271,7 +271,8 @@ class TestTunnelConnectionManager:
         # Verify sequence
         manager._execute_ice_restart.assert_called_once()
         manager._send_restart_offer.assert_called_once_with("test_sdp")
-        manager._verify_restart_success.assert_called_once()
+        # _verify_restart_success may be called multiple times during polling
+        assert manager._verify_restart_success.call_count >= 1
         
         # Should end in connected state
         assert manager.state == ConnectionState.CONNECTED

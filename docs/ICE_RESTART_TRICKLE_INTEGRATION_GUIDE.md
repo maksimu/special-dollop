@@ -610,8 +610,10 @@ For advanced use cases, you can manually trigger ICE restart:
 def manual_ice_restart(self, tube_id):
     """Manually trigger ICE restart for a specific connection"""
     try:
-        self.registry.restart_ice(tube_id)
+        restart_sdp = self.registry.restart_ice(tube_id)
         print(f"🔄 Manual ICE restart initiated for {tube_id}")
+        # Send restart_sdp to remote peer through your signaling mechanism
+        self.send_restart_offer_to_peer(restart_sdp, tube_id)
     except Exception as e:
         print(f"❌ Manual ICE restart failed for {tube_id}: {e}")
 ```

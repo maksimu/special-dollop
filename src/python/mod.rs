@@ -24,8 +24,9 @@ pub fn keeper_pam_webrtc_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     // Explicitly import and wrap the Python-specific logger initializer
     #[cfg(feature = "python")]
     {
-        use crate::logger::initialize_logger as py_initialize_logger;
+        use crate::logger::{initialize_logger as py_initialize_logger, set_verbose_logging};
         m.add_function(wrap_pyfunction!(py_initialize_logger, py)?)?;
+        m.add_function(wrap_pyfunction!(set_verbose_logging, py)?)?;
     }
 
     // Add runtime shutdown function for Python cleanup

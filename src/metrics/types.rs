@@ -33,6 +33,69 @@ impl ConnectionQuality {
     }
 }
 
+/// ICE candidate gathering and connection metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ICEStats {
+    /// Total ICE candidates gathered
+    pub total_candidates: u32,
+    /// Host candidates (direct connection)
+    pub host_candidates: u32,
+    /// Server reflexive candidates (STUN)
+    pub srflx_candidates: u32,
+    /// Relay candidates (TURN)
+    pub relay_candidates: u32,
+    /// Time to gather first candidate (ms)
+    pub first_candidate_time_ms: Option<f64>,
+    /// Time to complete gathering (ms)
+    pub gathering_complete_time_ms: Option<f64>,
+    /// STUN server response times (ms)
+    pub stun_response_times: Vec<f64>,
+    /// TURN allocation success rate (0.0 - 1.0)
+    pub turn_allocation_success_rate: f64,
+    /// TURN allocation time (ms)
+    pub turn_allocation_time_ms: Option<f64>,
+    /// Selected candidate pair details
+    pub selected_candidate_pair: Option<CandidatePairStats>,
+}
+
+impl Default for ICEStats {
+    fn default() -> Self {
+        Self {
+            total_candidates: 0,
+            host_candidates: 0,
+            srflx_candidates: 0,
+            relay_candidates: 0,
+            first_candidate_time_ms: None,
+            gathering_complete_time_ms: None,
+            stun_response_times: Vec::new(),
+            turn_allocation_success_rate: 0.0,
+            turn_allocation_time_ms: None,
+            selected_candidate_pair: None,
+        }
+    }
+}
+
+/// Selected ICE candidate pair performance metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidatePairStats {
+    /// Local candidate type (host, srflx, relay)
+    pub local_candidate_type: String,
+    /// Remote candidate type
+    pub remote_candidate_type: String,
+    /// Current round-trip time (ms)
+    pub current_rtt_ms: f64,
+    /// Total round-trip time samples
+    pub total_rtt_measurements: u64,
+    /// Connection establishment time (ms)
+    pub connection_time_ms: Option<f64>,
+    /// Bytes sent through this pair
+    pub bytes_sent: u64,
+    /// Bytes received through this pair
+    pub bytes_received: u64,
+    /// Path type (direct, relay, etc)
+    pub transport_protocol: String,
+}
+
 /// Real-time WebRTC transport statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RTCStats {
@@ -54,6 +117,8 @@ pub struct RTCStats {
     pub dtls_ready: bool,
     /// Number of active data channels
     pub active_data_channels: u32,
+    /// ICE and candidate statistics
+    pub ice_stats: ICEStats,
 }
 
 impl Default for RTCStats {
@@ -68,6 +133,7 @@ impl Default for RTCStats {
             ice_connection_state: "new".to_string(),
             dtls_ready: false,
             active_data_channels: 0,
+            ice_stats: ICEStats::default(),
         }
     }
 }
@@ -102,11 +168,32 @@ impl Default for SCTPStats {
     }
 }
 
+/// Connection leg performance breakdown
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConnectionLegMetrics {
+    /// Client to KRelay latency (ms)
+    pub client_to_krelay_latency_ms: Option<f64>,
+    /// KRelay to Gateway latency (ms)
+    pub krelay_to_gateway_latency_ms: Option<f64>,
+    /// End-to-end client to gateway latency (ms)
+    pub end_to_end_latency_ms: Option<f64>,
+    /// STUN server response time (ms)
+    pub stun_response_time_ms: Option<f64>,
+    /// TURN allocation latency (ms)
+    pub turn_allocation_latency_ms: Option<f64>,
+    /// Data channel establishment time (ms)
+    pub data_channel_establishment_ms: Option<f64>,
+    /// ICE connection establishment time (ms)
+    pub ice_connection_establishment_ms: Option<f64>,
+}
+
 /// Combined WebRTC metrics including RTC and SCTP stats
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRTCMetrics {
     pub rtc_stats: RTCStats,
     pub sctp_stats: SCTPStats,
+    /// Connection leg performance breakdown
+    pub connection_legs: ConnectionLegMetrics,
     /// Timestamp when these metrics were collected
     pub collected_at: DateTime<Utc>,
 }
@@ -116,6 +203,7 @@ impl Default for WebRTCMetrics {
         Self {
             rtc_stats: RTCStats::default(),
             sctp_stats: SCTPStats::default(),
+            connection_legs: ConnectionLegMetrics::default(),
             collected_at: Utc::now(),
         }
     }

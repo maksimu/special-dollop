@@ -384,8 +384,24 @@ impl TubeRegistry {
             );
 
             if use_turn_for_config_from_settings {
-                // Get TURN credentials if needed - only in client mode when ksm_config is available
-                if let Some(ksm_cfg) = ksm_config {
+                // Priority 1: Check for explicit TURN credentials in settings FIRST
+                if let (Some(turn_url), Some(turn_username), Some(turn_password)) = (
+                    settings.get("turn_url").and_then(|v| v.as_str()),
+                    settings.get("turn_username").and_then(|v| v.as_str()),
+                    settings.get("turn_password").and_then(|v| v.as_str()),
+                ) {
+                    debug!(
+                        "Using explicit TURN credentials from settings (tube_id: {}, turn_url: {})",
+                        tube_id, turn_url
+                    );
+                    ice_servers.push(RTCIceServer {
+                        urls: vec![turn_url.to_string()],
+                        username: turn_username.to_string(),
+                        credential: turn_password.to_string(),
+                    });
+                }
+                // Priority 2: Fallback to ksm_config if no explicit credentials
+                else if let Some(ksm_cfg) = ksm_config {
                     if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
                         // First, check if we can reuse an existing TURN connection
                         if let Some(existing_conn) =
@@ -403,16 +419,27 @@ impl TubeRegistry {
                                 "Fetching new TURN credentials from router (tube_id: {})",
                                 tube_id
                             );
+
+                            let turn_start_time = std::time::Instant::now();
                             match get_relay_access_creds(ksm_cfg, None, client_version).await {
                                 Ok(creds) => {
+                                    let turn_duration_ms =
+                                        turn_start_time.elapsed().as_millis() as f64;
                                     debug!(
-                                        "Successfully fetched TURN credentials (tube_id: {})",
-                                        tube_id
+                                        "Successfully fetched TURN credentials (tube_id: {}, duration: {:.1}ms)",
+                                        tube_id, turn_duration_ms
                                     );
                                     trace!(
                                         "Received TURN credentials (tube_id: {}, credentials: {})",
                                         tube_id,
                                         creds
+                                    );
+
+                                    // Record TURN allocation success metrics
+                                    crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
+                                        &tube_id,
+                                        turn_duration_ms,
+                                        true,
                                     );
 
                                     // Extract username and password from credentials
@@ -441,9 +468,18 @@ impl TubeRegistry {
                                     }
                                 }
                                 Err(e) => {
+                                    let turn_duration_ms =
+                                        turn_start_time.elapsed().as_millis() as f64;
                                     error!(
-                                        "Failed to get TURN credentials: {} (tube_id: {})",
-                                        e, tube_id
+                                        "Failed to get TURN credentials: {} (tube_id: {}, duration: {:.1}ms)",
+                                        e, tube_id, turn_duration_ms
+                                    );
+
+                                    // Record TURN allocation failure metrics
+                                    crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
+                                        &tube_id,
+                                        turn_duration_ms,
+                                        false,
                                     );
                                     // Don't fail the entire operation, just log the error
                                 }
@@ -451,7 +487,10 @@ impl TubeRegistry {
                         }
                     }
                 } else {
-                    debug!("Server mode: Skipping TURN credential fetch (no ksm_config available) (tube_id: {})", tube_id);
+                    debug!(
+                        "No TURN credentials available in settings or ksm_config (tube_id: {})",
+                        tube_id
+                    );
                 }
             }
         } else {
@@ -502,7 +541,7 @@ impl TubeRegistry {
 
         // Conditionally create channels only if in server mode (no initial offer from the client)
         if is_server_mode {
-            info!(
+            debug!(
                 "Server mode: Proactively creating control and main data channels. (tube_id: {})",
                 tube_id
             );
@@ -593,7 +632,7 @@ impl TubeRegistry {
             result_map.insert("answer".to_string(), BASE64_STANDARD.encode(answer_sdp));
         }
 
-        info!("Tube processing complete. (tube_id: {}, conversation_id: {}, mode: {}, result_keys: {:?}, settings_keys: {:?})",
+        debug!("Tube processing complete. (tube_id: {}, conversation_id: {}, mode: {}, result_keys: {:?}, settings_keys: {:?})",
               tube_id, conversation_id, if is_server_mode {"Server"} else {"Client"}, result_map.keys().collect::<Vec<_>>(), settings.keys().collect::<Vec<_>>());
 
         Ok(result_map)

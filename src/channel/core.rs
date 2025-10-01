@@ -283,7 +283,7 @@ impl Channel {
                                     error!("guacd_params was not a JSON object. Value: {:?} (channel_id: {})", guacd_params_json_val, channel_id);
                                 }
                             } else {
-                                warn!("'guacd_params' key not found in protocol_settings. (channel_id: {})", channel_id);
+                                debug!("'guacd_params' key not found in protocol_settings. (channel_id: {})", channel_id);
                             }
                         } else {
                             // Handle non-Guacd types like Tunnel or SOCKS5 if network rules are present
@@ -489,7 +489,7 @@ impl Channel {
             client_version,
         };
 
-        info!(
+        debug!(
             "Channel initialized (channel_id: {}, server_mode: {})",
             new_channel.channel_id, new_channel.server_mode
         );

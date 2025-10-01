@@ -390,24 +390,104 @@ pub(crate) async fn forward_udp_packet_to_tunnel(
     }
     udp_data.put_u16(peer_addr.port());
 
-    // For client-side, we would need to parse the SOCKS5 UDP packet format,
-    // But for simplicity, let's assume the packet_data is already in raw UDP format
-    // In a real implementation, we'd need to extract destination from SOCKS5 UDP format
+    // Parse SOCKS5 UDP relay packet format (RFC 1928 Section 7)
+    // Format: [RSV:2][FRAG:1][ATYP:1][DST.ADDR:var][DST.PORT:2][DATA:var]
 
-    // For now, use a placeholder destination (this would come from SOCKS5 UDP packet parsing)
-    let placeholder_host = "example.com";
-    let placeholder_port = 53u16;
+    if packet_data.len() < 10 {
+        return Err(anyhow::anyhow!("Invalid SOCKS5 UDP packet: too short"));
+    }
+
+    let mut cursor = 0;
+
+    // Skip reserved (2 bytes) and fragment (1 byte)
+    cursor += 3;
+
+    let atyp = packet_data[cursor];
+    cursor += 1;
+
+    let (destination_host, destination_port, udp_payload_start) = match atyp {
+        0x01 => {
+            // IPv4 address (4 bytes)
+            if packet_data.len() < cursor + 6 {
+                return Err(anyhow::anyhow!(
+                    "Invalid SOCKS5 UDP packet: incomplete IPv4"
+                ));
+            }
+            let ip = std::net::Ipv4Addr::new(
+                packet_data[cursor],
+                packet_data[cursor + 1],
+                packet_data[cursor + 2],
+                packet_data[cursor + 3],
+            );
+            cursor += 4;
+            let port = u16::from_be_bytes([packet_data[cursor], packet_data[cursor + 1]]);
+            cursor += 2;
+            (ip.to_string(), port, cursor)
+        }
+        0x03 => {
+            // Domain name (1 byte length + domain)
+            if packet_data.len() < cursor + 1 {
+                return Err(anyhow::anyhow!(
+                    "Invalid SOCKS5 UDP packet: missing domain length"
+                ));
+            }
+            let domain_len = packet_data[cursor] as usize;
+            cursor += 1;
+            if packet_data.len() < cursor + domain_len + 2 {
+                return Err(anyhow::anyhow!(
+                    "Invalid SOCKS5 UDP packet: incomplete domain"
+                ));
+            }
+            let domain = String::from_utf8(packet_data[cursor..cursor + domain_len].to_vec())
+                .map_err(|_| anyhow::anyhow!("Invalid UTF-8 in domain name"))?;
+            cursor += domain_len;
+            let port = u16::from_be_bytes([packet_data[cursor], packet_data[cursor + 1]]);
+            cursor += 2;
+            (domain, port, cursor)
+        }
+        0x04 => {
+            // IPv6 address (16 bytes)
+            if packet_data.len() < cursor + 18 {
+                return Err(anyhow::anyhow!(
+                    "Invalid SOCKS5 UDP packet: incomplete IPv6"
+                ));
+            }
+            let ip = std::net::Ipv6Addr::from([
+                packet_data[cursor],
+                packet_data[cursor + 1],
+                packet_data[cursor + 2],
+                packet_data[cursor + 3],
+                packet_data[cursor + 4],
+                packet_data[cursor + 5],
+                packet_data[cursor + 6],
+                packet_data[cursor + 7],
+                packet_data[cursor + 8],
+                packet_data[cursor + 9],
+                packet_data[cursor + 10],
+                packet_data[cursor + 11],
+                packet_data[cursor + 12],
+                packet_data[cursor + 13],
+                packet_data[cursor + 14],
+                packet_data[cursor + 15],
+            ]);
+            cursor += 16;
+            let port = u16::from_be_bytes([packet_data[cursor], packet_data[cursor + 1]]);
+            cursor += 2;
+            (ip.to_string(), port, cursor)
+        }
+        _ => return Err(anyhow::anyhow!("Unsupported SOCKS5 address type: {}", atyp)),
+    };
 
     // Destination host length and host
-    let host_bytes = placeholder_host.as_bytes();
+    let host_bytes = destination_host.as_bytes();
     udp_data.put_u32(host_bytes.len() as u32);
     udp_data.extend_from_slice(host_bytes);
 
     // Destination port
-    udp_data.put_u16(placeholder_port);
+    udp_data.put_u16(destination_port);
 
-    // UDP payload (raw packet data for now)
-    udp_data.extend_from_slice(packet_data);
+    // UDP payload (actual data starts at udp_payload_start)
+    udp_data.extend_from_slice(&packet_data[udp_payload_start..]);
 
     let frame = crate::tube_protocol::Frame::new_control_with_pool(
         ControlMessage::UdpPacket,

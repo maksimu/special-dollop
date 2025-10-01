@@ -3,9 +3,10 @@ use base64::{
     engine::general_purpose::URL_SAFE as URL_SAFE_BASE64, Engine as _,
 };
 
+use crate::unlikely;
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use log::{debug, error, trace};
+use log::{debug, error};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
@@ -358,13 +359,12 @@ async fn router_request(
     client_version: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
-    trace!(
-        "Router request (method: {}, path: {}, ksm_config: {:?}, client_version: {})",
-        http_method,
-        url_path,
-        ksm_config,
-        client_version
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Router request (method: {}, path: {}, ksm_config: {:?}, client_version: {})",
+            http_method, url_path, ksm_config, client_version
+        );
+    }
 
     let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
     let ksm_config_parsed: KsmConfig = serde_json::from_str(ksm_config)?;
@@ -554,11 +554,13 @@ pub async fn post_connection_state(
     }
 
     let request_body = serde_json::to_value(body)?;
-    trace!(
-        "Sending connection state to router (request_body: {})",
-        serde_json::to_string_pretty(&request_body)
-            .unwrap_or_else(|_| "failed to serialize".to_string())
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Sending connection state to router (request_body: {})",
+            serde_json::to_string_pretty(&request_body)
+                .unwrap_or_else(|_| "failed to serialize".to_string())
+        );
+    }
 
     router_request(
         ksm_config,

@@ -61,16 +61,35 @@ pub async fn open_backend(
         }
     }
 
-    // Connect to the backend
+    // Connect to the backend - measure connection time for latency visibility
+    let connect_start = std::time::Instant::now();
     let stream = TcpStream::connect(addr).await?;
-    trace!(
-        "PRE-CALL to setup_outbound_task (channel_id: {}, conn_no: {}, backend_addr: {}, active_protocol: {:?}, server_mode: {})",
-        channel.channel_id,
-        conn_no,
-        addr,
-        active_protocol,
-        channel.server_mode
-    );
+    let connect_duration_ms = connect_start.elapsed().as_millis() as f64;
+
+    // Log backend connection latency for connection leg visibility
+    let backend_type = if active_protocol == ActiveProtocol::Guacd {
+        "Gateway<->Guacd"
+    } else {
+        "Gateway<->Target"
+    };
+
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Backend connection established | channel_id: {} | {}: {:.1}ms | addr: {}",
+            channel.channel_id, backend_type, connect_duration_ms, addr
+        );
+    }
+
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "PRE-CALL to setup_outbound_task (channel_id: {}, conn_no: {}, backend_addr: {}, active_protocol: {:?}, server_mode: {})",
+            channel.channel_id,
+            conn_no,
+            addr,
+            active_protocol,
+            channel.server_mode
+        );
+    }
     setup_outbound_task(channel, conn_no, stream, active_protocol).await?;
 
     Ok(())

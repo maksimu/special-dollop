@@ -5,7 +5,8 @@ use crate::router_helpers::post_connection_state;
 use crate::runtime::{get_runtime, shutdown_runtime_from_python};
 use crate::tube_protocol::CloseConnectionReason;
 use crate::tube_registry::REGISTRY;
-use log::{debug, error, trace, warn};
+use crate::unlikely;
+use log::{debug, error, warn};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -245,9 +246,13 @@ impl PyTubeRegistry {
         // This outer block_on will handle the call to the registry's create_tube and setup signal handler
         let creation_result_map = Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                trace!("PyBind: Acquiring REGISTRY write lock for create_tube. (conversation_id: {})", conversation_id);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("PyBind: Acquiring REGISTRY write lock for create_tube. (conversation_id: {})", conversation_id);
+                }
                 let mut registry = REGISTRY.write().await;
-                trace!("PyBind: REGISTRY write lock acquired. (conversation_id: {})", conversation_id);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("PyBind: REGISTRY write lock acquired. (conversation_id: {})", conversation_id);
+                }
 
                 // Delegate to the main TubeRegistry::create_tube method
                 // This method now encapsulates Tube creation, ICE config, peer connection setup, and offer/answer generation.
@@ -270,7 +275,9 @@ impl PyTubeRegistry {
             })
         })?; // Propagate errors from block_on or create_tube
 
-        trace!("PyBind: TubeRegistry::create_tube call complete. Result map has {} keys. (conversation_id: {})", creation_result_map.len(), conversation_id);
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("PyBind: TubeRegistry::create_tube call complete. Result map has {} keys. (conversation_id: {})", creation_result_map.len(), conversation_id);
+        }
 
         // Extract tube_id for signal handler setup (it must be in the map)
         let final_tube_id = creation_result_map
@@ -1225,8 +1232,8 @@ impl PyTubeRegistry {
         Ok(formatted_output.join("\n"))
     }
 
-    /// Restart ICE for a specific tube
-    fn restart_ice(&self, py: Python<'_>, tube_id: &str) -> PyResult<()> {
+    /// Restart ICE for a specific tube and return the restart offer SDP
+    fn restart_ice(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let tube_id_owned = tube_id.to_string();
         let master_runtime = get_runtime();
 
@@ -1244,8 +1251,190 @@ impl PyTubeRegistry {
                     )))
                 }
             })
-        })?;
-        Ok(())
+        })
+    }
+
+    /// Export detailed connection leg metrics for visualization
+    fn export_connection_leg_metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let export_result = Python::detach(py, || -> Result<String, String> {
+            let rt = get_runtime();
+            rt.block_on(async {
+                let snapshot = crate::metrics::METRICS_COLLECTOR.create_snapshot();
+                let mut leg_metrics = std::collections::HashMap::new();
+
+                for (conversation_id, metrics) in snapshot.connections.iter() {
+                    let mut connection_data = std::collections::HashMap::new();
+
+                    // Basic connection info
+                    connection_data.insert(
+                        "tube_id".to_string(),
+                        serde_json::Value::String(metrics.tube_id.clone()),
+                    );
+                    connection_data.insert(
+                        "established_at".to_string(),
+                        serde_json::Value::String(metrics.established_at.to_rfc3339()),
+                    );
+
+                    // Connection leg latencies
+                    let legs = &metrics.webrtc_metrics.connection_legs;
+                    if let Some(client_krelay) = legs.client_to_krelay_latency_ms {
+                        if let Some(num) = serde_json::Number::from_f64(client_krelay) {
+                            connection_data.insert(
+                                "client_to_krelay_latency_ms".to_string(),
+                                serde_json::Value::Number(num),
+                            );
+                        }
+                    }
+                    if let Some(krelay_gateway) = legs.krelay_to_gateway_latency_ms {
+                        if let Some(num) = serde_json::Number::from_f64(krelay_gateway) {
+                            connection_data.insert(
+                                "krelay_to_gateway_latency_ms".to_string(),
+                                serde_json::Value::Number(num),
+                            );
+                        }
+                    }
+                    if let Some(end_to_end) = legs.end_to_end_latency_ms {
+                        if let Some(num) = serde_json::Number::from_f64(end_to_end) {
+                            connection_data.insert(
+                                "end_to_end_latency_ms".to_string(),
+                                serde_json::Value::Number(num),
+                            );
+                        }
+                    }
+
+                    // ICE/TURN performance metrics
+                    let ice_stats = &metrics.webrtc_metrics.rtc_stats.ice_stats;
+                    connection_data.insert(
+                        "ice_candidates_total".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(
+                            ice_stats.total_candidates,
+                        )),
+                    );
+                    connection_data.insert(
+                        "ice_candidates_host".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(
+                            ice_stats.host_candidates,
+                        )),
+                    );
+                    connection_data.insert(
+                        "ice_candidates_srflx".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(
+                            ice_stats.srflx_candidates,
+                        )),
+                    );
+                    connection_data.insert(
+                        "ice_candidates_relay".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(
+                            ice_stats.relay_candidates,
+                        )),
+                    );
+                    if let Some(num) =
+                        serde_json::Number::from_f64(ice_stats.turn_allocation_success_rate)
+                    {
+                        connection_data.insert(
+                            "turn_allocation_success_rate".to_string(),
+                            serde_json::Value::Number(num),
+                        );
+                    }
+
+                    if let Some(gathering_time) = ice_stats.gathering_complete_time_ms {
+                        if let Some(num) = serde_json::Number::from_f64(gathering_time) {
+                            connection_data.insert(
+                                "ice_gathering_duration_ms".to_string(),
+                                serde_json::Value::Number(num),
+                            );
+                        }
+                    }
+
+                    // Current performance metrics
+                    if let Some(rtt) = metrics.webrtc_metrics.rtc_stats.rtt_ms {
+                        if let Some(num) = serde_json::Number::from_f64(rtt) {
+                            connection_data.insert(
+                                "current_rtt_ms".to_string(),
+                                serde_json::Value::Number(num),
+                            );
+                        }
+                    }
+                    if let Some(num) = serde_json::Number::from_f64(
+                        metrics.webrtc_metrics.rtc_stats.packet_loss_rate,
+                    ) {
+                        connection_data.insert(
+                            "packet_loss_rate".to_string(),
+                            serde_json::Value::Number(num),
+                        );
+                    }
+                    if let Some(num) = serde_json::Number::from_f64(
+                        metrics.webrtc_metrics.rtc_stats.current_bitrate,
+                    ) {
+                        connection_data.insert(
+                            "current_bitrate_bps".to_string(),
+                            serde_json::Value::Number(num),
+                        );
+                    }
+
+                    leg_metrics.insert(conversation_id.clone(), connection_data);
+                }
+
+                // System-wide aggregated metrics
+                let mut system_metrics = std::collections::HashMap::new();
+                system_metrics.insert(
+                    "timestamp".to_string(),
+                    serde_json::Value::String(snapshot.aggregated.timestamp.to_rfc3339()),
+                );
+                system_metrics.insert(
+                    "active_connections".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        snapshot.aggregated.active_connections,
+                    )),
+                );
+                system_metrics.insert(
+                    "active_tubes".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        snapshot.aggregated.active_tubes,
+                    )),
+                );
+                system_metrics.insert(
+                    "avg_system_rtt_ms".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        snapshot.aggregated.avg_system_rtt.as_millis() as u64,
+                    )),
+                );
+                if let Some(num) = serde_json::Number::from_f64(snapshot.aggregated.avg_packet_loss)
+                {
+                    system_metrics.insert(
+                        "avg_packet_loss".to_string(),
+                        serde_json::Value::Number(num),
+                    );
+                }
+                if let Some(num) = serde_json::Number::from_f64(snapshot.aggregated.total_bandwidth)
+                {
+                    system_metrics.insert(
+                        "total_bandwidth_bps".to_string(),
+                        serde_json::Value::Number(num),
+                    );
+                }
+
+                let mut export_data = std::collections::HashMap::new();
+                export_data.insert(
+                    "connections".to_string(),
+                    serde_json::Value::Object(serde_json::Map::from_iter(
+                        leg_metrics.into_iter().map(|(k, v)| {
+                            (k, serde_json::Value::Object(serde_json::Map::from_iter(v)))
+                        }),
+                    )),
+                );
+                export_data.insert(
+                    "system".to_string(),
+                    serde_json::Value::Object(serde_json::Map::from_iter(system_metrics)),
+                );
+
+                serde_json::to_string_pretty(&export_data)
+                    .map_err(|e| format!("JSON serialization failed: {}", e))
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to execute metrics export: {}", e)))?;
+
+        Ok(pyo3::types::PyString::new(py, &export_result).into())
     }
 
     /// Get connection statistics for a specific tube
@@ -1408,6 +1597,115 @@ impl PyTubeRegistry {
                 "active_data_channels",
                 metrics.webrtc_metrics.rtc_stats.active_data_channels,
             )?;
+
+            // ICE statistics
+            let ice_dict = PyDict::new(py);
+            ice_dict.set_item(
+                "total_candidates",
+                metrics.webrtc_metrics.rtc_stats.ice_stats.total_candidates,
+            )?;
+            ice_dict.set_item(
+                "host_candidates",
+                metrics.webrtc_metrics.rtc_stats.ice_stats.host_candidates,
+            )?;
+            ice_dict.set_item(
+                "srflx_candidates",
+                metrics.webrtc_metrics.rtc_stats.ice_stats.srflx_candidates,
+            )?;
+            ice_dict.set_item(
+                "relay_candidates",
+                metrics.webrtc_metrics.rtc_stats.ice_stats.relay_candidates,
+            )?;
+
+            if let Some(first_candidate_time) = metrics
+                .webrtc_metrics
+                .rtc_stats
+                .ice_stats
+                .first_candidate_time_ms
+            {
+                ice_dict.set_item("first_candidate_time_ms", first_candidate_time)?;
+            }
+            if let Some(gathering_time) = metrics
+                .webrtc_metrics
+                .rtc_stats
+                .ice_stats
+                .gathering_complete_time_ms
+            {
+                ice_dict.set_item("gathering_complete_time_ms", gathering_time)?;
+            }
+            ice_dict.set_item(
+                "turn_allocation_success_rate",
+                metrics
+                    .webrtc_metrics
+                    .rtc_stats
+                    .ice_stats
+                    .turn_allocation_success_rate,
+            )?;
+            if let Some(turn_time) = metrics
+                .webrtc_metrics
+                .rtc_stats
+                .ice_stats
+                .turn_allocation_time_ms
+            {
+                ice_dict.set_item("turn_allocation_time_ms", turn_time)?;
+            }
+
+            if !metrics
+                .webrtc_metrics
+                .rtc_stats
+                .ice_stats
+                .stun_response_times
+                .is_empty()
+            {
+                ice_dict.set_item(
+                    "stun_response_times",
+                    metrics
+                        .webrtc_metrics
+                        .rtc_stats
+                        .ice_stats
+                        .stun_response_times
+                        .clone(),
+                )?;
+            }
+            webrtc_dict.set_item("ice_stats", ice_dict)?;
+
+            // Connection leg performance
+            let legs_dict = PyDict::new(py);
+            if let Some(client_krelay) = metrics
+                .webrtc_metrics
+                .connection_legs
+                .client_to_krelay_latency_ms
+            {
+                legs_dict.set_item("client_to_krelay_latency_ms", client_krelay)?;
+            }
+            if let Some(krelay_gateway) = metrics
+                .webrtc_metrics
+                .connection_legs
+                .krelay_to_gateway_latency_ms
+            {
+                legs_dict.set_item("krelay_to_gateway_latency_ms", krelay_gateway)?;
+            }
+            if let Some(end_to_end) = metrics.webrtc_metrics.connection_legs.end_to_end_latency_ms {
+                legs_dict.set_item("end_to_end_latency_ms", end_to_end)?;
+            }
+            if let Some(stun_time) = metrics.webrtc_metrics.connection_legs.stun_response_time_ms {
+                legs_dict.set_item("stun_response_time_ms", stun_time)?;
+            }
+            if let Some(turn_time) = metrics
+                .webrtc_metrics
+                .connection_legs
+                .turn_allocation_latency_ms
+            {
+                legs_dict.set_item("turn_allocation_latency_ms", turn_time)?;
+            }
+            if let Some(ice_time) = metrics
+                .webrtc_metrics
+                .connection_legs
+                .ice_connection_establishment_ms
+            {
+                legs_dict.set_item("ice_connection_establishment_ms", ice_time)?;
+            }
+            webrtc_dict.set_item("connection_legs", legs_dict)?;
 
             dict.set_item("webrtc_stats", webrtc_dict)?;
 

@@ -1,7 +1,7 @@
 // Server functionality for the Channel implementation
 
 use crate::tube_protocol::{ControlMessage, Frame};
-use crate::webrtc_data_channel::WebRTCDataChannel;
+use crate::webrtc_data_channel::{EventDrivenSender, WebRTCDataChannel, STANDARD_BUFFER_THRESHOLD};
 use anyhow::{anyhow, Result};
 use bytes::BufMut;
 use log::{debug, error, info, warn};
@@ -307,13 +307,22 @@ async fn handle_generic_server_connection(
         let mut read_buffer = buffer_pool_clone.acquire();
         let mut encode_buffer = buffer_pool_clone.acquire();
 
-        // Use 8KB max read size to stay under SCTP limits
-        const MAX_READ_SIZE: usize = 8 * 1024;
+        // Use 64KB max read size - maximum safe size under webrtc-rs limits
+        // 64KB payload + 17 byte frame overhead = 65,553 bytes total
+        // Safely under webrtc-rs hard limit (~96KB message size)
+        // Larger frames = fewer frames = less overhead = higher throughput
+        // Tested: 98KB+ frames fail with "outbound packet larger than maximum message size"
+        const MAX_READ_SIZE: usize = 64 * 1024;
+
+        // Create EventDrivenSender for proper backpressure management
+        // This prevents overwhelming WebRTC buffers and provides natural flow control
+        let event_sender =
+            EventDrivenSender::new(Arc::new(dc_clone.clone()), STANDARD_BUFFER_THRESHOLD);
 
         // Add a print statement to see the conn_no being used
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(
-                "Server-side TCP reader task started for conn_no: {}",
+                "Server-side TCP reader task started for conn_no: {} with EventDrivenSender",
                 conn_no
             );
         }
@@ -354,12 +363,14 @@ async fn handle_generic_server_connection(
                         &eof_payload,
                         &buffer_pool_clone,
                     );
-                    if let Err(e) = dc_clone
-                        .send(eof_frame.encode_with_pool(&buffer_pool_clone))
+                    if let Err(e) = event_sender
+                        .send_with_natural_backpressure(
+                            eof_frame.encode_with_pool(&buffer_pool_clone),
+                        )
                         .await
                     {
                         error!(
-                            "Channel({}): Failed to send EOF for conn_no {}: {}",
+                            "Channel({}): Failed to send EOF via EventDrivenSender for conn_no {}: {}",
                             channel_id_clone, conn_no, e
                         );
                     }
@@ -406,9 +417,12 @@ async fn handle_generic_server_connection(
                     // Freeze to get a Bytes instance we can send
                     let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
 
-                    // Send it directly without checking the buffer amount
+                    // Use EventDrivenSender for proper backpressure management
                     let send_start = std::time::Instant::now();
-                    match dc_clone.send(encoded_frame_bytes.clone()).await {
+                    match event_sender
+                        .send_with_natural_backpressure(encoded_frame_bytes.clone())
+                        .await
+                    {
                         Ok(_) => {
                             let send_latency = send_start.elapsed();
 
@@ -420,7 +434,7 @@ async fn handle_generic_server_connection(
                             );
 
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!("Successfully sent data frame for conn_no {}", conn_no);
+                                debug!("Successfully sent data frame via EventDrivenSender for conn_no {}", conn_no);
                             }
                         }
                         Err(e) => {
@@ -429,7 +443,7 @@ async fn handle_generic_server_connection(
                                 .record_error(&channel_id_clone, "webrtc_send_failed");
 
                             if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!("Failed to send data frame for conn_no {}: {}", conn_no, e);
+                                debug!("Failed to send data frame via EventDrivenSender for conn_no {}: {}", conn_no, e);
                             }
                             break;
                         }

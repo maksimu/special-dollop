@@ -209,8 +209,10 @@ pub(crate) async fn handle_socks5_connection(
         let mut read_buffer = buffer_pool_clone.acquire();
         let mut encode_buffer = buffer_pool_clone.acquire();
 
-        // Use 8KB max read size to stay under SCTP limits
-        const MAX_READ_SIZE: usize = 8 * 1024;
+        // Use 64KB max read size - maximum safe size under webrtc-rs limits
+        // Matches server.rs and connections.rs for consistent performance
+        // 64KB is the hard limit (OUR_MAX_MESSAGE_SIZE in webrtc_core.rs)
+        const MAX_READ_SIZE: usize = 64 * 1024;
 
         // **BOLD WARNING: ENTERING HOT PATH - TCP→WEBRTC FORWARDING LOOP**
         // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**

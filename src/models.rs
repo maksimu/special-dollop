@@ -239,11 +239,6 @@ async fn backend_task_runner(
                 // Write to backend without complex stats tracking
                 match backend.write_all(payload.as_ref()).await {
                     Ok(_) => {
-                        if let Err(flush_err) = backend.flush().await {
-                            warn!("Backend flush error, client disconnected (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, flush_err);
-                            break; // Exit the task on flush error
-                        }
-
                         debug!("Backend write successful (channel_id: {}, conn_no: {}, bytes_written: {})", channel_id, conn_no, payload.len());
                     }
                     Err(write_err) => {

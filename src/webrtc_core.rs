@@ -289,15 +289,15 @@ pub async fn create_data_channel(
     label: &str,
 ) -> webrtc::error::Result<Arc<RTCDataChannel>> {
     let config = RTCDataChannelInit {
-        ordered: Some(true),        // Guarantee message order
-        max_retransmits: Some(0),   // No retransmits
+        ordered: Some(true),   // Guarantee message order (required for TCP tunneling)
+        max_retransmits: None, // CRITICAL FIX: Unlimited retransmits for fully reliable delivery
         max_packet_life_time: None, // No timeout for packets
-        protocol: None,             // No specific protocol
-        negotiated: None,           // Let WebRTC handle negotiation
+        protocol: None,        // No specific protocol
+        negotiated: None,      // Let WebRTC handle negotiation
     };
 
     debug!(
-        "Creating data channel '{}' with config: ordered={:?}, reliable delivery",
+        "Creating data channel '{}' with config: ordered={:?}, fully reliable with unlimited retransmits",
         label, config.ordered
     );
 
@@ -747,7 +747,7 @@ impl WebRTCPeerConnection {
                             let elapsed = start_time.elapsed().as_secs();
                             if elapsed < MIN_GATHERING_DURATION_SECS {
                                 let delay_needed = MIN_GATHERING_DURATION_SECS - elapsed;
-                                info!(
+                                debug!(
                                     "ICE gathering completed early (tube_id: {}, elapsed: {}s, delaying {}s to allow TURN allocation + signaling)",
                                     context_handler.tube_id, elapsed, delay_needed
                                 );
@@ -773,7 +773,7 @@ impl WebRTCPeerConnection {
                         .map(|start| start.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
 
-                    info!(
+                    debug!(
                         "ICE gathering complete (tube_id: {}, total_candidates: {}, duration: {:.1}s)",
                         context_handler.tube_id, final_count, gathering_duration
                     );
@@ -2435,7 +2435,7 @@ impl WebRTCPeerConnection {
 
             // Special logging for TURN candidates
             if candidate_type == &"relay" {
-                info!(
+                debug!(
                     "[TURN_DEBUG] TURN relay candidate {} (tube_id: {}, relay_ip: {}, relay_port: {})",
                     direction, self.tube_id, ip_addr, port
                 );
@@ -2459,10 +2459,10 @@ impl WebRTCPeerConnection {
                     match Self::test_udp_connectivity_static(&ip_clone, &port_clone).await {
                         Ok(_) => {
                             // Use println! to ensure log shows up immediately
-                            println!("[PAIR_TEST] Candidate pair viable (tube_id: {}, result: Reachable)", tube_id_clone);
+                            debug!("[PAIR_TEST] Candidate pair viable (tube_id: {}, result: Reachable)", tube_id_clone);
                         }
                         Err(e) => {
-                            println!(
+                            debug!(
                                 "[PAIR_TEST] Candidate pair not viable (tube_id: {}, result: {:?})",
                                 tube_id_clone, e
                             );
@@ -2504,7 +2504,7 @@ impl WebRTCPeerConnection {
 
             // Special logging for TURN candidates
             if candidate_type == &"relay" {
-                info!(
+                debug!(
                     "[TURN_DEBUG] TURN relay candidate {} (tube_id: {}, relay_ip: {}, relay_port: {})",
                     direction, tube_id, ip_addr, port
                 );
@@ -2562,14 +2562,14 @@ impl WebRTCPeerConnection {
         }
 
         // Log data channel connectivity analysis with real WebRTC data - use println! to ensure visibility
-        println!(
+        debug!(
             "[CONNECTIVITY_DEBUG] Data channel connectivity (tube_id: {}, candidate_pairs: {}, data_channels: {}, ice_state: {:?}, peer_state: {:?})",
             tube_id, total_pairs, data_channel_count, ice_connection_state, peer_connection_state
         );
 
         // Critical warnings for your specific "no candidate pairs" issue
         if total_pairs == 0 {
-            println!(
+            debug!(
                 "[CONNECTIVITY_DEBUG] NO CANDIDATE PAIRS FORMED! Data channel connectivity impossible. Check that both local and remote candidates are being added. (tube_id: {})",
                 tube_id
             );

@@ -430,7 +430,7 @@ impl Tube {
         let tube_client_version_for_on_data_channel = self.client_version.clone(); // Clone for on_data_channel
         let peer_connection_for_on_data_channel = connection_arc.clone(); // Clone peer connection for data channel handler
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
-            info!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), rtc_data_channel.label(), rtc_data_channel.id());
+            debug!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), rtc_data_channel.label(), rtc_data_channel.id());
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
@@ -442,8 +442,8 @@ impl Tube {
             let rtc_data_channel_id = rtc_data_channel.id();
 
             Box::pin(async move {
-                println!("[TUBE_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {:?}", tube.id, rtc_data_channel_label, rtc_data_channel_id);
-                info!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+                debug!("[TUBE_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {:?}", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+                debug!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("on_data_channel: Protocol settings for this channel. (tube_id: {}, channel_label: {}, protocol_settings_for_channel_setup: {:?})", tube.id, rtc_data_channel_label, protocol_settings_for_channel_setup);
                 }

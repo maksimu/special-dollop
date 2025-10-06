@@ -846,7 +846,7 @@ impl Channel {
                 warn!("In ConnectionOpened, to_webrtc task was already finished. This is unexpected. (channel_id: {}, conn_no: {})", self.channel_id, connection_no);
             }
 
-            info!(
+            debug!(
                 "Connection fully opened and ready. (channel_id: {}, conn_no: {})",
                 self.channel_id, connection_no
             );

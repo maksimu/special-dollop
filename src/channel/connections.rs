@@ -66,6 +66,10 @@ pub async fn open_backend(
     let stream = TcpStream::connect(addr).await?;
     let connect_duration_ms = connect_start.elapsed().as_millis() as f64;
 
+    // **CRITICAL: Disable Nagle's algorithm for low latency + high throughput**
+    // This prevents batching delays while still allowing kernel-level optimizations
+    stream.set_nodelay(true)?;
+
     // Log backend connection latency for connection leg visibility
     let backend_type = if active_protocol == ActiveProtocol::Guacd {
         "Gateway<->Guacd"
@@ -75,7 +79,7 @@ pub async fn open_backend(
 
     if unlikely!(crate::logger::is_verbose_logging()) {
         debug!(
-            "Backend connection established | channel_id: {} | {}: {:.1}ms | addr: {}",
+            "Backend connection established (TCP_NODELAY) | channel_id: {} | {}: {:.1}ms | addr: {}",
             channel.channel_id, backend_type, connect_duration_ms, addr
         );
     }
@@ -296,9 +300,9 @@ pub async fn setup_outbound_task(
 
         let mut main_read_buffer = buffer_pool.acquire();
         let mut encode_buffer = buffer_pool.acquire();
-        const MAX_READ_SIZE: usize = 8 * 1024;
-        const GUACD_BATCH_SIZE: usize = 16 * 1024; // Batch up to 16KB of Guacd instructions
-        const LARGE_INSTRUCTION_THRESHOLD: usize = MAX_READ_SIZE; // If a single instruction is this big, send it directly
+        const MAX_READ_SIZE: usize = 64 * 1024; // 64KB - safe under message size limit
+        const GUACD_BATCH_SIZE: usize = 8 * 1024; // Batch up to 8KB of Guacd instructions
+        const LARGE_INSTRUCTION_THRESHOLD: usize = 16 * 1024; // If a single Guacd instruction is >16KB, send it directly without batching
 
         // **BOLD WARNING: HOT PATH - NO STRING/OBJECT ALLOCATIONS ALLOWED IN THE MAIN LOOP**
         // **USE BUFFER POOL FOR ALL ALLOCATIONS**
@@ -335,6 +339,34 @@ pub async fn setup_outbound_task(
                 loop_iterations,
                 main_read_buffer.len()
             );
+
+            // **CRITICAL: TCP BACKPRESSURE - Check queue depth before reading more data**
+            let queue_depth = event_sender.queue_depth();
+            const MAX_QUEUE_FRAMES: usize = 10000; // Match the queue size in EventDrivenSender
+            const BACKPRESSURE_THRESHOLD: usize = MAX_QUEUE_FRAMES / 2; // 50% = 5,000 frames (adjusted for faster drain rate)
+
+            // Log queue status periodically for monitoring
+            if unlikely!(crate::logger::is_verbose_logging()) && loop_iterations % 1000 == 0 {
+                debug!(
+                    "Queue status check (channel_id: {}, conn_no: {}, queue_depth: {}/{}, fill: {:.1}%)",
+                    channel_id_for_task, conn_no, queue_depth, MAX_QUEUE_FRAMES,
+                    (queue_depth as f64 / MAX_QUEUE_FRAMES as f64) * 100.0
+                );
+            }
+
+            // If queue is > 50% full (5,000 frames), pause reading to prevent overflow
+            if queue_depth > BACKPRESSURE_THRESHOLD {
+                warn!(
+                    "⚠️  BACKPRESSURE ENGAGED: Queue filling up (channel_id: {}, conn_no: {}, queue_depth: {}/{} = {:.1}%, threshold: {}, pausing reads)",
+                    channel_id_for_task, conn_no, queue_depth, MAX_QUEUE_FRAMES,
+                    (queue_depth as f64 / MAX_QUEUE_FRAMES as f64) * 100.0,
+                    BACKPRESSURE_THRESHOLD
+                );
+
+                // Brief pause to let queue drain
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue; // Skip this read iteration, check queue again
+            }
 
             if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE / 2 {
                 main_read_buffer.reserve(MAX_READ_SIZE);

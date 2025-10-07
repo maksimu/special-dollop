@@ -1378,6 +1378,14 @@ impl Tube {
         *self.status.write().await = TubeStatus::Closed;
         debug!("Set tube status to Closed");
 
+        // Unregister the original conversation from metrics if it exists
+        // This cleans up the monitoring registration created during start_monitoring()
+        if let Some(ref original_conv_id) = self.original_conversation_id {
+            crate::metrics::METRICS_COLLECTOR.unregister_connection(original_conv_id);
+            debug!("Unregistered original conversation from metrics (tube_id: {}, conversation_id: {})",
+                   self.id, original_conv_id);
+        }
+
         // Send connection_close callbacks for all active channels
         let channel_names: Vec<String> = {
             let channels_guard = self.active_channels.read().await;
@@ -1765,6 +1773,31 @@ impl Tube {
         } else {
             Err("No peer connection available for stats".to_string())
         }
+    }
+
+    /// Check if this tube has any active channels
+    pub async fn has_active_channels(&self) -> bool {
+        let channels_guard = self.active_channels.read().await;
+        !channels_guard.is_empty()
+    }
+
+    /// Check if this tube appears to be stale/abandoned
+    /// A tube is considered stale if it has no active channels AND is in a terminal state
+    pub async fn is_stale(&self) -> bool {
+        // Tube is stale if:
+        // 1. No active channels
+        // 2. Status is Failed/Closed/Disconnected
+
+        let has_channels = self.has_active_channels().await;
+        if has_channels {
+            return false; // Has active channels, not stale
+        }
+
+        let status = *self.status.read().await;
+        matches!(
+            status,
+            TubeStatus::Failed | TubeStatus::Closed | TubeStatus::Disconnected
+        )
     }
 }
 

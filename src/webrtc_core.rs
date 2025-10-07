@@ -1626,6 +1626,15 @@ impl WebRTCPeerConnection {
 
     /// Stop all monitoring systems during shutdown
     pub async fn stop_monitoring_systems(&self) -> Result<(), String> {
+        // Unregister from metrics collector first
+        if let Some(ref conv_id) = self.conversation_id {
+            crate::metrics::METRICS_COLLECTOR.unregister_connection(conv_id);
+            debug!(
+                "Unregistered monitoring connection from metrics (tube_id: {}, conversation_id: {})",
+                self.tube_id, conv_id
+            );
+        }
+
         // Stop quality monitoring
         self.quality_manager.stop_monitoring();
 

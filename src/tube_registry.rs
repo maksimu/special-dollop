@@ -761,4 +761,41 @@ impl TubeRegistry {
 
         Ok(())
     }
+
+    /// Clean up stale tubes that have no active channels and are in terminal states
+    /// Returns the list of tube IDs that were successfully cleaned up
+    pub(crate) async fn cleanup_stale_tubes(&mut self) -> Vec<String> {
+        let mut stale_tube_ids = Vec::new();
+
+        // Collect stale tube IDs
+        for (tube_id, tube) in &self.tubes_by_id {
+            if tube.is_stale().await {
+                debug!("Detected stale tube (tube_id: {})", tube_id);
+                stale_tube_ids.push(tube_id.clone());
+            }
+        }
+
+        // Close stale tubes
+        let mut closed_tubes = Vec::new();
+        for tube_id in stale_tube_ids {
+            debug!("Auto-closing stale tube (tube_id: {})", tube_id);
+            match self
+                .close_tube(&tube_id, Some(CloseConnectionReason::Timeout))
+                .await
+            {
+                Ok(_) => {
+                    info!("Successfully auto-closed stale tube (tube_id: {})", tube_id);
+                    closed_tubes.push(tube_id);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to auto-close stale tube: {} (tube_id: {})",
+                        e, tube_id
+                    );
+                }
+            }
+        }
+
+        closed_tubes
+    }
 }

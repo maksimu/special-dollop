@@ -1911,6 +1911,8 @@ impl Drop for PyTubeRegistry {
                                 crate::metrics::METRICS_COLLECTOR
                                     .unregister_connection(conversation_id);
                             }
+                            // Also clean up the tube_id itself if it's registered as a conversation
+                            crate::metrics::METRICS_COLLECTOR.unregister_connection(tube_id);
                         }
 
                         // 2. Immediately drop all signal channels (stops background tasks)

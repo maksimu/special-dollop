@@ -46,6 +46,7 @@ fn test_tube_creation() {
             false,
             "TEST_MODE_KSM_CONFIG_1".to_string(),
             "TEST_CALLBACK_TOKEN_1".to_string(),
+            "test-krelay.example.com".to_string(), // krelay_server for tests
             "ms16.5.0",
             settings,
             signal_tx,
@@ -156,7 +157,7 @@ fn test_tube_channel_creation() {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            tube.create_peer_connection(None, true, false, "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), "ms16.5.0", settings.clone(), signal_tx)
+            tube.create_peer_connection(None, true, false, "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), "test-krelay.example.com".to_string(), "ms16.5.0", settings.clone(), signal_tx)
         ).await.map_or_else(
             |_| println!("Timeout creating peer connection, continuing with test"),
             |res| res.expect("Failed to create peer connection")
@@ -225,6 +226,7 @@ async fn test_tube_create_with_pc() {
         false, // turn_only
         "TEST_MODE_KSM_CONFIG_1".to_string(),
         "TEST_CALLBACK_TOKEN_1".to_string(),
+        "test-krelay.example.com".to_string(), // krelay_server for tests
         "ms16.5.0",
         settings,
         signal_tx,
@@ -248,6 +250,7 @@ async fn test_tube_webrtc_connection() {
         false, // turn_only
         "TEST_MODE_KSM_CONFIG_1".to_string(),
         "TEST_CALLBACK_TOKEN_1".to_string(),
+        "test-krelay.example.com".to_string(), // krelay_server for tests
         "ms16.5.0",
         settings,
         signal_tx,
@@ -273,6 +276,7 @@ async fn test_tube_create_channel() {
         false,
         "TEST_MODE_KSM_CONFIG".to_string(),
         "test_callback_token".to_string(),
+        "test-krelay.example.com".to_string(), // krelay_server for tests
         "ms16.5.0",
         settings.clone(),
         signal_tx,
@@ -626,6 +630,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             false,
             ksm_config_t1.clone(),
             token_t1.clone(),
+            "test-krelay.example.com".to_string(), // krelay_server for tests
             "ms16.5.0",
             settings.clone(),
             signal_tx1,
@@ -639,6 +644,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             false,
             ksm_config_t2.clone(),
             token_t2.clone(),
+            "test-krelay.example.com".to_string(), // krelay_server for tests
             "ms16.5.0",
             settings,
             signal_tx2,

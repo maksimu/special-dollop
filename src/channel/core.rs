@@ -448,7 +448,7 @@ impl Channel {
                 }
             }
         } else {
-            warn!("'connect_as_settings' key not found in protocol_settings. Using default. (channel_id: {})", channel_id);
+            debug!("'connect_as_settings' key not found in protocol_settings. Using default. (channel_id: {})", channel_id);
         }
 
         let new_channel = Self {

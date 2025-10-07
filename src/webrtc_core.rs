@@ -289,15 +289,15 @@ pub async fn create_data_channel(
     label: &str,
 ) -> webrtc::error::Result<Arc<RTCDataChannel>> {
     let config = RTCDataChannelInit {
-        ordered: Some(true),        // Guarantee message order
-        max_retransmits: Some(0),   // No retransmits
+        ordered: Some(true),   // Guarantee message order (required for TCP tunneling)
+        max_retransmits: None, // CRITICAL FIX: Unlimited retransmits for fully reliable delivery
         max_packet_life_time: None, // No timeout for packets
-        protocol: None,             // No specific protocol
-        negotiated: None,           // Let WebRTC handle negotiation
+        protocol: None,        // No specific protocol
+        negotiated: None,      // Let WebRTC handle negotiation
     };
 
     debug!(
-        "Creating data channel '{}' with config: ordered={:?}, reliable delivery",
+        "Creating data channel '{}' with config: ordered={:?}, fully reliable with unlimited retransmits",
         label, config.ordered
     );
 
@@ -383,6 +383,13 @@ pub struct WebRTCPeerConnection {
     // ICE restart and connection quality tracking
     connection_quality_degraded: Arc<AtomicBool>,
     initial_network_scan_triggered: Arc<AtomicBool>,
+    ice_restart_in_progress: Arc<AtomicBool>, // Prevent concurrent ICE restarts
+
+    // TURN credential refresh infrastructure
+    ksm_config: Option<String>,    // For fetching fresh credentials
+    krelay_server: Option<String>, // TURN server hostname
+    client_version: String,        // For API calls
+    credential_refresh_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
     // ICE gathering timing for minimum duration enforcement
     ice_gathering_start_time: Arc<Mutex<Option<Instant>>>,
@@ -458,6 +465,7 @@ impl WebRTCPeerConnection {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Option<RTCConfiguration>,
         trickle_ice: bool,
@@ -465,6 +473,9 @@ impl WebRTCPeerConnection {
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         tube_id: String,
         conversation_id: Option<String>,
+        ksm_config: Option<String>,    // For TURN credential refresh
+        krelay_server: Option<String>, // For TURN credential refresh
+        client_version: String,        // For API calls
     ) -> Result<Self, String> {
         debug!("Creating isolated WebRTC connection for tube {}", tube_id);
 
@@ -600,6 +611,13 @@ impl WebRTCPeerConnection {
             // Initialize ICE restart and connection quality tracking
             connection_quality_degraded: Arc::new(AtomicBool::new(false)),
             initial_network_scan_triggered: Arc::new(AtomicBool::new(false)),
+            ice_restart_in_progress: Arc::new(AtomicBool::new(false)),
+
+            // Initialize TURN credential refresh
+            ksm_config,
+            krelay_server,
+            client_version,
+            credential_refresh_task: Arc::new(Mutex::new(None)),
 
             // Initialize ICE gathering timing
             ice_gathering_start_time: Arc::new(Mutex::new(None)),
@@ -747,7 +765,7 @@ impl WebRTCPeerConnection {
                             let elapsed = start_time.elapsed().as_secs();
                             if elapsed < MIN_GATHERING_DURATION_SECS {
                                 let delay_needed = MIN_GATHERING_DURATION_SECS - elapsed;
-                                info!(
+                                debug!(
                                     "ICE gathering completed early (tube_id: {}, elapsed: {}s, delaying {}s to allow TURN allocation + signaling)",
                                     context_handler.tube_id, elapsed, delay_needed
                                 );
@@ -773,7 +791,7 @@ impl WebRTCPeerConnection {
                         .map(|start| start.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
 
-                    info!(
+                    debug!(
                         "ICE gathering complete (tube_id: {}, total_candidates: {}, duration: {:.1}s)",
                         context_handler.tube_id, final_count, gathering_duration
                     );
@@ -995,6 +1013,437 @@ impl WebRTCPeerConnection {
         }
     }
 
+    /// Send ICE restart offer to remote peer via signaling channel
+    /// This is called after generating a new offer during ICE restart
+    pub async fn send_ice_restart_offer(&self, offer_sdp: String) {
+        if let Some(sender) = &self.signal_sender {
+            // Encode the offer SDP to base64 for transmission
+            use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+            let encoded_offer = BASE64_STANDARD.encode(&offer_sdp);
+
+            let signal_msg = SignalMessage {
+                tube_id: self.tube_id.clone(),
+                kind: "ice_restart_offer".to_string(),
+                data: encoded_offer,
+                conversation_id: self
+                    .conversation_id
+                    .clone()
+                    .unwrap_or_else(|| self.tube_id.clone()),
+                progress_flag: Some(2), // PROGRESS - waiting for answer
+                progress_status: Some("ICE restart offer sent, awaiting answer".to_string()),
+                is_ok: Some(true),
+            };
+
+            if let Err(e) = sender.send(signal_msg) {
+                error!(
+                    "Failed to send ICE restart offer signal (tube_id: {}, error: {})",
+                    self.tube_id, e
+                );
+            } else {
+                info!(
+                    "Sent ICE restart offer to remote peer (tube_id: {}, sdp_length: {})",
+                    self.tube_id,
+                    offer_sdp.len()
+                );
+            }
+        } else {
+            warn!(
+                "No signal sender available for ICE restart offer (tube_id: {})",
+                self.tube_id
+            );
+        }
+    }
+
+    /// Complete ICE restart after receiving answer from remote peer
+    /// This should be called by Python after set_remote_description() succeeds
+    pub fn complete_ice_restart(&self) {
+        if self.ice_restart_in_progress.swap(false, Ordering::AcqRel) {
+            info!(
+                "ICE restart completed successfully - answer received and applied (tube_id: {})",
+                self.tube_id
+            );
+        } else {
+            debug!(
+                "complete_ice_restart called but no restart was in progress (tube_id: {})",
+                self.tube_id
+            );
+        }
+    }
+
+    /// Start automatic TURN credential refresh (every 30 minutes)
+    /// Prevents credential expiration by fetching fresh credentials and updating configuration
+    pub async fn start_credential_refresh(&self) -> Result<(), String> {
+        // Check if we have the required configuration for refresh
+        let ksm_config = match &self.ksm_config {
+            Some(cfg) if !cfg.is_empty() && !cfg.starts_with("TEST_MODE") => cfg.clone(),
+            _ => {
+                debug!(
+                    "No ksm_config available for credential refresh, skipping (tube_id: {})",
+                    self.tube_id
+                );
+                return Ok(()); // Not an error, just can't refresh
+            }
+        };
+
+        let krelay_server = match &self.krelay_server {
+            Some(server) if !server.is_empty() => server.clone(),
+            _ => {
+                debug!(
+                    "No krelay_server available for credential refresh, skipping (tube_id: {})",
+                    self.tube_id
+                );
+                return Ok(());
+            }
+        };
+
+        // Credential refresh only makes sense with trickle ICE
+        // (non-trickle connections are typically short-lived anyway)
+        if !self.trickle_ice {
+            debug!(
+                "Credential refresh skipped - only applicable for trickle ICE mode (tube_id: {})",
+                self.tube_id
+            );
+            return Ok(());
+        }
+
+        // Check if TURN is actually enabled in the configuration
+        let config = self.peer_connection.get_configuration().await;
+        let has_turn_servers = config.ice_servers.iter().any(|ice_server| {
+            ice_server
+                .urls
+                .iter()
+                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+        });
+
+        if !has_turn_servers {
+            debug!(
+                "Credential refresh skipped - no TURN servers configured (tube_id: {})",
+                self.tube_id
+            );
+            return Ok(());
+        }
+
+        info!(
+            "TURN servers detected, credential refresh will be enabled (tube_id: {})",
+            self.tube_id
+        );
+
+        let tube_id = self.tube_id.clone();
+        let peer_connection = Arc::clone(&self.peer_connection);
+        let client_version = self.client_version.clone();
+        let is_closing = Arc::clone(&self.is_closing);
+
+        info!(
+            "Starting TURN credential refresh task (every 30min, TTL=1h) (tube_id: {})",
+            tube_id
+        );
+
+        let refresh_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1800)); // 30 minutes
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let mut consecutive_failures = 0u32;
+
+            loop {
+                interval.tick().await;
+
+                // Stop if connection is closing
+                if is_closing.load(Ordering::Acquire) {
+                    debug!(
+                        "Connection closing, stopping credential refresh (tube_id: {})",
+                        tube_id
+                    );
+                    break;
+                }
+
+                debug!("Refreshing TURN credentials (tube_id: {})", tube_id);
+
+                // Attempt to fetch and update credentials
+                match Self::fetch_and_update_turn_credentials(
+                    &peer_connection,
+                    &ksm_config,
+                    &krelay_server,
+                    &client_version,
+                    &tube_id,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "TURN credentials refreshed successfully (tube_id: {}, consecutive_failures_reset: {})",
+                            tube_id, consecutive_failures
+                        );
+                        consecutive_failures = 0; // Reset on success
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        warn!(
+                            "Failed to refresh TURN credentials (attempt #{}, tube_id: {}): {}",
+                            consecutive_failures, tube_id, e
+                        );
+
+                        // Calculate retry delay with exponential backoff
+                        let retry_delay = match consecutive_failures {
+                            1 => Duration::from_secs(60),  // 1 minute
+                            2 => Duration::from_secs(300), // 5 minutes
+                            3 => Duration::from_secs(900), // 15 minutes
+                            _ => {
+                                // After 3 failures, just log critical and wait for next cycle
+                                error!(
+                                    "CRITICAL: TURN credentials have not refreshed in {}min due to failures. ICE restart may fail if credentials expire. (tube_id: {})",
+                                    consecutive_failures * 30,
+                                    tube_id
+                                );
+                                continue; // Skip retry, wait for next 30min cycle
+                            }
+                        };
+
+                        info!(
+                            "Will retry TURN credential refresh in {}s (tube_id: {})",
+                            retry_delay.as_secs(),
+                            tube_id
+                        );
+
+                        // Wait for backoff period
+                        tokio::time::sleep(retry_delay).await;
+
+                        // Check again if closing
+                        if is_closing.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        // Retry immediately after backoff
+                        match Self::fetch_and_update_turn_credentials(
+                            &peer_connection,
+                            &ksm_config,
+                            &krelay_server,
+                            &client_version,
+                            &tube_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                info!(
+                                    "TURN credentials refreshed on retry #{} (tube_id: {})",
+                                    consecutive_failures, tube_id
+                                );
+                                consecutive_failures = 0; // Reset on successful retry
+                            }
+                            Err(e) => {
+                                error!(
+                                    "TURN credential refresh retry #{} also failed (tube_id: {}): {}",
+                                    consecutive_failures, tube_id, e
+                                );
+                                // Will wait for next 30min cycle
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!("Credential refresh task terminated (tube_id: {})", tube_id);
+        });
+
+        // Store task handle for cleanup
+        if let Ok(mut task_guard) = self.credential_refresh_task.lock() {
+            *task_guard = Some(refresh_task);
+            debug!(
+                "Credential refresh task started and handle stored (tube_id: {})",
+                self.tube_id
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Fetch new TURN credentials and update peer connection configuration
+    async fn fetch_and_update_turn_credentials(
+        peer_connection: &Arc<RTCPeerConnection>,
+        ksm_config: &str,
+        _krelay_server: &str, // Not used but kept for API consistency
+        client_version: &str,
+        tube_id: &str,
+    ) -> Result<(), String> {
+        // Fetch new credentials with 1-hour TTL
+        let creds =
+            crate::router_helpers::get_relay_access_creds(ksm_config, Some(3600), client_version)
+                .await
+                .map_err(|e| format!("Failed to fetch credentials from router: {}", e))?;
+
+        // Extract credentials
+        let (username, password) = match (
+            creds.get("username").and_then(|v| v.as_str()),
+            creds.get("password").and_then(|v| v.as_str()),
+        ) {
+            (Some(u), Some(p)) => (u.to_string(), p.to_string()),
+            _ => return Err("Invalid credential format in router response".to_string()),
+        };
+
+        debug!(
+            "Fetched fresh TURN credentials (tube_id: {}, username: {})",
+            tube_id, username
+        );
+
+        // Get current configuration
+        let mut config = peer_connection.get_configuration().await;
+
+        // Update TURN server credentials in ice_servers
+        let mut updated_count = 0;
+        for ice_server in &mut config.ice_servers {
+            // Update any TURN/TURNS server
+            let has_turn = ice_server
+                .urls
+                .iter()
+                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"));
+
+            if has_turn {
+                ice_server.username = username.clone();
+                ice_server.credential = password.clone();
+                updated_count += 1;
+            }
+        }
+
+        if updated_count == 0 {
+            return Err(
+                "No TURN servers found in configuration to update (connection may not use TURN)"
+                    .to_string(),
+            );
+        }
+
+        debug!(
+            "Updated {} TURN server(s) with fresh credentials (tube_id: {})",
+            updated_count, tube_id
+        );
+
+        // Apply updated configuration to live peer connection
+        peer_connection
+            .set_configuration(config)
+            .await
+            .map_err(|e| format!("Failed to apply updated configuration: {}", e))?;
+
+        info!(
+            "TURN credentials updated in live peer connection (tube_id: {})",
+            tube_id
+        );
+
+        Ok(())
+    }
+
+    /// Stop credential refresh task during shutdown
+    pub async fn stop_credential_refresh(&self) {
+        if let Ok(mut task_guard) = self.credential_refresh_task.lock() {
+            if let Some(handle) = task_guard.take() {
+                handle.abort();
+                info!(
+                    "Credential refresh task stopped (tube_id: {})",
+                    self.tube_id
+                );
+            }
+        }
+    }
+
+    /// Handle ICE restart with full signaling workflow
+    /// This method performs ICE restart and sends the offer to the remote peer
+    pub async fn handle_ice_restart_with_signaling(&self) -> WebRTCResult<()> {
+        // Check if restart already in progress (prevent concurrent restarts)
+        if self.ice_restart_in_progress.swap(true, Ordering::AcqRel) {
+            debug!(
+                "ICE restart already in progress, skipping duplicate request (tube_id: {})",
+                self.tube_id
+            );
+            return Ok(());
+        }
+
+        // Generate new offer with ICE restart
+        let restart_result = self.restart_ice().await;
+
+        // Handle circuit breaker trip - close connection immediately
+        if let Err(WebRTCError::CircuitBreakerOpen {
+            ref tube_id,
+            ref breaker_type,
+            failure_count,
+        }) = restart_result
+        {
+            error!(
+                "ICE restart circuit breaker tripped after {} failures - closing connection (tube_id: {}, breaker_type: {})",
+                failure_count, tube_id, breaker_type
+            );
+            self.ice_restart_in_progress.store(false, Ordering::Release);
+
+            // Mark connection as permanently failed
+            self.is_closing.store(true, Ordering::Release);
+
+            return Err(WebRTCError::IceRestartFailed {
+                tube_id: tube_id.clone(),
+                attempts: failure_count,
+                reason: format!(
+                    "Circuit breaker tripped after {} failures - recovery impossible",
+                    failure_count
+                ),
+            });
+        }
+
+        match restart_result {
+            Ok(new_offer_sdp) => {
+                info!(
+                    "ICE restart offer generated, sending to remote peer (tube_id: {}, sdp_length: {})",
+                    self.tube_id,
+                    new_offer_sdp.len()
+                );
+
+                // Send the offer to remote peer
+                self.send_ice_restart_offer(new_offer_sdp).await;
+
+                // Start timeout task - if no answer received in 15 seconds, close connection
+                let tube_id = self.tube_id.clone();
+                let restart_flag = Arc::clone(&self.ice_restart_in_progress);
+                let peer_connection = Arc::clone(&self.peer_connection);
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+
+                    // If restart still in progress after 15s, assume answer won't come
+                    if restart_flag.swap(false, Ordering::AcqRel) {
+                        warn!(
+                            "ICE restart answer timeout - no response from remote peer after 15s. Closing connection. (tube_id: {})",
+                            tube_id
+                        );
+
+                        // Close the peer connection to trigger cleanup cascade
+                        // This will change state to Closed, which triggers tube closure
+                        match peer_connection.close().await {
+                            Ok(()) => {
+                                info!(
+                                    "Peer connection closed after ICE restart timeout (tube_id: {})",
+                                    tube_id
+                                );
+                                // State change to Closed will trigger tube closure automatically via handler
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to close peer connection after ICE restart timeout (tube_id: {}): {}",
+                                    tube_id, e
+                                );
+                                // Connection is already failed/unusable anyway
+                            }
+                        }
+                    }
+                });
+
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "ICE restart failed (tube_id: {}, error: {:?})",
+                    self.tube_id, e
+                );
+                // Clear the in-progress flag on failure
+                self.ice_restart_in_progress.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
     pub(crate) async fn create_description_with_checks(
         &self,
         is_offer: bool,
@@ -1109,7 +1558,16 @@ impl WebRTCPeerConnection {
                 })
             }));
 
-            match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            // Use resource manager timeout instead of hardcoded value
+            let gather_timeout = crate::resource_manager::RESOURCE_MANAGER
+                .get_limits()
+                .ice_gather_timeout;
+            debug!(
+                "Waiting for ICE gathering with timeout {:?} (tube_id: {})",
+                gather_timeout, self.tube_id
+            );
+
+            match tokio::time::timeout(gather_timeout, rx).await {
                 Ok(Ok(_)) => {
                     debug!(
                         "ICE gathering complete for non-trickle {} (tube_id: {})",
@@ -1291,6 +1749,15 @@ impl WebRTCPeerConnection {
             if local_desc.is_some() && remote_desc.is_some() {
                 debug!("Both descriptions now set after remote description, flushing buffered incoming ICE candidates (tube_id: {})", self.tube_id);
                 self.flush_buffered_incoming_ice_candidates().await;
+            }
+
+            // If this is an answer to an ICE restart offer, mark restart as complete
+            if is_answer && self.ice_restart_in_progress.load(Ordering::Acquire) {
+                debug!(
+                    "Received ICE restart answer, marking restart complete (tube_id: {})",
+                    self.tube_id
+                );
+                self.complete_ice_restart();
             }
         }
 
@@ -1482,28 +1949,38 @@ impl WebRTCPeerConnection {
 
         // Monitor peer connection state changes
         let peer_connection = Arc::clone(&self.peer_connection);
+        let trickle_ice_for_state_handler = self.trickle_ice; // Capture trickle_ice state
         peer_connection.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             let network_integration = Arc::clone(&network_integration);
             let tube_id = tube_id.clone();
             let initial_scan_triggered = Arc::clone(&initial_scan_triggered);
+            let trickle_ice = trickle_ice_for_state_handler; // Capture in closure
 
             Box::pin(async move {
                 debug!("Peer connection state changed for tube {}: {:?}", tube_id, state);
 
-                // Trigger ICE restart for problematic states
+                // Trigger ICE restart for problematic states (only if trickle ICE is enabled)
                 match state {
                     RTCPeerConnectionState::Disconnected => {
-                        info!("Connection disconnected for tube {}, considering ICE restart", tube_id);
-                        // Wait a moment to see if connection recovers
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        network_integration.trigger_ice_restart(&tube_id, "connection disconnected");
+                        if trickle_ice {
+                            info!("Connection disconnected for tube {}, considering ICE restart (trickle_ice enabled)", tube_id);
+                            // Wait a moment to see if connection recovers
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            network_integration.trigger_ice_restart(&tube_id, "connection disconnected");
+                        } else {
+                            info!("Connection disconnected for tube {} - ICE restart not available (trickle_ice disabled)", tube_id);
+                        }
                     },
                     RTCPeerConnectionState::Failed => {
-                        warn!("Connection failed for tube {}, triggering immediate ICE restart", tube_id);
-                        network_integration.trigger_ice_restart(&tube_id, "connection failed");
+                        if trickle_ice {
+                            warn!("Connection failed for tube {}, triggering immediate ICE restart (trickle_ice enabled)", tube_id);
+                            network_integration.trigger_ice_restart(&tube_id, "connection failed");
+                        } else {
+                            warn!("Connection failed for tube {} - ICE restart not available (trickle_ice disabled)", tube_id);
+                        }
                     },
                     RTCPeerConnectionState::Connected => {
-                        info!("Connection established/restored for tube {}", tube_id);
+                        debug!("Connection established/restored for tube {}", tube_id);
 
                         // Trigger initial network scan now that WebRTC connection is established (idempotent)
                         if !initial_scan_triggered.load(Ordering::Acquire)
@@ -1585,20 +2062,26 @@ impl WebRTCPeerConnection {
         debug!("Skipping network monitoring startup to avoid Python interpreter issues");
 
         // Register ICE restart callback for network changes
+        // Note: This callback is ONLY called when trickle_ice=true (guarded in the state change handler above)
+        // It performs the actual ICE restart and sends the offer to the remote peer
         let ice_restart_callback = {
-            let peer_connection = Arc::clone(&self.peer_connection);
+            let webrtc_conn = self.clone(); // Clone the entire WebRTCPeerConnection
             let tube_id = self.tube_id.clone();
+
             move || {
-                let pc = Arc::clone(&peer_connection);
+                let conn = webrtc_conn.clone();
                 let id = tube_id.clone();
+
                 tokio::spawn(async move {
                     info!(
-                        "Network change detected, triggering ICE restart for tube {}",
+                        "Network change detected, triggering ICE restart for tube {} (trickle_ice enabled)",
                         id
                     );
-                    if let Err(e) = pc.restart_ice().await {
+
+                    // Perform ICE restart with signaling
+                    if let Err(e) = conn.handle_ice_restart_with_signaling().await {
                         warn!(
-                            "Failed to restart ICE due to network change (tube_id: {}, error: {})",
+                            "Failed to restart ICE due to network change (tube_id: {}, error: {:?})",
                             id, e
                         );
                     }
@@ -1620,12 +2103,32 @@ impl WebRTCPeerConnection {
         // Enable connection state-based ICE restart triggers as backup
         self.setup_connection_state_monitoring().await?;
 
+        // Start TURN credential refresh (every 30 minutes)
+        if let Err(e) = self.start_credential_refresh().await {
+            warn!(
+                "Failed to start TURN credential refresh (tube_id: {}, error: {})",
+                self.tube_id, e
+            );
+        }
+
         debug!("Monitoring systems started for tube {}", self.tube_id);
         Ok(())
     }
 
     /// Stop all monitoring systems during shutdown
     pub async fn stop_monitoring_systems(&self) -> Result<(), String> {
+        // Stop credential refresh task first
+        self.stop_credential_refresh().await;
+
+        // Unregister from metrics collector
+        if let Some(ref conv_id) = self.conversation_id {
+            crate::metrics::METRICS_COLLECTOR.unregister_connection(conv_id);
+            debug!(
+                "Unregistered monitoring connection from metrics (tube_id: {}, conversation_id: {})",
+                self.tube_id, conv_id
+            );
+        }
+
         // Stop quality monitoring
         self.quality_manager.stop_monitoring();
 
@@ -2229,6 +2732,17 @@ impl WebRTCPeerConnection {
 
     // Internal ICE restart method (wrapped by circuit breaker)
     async fn restart_ice_internal(&self) -> Result<String, String> {
+        // ICE restart requires trickle ICE for proper signaling coordination
+        if !self.trickle_ice {
+            warn!(
+                "ICE restart blocked: trickle ICE is required but disabled (tube_id: {})",
+                self.tube_id
+            );
+            return Err(
+                "ICE restart requires trickle ICE to be enabled for proper signaling".to_string(),
+            );
+        }
+
         // This is the existing restart_ice logic, renamed to be internal
         info!(
             "ICE restart initiated for connection recovery (tube_id: {})",
@@ -2435,7 +2949,7 @@ impl WebRTCPeerConnection {
 
             // Special logging for TURN candidates
             if candidate_type == &"relay" {
-                info!(
+                debug!(
                     "[TURN_DEBUG] TURN relay candidate {} (tube_id: {}, relay_ip: {}, relay_port: {})",
                     direction, self.tube_id, ip_addr, port
                 );
@@ -2459,10 +2973,10 @@ impl WebRTCPeerConnection {
                     match Self::test_udp_connectivity_static(&ip_clone, &port_clone).await {
                         Ok(_) => {
                             // Use println! to ensure log shows up immediately
-                            println!("[PAIR_TEST] Candidate pair viable (tube_id: {}, result: Reachable)", tube_id_clone);
+                            debug!("[PAIR_TEST] Candidate pair viable (tube_id: {}, result: Reachable)", tube_id_clone);
                         }
                         Err(e) => {
-                            println!(
+                            debug!(
                                 "[PAIR_TEST] Candidate pair not viable (tube_id: {}, result: {:?})",
                                 tube_id_clone, e
                             );
@@ -2504,7 +3018,7 @@ impl WebRTCPeerConnection {
 
             // Special logging for TURN candidates
             if candidate_type == &"relay" {
-                info!(
+                debug!(
                     "[TURN_DEBUG] TURN relay candidate {} (tube_id: {}, relay_ip: {}, relay_port: {})",
                     direction, tube_id, ip_addr, port
                 );
@@ -2562,14 +3076,14 @@ impl WebRTCPeerConnection {
         }
 
         // Log data channel connectivity analysis with real WebRTC data - use println! to ensure visibility
-        println!(
+        debug!(
             "[CONNECTIVITY_DEBUG] Data channel connectivity (tube_id: {}, candidate_pairs: {}, data_channels: {}, ice_state: {:?}, peer_state: {:?})",
             tube_id, total_pairs, data_channel_count, ice_connection_state, peer_connection_state
         );
 
         // Critical warnings for your specific "no candidate pairs" issue
         if total_pairs == 0 {
-            println!(
+            debug!(
                 "[CONNECTIVITY_DEBUG] NO CANDIDATE PAIRS FORMED! Data channel connectivity impossible. Check that both local and remote candidates are being added. (tube_id: {})",
                 tube_id
             );

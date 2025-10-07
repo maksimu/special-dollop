@@ -889,6 +889,23 @@ impl MetricsCollector {
             // Try to get the tube from the registry and collect stats
             let registry = crate::tube_registry::REGISTRY.read().await;
             if let Some(tube) = registry.get_by_tube_id(&tube_id) {
+                // Check if tube has any active channels
+                let has_active_channels = tube.has_active_channels().await;
+
+                if !has_active_channels {
+                    // Tube has no active channels - check if it's stale
+                    if tube.is_stale().await {
+                        debug!(
+                            "Tube has no active channels and is stale, auto-unregistering from metrics (conversation_id: {}, tube_id: {})",
+                            conversation_id, tube_id
+                        );
+                        drop(registry); // Release registry lock before unregister
+                        self.unregister_connection(&conversation_id);
+                        continue;
+                    }
+                }
+
+                // Collect stats if tube is still active
                 match tube.get_connection_stats().await {
                     Ok(_) => {
                         stats_collected += 1;
@@ -899,17 +916,18 @@ impl MetricsCollector {
                     }
                     Err(e) => {
                         if unlikely!(crate::logger::is_verbose_logging()) {
-                            debug!("Failed to collect WebRTC stats (conversation_id: {}, tube_id: {}, error: {})", conversation_id, tube_id, e);
+                            debug!(
+                                "Failed to collect WebRTC stats (conversation_id: {}, tube_id: {}, error: {})",
+                                conversation_id, tube_id, e
+                            );
                         }
                     }
                 }
             } else {
-                // If tube is not found in registry, remove it from our metrics tracking
-                // to prevent persistent lookups
+                // Tube not found in registry, remove it from our metrics tracking
                 debug!(
                     "Tube not found in registry, auto-unregistering from metrics (conversation_id: {}, tube_id: {})",
-                    conversation_id,
-                    tube_id
+                    conversation_id, tube_id
                 );
                 self.unregister_connection(&conversation_id);
             }
@@ -927,6 +945,20 @@ impl MetricsCollector {
     async fn cleanup_old_data(&self) {
         // Clean up old alerts
         self.alert_manager.cleanup_old_alerts();
+
+        // Trigger stale tube cleanup in the registry
+        let cleaned_count = {
+            let mut registry = crate::tube_registry::REGISTRY.write().await;
+            let cleaned_tubes = registry.cleanup_stale_tubes().await;
+            cleaned_tubes.len()
+        };
+
+        if cleaned_count > 0 {
+            debug!(
+                "Cleaned up {} stale tubes during periodic maintenance",
+                cleaned_count
+            );
+        }
 
         debug!("Metrics cleanup completed");
     }

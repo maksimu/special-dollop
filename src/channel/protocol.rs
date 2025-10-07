@@ -96,7 +96,7 @@ impl Channel {
             let channel_id_log = channel_id_for_runtime_spawn.clone(); // Clone for use in loop
             while let Some(current_state) = state_rx.recv().await {
                 if current_state != last_state_in_task {
-                    info!("Endpoint WebRTC state changed: {} -> {} (channel_id: {})", last_state_in_task, current_state, channel_id_log);
+                    debug!("Endpoint WebRTC state changed: {} -> {} (channel_id: {})", last_state_in_task, current_state, channel_id_log);
                     last_state_in_task = current_state.clone();
                 }
 
@@ -846,7 +846,7 @@ impl Channel {
                 warn!("In ConnectionOpened, to_webrtc task was already finished. This is unexpected. (channel_id: {}, conn_no: {})", self.channel_id, connection_no);
             }
 
-            info!(
+            debug!(
                 "Connection fully opened and ready. (channel_id: {}, conn_no: {})",
                 self.channel_id, connection_no
             );

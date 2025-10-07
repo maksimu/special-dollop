@@ -103,6 +103,7 @@ impl Tube {
         turn_only: bool,
         ksm_config: String,
         callback_token: String,
+        krelay_server: String, // For TURN credential refresh
         client_version: &str,
         protocol_settings: HashMap<String, serde_json::Value>,
         signal_sender: UnboundedSender<SignalMessage>,
@@ -133,6 +134,9 @@ impl Tube {
             Some(signal_sender),
             self.id.clone(),                       // Pass tube_id
             self.original_conversation_id.clone(), // Pass original conversation_id for WebRTC signals
+            Some(ksm_config.clone()),              // For TURN credential refresh
+            Some(krelay_server.clone()),           // For TURN credential refresh
+            client_version.to_string(),            // For API calls
         )
         .await
         .map_err(|e| anyhow!("{}", e))?;
@@ -430,7 +434,7 @@ impl Tube {
         let tube_client_version_for_on_data_channel = self.client_version.clone(); // Clone for on_data_channel
         let peer_connection_for_on_data_channel = connection_arc.clone(); // Clone peer connection for data channel handler
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
-            info!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), rtc_data_channel.label(), rtc_data_channel.id());
+            debug!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), rtc_data_channel.label(), rtc_data_channel.id());
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
@@ -442,8 +446,8 @@ impl Tube {
             let rtc_data_channel_id = rtc_data_channel.id();
 
             Box::pin(async move {
-                println!("[TUBE_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {:?}", tube.id, rtc_data_channel_label, rtc_data_channel_id);
-                info!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+                debug!("[TUBE_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {:?}", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+                debug!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("on_data_channel: Protocol settings for this channel. (tube_id: {}, channel_label: {}, protocol_settings_for_channel_setup: {:?})", tube.id, rtc_data_channel_label, protocol_settings_for_channel_setup);
                 }
@@ -1324,21 +1328,11 @@ impl Tube {
         let pc_guard = self.peer_connection.lock().await;
 
         if let Some(pc) = &*pc_guard {
-            // Create SessionDescription based on type
-            let desc = if is_answer {
-                webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(
-                    sdp,
-                )
-            } else {
-                webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp)
-            }
-            .map_err(|e| format!("Failed to create session description: {e}"))?;
-
-            // Set the remote description directly on the WebRTC library, bypassing wrapper
-            pc.peer_connection
-                .set_remote_description(desc)
+            // Use the WebRTCPeerConnection wrapper method instead of bypassing to raw library
+            // This ensures activity updates, candidate flushing, and ICE restart completion
+            pc.set_remote_description(sdp, is_answer)
                 .await
-                .map_err(|e| format!("Failed to set remote description: {e}"))
+                .map_err(|e| format!("Failed to set remote description: {e:?}"))
         } else {
             Err("No peer connection available".to_string())
         }
@@ -1377,6 +1371,14 @@ impl Tube {
         // Set the status to Closed first to prevent Drop from trying to remove
         *self.status.write().await = TubeStatus::Closed;
         debug!("Set tube status to Closed");
+
+        // Unregister the original conversation from metrics if it exists
+        // This cleans up the monitoring registration created during start_monitoring()
+        if let Some(ref original_conv_id) = self.original_conversation_id {
+            crate::metrics::METRICS_COLLECTOR.unregister_connection(original_conv_id);
+            debug!("Unregistered original conversation from metrics (tube_id: {}, conversation_id: {})",
+                   self.id, original_conv_id);
+        }
 
         // Send connection_close callbacks for all active channels
         let channel_names: Vec<String> = {
@@ -1765,6 +1767,31 @@ impl Tube {
         } else {
             Err("No peer connection available for stats".to_string())
         }
+    }
+
+    /// Check if this tube has any active channels
+    pub async fn has_active_channels(&self) -> bool {
+        let channels_guard = self.active_channels.read().await;
+        !channels_guard.is_empty()
+    }
+
+    /// Check if this tube appears to be stale/abandoned
+    /// A tube is considered stale if it has no active channels AND is in a terminal state
+    pub async fn is_stale(&self) -> bool {
+        // Tube is stale if:
+        // 1. No active channels
+        // 2. Status is Failed/Closed/Disconnected
+
+        let has_channels = self.has_active_channels().await;
+        if has_channels {
+            return false; // Has active channels, not stale
+        }
+
+        let status = *self.status.read().await;
+        matches!(
+            status,
+            TubeStatus::Failed | TubeStatus::Closed | TubeStatus::Disconnected
+        )
     }
 }
 

@@ -335,10 +335,22 @@ pub async fn test_webrtc_connectivity_internal(
         // Priority 1: Try to get credentials from ksm_config if provided
         if let (Some(ksm_cfg), Some(client_ver)) = (ksm_config, client_version) {
             if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
-                debug!("Fetching TURN credentials from KSM router");
-                match get_relay_access_creds(ksm_cfg, None, client_ver).await {
+                debug!("Fetching TURN credentials from KSM router with 1h TTL");
+                // Request 1-hour TTL for connectivity testing (matches production)
+                match get_relay_access_creds(ksm_cfg, Some(3600), client_ver).await {
                     Ok(creds) => {
                         debug!("Successfully fetched TURN credentials from router");
+
+                        // Log TTL for diagnostics
+                        if let Some(ttl) = creds.get("ttl").and_then(|v| v.as_u64()) {
+                            debug!(
+                                "Router returned TURN TTL: {}s ({:.1}h)",
+                                ttl,
+                                ttl as f64 / 3600.0
+                            );
+                        } else {
+                            debug!("No TTL in router response");
+                        }
 
                         // Extract username and password from credentials
                         if let (Some(router_username), Some(router_password)) = (

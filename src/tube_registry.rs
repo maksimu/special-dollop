@@ -421,7 +421,9 @@ impl TubeRegistry {
                             );
 
                             let turn_start_time = std::time::Instant::now();
-                            match get_relay_access_creds(ksm_cfg, None, client_version).await {
+                            // Request 1-hour TTL for TURN credentials (will be refreshed every 30min)
+                            match get_relay_access_creds(ksm_cfg, Some(3600), client_version).await
+                            {
                                 Ok(creds) => {
                                     let turn_duration_ms =
                                         turn_start_time.elapsed().as_millis() as f64;
@@ -434,6 +436,24 @@ impl TubeRegistry {
                                         tube_id,
                                         creds
                                     );
+
+                                    // Extract and log TTL to understand router behavior
+                                    let ttl_seconds =
+                                        creds.get("ttl").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                                    if ttl_seconds > 0 {
+                                        info!(
+                                            "TURN credentials TTL: {}s ({:.1}h) (tube_id: {}, requested: 1h, will refresh every 30min)",
+                                            ttl_seconds,
+                                            ttl_seconds as f64 / 3600.0,
+                                            tube_id
+                                        );
+                                    } else {
+                                        warn!(
+                                            "No TTL in TURN credentials response - assuming 1h default, will refresh every 30min (tube_id: {})",
+                                            tube_id
+                                        );
+                                    }
 
                                     // Record TURN allocation success metrics
                                     crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
@@ -530,6 +550,7 @@ impl TubeRegistry {
                 turn_only_for_config,
                 ksm_config_for_peer_connection.to_string(),
                 callback_token.to_string(),
+                krelay_server.to_string(), // For TURN credential refresh
                 client_version,
                 settings.clone(),
                 signal_sender.clone(),

@@ -103,6 +103,7 @@ impl Tube {
         turn_only: bool,
         ksm_config: String,
         callback_token: String,
+        krelay_server: String, // For TURN credential refresh
         client_version: &str,
         protocol_settings: HashMap<String, serde_json::Value>,
         signal_sender: UnboundedSender<SignalMessage>,
@@ -133,6 +134,9 @@ impl Tube {
             Some(signal_sender),
             self.id.clone(),                       // Pass tube_id
             self.original_conversation_id.clone(), // Pass original conversation_id for WebRTC signals
+            Some(ksm_config.clone()),              // For TURN credential refresh
+            Some(krelay_server.clone()),           // For TURN credential refresh
+            client_version.to_string(),            // For API calls
         )
         .await
         .map_err(|e| anyhow!("{}", e))?;
@@ -1324,21 +1328,11 @@ impl Tube {
         let pc_guard = self.peer_connection.lock().await;
 
         if let Some(pc) = &*pc_guard {
-            // Create SessionDescription based on type
-            let desc = if is_answer {
-                webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(
-                    sdp,
-                )
-            } else {
-                webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp)
-            }
-            .map_err(|e| format!("Failed to create session description: {e}"))?;
-
-            // Set the remote description directly on the WebRTC library, bypassing wrapper
-            pc.peer_connection
-                .set_remote_description(desc)
+            // Use the WebRTCPeerConnection wrapper method instead of bypassing to raw library
+            // This ensures activity updates, candidate flushing, and ICE restart completion
+            pc.set_remote_description(sdp, is_answer)
                 .await
-                .map_err(|e| format!("Failed to set remote description: {e}"))
+                .map_err(|e| format!("Failed to set remote description: {e:?}"))
         } else {
             Err("No peer connection available".to_string())
         }

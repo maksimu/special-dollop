@@ -24,6 +24,45 @@ This guide covers integrating with the library's ICE restart and trickle ICE fea
 
 ---
 
+## ⚠️ **Prerequisites & Requirements**
+
+### **CRITICAL: Trickle ICE Required for ICE Restart**
+
+ICE restart functionality **requires** `trickle_ice=True`. This is a fundamental requirement due to RFC 5245 ICE restart protocol:
+
+**❌ Will NOT Work:**
+```python
+tube_info = registry.create_tube(
+    trickle_ice=False,  # ❌ ICE restart disabled!
+    # ... other params
+)
+# Network changes → Connection closes gracefully (no restart attempted)
+```
+
+**✅ Correct Configuration:**
+```python
+tube_info = registry.create_tube(
+    trickle_ice=True,   # ✅ ICE restart enabled
+    # ... other params
+)
+# Network changes → ICE restart attempted → Connection recovers
+```
+
+**Why Trickle ICE is Required:**
+- ICE restart generates new offer with fresh ICE credentials
+- Offer must be sent to remote peer BEFORE candidate gathering completes
+- Non-trickle ICE waits for ALL candidates (15-30 seconds) before returning SDP
+- By the time SDP is ready, connection may be dead and timing is unpredictable
+- Trickle ICE returns SDP immediately while gathering candidates in parallel
+
+**What Happens Without Trickle ICE:**
+- Network changes are detected ✅
+- ICE restart is **blocked** with clear log message ✅
+- Connection closes gracefully without restart attempts ✅
+- No "pingAllCandidates" spam or hanging connections ✅
+
+---
+
 ## 🚀 **Quick Start**
 
 ### **Python Integration**
@@ -108,7 +147,62 @@ class WebRTCManager:
                         print(f"🏁 ICE gathering complete: {tube_id}")
                 except Exception as e:
                     print(f"❌ ICE candidate relay failed: {e}")
-    
+
+        elif kind == "ice_restart_offer":
+            # ⚡ NEW: ICE restart offer - forward to remote peer
+            conversation_id = signal_dict.get('conversation_id')
+            offer_sdp_base64 = data  # Already base64 encoded
+
+            print(f"🔄 ICE restart offer received (tube: {tube_id})")
+
+            # Forward to remote peer via your signaling mechanism
+            self.send_to_remote_peer({
+                'action': 'ice_restart',
+                'tube_id': tube_id,
+                'conversation_id': conversation_id,
+                'offer': offer_sdp_base64
+            })
+
+    async def handle_ice_restart_answer(self, tube_id, answer_sdp_base64):
+        """Handle ICE restart answer from remote peer"""
+        print(f"📥 Applying ICE restart answer (tube: {tube_id})")
+        try:
+            # Rust auto-detects this completes ICE restart
+            self.registry.set_remote_description(tube_id, answer_sdp_base64, is_answer=True)
+            print(f"✅ ICE restart completed (tube: {tube_id})")
+        except Exception as e:
+            print(f"❌ ICE restart answer failed: {e}")
+
+---
+
+### **Signal Types Reference**
+
+The library sends these signal types to your Python callback:
+
+| Signal Type | Description | Data Format | Required Action |
+|------------|-------------|-------------|-----------------|
+| `connection_state_changed` | Peer connection state changed | `"connected"`, `"disconnected"`, `"failed"`, etc. | Update UI/monitoring |
+| `icecandidate` | ICE candidate discovered | SDP candidate string (or empty for end) | Forward to remote peer immediately |
+| `ice_restart_offer` | **ICE restart offer generated** | Base64-encoded SDP offer | **Forward to remote peer, apply answer** |
+| `channel_closed` | Data channel closed | JSON with close reason | Cleanup resources |
+
+#### **ice_restart_offer Signal Structure:**
+```python
+{
+    'tube_id': 'fef8e337-423f-4071-9d43-ae4fb0b9172f',
+    'kind': 'ice_restart_offer',
+    'data': 'dmV...==',  # Base64-encoded offer SDP
+    'conversation_id': 'M0xZ4rCngyOpC4KNvz83Cw==',
+    'progress_flag': 2,  # PROGRESS - awaiting answer
+    'progress_status': 'ICE restart offer sent, awaiting answer',
+    'is_ok': True
+}
+```
+
+**Critical:** You have **15 seconds** to forward the offer and apply the answer, or the connection will timeout.
+
+---
+
     def monitor_connection_health(self, tube_id):
         """Monitor connection health and recovery"""
         import threading
@@ -239,24 +333,27 @@ class RustLibraryWebRTCPeer {
     }
     
     // Handle ICE restart initiated by Rust library
+    // This is called when you receive an 'ice_restart_offer' signal from Python
     async handleIceRestartOfferFromRustLibrary(newOfferSdp) {
         try {
-            console.log('📥 Received ICE restart offer from Rust library');
-            
+            console.log('📥 Received ICE restart offer from Rust library (via Python ice_restart_offer signal)');
+
             // Process new offer from Rust library
             await this.peerConnection.setRemoteDescription({
                 type: 'offer',
                 sdp: newOfferSdp
             });
-            
+
             // Generate new answer
             const answer = await this.peerConnection.createAnswer();
             await this.peerConnection.setLocalDescription(answer);
-            
+
             // Send answer back to Rust library through your signaling mechanism
+            // Python will call registry.set_remote_description(tube_id, answer, is_answer=True)
             this.sendAnswerToRustLibrary(answer.sdp);
-            
+
             console.log('📤 ICE restart answer sent back to Rust library');
+            console.log('⏱️  Answer must reach Rust within 15 seconds or connection will timeout');
         } catch (error) {
             console.error('❌ Failed to handle ICE restart from Rust library:', error);
         }
@@ -545,6 +642,83 @@ def enhanced_signal_handler(self, signal_dict):
         
         elif state in ["disconnected", "failed"]:
             print(f"🔧 RESTART: {tube_id} will attempt ICE restart (automatic)")
+```
+
+### **ICE Restart Timeout Behavior**
+
+The library implements comprehensive timeout protection to prevent hanging connections:
+
+#### **ICE Gathering Timeout**
+- **Default:** 30 seconds (configurable via `ice_gather_timeout_seconds`)
+- **Purpose:** Prevent infinite wait during candidate gathering
+- **Applies to:** Non-trickle ICE offer/answer generation
+- **Failure:** Connection fails with clear error if timeout exceeded
+
+#### **ICE Restart Answer Timeout**
+- **Duration:** 15 seconds (**not configurable**)
+- **Purpose:** Prevent hanging after sending ICE restart offer
+- **Trigger:** Starts when `ice_restart_offer` signal is sent
+- **If Timeout Occurs:**
+  - Connection marked as closing
+  - No further restart attempts allowed
+  - Log message: `"ICE restart answer timeout - no response from remote peer after 15s"`
+- **To Prevent:** Handle `ice_restart_offer` signals and apply answers promptly
+
+#### **Circuit Breaker Protection**
+- **Failure Threshold:** 5 failed ICE restart attempts
+- **Breaker Opens:** After 5th consecutive failure
+- **When Open:** All restart attempts blocked for 30 seconds
+- **After Breaker Trips:** Connection closes **immediately** (doesn't wait 30s)
+- **Reset:** Breaker closes after 3 successful operations
+
+**Important:** If you don't implement `ice_restart_offer` signal handling, ICE restart will:
+1. Send offer signal (ignored by Python)
+2. Wait 15 seconds for answer
+3. Timeout and close connection
+4. Prevent "pingAllCandidates" spam ✅
+
+### **Concurrent Restart Protection**
+
+The library prevents multiple simultaneous ICE restart attempts:
+
+**Example Timeline:**
+```
+T+0s:  Connection: Disconnected → ICE restart #1 triggered
+T+2s:  Connection: Failed → ICE restart #2 attempted
+T+2s:  ✅ Blocked: "ICE restart already in progress, skipping duplicate request"
+T+7s:  Restart #1 completes (answer received) → Flag cleared
+T+10s: New restart attempts now allowed if needed
+```
+
+**Protection Mechanism:**
+- Internal `ice_restart_in_progress` atomic flag
+- Set when restart starts, cleared when complete or timeout
+- Duplicate attempts logged and skipped
+- No manual management required
+
+### **Automatic Restart Completion**
+
+When remote peer sends ICE restart answer, the library **automatically** completes the restart:
+
+**Flow:**
+1. ICE restart triggered → `ice_restart_in_progress = true`
+2. Offer sent via `ice_restart_offer` signal
+3. Python forwards to remote peer
+4. Remote peer sends answer back
+5. Python calls `registry.set_remote_description(tube_id, answer, is_answer=True)`
+6. **Library auto-detects:** answer + restart in progress
+7. **Automatically calls:** internal `complete_ice_restart()`
+8. **Clears flag:** `ice_restart_in_progress = false`
+9. **Cancels timeout:** 15s timeout task becomes no-op
+
+**No Explicit Call Needed:**
+```python
+# ❌ DON'T DO THIS (method not exposed to Python):
+# registry.complete_ice_restart(tube_id)
+
+# ✅ DO THIS (auto-completion built-in):
+registry.set_remote_description(tube_id, answer, is_answer=True)
+# → Rust automatically detects and completes ICE restart
 ```
 
 **JavaScript (monitoring recovery from peer side):**
@@ -934,19 +1108,22 @@ def configure_for_environment(registry, config_type="corporate"):
 ### **Key Integration Points:**
 
 **Python (using the library):**
-1. **Enable Trickle ICE**: Always use `trickle_ice=True` for best performance
-2. **Handle Signaling**: Process `connection_state_changed` and `icecandidate` events
-3. **Forward ICE Candidates**: Send candidates to JavaScript peer immediately 
-4. **Monitor Recovery**: Track state transitions for recovery timing
-5. **Use Connection APIs**: `restart_ice()` for manual restart, `get_connection_stats()` for quality monitoring
-6. **Configure Logging**: Enable WebRTC logging targets for debugging
+1. **Enable Trickle ICE**: **REQUIRED** for ICE restart - always use `trickle_ice=True`
+2. **Handle Signaling**: Process `connection_state_changed`, `icecandidate`, **and `ice_restart_offer`** events
+3. **Forward ICE Restart Offers**: Send `ice_restart_offer` signal data to remote peer (you have 15 seconds)
+4. **Apply ICE Restart Answers**: Call `set_remote_description(tube_id, answer, is_answer=True)` when remote peer responds
+5. **Forward ICE Candidates**: Send candidates to JavaScript peer immediately during normal operation
+6. **Monitor Recovery**: Track state transitions for recovery timing
+7. **Use Connection APIs**: `restart_ice()` for manual restart, `get_connection_stats()` for quality monitoring
+8. **Configure Logging**: Enable WebRTC logging targets for debugging
 
 **JavaScript (connecting to the library):**
 1. **Handle Trickle ICE**: Send candidates to Rust library immediately as discovered
-2. **Process ICE Restart**: Be ready to handle new offers from Rust library
-3. **Monitor Connection State**: Track connection health from peer perspective
-4. **Implement Signaling**: Handle SDP and candidate exchange with Rust library
-5. **Test Network Changes**: Validate that Rust library recovery works
+2. **Process ICE Restart Offers**: Handle `ice_restart_offer` signals forwarded from Python (respond within 15 seconds)
+3. **Send ICE Restart Answers**: Generate answer and send back to Python for application
+4. **Monitor Connection State**: Track connection health from peer perspective
+5. **Implement Signaling**: Handle SDP and candidate exchange with Rust library
+6. **Test Network Changes**: Validate that Rust library recovery works
 
 ### **What You Get:**
 

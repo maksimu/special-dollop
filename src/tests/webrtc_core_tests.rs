@@ -16,6 +16,9 @@ async fn create_test_peer_connection() -> WebRTCPeerConnection {
         Some(tx), // signal_sender
         "test_tube_123".to_string(),
         Some("test_conversation".to_string()),
+        None,                           // ksm_config (no credential refresh in tests)
+        None,                           // krelay_server (no credential refresh in tests)
+        "test-client-v1.0".to_string(), // client_version
     )
     .await
     .expect("Failed to create test peer connection")
@@ -55,6 +58,9 @@ async fn test_keepalive_lifecycle() {
         Some(tx),
         "test_tube_keepalive".to_string(),
         Some("test_conversation".to_string()),
+        None,                           // ksm_config (no credential refresh in tests)
+        None,                           // krelay_server (no credential refresh in tests)
+        "test-client-v1.0".to_string(), // client_version
     )
     .await
     .expect("Failed to create peer connection");
@@ -168,6 +174,9 @@ async fn test_network_change_detection() {
         Some(tx),
         "test_tube_network".to_string(),
         Some("test_conversation".to_string()),
+        None,                           // ksm_config (no credential refresh in tests)
+        None,                           // krelay_server (no credential refresh in tests)
+        "test-client-v1.0".to_string(), // client_version
     )
     .await
     .expect("Failed to create peer connection");

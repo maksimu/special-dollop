@@ -19,6 +19,7 @@ mod tube;
 mod tube_and_channel_helpers;
 mod tube_protocol;
 mod tube_registry;
+mod webrtc_circuit_breaker;
 mod webrtc_data_channel;
 mod webrtc_errors;
 mod webrtc_network_monitor;

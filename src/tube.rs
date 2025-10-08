@@ -1793,6 +1793,28 @@ impl Tube {
             TubeStatus::Failed | TubeStatus::Closed | TubeStatus::Disconnected
         )
     }
+
+    /// Get comprehensive circuit breaker statistics
+    pub async fn get_circuit_breaker_stats(
+        &self,
+    ) -> Result<crate::webrtc_circuit_breaker::CircuitBreakerStats, String> {
+        let pc_guard = self.peer_connection.lock().await;
+        if let Some(ref pc) = *pc_guard {
+            Ok(pc.get_comprehensive_circuit_breaker_stats())
+        } else {
+            Err("Peer connection not available".to_string())
+        }
+    }
+
+    /// Check if circuit breaker is healthy (closed state)
+    pub async fn is_circuit_breaker_healthy(&self) -> Result<bool, String> {
+        let pc_guard = self.peer_connection.lock().await;
+        if let Some(ref pc) = *pc_guard {
+            Ok(pc.is_circuit_breaker_healthy())
+        } else {
+            Err("Peer connection not available".to_string())
+        }
+    }
 }
 
 // Connection statistics structure

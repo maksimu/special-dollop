@@ -57,24 +57,30 @@ pub struct TubeCircuitBreaker {
 - **Success threshold:** 3 successes to close circuit
 - **Request timeout:** 10 seconds per operation
 
-#### 3. IsolatedTubeRuntime
+#### 3. Shared Runtime with Tokio Panic Isolation
+
+**Architecture Decision:** All tubes share a global tokio runtime with automatic panic isolation.
+
+**Why Shared Runtime:**
+- **Tokio best practice** - per-connection runtimes are anti-pattern
+- **Efficient threading** - 10 worker threads (matches CPU cores) vs 2×N threads per tube
+- **Automatic panic isolation** - `tokio::spawn()` catches panics and returns `JoinError`
+- **Work stealing** - better CPU utilization across tubes
+- **Simpler lifecycle** - single runtime initialization and shutdown
+
+**Panic Protection:**
 ```rust
-pub struct IsolatedTubeRuntime {
-    runtime: Arc<tokio::runtime::Runtime>, // Dedicated runtime
-    tube_id: String,                       // Tube identification
-    panic_count: Arc<AtomicUsize>,         // Panic tracking
-    max_panics: usize,                     // Circuit breaker limit
-    is_healthy: Arc<AtomicBool>,           // Health status
-    active_tasks: Arc<AtomicUsize>,        // Task monitoring
-}
+// Each tube spawns isolated tasks via tokio::spawn
+runtime.spawn(async move {
+    // Panic here won't affect other tubes
+    // tokio::spawn catches the panic and converts to JoinError
+});
 ```
 
-**Isolation Features:**
-- **Dedicated worker threads** - 2 threads per tube maximum
-- **Panic protection** - catches and isolates task panics
-- **Circuit breaking** - disabled after 3 panics
-- **Resource limits** - prevents resource exhaustion
-- **Graceful shutdown** - clean task termination
+**Three-Layer Isolation:**
+1. **WebRTC API Layer** - `IsolatedWebRTCAPI` prevents TURN corruption
+2. **Circuit Breaker Layer** - `TubeCircuitBreaker` prevents cascading failures
+3. **Task Layer** - `tokio::spawn` isolates panics between tubes
 
 ## Implementation Details
 
@@ -135,8 +141,8 @@ pub async fn restart_ice_protected(&self) -> Result<String, String> {
 | **Frame Processing** | 398-2213ns | 398-2213ns | **0ns (unchanged)** |
 | **Connection Creation** | ~200ms | ~201ms | **1ms (<0.5%)** |
 | **Circuit Breaker Check** | N/A | ~1μs | **1μs per operation** |
-| **Panic Safety** | N/A | ~100ns | **100ns per protected task** |
 | **Memory per Tube** | ~50KB | ~52KB | **2KB (4% increase)** |
+| **Panic Isolation** | N/A | 0ns | **0ns (built into tokio::spawn)** |
 
 ### Hot Path Preservation
 
@@ -154,30 +160,31 @@ pub async fn restart_ice_protected(&self) -> Result<String, String> {
 // Get WebRTC API health
 let (healthy, errors, turn_failures, age) = connection.get_api_health();
 
-// Get circuit breaker status
+// Get circuit breaker status (simple)
 let (state, metrics) = connection.get_circuit_breaker_status();
 
-// Get detailed circuit information
-let state_info = connection.circuit_breaker.get_detailed_state();
+// Get comprehensive circuit breaker statistics
+let stats = connection.get_comprehensive_circuit_breaker_stats();
+
+// Check circuit health
+let is_healthy = connection.is_circuit_breaker_healthy();
 ```
 
-### Circuit State Information
+### Circuit Breaker Statistics Structure
 
 ```rust
-pub enum CircuitStateInfo {
-    Closed {
-        failure_count: u32,
-        last_failure_ago: Option<Duration>,
-    },
-    Open {
-        opened_ago: Duration,
-        last_attempt_ago: Option<Duration>,
-    },
-    HalfOpen {
-        test_started_ago: Duration,
-        test_count: u32,
-        success_count: u32,
-    },
+pub struct CircuitBreakerStats {
+    pub tube_id: String,
+    pub state: String,              // "Closed", "Open", or "Half-Open" with details
+    pub total_requests: usize,
+    pub successful_requests: usize,
+    pub failed_requests: usize,
+    pub circuit_opens: usize,
+    pub circuit_closes: usize,
+    pub timeouts: usize,
+    pub error_type_counts: HashMap<String, u32>,           // Failures by error type
+    pub error_type_triggered_opens: HashMap<String, u32>,  // Opens by error type
+    pub current_error_type_failures: HashMap<String, u32>, // Current failures by type
 }
 ```
 
@@ -188,7 +195,7 @@ pub enum CircuitStateInfo {
 - **Failed operations** count
 - **Circuit opens/closes** frequency
 - **Timeout occurrences** tracking
-- **Panic counts** per runtime
+- **Error-type specific** failure breakdown
 
 ## Recovery Mechanisms
 
@@ -199,10 +206,10 @@ pub enum CircuitStateInfo {
    - 3 successful operations close the circuit
    - Failed test immediately reopens circuit
 
-2. **Runtime Recovery**
-   - Panic detection and counting
-   - Circuit breaking after 3 panics
-   - Manual reset capabilities
+2. **Automatic Panic Isolation**
+   - `tokio::spawn()` catches panics automatically
+   - Panics converted to `JoinError` on await
+   - Other tubes unaffected by task panics
 
 ### Manual Recovery
 
@@ -212,9 +219,6 @@ connection.reset_api_circuit_breaker();
 
 // Reset tube-level circuit breaker
 connection.reset_circuit_breaker();
-
-// Reset runtime circuit breaker
-runtime.reset_circuit_breaker();
 ```
 
 ## Migration Notes
@@ -246,9 +250,9 @@ let pc = create_peer_connection_isolated(&api, Some(config)).await?;
 
 ### System Requirements
 
-- **Memory:** Additional 2KB per active tube
+- **Memory:** Additional 2KB per active tube (for isolation structures)
 - **CPU:** <1% overhead for isolation features
-- **Threads:** 2 additional worker threads per tube maximum
+- **Threads:** Shared runtime with ~10 worker threads (matches CPU cores)
 
 ### Configuration
 
@@ -283,7 +287,7 @@ CircuitConfig {
 3. **Alerting Thresholds**
    - Circuit breaker opens > 5 per hour
    - TURN failure rate > 10%
-   - Runtime panic count > 0
+   - Error-type specific failure spikes
 
 ## Verification
 

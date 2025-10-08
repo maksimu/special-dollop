@@ -1889,6 +1889,94 @@ impl PyTubeRegistry {
         crate::metrics::METRICS_COLLECTOR.clear_all_connections();
         Ok(())
     }
+
+    // =============================================================================
+    // CIRCUIT BREAKER MONITORING
+    // =============================================================================
+
+    /// Get detailed circuit breaker statistics for a specific tube
+    /// Returns comprehensive stats including error-type specific metrics
+    fn get_tube_circuit_breaker_stats(&self, py: Python<'_>, tube_id: &str) -> PyResult<Py<PyAny>> {
+        let tube_id_owned = tube_id.to_string();
+        let master_runtime = get_runtime();
+
+        let stats_result = Python::detach(py, || {
+            master_runtime.block_on(async move {
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                    tube.get_circuit_breaker_stats()
+                        .await
+                        .map_err(|e| format!("Failed to get circuit breaker stats: {}", e))
+                } else {
+                    Err(format!("Tube not found: {}", tube_id_owned))
+                }
+            })
+        });
+
+        match stats_result {
+            Ok(stats) => {
+                let dict = PyDict::new(py);
+                dict.set_item("tube_id", &stats.tube_id)?;
+                dict.set_item("state", &stats.state)?;
+                dict.set_item("total_requests", stats.total_requests)?;
+                dict.set_item("successful_requests", stats.successful_requests)?;
+                dict.set_item("failed_requests", stats.failed_requests)?;
+                dict.set_item("circuit_opens", stats.circuit_opens)?;
+                dict.set_item("circuit_closes", stats.circuit_closes)?;
+                dict.set_item("timeouts", stats.timeouts)?;
+
+                // Error type counts
+                let error_counts_dict = PyDict::new(py);
+                for (error_type, count) in stats.error_type_counts.iter() {
+                    error_counts_dict.set_item(error_type, *count)?;
+                }
+                dict.set_item("error_type_counts", error_counts_dict)?;
+
+                // Error types that triggered circuit opens
+                let triggered_opens_dict = PyDict::new(py);
+                for (error_type, count) in stats.error_type_triggered_opens.iter() {
+                    triggered_opens_dict.set_item(error_type, *count)?;
+                }
+                dict.set_item("error_type_triggered_opens", triggered_opens_dict)?;
+
+                // Current error type failures (in Closed state)
+                let current_failures_dict = PyDict::new(py);
+                for (error_type, count) in stats.current_error_type_failures.iter() {
+                    current_failures_dict.set_item(error_type, *count)?;
+                }
+                dict.set_item("current_error_type_failures", current_failures_dict)?;
+
+                Ok(dict.into())
+            }
+            Err(e) => Err(PyRuntimeError::new_err(e)),
+        }
+    }
+
+    /// Check if a tube's circuit breaker is healthy (closed state)
+    /// Returns boolean indicating if the circuit is closed (healthy)
+    fn get_tube_circuit_breaker_health(&self, py: Python<'_>, tube_id: &str) -> PyResult<bool> {
+        let tube_id_owned = tube_id.to_string();
+        let master_runtime = get_runtime();
+
+        Python::detach(py, || {
+            master_runtime.block_on(async move {
+                let registry = REGISTRY.read().await;
+                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                    tube.is_circuit_breaker_healthy().await.map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "Failed to get circuit breaker health: {}",
+                            e
+                        ))
+                    })
+                } else {
+                    Err(PyRuntimeError::new_err(format!(
+                        "Tube not found: {}",
+                        tube_id_owned
+                    )))
+                }
+            })
+        })
+    }
 }
 
 // Implement Drop trait for PyTubeRegistry as a safety net

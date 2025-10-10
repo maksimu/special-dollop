@@ -46,9 +46,13 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_concurrent_sockets: 64,
+            // Production tuning: Set to 100k (effectively unlimited) to let OS limits dictate capacity
+            // Real limits will be: file descriptors (~65k typical), memory (~500KB per connection),
+            // bandwidth, and CPU - all of which give meaningful errors unlike artificial caps.
+            // Typical production capacity: 500-1000 concurrent connections before hitting OS/HW limits.
+            max_concurrent_sockets: 100_000,
             max_interfaces_per_agent: 8,
-            max_concurrent_ice_agents: 32,
+            max_concurrent_ice_agents: 100_000,
             max_turn_connections_per_server: 4,
             socket_reuse_enabled: true,
             ice_gather_timeout: Duration::from_secs(30), // Increased for trickle ICE + signaling latency
@@ -187,8 +191,9 @@ impl ResourceManager {
             if let Some(conn) = server_connections
                 .iter()
                 .min_by_key(|c| c.ref_count.load(Ordering::SeqCst))
-                .filter(|c| c.ref_count.load(Ordering::SeqCst) < 10)
-            // Max refs per connection
+                .filter(|c| c.ref_count.load(Ordering::SeqCst) < 1)
+            // No sharing - each tube gets dedicated TURN allocation for maximum throughput
+            // This ensures RBI sessions don't compete for bandwidth through shared TURN ports
             {
                 conn.ref_count.fetch_add(1, Ordering::SeqCst);
                 let mut stats = self.stats.lock().unwrap();

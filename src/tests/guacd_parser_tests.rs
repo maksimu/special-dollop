@@ -1341,17 +1341,17 @@ fn test_expandable_opcode_detection() {
     assert_eq!(result.0, error_instruction.len());
     assert_eq!(result.1, OpcodeAction::CloseConnection);
 
-    // Test normal instruction
+    // Test sync instruction (now returns ServerSync for keepalive auto-response)
     let sync_instruction = b"4.sync,10.1699999999;";
     let result = GuacdParser::validate_and_detect_special(sync_instruction).unwrap();
     assert_eq!(result.0, sync_instruction.len());
-    assert_eq!(result.1, OpcodeAction::Normal);
+    assert_eq!(result.1, OpcodeAction::ServerSync);
 
     // Test fast path for sync
     let fast_sync = b"4.sync;";
     let result = GuacdParser::validate_and_detect_special(fast_sync).unwrap();
     assert_eq!(result.0, 7);
-    assert_eq!(result.1, OpcodeAction::Normal);
+    assert_eq!(result.1, OpcodeAction::ServerSync);
 
     // Test another normal instruction
     let copy_instruction = b"4.copy,2.10,1.0,1.0,3.100,3.100,1.0,1.0,1.0;";

@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -77,7 +78,13 @@ impl PyTubeRegistry {
         let master_runtime = get_runtime();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
+                let mut registry = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    REGISTRY.write()
+                ).await.map_err(|_| {
+                    error!("Timeout acquiring REGISTRY write lock for cleanup_all after 30s - possible deadlock");
+                }).expect("Failed to acquire registry lock for cleanup_all");
+
                 let tube_ids: Vec<String> = registry.tubes_by_id.keys().cloned().collect();
                 debug!(
                     "Starting explicit cleanup of all tubes (tube_count: {})",
@@ -114,7 +121,13 @@ impl PyTubeRegistry {
         let master_runtime = get_runtime();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
+                let mut registry = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    REGISTRY.write()
+                ).await.map_err(|_| {
+                    error!("Timeout acquiring REGISTRY write lock for cleanup_tubes after 30s - possible deadlock");
+                }).expect("Failed to acquire registry lock for cleanup_tubes");
+
                 debug!(
                     "Starting cleanup of specific tubes (tube_count: {})",
                     tube_ids.len()
@@ -249,7 +262,17 @@ impl PyTubeRegistry {
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("PyBind: Acquiring REGISTRY write lock for create_tube. (conversation_id: {})", conversation_id);
                 }
-                let mut registry = REGISTRY.write().await;
+
+                // CRITICAL: Add timeout to prevent indefinite blocking on lock acquisition
+                // This prevents deadlocks when metrics collector or other tasks hold read locks across awaits
+                let mut registry = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    REGISTRY.write()
+                ).await.map_err(|_| {
+                    error!("PyBind: Timeout acquiring REGISTRY write lock after 30s - possible deadlock (conversation_id: {})", conversation_id);
+                    PyRuntimeError::new_err(format!("Timeout acquiring registry lock for tube creation (possible deadlock) - conversation: {}", conversation_id))
+                })?;
+
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("PyBind: REGISTRY write lock acquired. (conversation_id: {})", conversation_id);
                 }
@@ -310,8 +333,13 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.to_string();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                // Clone tube Arc before awaiting to release read lock immediately
+                let tube_arc = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                }; // Read lock released here
+
+                if let Some(tube) = tube_arc {
                     tube.create_offer().await.map_err(|e| {
                         PyRuntimeError::new_err(format!("Failed to create offer: {e}"))
                     })
@@ -330,8 +358,13 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.to_string();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                // Clone tube Arc before awaiting to release read lock immediately
+                let tube_arc = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                }; // Read lock released here
+
+                if let Some(tube) = tube_arc {
                     tube.create_answer().await.map_err(|e| {
                         PyRuntimeError::new_err(format!("Failed to create answer: {e}"))
                     })
@@ -360,13 +393,18 @@ impl PyTubeRegistry {
         let master_runtime = get_runtime();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                registry
-                    .set_remote_description(tube_id, &sdp, is_answer)
-                    .await
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to set remote description: {e}"))
-                    })
+                // CRITICAL: Don't hold REGISTRY lock while calling registry method that internally awaits
+                // The method will do tube lookups and awaits - holding lock causes deadlock
+                let result = {
+                    let registry = REGISTRY.read().await;
+                    registry
+                        .set_remote_description(tube_id, &sdp, is_answer)
+                        .await
+                }; // Lock released after method completes
+
+                result.map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to set remote description: {e}"))
+                })
             })
         })
     }
@@ -378,11 +416,15 @@ impl PyTubeRegistry {
         let candidate_owned = candidate;
 
         master_runtime.spawn(async move {
-            let registry = REGISTRY.read().await;
-            if let Err(e) = registry
-                .add_external_ice_candidate(&tube_id_owned, &candidate_owned)
-                .await
-            {
+            // CRITICAL: Don't hold REGISTRY lock while calling registry method that internally awaits
+            let result = {
+                let registry = REGISTRY.read().await;
+                registry
+                    .add_external_ice_candidate(&tube_id_owned, &candidate_owned)
+                    .await
+            }; // Lock released after method completes
+
+            if let Err(e) = result {
                 warn!(
                     "Error adding ICE candidate for tube {}: {}",
                     tube_id_owned, e
@@ -399,13 +441,15 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.to_string();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
-                registry
-                    .get_connection_state(&tube_id_owned)
-                    .await
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Failed to get connection state: {e}"))
-                    })
+                // CRITICAL: Don't hold REGISTRY lock while calling registry method that internally awaits
+                let result = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_connection_state(&tube_id_owned).await
+                }; // Lock released after method completes
+
+                result.map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to get connection state: {e}"))
+                })
             })
         })
     }
@@ -441,7 +485,14 @@ impl PyTubeRegistry {
         let master_runtime = get_runtime();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
+                let mut registry = tokio::time::timeout(Duration::from_secs(10), REGISTRY.write())
+                    .await
+                    .map_err(|_| {
+                        error!(
+                            "Timeout acquiring REGISTRY write lock for set_server_mode after 10s"
+                        );
+                    })
+                    .expect("Failed to acquire registry lock");
                 registry.set_server_mode(server_mode);
             });
         });
@@ -471,7 +522,14 @@ impl PyTubeRegistry {
         let connection_id_owned = connection_id.to_string();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let mut registry = REGISTRY.write().await;
+                let mut registry = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    REGISTRY.write()
+                ).await.map_err(|_| {
+                    error!("Timeout acquiring REGISTRY write lock for associate_conversation after 10s");
+                    PyRuntimeError::new_err("Timeout acquiring registry lock for conversation association")
+                })?;
+
                 registry
                     .associate_conversation(&tube_id_owned, &connection_id_owned)
                     .map_err(|e| {
@@ -601,7 +659,16 @@ impl PyTubeRegistry {
         let tube_id_owned = tube_id.to_string();
 
         safe_python_async_execute(py, async move {
-            let mut registry = REGISTRY.write().await;
+            // CRITICAL: Add timeout to prevent indefinite blocking on lock acquisition
+            // This prevents deadlocks when metrics collector or other tasks hold read locks across awaits
+            let mut registry = tokio::time::timeout(
+                Duration::from_secs(30),
+                REGISTRY.write()
+            ).await.map_err(|_| {
+                error!("PyBind: Timeout acquiring REGISTRY write lock for close_tube after 30s - possible deadlock (tube_id: {})", tube_id_owned);
+                PyRuntimeError::new_err(format!("Timeout acquiring registry lock for tube closure (possible deadlock) - tube: {}", tube_id_owned))
+            })?;
+
             let close_reason = reason.map(CloseConnectionReason::from_code);
             registry
                 .close_tube(&tube_id_owned, close_reason)
@@ -643,16 +710,21 @@ impl PyTubeRegistry {
         let master_runtime = get_runtime();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
-                let registry = REGISTRY.read().await;
+                // CRITICAL DEADLOCK FIX: Clone all tube Arcs BEFORE any awaits
+                // Holding read lock while awaiting in a loop over ALL tubes is extremely dangerous
+                let tube_arcs: Vec<Arc<crate::Tube>> = {
+                    let registry = REGISTRY.read().await;
+                    registry.tubes_by_id.values().cloned().collect()
+                }; // Read lock released here - crucial!
 
-                // Collect all callback tokens from active tubes
+                // Now collect callback tokens WITHOUT holding registry lock
                 let mut callback_tokens = Vec::new();
-
-                for tube_arc in registry.tubes_by_id.values() {
-                    // Get callback tokens from all channels in this tube
+                for tube_arc in tube_arcs {
+                    // Get callback tokens from all channels in this tube (can await safely now)
                     let tube_channel_tokens = tube_arc.get_callback_tokens().await;
                     callback_tokens.extend(tube_channel_tokens);
                 }
+
                 // The post_connection_state function handles TEST_MODE_KSM_CONFIG internally.
                 // It will also error out if ksm_config_from_python is empty and not a test string.
                 debug!(
@@ -1239,8 +1311,13 @@ impl PyTubeRegistry {
 
         Python::detach(py, || {
             master_runtime.block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                // Clone tube Arc before awaiting to release read lock immediately
+                let tube_arc = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                }; // Read lock released here
+
+                if let Some(tube) = tube_arc {
                     tube.restart_ice()
                         .await
                         .map_err(|e| PyRuntimeError::new_err(format!("ICE restart failed: {}", e)))
@@ -1260,10 +1337,10 @@ impl PyTubeRegistry {
             let rt = get_runtime();
             rt.block_on(async {
                 let snapshot = crate::metrics::METRICS_COLLECTOR.create_snapshot();
-                let mut leg_metrics = std::collections::HashMap::new();
+                let mut leg_metrics = HashMap::new();
 
                 for (conversation_id, metrics) in snapshot.connections.iter() {
-                    let mut connection_data = std::collections::HashMap::new();
+                    let mut connection_data = HashMap::new();
 
                     // Basic connection info
                     connection_data.insert(
@@ -1376,7 +1453,7 @@ impl PyTubeRegistry {
                 }
 
                 // System-wide aggregated metrics
-                let mut system_metrics = std::collections::HashMap::new();
+                let mut system_metrics = HashMap::new();
                 system_metrics.insert(
                     "timestamp".to_string(),
                     serde_json::Value::String(snapshot.aggregated.timestamp.to_rfc3339()),
@@ -1414,7 +1491,7 @@ impl PyTubeRegistry {
                     );
                 }
 
-                let mut export_data = std::collections::HashMap::new();
+                let mut export_data = HashMap::new();
                 export_data.insert(
                     "connections".to_string(),
                     serde_json::Value::Object(serde_json::Map::from_iter(
@@ -1444,8 +1521,13 @@ impl PyTubeRegistry {
 
         let stats_result = Python::detach(py, || {
             master_runtime.block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                // Clone tube Arc before awaiting to release read lock immediately
+                let tube_arc = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                }; // Read lock released here
+
+                if let Some(tube) = tube_arc {
                     tube.get_connection_stats()
                         .await
                         .map_err(|e| format!("Failed to get stats: {}", e))
@@ -1902,8 +1984,13 @@ impl PyTubeRegistry {
 
         let stats_result = Python::detach(py, || {
             master_runtime.block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                // Clone tube Arc before awaiting to release read lock immediately
+                let tube_arc = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                }; // Read lock released here
+
+                if let Some(tube) = tube_arc {
                     tube.get_circuit_breaker_stats()
                         .await
                         .map_err(|e| format!("Failed to get circuit breaker stats: {}", e))
@@ -1960,8 +2047,13 @@ impl PyTubeRegistry {
 
         Python::detach(py, || {
             master_runtime.block_on(async move {
-                let registry = REGISTRY.read().await;
-                if let Some(tube) = registry.get_by_tube_id(&tube_id_owned) {
+                // Clone tube Arc before awaiting to release read lock immediately
+                let tube_arc = {
+                    let registry = REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id_owned)
+                }; // Read lock released here
+
+                if let Some(tube) = tube_arc {
                     tube.is_circuit_breaker_healthy().await.map_err(|e| {
                         PyRuntimeError::new_err(format!(
                             "Failed to get circuit breaker health: {}",

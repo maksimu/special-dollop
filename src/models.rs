@@ -222,7 +222,7 @@ impl Conn {
 }
 
 // Backend task runner
-async fn backend_task_runner(
+pub(crate) async fn backend_task_runner(
     mut backend: Box<dyn AsyncReadWrite>,
     mut data_rx: mpsc::UnboundedReceiver<ConnectionMessage>,
     conn_no: u32,

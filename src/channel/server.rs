@@ -111,7 +111,7 @@ impl Channel {
 
                                 // Read the initial greeting to determine the SOCKS version
                                 let mut buf = [0u8; 2];
-                                if (reader.read_exact(&mut buf).await).is_ok() {
+                                if reader.read_exact(&mut buf).await.is_ok() {
                                     // Send connection didn't allow response
                                     let version = buf[0];
                                     if version == SOCKS5_VERSION {

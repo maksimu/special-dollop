@@ -8,7 +8,7 @@ use super::types::{
 };
 use crate::unlikely;
 use chrono::Utc;
-use log::debug;
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -72,6 +72,8 @@ pub struct MetricsCollector {
     start_time: Instant,
     /// Background task handle
     background_task_running: Arc<RwLock<bool>>,
+    /// Track if we've logged idle state (0 connections) to avoid spam
+    idle_state_logged: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MetricsCollector {
@@ -83,6 +85,7 @@ impl MetricsCollector {
             aggregated_metrics: Arc::new(RwLock::new(AggregatedMetrics::default())),
             start_time: Instant::now(),
             background_task_running: Arc::new(RwLock::new(false)),
+            idle_state_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -139,7 +142,13 @@ impl MetricsCollector {
             }
         });
 
-        debug!("Background metrics tasks started");
+        // Start zombie tube sweeper (backstop for missed cleanups)
+        let collector_for_sweeper = self.clone();
+        runtime_handle.spawn(async move {
+            collector_for_sweeper.zombie_tube_sweeper().await;
+        });
+
+        debug!("Background metrics tasks started (aggregation, cleanup, stats collection, zombie sweeper)");
     }
 
     /// Register a new connection for metrics tracking
@@ -399,7 +408,7 @@ impl MetricsCollector {
     pub fn update_webrtc_stats(
         &self,
         conversation_id: &str,
-        webrtc_stats: &std::collections::HashMap<String, StatsReportType>,
+        webrtc_stats: &HashMap<String, StatsReportType>,
     ) {
         debug!(
             "update_webrtc_stats called (conversation_id: {}, stats_count: {})",
@@ -823,24 +832,47 @@ impl MetricsCollector {
         // - Throughput: Total data transfer rate in KB/s
         // - Quality: Connection quality distribution (Excellent/Good/Fair/Poor)
         // - Alerts: Number of active performance alerts
-        if unlikely!(crate::logger::is_verbose_logging()) {
-            debug!(
-                "Metrics Heartbeat - Connections: {}, Tubes: {}, Avg RTT: {:.1}ms, Packet Loss: {:.2}%, P95 Latency: {:.1}ms, Throughput: {:.1}KB/s, Quality: {}/{}/{}/{}, Alerts: {}",
-                aggregated.active_connections,
-                aggregated.active_tubes,
-                aggregated.avg_system_rtt.as_millis() as f64,
-                aggregated.avg_packet_loss * 100.0,
-                aggregated.avg_p95_latency.as_millis() as f64,
-                aggregated.total_bandwidth / 1024.0, // Convert to KB/s
-                aggregated.excellent_connections,
-                aggregated.good_connections,
-                aggregated.fair_connections,
-                aggregated.poor_connections,
-                aggregated.total_alerts
-            );
-        }
+
+        // Skip heartbeat logging when idle (0 connections/tubes) unless first time transitioning to idle
+        let is_idle = aggregated.active_connections == 0 && aggregated.active_tubes == 0;
 
         if unlikely!(crate::logger::is_verbose_logging()) {
+            if is_idle {
+                // Log once when transitioning to idle, then silence
+                if !self
+                    .idle_state_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    debug!(
+                        "Metrics Heartbeat - System now IDLE (Connections: 0, Tubes: 0) - heartbeat logging paused until activity resumes"
+                    );
+                }
+                // Skip logging on subsequent idle heartbeats
+            } else {
+                // Reset idle flag when activity resumes
+                self.idle_state_logged
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+
+                // Log normal heartbeat
+                debug!(
+                    "Metrics Heartbeat - Connections: {}, Tubes: {}, Avg RTT: {:.1}ms, Packet Loss: {:.2}%, P95 Latency: {:.1}ms, Throughput: {:.1}KB/s, Quality: {}/{}/{}/{}, Alerts: {}",
+                    aggregated.active_connections,
+                    aggregated.active_tubes,
+                    aggregated.avg_system_rtt.as_millis() as f64,
+                    aggregated.avg_packet_loss * 100.0,
+                    aggregated.avg_p95_latency.as_millis() as f64,
+                    aggregated.total_bandwidth / 1024.0, // Convert to KB/s
+                    aggregated.excellent_connections,
+                    aggregated.good_connections,
+                    aggregated.fair_connections,
+                    aggregated.poor_connections,
+                    aggregated.total_alerts
+                );
+            }
+        }
+
+        // Only log metrics update when not idle (avoids spam when system has no activity)
+        if unlikely!(crate::logger::is_verbose_logging()) && !is_idle {
             debug!("Aggregated metrics updated");
         }
     }
@@ -886,12 +918,32 @@ impl MetricsCollector {
                 continue;
             }
 
-            // Try to get the tube from the registry and collect stats
-            let registry = crate::tube_registry::REGISTRY.read().await;
-            if let Some(tube) = registry.get_by_tube_id(&tube_id) {
-                // Check if tube has any active channels
+            // CRITICAL FIX: Clone tube Arc BEFORE doing any awaits to avoid holding read lock
+            // Holding read lock across await points can block write lock acquisitions and cause deadlocks
+            let tube_arc: Option<Arc<crate::Tube>> = {
+                let registry = crate::tube_registry::REGISTRY.read().await;
+                registry.get_by_tube_id(&tube_id)
+            }; // Read lock released here - crucial for allowing write locks (create_tube, close_tube)
+
+            if let Some(tube) = tube_arc {
+                // Now we can safely await without holding the registry lock
+
+                // MULTI-FACTOR ZOMBIE TUBE DETECTION
+                // Factor 1: Check if tube has active channels (classic check)
                 let has_active_channels = tube.has_active_channels().await;
 
+                // Factor 2: Check connection state (Failed/Disconnected)
+                let connection_state = tube.get_connection_state().await;
+                let is_failed_or_disconnected = matches!(
+                    connection_state,
+                    Some(webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed)
+                        | Some(webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected)
+                );
+
+                // Factor 3: Check inactivity (no data for 60s)
+                let inactive_60s = tube.is_inactive_for_duration(Duration::from_secs(60)).await;
+
+                // PATH 1: Classic cleanup (no channels + terminal state)
                 if !has_active_channels {
                     // Tube has no active channels - check if it's stale
                     if tube.is_stale().await {
@@ -899,10 +951,58 @@ impl MetricsCollector {
                             "Tube has no active channels and is stale, auto-unregistering from metrics (conversation_id: {}, tube_id: {})",
                             conversation_id, tube_id
                         );
-                        drop(registry); // Release registry lock before unregister
                         self.unregister_connection(&conversation_id);
                         continue;
                     }
+                }
+
+                // PATH 2: ZOMBIE CLEANUP - Failed/Disconnected + inactive for 60s
+                // This catches tubes where data channel on_close event didn't fire (browser force-close, network drop)
+                if is_failed_or_disconnected && inactive_60s {
+                    warn!(
+                        "ZOMBIE TUBE DETECTED: Connection in failed/disconnected state with 60s inactivity - force closing (conversation_id: {}, tube_id: {}, state: {:?}, has_channels: {})",
+                        conversation_id, tube_id, connection_state, has_active_channels
+                    );
+
+                    // Force close the zombie tube via registry
+                    let tube_id_clone = tube_id.clone();
+                    let conversation_id_clone = conversation_id.clone();
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        crate::tube_registry::REGISTRY.write(),
+                    )
+                    .await
+                    {
+                        Ok(mut registry) => {
+                            match registry
+                                .close_tube(
+                                    &tube_id_clone,
+                                    Some(crate::tube_protocol::CloseConnectionReason::Timeout),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    info!(
+                                        "Successfully force-closed zombie tube (tube_id: {})",
+                                        tube_id_clone
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to force-close zombie tube: {} (tube_id: {})",
+                                        e, tube_id_clone
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            error!("Timeout acquiring REGISTRY write lock for zombie cleanup (tube_id: {})", tube_id_clone);
+                        }
+                    }
+
+                    // Unregister from metrics regardless of close outcome
+                    self.unregister_connection(&conversation_id_clone);
+                    continue;
                 }
 
                 // Collect stats if tube is still active
@@ -992,6 +1092,100 @@ impl MetricsCollector {
         if let Ok(mut aggregated) = self.aggregated_metrics.write() {
             *aggregated = AggregatedMetrics::default();
             debug!("Cleared aggregated metrics");
+        }
+    }
+
+    /// Background task to sweep for zombie tubes every 5 minutes
+    /// This is a safety net for tubes that slip through metrics-based detection
+    /// Zombies are tubes in Failed/Disconnected state with prolonged inactivity
+    async fn zombie_tube_sweeper(&self) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
+
+            debug!("Zombie tube sweeper: Starting periodic sweep");
+
+            // Get all tube IDs from registry
+            let tube_ids: Vec<String> = {
+                let registry = crate::tube_registry::REGISTRY.read().await;
+                registry.tubes_by_id.keys().cloned().collect()
+            };
+
+            let mut zombies_found = 0;
+
+            for tube_id in tube_ids {
+                // Clone tube Arc before awaits to release read lock
+                let tube_arc: Option<Arc<crate::Tube>> = {
+                    let registry = crate::tube_registry::REGISTRY.read().await;
+                    registry.get_by_tube_id(&tube_id)
+                };
+
+                if let Some(tube) = tube_arc {
+                    let state = tube.get_connection_state().await;
+                    let inactive_5min = tube
+                        .is_inactive_for_duration(Duration::from_secs(300))
+                        .await;
+
+                    // Zombie criteria: Failed/Disconnected + 5min inactivity
+                    if matches!(
+                        state,
+                        Some(
+                            webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed
+                        ) | Some(
+                            webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected
+                        )
+                    ) && inactive_5min
+                    {
+                        zombies_found += 1;
+                        warn!(
+                            "Zombie sweeper: Found zombie tube (tube_id: {}, state: {:?}, inactive: 5min+)",
+                            tube_id, state
+                        );
+
+                        // Force close the zombie tube
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            crate::tube_registry::REGISTRY.write(),
+                        )
+                        .await
+                        {
+                            Ok(mut registry) => {
+                                match registry
+                                    .close_tube(
+                                        &tube_id,
+                                        Some(crate::tube_protocol::CloseConnectionReason::Timeout),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        info!(
+                                            "Zombie sweeper: Closed zombie tube (tube_id: {})",
+                                            tube_id
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Zombie sweeper: Failed to close tube: {} (tube_id: {})",
+                                            e, tube_id
+                                        );
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                error!(
+                                    "Zombie sweeper: Timeout acquiring registry lock (tube_id: {})",
+                                    tube_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if zombies_found > 0 {
+                debug!("Zombie sweeper: Cleaned {} zombie tubes", zombies_found);
+            } else {
+                debug!("Zombie sweeper: No zombies found");
+            }
         }
     }
 }

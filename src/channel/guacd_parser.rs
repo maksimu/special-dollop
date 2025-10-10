@@ -87,10 +87,12 @@ impl SpecialOpcode {
 pub enum OpcodeAction {
     /// Normal instruction - batch with others
     Normal,
-    /// Error instruction - close connection immediately  
+    /// Error instruction - close connection immediately
     CloseConnection,
     /// Special instruction needing custom processing
     ProcessSpecial(SpecialOpcode),
+    /// Server sync keepalive - auto-respond immediately to prevent timeout when browser throttled
+    ServerSync,
 }
 
 /// Error type for the peeking operation.
@@ -653,9 +655,9 @@ impl GuacdParser {
             return Err(PeekError::Incomplete);
         }
 
-        // Fast path for common "4.sync;" instruction
+        // Fast path for common "4.sync;" instruction (server keepalive)
         if buffer_slice.len() >= 7 && &buffer_slice[0..7] == b"4.sync;" {
-            return Ok((7, OpcodeAction::Normal));
+            return Ok((7, OpcodeAction::ServerSync));
         }
 
         let mut pos = 0;
@@ -685,6 +687,9 @@ impl GuacdParser {
             OpcodeAction::CloseConnection
         } else if opcode_str == SIZE_OPCODE {
             OpcodeAction::ProcessSpecial(SpecialOpcode::Size)
+        } else if opcode_str == "sync" {
+            // Server sync keepalive - needs immediate response to prevent 15s timeout
+            OpcodeAction::ServerSync
         } else {
             // Add more checks as needed:
             // } else if opcode_str == "disconnect" {

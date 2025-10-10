@@ -384,11 +384,10 @@ pub struct WebRTCPeerConnection {
     initial_network_scan_triggered: Arc<AtomicBool>,
     ice_restart_in_progress: Arc<AtomicBool>, // Prevent concurrent ICE restarts
 
-    // TURN credential refresh infrastructure
-    ksm_config: Option<String>,    // For fetching fresh credentials
-    krelay_server: Option<String>, // TURN server hostname
-    client_version: String,        // For API calls
-    credential_refresh_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    // TURN credential refresh infrastructure (on-demand, not background task)
+    ksm_config: Option<String>, // For fetching fresh credentials
+    client_version: String,     // For API calls
+    turn_credentials_created_at: Arc<Mutex<Option<Instant>>>, // Track credential age for on-demand refresh
 
     // ICE gathering timing for minimum duration enforcement
     ice_gathering_start_time: Arc<Mutex<Option<Instant>>>,
@@ -472,9 +471,9 @@ impl WebRTCPeerConnection {
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         tube_id: String,
         conversation_id: Option<String>,
-        ksm_config: Option<String>,    // For TURN credential refresh
-        krelay_server: Option<String>, // For TURN credential refresh
-        client_version: String,        // For API calls
+        ksm_config: Option<String>, // For TURN credential refresh
+        client_version: String,     // For API calls
+        turn_credentials_created_at: Option<Instant>, // Timestamp when TURN credentials were created
     ) -> Result<Self, String> {
         debug!("Creating isolated WebRTC connection for tube {}", tube_id);
 
@@ -612,11 +611,10 @@ impl WebRTCPeerConnection {
             initial_network_scan_triggered: Arc::new(AtomicBool::new(false)),
             ice_restart_in_progress: Arc::new(AtomicBool::new(false)),
 
-            // Initialize TURN credential refresh
+            // Initialize TURN credential tracking (on-demand refresh)
             ksm_config,
-            krelay_server,
             client_version,
-            credential_refresh_task: Arc::new(Mutex::new(None)),
+            turn_credentials_created_at: Arc::new(Mutex::new(turn_credentials_created_at)),
 
             // Initialize ICE gathering timing
             ice_gathering_start_time: Arc::new(Mutex::new(None)),
@@ -729,7 +727,7 @@ impl WebRTCPeerConnection {
                     }
 
                     // Increment candidate count
-                    let count = context_handler.ice_candidate_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let count = context_handler.ice_candidate_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                     // Convert the ICE candidate to a string representation
                     let candidate_str = format_ice_candidate(&c);
@@ -784,7 +782,7 @@ impl WebRTCPeerConnection {
                         tokio::time::sleep(delay).await;
                     }
 
-                    let final_count = context_handler.ice_candidate_count.load(std::sync::atomic::Ordering::Relaxed);
+                    let final_count = context_handler.ice_candidate_count.load(Ordering::Relaxed);
                     let gathering_duration = context_handler.ice_gathering_start_time.lock().unwrap()
                         .map(|start| start.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
@@ -1068,278 +1066,6 @@ impl WebRTCPeerConnection {
         }
     }
 
-    /// Start automatic TURN credential refresh (every 30 minutes)
-    /// Prevents credential expiration by fetching fresh credentials and updating configuration
-    pub async fn start_credential_refresh(&self) -> Result<(), String> {
-        // Check if we have the required configuration for refresh
-        let ksm_config = match &self.ksm_config {
-            Some(cfg) if !cfg.is_empty() && !cfg.starts_with("TEST_MODE") => cfg.clone(),
-            _ => {
-                debug!(
-                    "No ksm_config available for credential refresh, skipping (tube_id: {})",
-                    self.tube_id
-                );
-                return Ok(()); // Not an error, just can't refresh
-            }
-        };
-
-        let krelay_server = match &self.krelay_server {
-            Some(server) if !server.is_empty() => server.clone(),
-            _ => {
-                debug!(
-                    "No krelay_server available for credential refresh, skipping (tube_id: {})",
-                    self.tube_id
-                );
-                return Ok(());
-            }
-        };
-
-        // Credential refresh only makes sense with trickle ICE
-        // (non-trickle connections are typically short-lived anyway)
-        if !self.trickle_ice {
-            debug!(
-                "Credential refresh skipped - only applicable for trickle ICE mode (tube_id: {})",
-                self.tube_id
-            );
-            return Ok(());
-        }
-
-        // Check if TURN is actually enabled in the configuration
-        let config = self.peer_connection.get_configuration().await;
-        let has_turn_servers = config.ice_servers.iter().any(|ice_server| {
-            ice_server
-                .urls
-                .iter()
-                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
-        });
-
-        if !has_turn_servers {
-            debug!(
-                "Credential refresh skipped - no TURN servers configured (tube_id: {})",
-                self.tube_id
-            );
-            return Ok(());
-        }
-
-        info!(
-            "TURN servers detected, credential refresh will be enabled (tube_id: {})",
-            self.tube_id
-        );
-
-        let tube_id = self.tube_id.clone();
-        let peer_connection = Arc::clone(&self.peer_connection);
-        let client_version = self.client_version.clone();
-        let is_closing = Arc::clone(&self.is_closing);
-
-        info!(
-            "Starting TURN credential refresh task (every 30min, TTL=1h) (tube_id: {})",
-            tube_id
-        );
-
-        let refresh_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1800)); // 30 minutes
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            let mut consecutive_failures = 0u32;
-
-            loop {
-                interval.tick().await;
-
-                // Stop if connection is closing
-                if is_closing.load(Ordering::Acquire) {
-                    debug!(
-                        "Connection closing, stopping credential refresh (tube_id: {})",
-                        tube_id
-                    );
-                    break;
-                }
-
-                debug!("Refreshing TURN credentials (tube_id: {})", tube_id);
-
-                // Attempt to fetch and update credentials
-                match Self::fetch_and_update_turn_credentials(
-                    &peer_connection,
-                    &ksm_config,
-                    &krelay_server,
-                    &client_version,
-                    &tube_id,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        info!(
-                            "TURN credentials refreshed successfully (tube_id: {}, consecutive_failures_reset: {})",
-                            tube_id, consecutive_failures
-                        );
-                        consecutive_failures = 0; // Reset on success
-                    }
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        warn!(
-                            "Failed to refresh TURN credentials (attempt #{}, tube_id: {}): {}",
-                            consecutive_failures, tube_id, e
-                        );
-
-                        // Calculate retry delay with exponential backoff
-                        let retry_delay = match consecutive_failures {
-                            1 => Duration::from_secs(60),  // 1 minute
-                            2 => Duration::from_secs(300), // 5 minutes
-                            3 => Duration::from_secs(900), // 15 minutes
-                            _ => {
-                                // After 3 failures, just log critical and wait for next cycle
-                                error!(
-                                    "CRITICAL: TURN credentials have not refreshed in {}min due to failures. ICE restart may fail if credentials expire. (tube_id: {})",
-                                    consecutive_failures * 30,
-                                    tube_id
-                                );
-                                continue; // Skip retry, wait for next 30min cycle
-                            }
-                        };
-
-                        info!(
-                            "Will retry TURN credential refresh in {}s (tube_id: {})",
-                            retry_delay.as_secs(),
-                            tube_id
-                        );
-
-                        // Wait for backoff period
-                        tokio::time::sleep(retry_delay).await;
-
-                        // Check again if closing
-                        if is_closing.load(Ordering::Acquire) {
-                            break;
-                        }
-
-                        // Retry immediately after backoff
-                        match Self::fetch_and_update_turn_credentials(
-                            &peer_connection,
-                            &ksm_config,
-                            &krelay_server,
-                            &client_version,
-                            &tube_id,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                info!(
-                                    "TURN credentials refreshed on retry #{} (tube_id: {})",
-                                    consecutive_failures, tube_id
-                                );
-                                consecutive_failures = 0; // Reset on successful retry
-                            }
-                            Err(e) => {
-                                error!(
-                                    "TURN credential refresh retry #{} also failed (tube_id: {}): {}",
-                                    consecutive_failures, tube_id, e
-                                );
-                                // Will wait for next 30min cycle
-                            }
-                        }
-                    }
-                }
-            }
-
-            debug!("Credential refresh task terminated (tube_id: {})", tube_id);
-        });
-
-        // Store task handle for cleanup
-        if let Ok(mut task_guard) = self.credential_refresh_task.lock() {
-            *task_guard = Some(refresh_task);
-            debug!(
-                "Credential refresh task started and handle stored (tube_id: {})",
-                self.tube_id
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Fetch new TURN credentials and update peer connection configuration
-    async fn fetch_and_update_turn_credentials(
-        peer_connection: &Arc<RTCPeerConnection>,
-        ksm_config: &str,
-        _krelay_server: &str, // Not used but kept for API consistency
-        client_version: &str,
-        tube_id: &str,
-    ) -> Result<(), String> {
-        // Fetch new credentials with 1-hour TTL
-        let creds =
-            crate::router_helpers::get_relay_access_creds(ksm_config, Some(3600), client_version)
-                .await
-                .map_err(|e| format!("Failed to fetch credentials from router: {}", e))?;
-
-        // Extract credentials
-        let (username, password) = match (
-            creds.get("username").and_then(|v| v.as_str()),
-            creds.get("password").and_then(|v| v.as_str()),
-        ) {
-            (Some(u), Some(p)) => (u.to_string(), p.to_string()),
-            _ => return Err("Invalid credential format in router response".to_string()),
-        };
-
-        debug!(
-            "Fetched fresh TURN credentials (tube_id: {}, username: {})",
-            tube_id, username
-        );
-
-        // Get current configuration
-        let mut config = peer_connection.get_configuration().await;
-
-        // Update TURN server credentials in ice_servers
-        let mut updated_count = 0;
-        for ice_server in &mut config.ice_servers {
-            // Update any TURN/TURNS server
-            let has_turn = ice_server
-                .urls
-                .iter()
-                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"));
-
-            if has_turn {
-                ice_server.username = username.clone();
-                ice_server.credential = password.clone();
-                updated_count += 1;
-            }
-        }
-
-        if updated_count == 0 {
-            return Err(
-                "No TURN servers found in configuration to update (connection may not use TURN)"
-                    .to_string(),
-            );
-        }
-
-        debug!(
-            "Updated {} TURN server(s) with fresh credentials (tube_id: {})",
-            updated_count, tube_id
-        );
-
-        // Apply updated configuration to live peer connection
-        peer_connection
-            .set_configuration(config)
-            .await
-            .map_err(|e| format!("Failed to apply updated configuration: {}", e))?;
-
-        info!(
-            "TURN credentials updated in live peer connection (tube_id: {})",
-            tube_id
-        );
-
-        Ok(())
-    }
-
-    /// Stop credential refresh task during shutdown
-    pub async fn stop_credential_refresh(&self) {
-        if let Ok(mut task_guard) = self.credential_refresh_task.lock() {
-            if let Some(handle) = task_guard.take() {
-                handle.abort();
-                info!(
-                    "Credential refresh task stopped (tube_id: {})",
-                    self.tube_id
-                );
-            }
-        }
-    }
-
     /// Handle ICE restart with full signaling workflow
     /// This method performs ICE restart and sends the offer to the remote peer
     pub async fn handle_ice_restart_with_signaling(&self) -> WebRTCResult<()> {
@@ -1557,9 +1283,7 @@ impl WebRTCPeerConnection {
             }));
 
             // Use resource manager timeout instead of hardcoded value
-            let gather_timeout = crate::resource_manager::RESOURCE_MANAGER
-                .get_limits()
-                .ice_gather_timeout;
+            let gather_timeout = RESOURCE_MANAGER.get_limits().ice_gather_timeout;
             debug!(
                 "Waiting for ICE gathering with timeout {:?} (tube_id: {})",
                 gather_timeout, self.tube_id
@@ -2101,23 +1825,12 @@ impl WebRTCPeerConnection {
         // Enable connection state-based ICE restart triggers as backup
         self.setup_connection_state_monitoring().await?;
 
-        // Start TURN credential refresh (every 30 minutes)
-        if let Err(e) = self.start_credential_refresh().await {
-            warn!(
-                "Failed to start TURN credential refresh (tube_id: {}, error: {})",
-                self.tube_id, e
-            );
-        }
-
         debug!("Monitoring systems started for tube {}", self.tube_id);
         Ok(())
     }
 
     /// Stop all monitoring systems during shutdown
     pub async fn stop_monitoring_systems(&self) -> Result<(), String> {
-        // Stop credential refresh task first
-        self.stop_credential_refresh().await;
-
         // Unregister from metrics collector
         if let Some(ref conv_id) = self.conversation_id {
             crate::metrics::METRICS_COLLECTOR.unregister_connection(conv_id);
@@ -2156,6 +1869,129 @@ impl WebRTCPeerConnection {
             "Success reported for tube {} operation: {}",
             self.tube_id, operation
         );
+        Ok(())
+    }
+
+    /// Check if TURN credentials are older than 50 minutes (need refresh before 1h expiry)
+    /// Returns true if credentials should be refreshed before ICE restart
+    fn should_refresh_turn_credentials(&self) -> bool {
+        // If no timestamp recorded, we don't know credential age - assume fresh
+        if let Ok(guard) = self.turn_credentials_created_at.lock() {
+            if let Some(created_at) = *guard {
+                // Check if credentials are >50 minutes old (3000 seconds)
+                // This provides a 10-minute safety margin before 1-hour expiry
+                let age = created_at.elapsed();
+                if age > Duration::from_secs(3000) {
+                    debug!(
+                        "TURN credentials are {}s old (>50min threshold), refresh needed (tube_id: {})",
+                        age.as_secs(),
+                        self.tube_id
+                    );
+                    return true;
+                }
+                debug!(
+                    "TURN credentials are {}s old (<50min threshold), still fresh (tube_id: {})",
+                    age.as_secs(),
+                    self.tube_id
+                );
+                false
+            } else {
+                // No timestamp - either no TURN configured or credentials not tracked yet
+                false
+            }
+        } else {
+            // Failed to acquire lock - assume fresh to be safe
+            false
+        }
+    }
+
+    /// Fetch fresh TURN credentials and update peer connection configuration
+    /// This is called on-demand before ICE restart when credentials are >50min old
+    async fn fetch_fresh_turn_credentials_for_restart(&self) -> Result<(), String> {
+        // Check if we have the required configuration for refresh
+        let ksm_config = match &self.ksm_config {
+            Some(cfg) if !cfg.is_empty() && !cfg.starts_with("TEST_MODE") => cfg.clone(),
+            _ => {
+                debug!(
+                    "No ksm_config available for credential refresh, skipping (tube_id: {})",
+                    self.tube_id
+                );
+                return Ok(()); // Not an error, just can't refresh
+            }
+        };
+
+        // Fetch new credentials with 1-hour TTL
+        let creds = crate::router_helpers::get_relay_access_creds(
+            &ksm_config,
+            Some(3600),
+            &self.client_version,
+        )
+        .await
+        .map_err(|e| format!("Failed to fetch credentials from router: {}", e))?;
+
+        // Extract credentials
+        let (username, password) = match (
+            creds.get("username").and_then(|v| v.as_str()),
+            creds.get("password").and_then(|v| v.as_str()),
+        ) {
+            (Some(u), Some(p)) => (u.to_string(), p.to_string()),
+            _ => return Err("Invalid credential format in router response".to_string()),
+        };
+
+        info!(
+            "Fetched fresh TURN credentials for ICE restart (tube_id: {}, username: {})",
+            self.tube_id, username
+        );
+
+        // Get current configuration
+        let mut config = self.peer_connection.get_configuration().await;
+
+        // Update TURN server credentials in ice_servers
+        let mut updated_count = 0;
+        for ice_server in &mut config.ice_servers {
+            // Update any TURN/TURNS server
+            let has_turn = ice_server
+                .urls
+                .iter()
+                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"));
+
+            if has_turn {
+                ice_server.username = username.clone();
+                ice_server.credential = password.clone();
+                updated_count += 1;
+            }
+        }
+
+        if updated_count == 0 {
+            debug!(
+                "No TURN servers found in configuration (tube_id: {})",
+                self.tube_id
+            );
+            return Ok(());
+        }
+
+        info!(
+            "Updated {} TURN server(s) with fresh credentials for ICE restart (tube_id: {})",
+            updated_count, self.tube_id
+        );
+
+        // Apply updated configuration - this will be used for the NEW ICE session
+        // created by the upcoming ICE restart offer/answer exchange
+        self.peer_connection
+            .set_configuration(config)
+            .await
+            .map_err(|e| format!("Failed to apply updated configuration: {}", e))?;
+
+        // Update credential timestamp
+        if let Ok(mut guard) = self.turn_credentials_created_at.lock() {
+            *guard = Some(Instant::now());
+        }
+
+        info!(
+            "Fresh TURN credentials applied and ready for ICE restart (tube_id: {})",
+            self.tube_id
+        );
+
         Ok(())
     }
 
@@ -2225,8 +2061,7 @@ impl WebRTCPeerConnection {
                 };
 
                 if ipv6_failures > 0 {
-                    ipv6_binding_failures
-                        .store(ipv6_failures, std::sync::atomic::Ordering::Relaxed);
+                    ipv6_binding_failures.store(ipv6_failures, Ordering::Relaxed);
 
                     if ipv6_failures > 5 {
                         debug!(
@@ -2775,6 +2610,22 @@ impl WebRTCPeerConnection {
         self.connection_quality_degraded
             .store(true, Ordering::Relaxed);
 
+        // Check if TURN credentials need refreshing before creating new ICE session
+        // This ensures fresh credentials are used for the new TURN allocations
+        if self.should_refresh_turn_credentials() {
+            info!(
+                "TURN credentials >50min old, fetching fresh credentials before ICE restart (tube_id: {})",
+                self.tube_id
+            );
+            if let Err(e) = self.fetch_fresh_turn_credentials_for_restart().await {
+                warn!(
+                    "Failed to refresh TURN credentials before ICE restart: {} (tube_id: {}) - continuing with existing credentials",
+                    e, self.tube_id
+                );
+                // Continue with existing credentials - not a fatal error
+            }
+        }
+
         // Generate new offer with ICE restart
         match self.peer_connection.create_offer(None).await {
             Ok(offer) => {
@@ -2897,6 +2748,17 @@ impl WebRTCPeerConnection {
     pub fn set_last_activity(&self, time: Instant) {
         let mut activity_guard = self.last_activity.lock().unwrap();
         *activity_guard = time;
+    }
+
+    /// Get time since last activity (for zombie tube detection)
+    /// Returns duration since last successful data channel activity
+    /// Used by metrics collector to detect inactive Failed/Disconnected tubes
+    pub fn time_since_last_activity(&self) -> Duration {
+        if let Ok(activity_guard) = self.last_activity.try_lock() {
+            activity_guard.elapsed()
+        } else {
+            Duration::from_secs(0) // Can't get lock, assume recent activity to be safe
+        }
     }
 
     /// Static version of UDP connectivity test

@@ -333,6 +333,7 @@ impl TubeRegistry {
         }
 
         let mut ice_servers = Vec::new();
+        let mut turn_credentials_timestamp: Option<std::time::Instant> = None; // Track when TURN credentials were created
         let mut turn_only_for_config = settings
             .get("turn_only")
             .is_some_and(|v| v.as_bool().unwrap_or(false));
@@ -421,10 +422,13 @@ impl TubeRegistry {
                             );
 
                             let turn_start_time = std::time::Instant::now();
-                            // Request 1-hour TTL for TURN credentials (will be refreshed every 30min)
+                            // Request 1-hour TTL for TURN credentials (on-demand refresh before ICE restart)
                             match get_relay_access_creds(ksm_cfg, Some(3600), client_version).await
                             {
                                 Ok(creds) => {
+                                    // Capture credential creation timestamp for on-demand refresh tracking
+                                    turn_credentials_timestamp = Some(std::time::Instant::now());
+
                                     let turn_duration_ms =
                                         turn_start_time.elapsed().as_millis() as f64;
                                     debug!(
@@ -443,14 +447,14 @@ impl TubeRegistry {
 
                                     if ttl_seconds > 0 {
                                         info!(
-                                            "TURN credentials TTL: {}s ({:.1}h) (tube_id: {}, requested: 1h, will refresh every 30min)",
+                                            "TURN credentials TTL: {}s ({:.1}h) (tube_id: {}, will refresh on-demand before ICE restart if >50min old)",
                                             ttl_seconds,
                                             ttl_seconds as f64 / 3600.0,
                                             tube_id
                                         );
                                     } else {
                                         warn!(
-                                            "No TTL in TURN credentials response - assuming 1h default, will refresh every 30min (tube_id: {})",
+                                            "No TTL in TURN credentials response - assuming 1h default (tube_id: {})",
                                             tube_id
                                         );
                                     }
@@ -550,10 +554,10 @@ impl TubeRegistry {
                 turn_only_for_config,
                 ksm_config_for_peer_connection.to_string(),
                 callback_token.to_string(),
-                krelay_server.to_string(), // For TURN credential refresh
                 client_version,
                 settings.clone(),
                 signal_sender.clone(),
+                turn_credentials_timestamp, // Pass timestamp for on-demand credential refresh
             )
             .await
             .context("Failed to create peer connection")?;
@@ -747,20 +751,92 @@ impl TubeRegistry {
 
                 // Use the provided reason or default to AdminClosed
                 let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
-                tube_arc
-                    .close_with_reason(self, close_reason)
-                    .await
-                    .map_err(|e| {
+
+                // CRITICAL: Add timeout to prevent tube closure from hanging indefinitely
+                // RBI/HTTP sessions can block on channel_closed signal sending (WebRTC .label() calls)
+                // Without timeout, hung tubes never get removed from registry → Python threads exhaust → gateway dies
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tube_arc.close_with_reason(self, close_reason),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        // Normal completion - tube.close_with_reason() finished
+                        result.map_err(|e| {
+                            error!(
+                                "close_tube: tube.close_with_reason() failed: {} (tube_id: {})",
+                                e, tube_id
+                            );
+                            anyhow!(
+                                "Failed during tube.close_with_reason() for {}: {}",
+                                tube_id,
+                                e
+                            )
+                        })
+                    }
+                    Err(_) => {
+                        // Timeout - tube.close_with_reason() hung (likely on channel signal sending)
                         error!(
-                            "close_tube: tube.close_with_reason() failed: {} (tube_id: {})",
-                            e, tube_id
+                            "TIMEOUT: Tube closure hung after 10s, initiating emergency cleanup (tube_id: {})",
+                            tube_id
                         );
-                        anyhow!(
-                            "Failed during tube.close_with_reason() for {}: {}",
-                            tube_id,
-                            e
-                        )
-                    })
+
+                        // EMERGENCY CLEANUP SEQUENCE - ensure resources are freed immediately
+
+                        // 1. Force all channel tasks to exit (non-blocking, best effort)
+                        if let Ok(signals) = tube_arc.channel_shutdown_signals.try_write() {
+                            let signal_count = signals.len();
+                            for (channel_name, signal) in signals.iter() {
+                                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                                debug!("Emergency: Set shutdown signal for channel (tube_id: {}, channel: {})", tube_id, channel_name);
+                            }
+                            info!(
+                                "Emergency: Signaled {} channels to exit (tube_id: {})",
+                                signal_count, tube_id
+                            );
+                        } else {
+                            warn!(
+                                "Emergency: Could not acquire shutdown signals lock (tube_id: {})",
+                                tube_id
+                            );
+                        }
+
+                        // 2. Close peer connection in background (don't block on it)
+                        if let Ok(mut pc_guard) = tube_arc.peer_connection.try_lock() {
+                            if let Some(pc) = pc_guard.take() {
+                                let tube_id_clone = tube_id.to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) = pc.close().await {
+                                        warn!("Emergency peer connection close failed: {} (tube_id: {})", e, tube_id_clone);
+                                    } else {
+                                        debug!(
+                                            "Emergency peer connection closed (tube_id: {})",
+                                            tube_id_clone
+                                        );
+                                    }
+                                });
+                                info!("Emergency: Spawned background task to close peer connection (tube_id: {})", tube_id);
+                            } else {
+                                debug!(
+                                    "Emergency: Peer connection already None (tube_id: {})",
+                                    tube_id
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "Emergency: Could not acquire peer connection lock (tube_id: {})",
+                                tube_id
+                            );
+                        }
+
+                        // 3. Remove tube from registry immediately
+                        self.remove_tube(tube_id);
+                        info!("Emergency: Removed tube from registry, resources will cleanup in background (tube_id: {})", tube_id);
+
+                        Ok(()) // Return Ok - tube is removed, gateway stays responsive, cleanup continues in background
+                    }
+                }
             }
         }
     }

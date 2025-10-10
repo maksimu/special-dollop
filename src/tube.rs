@@ -103,10 +103,10 @@ impl Tube {
         turn_only: bool,
         ksm_config: String,
         callback_token: String,
-        krelay_server: String, // For TURN credential refresh
         client_version: &str,
         protocol_settings: HashMap<String, serde_json::Value>,
         signal_sender: UnboundedSender<SignalMessage>,
+        turn_credentials_created_at: Option<std::time::Instant>, // Track when TURN credentials were fetched
     ) -> Result<()> {
         debug!(
             "[TUBE_DEBUG] Tube {}: create_peer_connection called. trickle_ice: {}, turn_only: {}",
@@ -135,8 +135,8 @@ impl Tube {
             self.id.clone(),                       // Pass tube_id
             self.original_conversation_id.clone(), // Pass original conversation_id for WebRTC signals
             Some(ksm_config.clone()),              // For TURN credential refresh
-            Some(krelay_server.clone()),           // For TURN credential refresh
             client_version.to_string(),            // For API calls
+            turn_credentials_created_at,           // Timestamp when TURN credentials were fetched
         )
         .await
         .map_err(|e| anyhow!("{}", e))?;
@@ -221,11 +221,23 @@ impl Tube {
                             let runtime = get_runtime();
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection failure. (tube_id: {})", tube_id_log);
-                                let mut registry = crate::tube_registry::REGISTRY.write().await;
-                                if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionFailed)).await {
-                                     error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
-                                } else {
-                                     debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
+
+                                // CRITICAL: Add timeout to prevent indefinite blocking on lock acquisition
+                                // This spawned task runs in background - if it deadlocks, it's hard to detect
+                                match tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    crate::tube_registry::REGISTRY.write()
+                                ).await {
+                                    Ok(mut registry) => {
+                                        if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionFailed)).await {
+                                            error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
+                                        } else {
+                                            debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        error!("Timeout acquiring REGISTRY write lock for tube closure after 30s - possible deadlock (tube_id: {})", tube_id_log);
+                                    }
                                 }
                             });
                         } else {
@@ -1792,6 +1804,30 @@ impl Tube {
             status,
             TubeStatus::Failed | TubeStatus::Closed | TubeStatus::Disconnected
         )
+    }
+
+    /// Check if tube has been inactive for specified duration
+    /// Used for zombie detection when data channel close events don't fire
+    /// Returns true if no WebRTC activity for the given duration
+    pub async fn is_inactive_for_duration(&self, duration: std::time::Duration) -> bool {
+        if let Ok(pc_guard) = self.peer_connection.try_lock() {
+            if let Some(pc) = &*pc_guard {
+                return pc.time_since_last_activity() > duration;
+            }
+        }
+        false // Can't check, assume active to be safe
+    }
+
+    /// Get current peer connection state (for zombie detection)
+    /// Returns None if peer connection is not available or locked
+    pub async fn get_connection_state(&self) -> Option<RTCPeerConnectionState> {
+        if let Ok(pc_guard) = self.peer_connection.try_lock() {
+            pc_guard
+                .as_ref()
+                .map(|pc| pc.peer_connection.connection_state())
+        } else {
+            None // Can't get lock
+        }
     }
 
     /// Get comprehensive circuit breaker statistics

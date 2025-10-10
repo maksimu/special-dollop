@@ -5,21 +5,21 @@ use crate::channel::guacd_parser::{
     GuacdInstruction, GuacdParser, OpcodeAction, PeekError, SpecialOpcode,
 };
 use crate::channel::types::ActiveProtocol;
-use crate::models::{Conn, StreamHalf};
+use crate::models::Conn;
 use crate::trace_hot_path;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
 use crate::unlikely; // Import branch prediction macros
 use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
 use super::core::Channel;
@@ -234,6 +234,26 @@ pub async fn setup_outbound_task(
         active_protocol,
         is_channel_server_mode
     );
+
+    // Create channel for backend task (client→guacd direction)
+    let (data_tx, data_rx) = mpsc::unbounded_channel::<crate::models::ConnectionMessage>();
+
+    // Clone data_tx for use in outbound task (to send sync auto-responses back to guacd)
+    let data_tx_for_sync = data_tx.clone();
+
+    // Create StreamHalf wrapper for backend_writer (needed for AsyncReadWrite trait)
+    let stream_half = crate::models::StreamHalf {
+        reader: None,
+        writer: backend_writer,
+    };
+
+    // Start backend task FIRST (handles client→guacd writes, including our sync responses)
+    let backend_task = tokio::spawn(crate::models::backend_task_runner(
+        Box::new(stream_half),
+        data_rx,
+        conn_no,
+        channel_id_for_task.clone(),
+    ));
 
     let outbound_handle = tokio::spawn(async move {
         // This is the very first log inside the spawned task
@@ -483,8 +503,10 @@ pub async fn setup_outbound_task(
                             let parse_start = std::time::Instant::now();
 
                             // **ULTRA-FAST PATH: Validate format and detect special opcodes**
-                            trace!("OUTBOUND: About to validate and detect special opcodes (channel_id: {}, conn_no: {}, slice_len: {}, first_bytes: {:?})",
-                                   channel_id_for_task, conn_no, current_slice.len(), &current_slice[..std::cmp::min(50, current_slice.len())]);
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("OUTBOUND: About to validate and detect special opcodes (channel_id: {}, conn_no: {}, slice_len: {}, first_bytes: {:?})",
+                                       channel_id_for_task, conn_no, current_slice.len(), &current_slice[..std::cmp::min(50, current_slice.len())]);
+                            }
                             match GuacdParser::validate_and_detect_special(current_slice) {
                                 Ok((instruction_len, action)) => {
                                     #[cfg(feature = "profiling")]
@@ -499,9 +521,11 @@ pub async fn setup_outbound_task(
                                         }
                                     }
 
-                                    // Log opcode action for trace-level debugging
-                                    trace!("Opcode action dispatched by expandable system (channel_id: {}, conn_no: {}, action: {:?}, instruction_len: {})",
-                                       channel_id_for_task, conn_no, action, instruction_len);
+                                    // Log opcode action for verbose debugging
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!("Opcode action dispatched by expandable system (channel_id: {}, conn_no: {}, action: {:?}, instruction_len: {})",
+                                           channel_id_for_task, conn_no, action, instruction_len);
+                                    }
 
                                     // Dispatch based on opcode action
                                     match action {
@@ -580,6 +604,90 @@ pub async fn setup_outbound_task(
                                             }
                                             close_conn_and_break = true;
                                             break;
+                                        }
+                                        OpcodeAction::ServerSync => {
+                                            // GUACD KEEPALIVE AUTO-RESPONSE
+                                            // Guacd sends sync every ~5s as keepalive ping, client must respond within 15s
+                                            // When browser is backgrounded (throttled to 1 FPS), response is delayed 10-16s → timeout
+                                            // We intercept and respond immediately to prevent false "User is not responding" disconnects
+
+                                            if let Ok(peeked_instr) =
+                                                GuacdParser::peek_instruction(current_slice)
+                                            {
+                                                if peeked_instr.opcode == "sync"
+                                                    && !peeked_instr.args.is_empty()
+                                                {
+                                                    let timestamp = peeked_instr.args[0];
+
+                                                    if unlikely!(crate::logger::is_verbose_logging())
+                                                    {
+                                                        debug!(
+                                                            "KEEPALIVE: Detected guacd sync, auto-responding immediately (channel_id: {}, conn_no: {}, timestamp: {})",
+                                                            channel_id_for_task, conn_no, timestamp
+                                                        );
+                                                    }
+
+                                                    // Send sync response back to guacd IMMEDIATELY (write directly to backend)
+                                                    let sync_response =
+                                                        GuacdParser::guacd_encode_instruction(
+                                                            &GuacdInstruction::new(
+                                                                "sync".to_string(),
+                                                                vec![timestamp.to_string()],
+                                                            ),
+                                                        );
+
+                                                    if let Err(e) = data_tx_for_sync.send(
+                                                        crate::models::ConnectionMessage::Data(
+                                                            sync_response,
+                                                        ),
+                                                    ) {
+                                                        error!(
+                                                            "Failed to send sync auto-response to guacd: {} (channel_id: {}, conn_no: {})",
+                                                            e, channel_id_for_task, conn_no
+                                                        );
+                                                    } else if unlikely!(
+                                                        crate::logger::is_verbose_logging()
+                                                    ) {
+                                                        debug!(
+                                                            "KEEPALIVE: Sent sync auto-response to guacd (channel_id: {}, timestamp: {}, prevents 15s timeout)",
+                                                            channel_id_for_task, timestamp
+                                                        );
+                                                    }
+                                                }
+                                            }
+
+                                            // Still forward the original sync to client (for frame timing/display sync)
+                                            // This is intentional - both our auto-response AND client's eventual response are fine
+                                            // Guacd will accept the first response (ours) and ignore duplicates
+                                            let instruction_slice =
+                                                &current_slice[..instruction_len];
+                                            let data_frame = Frame::new_data_with_pool(
+                                                conn_no,
+                                                instruction_slice,
+                                                &buffer_pool,
+                                            );
+                                            let encoded_data =
+                                                data_frame.encode_with_pool(&buffer_pool);
+
+                                            if send_with_event_backpressure(
+                                                encoded_data,
+                                                conn_no,
+                                                &event_sender,
+                                                &channel_id_for_task,
+                                                "Guacd sync forward to client",
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                error!(
+                                                    "Channel({}): Conn {}: Failed to forward sync to client",
+                                                    channel_id_for_task, conn_no
+                                                );
+                                            }
+
+                                            // Consume the instruction from buffer
+                                            consumed_offset += instruction_len;
+                                            continue; // Process next instruction
                                         }
                                         OpcodeAction::ProcessSpecial(opcode) => {
                                             debug!("OUTBOUND: Special opcode detected - dispatching to handler (channel_id: {}, conn_no: {}, opcode_name: {}, opcode: {:?})", channel_id_for_task, conn_no, opcode.as_str(), opcode);
@@ -946,19 +1054,13 @@ pub async fn setup_outbound_task(
         conn_no
     );
 
-    let stream_half = StreamHalf {
-        reader: None,
-        writer: backend_writer,
+    // Create connection struct with our pre-created backend task and data_tx channel
+    // Note: outbound_handle is the to_webrtc task (guacd→client)
+    let conn = Conn {
+        data_tx,                    // Channel for sending data to guacd (including sync responses)
+        backend_task,               // Task that writes client data to guacd
+        to_webrtc: outbound_handle, // Task that reads guacd data and sends to client
     };
-
-    // Create lock-free connection with a dedicated backend task
-    let conn = Conn::new_with_backend(
-        Box::new(stream_half),
-        outbound_handle,
-        conn_no,
-        channel.channel_id.clone(),
-    )
-    .await;
 
     channel.conns.insert(conn_no, conn);
 
@@ -1086,7 +1188,9 @@ where
                     }
                     handshake_buffer.put_slice(&temp_read_buf[..n_read]);
                     *current_buffer_len += n_read;
-                    trace!("Read more data for handshake, waiting for '{}' (channel_id: {}, conn_no: {}, bytes_read: {}, new_buffer_len: {})", expected_opcode, channel_id, conn_no, n_read, *current_buffer_len);
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("Read more data for handshake, waiting for '{}' (channel_id: {}, conn_no: {}, bytes_read: {}, new_buffer_len: {})", expected_opcode, channel_id, conn_no, n_read, *current_buffer_len);
+                    }
                 }
                 Err(e) => {
                     error!("Read error waiting for Guacd instruction (channel_id: {}, expected_opcode: {}, error: {})", channel_id, expected_opcode, e);
@@ -1123,11 +1227,12 @@ where
 
     let join_connection_id_key = "connectionid";
     let join_connection_id_opt = guacd_params_locked.get(join_connection_id_key).cloned();
-    trace!(
-        "Checked for join connection ID in guacd_params (channel_id: {}, key_looked_up: {})",
-        channel_id,
-        join_connection_id_key
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Checked for join connection ID in guacd_params (channel_id: {}, key_looked_up: {})",
+            channel_id, join_connection_id_key
+        );
+    }
 
     let select_arg: String;
     if let Some(id_to_join) = &join_connection_id_opt {
@@ -1140,18 +1245,23 @@ where
 
     let readonly_param_key = "readonly";
     let readonly_param_value_from_map = guacd_params_locked.get(readonly_param_key).cloned();
-    trace!("Initial 'readonly' value from guacd_params_locked for join attempt. (channel_id: {}, readonly_param_value_from_map: {:?})", channel_id, readonly_param_value_from_map);
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!("Initial 'readonly' value from guacd_params_locked for join attempt. (channel_id: {}, readonly_param_value_from_map: {:?})", channel_id, readonly_param_value_from_map);
+    }
 
     let readonly_str_for_join =
         readonly_param_value_from_map.unwrap_or_else(|| "false".to_string());
-    trace!("Effective 'readonly_str_for_join' (after unwrap_or_else) for join attempt. (channel_id: {}, readonly_str_for_join: {})", channel_id, readonly_str_for_join);
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!("Effective 'readonly_str_for_join' (after unwrap_or_else) for join attempt. (channel_id: {}, readonly_str_for_join: {})", channel_id, readonly_str_for_join);
+    }
 
     let is_readonly = readonly_str_for_join.eq_ignore_ascii_case("true");
-    trace!(
-        "Final 'is_readonly' boolean for join attempt. (channel_id: {}, is_readonly_bool: {})",
-        channel_id,
-        is_readonly
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Final 'is_readonly' boolean for join attempt. (channel_id: {}, is_readonly_bool: {})",
+            channel_id, is_readonly
+        );
+    }
 
     let width_for_new = guacd_params_locked
         .get("width")
@@ -1245,7 +1355,9 @@ where
             let is_current_arg_readonly_keyword =
                 arg_name_from_guacd == is_readonly_arg_name_literal;
 
-            trace!("Looping for connect_args (join). Comparing '{}' with '{}' (channel_id: {}, conn_no: {}, current_arg_name_from_guacd: {}, is_readonly_param_from_config: {}, is_current_arg_the_readonly_keyword: {})", arg_name_from_guacd, is_readonly_arg_name_literal, channel_id, conn_no, arg_name_from_guacd, is_readonly, is_current_arg_readonly_keyword);
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("Looping for connect_args (join). Comparing '{}' with '{}' (channel_id: {}, conn_no: {}, current_arg_name_from_guacd: {}, is_readonly_param_from_config: {}, is_current_arg_the_readonly_keyword: {})", arg_name_from_guacd, is_readonly_arg_name_literal, channel_id, conn_no, arg_name_from_guacd, is_readonly, is_current_arg_readonly_keyword);
+            }
 
             if is_current_arg_readonly_keyword {
                 let value_to_push = if is_readonly {
@@ -1364,11 +1476,12 @@ where
         "Guacd Handshake: Sending 'connect' (channel_id: {})",
         channel_id
     );
-    trace!(
-        "Guacd Handshake: params (channel_id: {}, instruction: {:?})",
-        channel_id,
-        connect_instruction
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Guacd Handshake: params (channel_id: {}, instruction: {:?})",
+            channel_id, connect_instruction
+        );
+    }
     writer
         .write_all(&GuacdParser::guacd_encode_instruction(&connect_instruction))
         .await?;

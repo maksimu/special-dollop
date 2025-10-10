@@ -26,7 +26,7 @@ echo "Installing wheel: $WHEEL"
 
 # Force reinstall to ensure the latest version is used
 pip uninstall -y keeper_pam_webrtc_rs || true
-pip install $WHEEL --force-reinstall
+pip install "$WHEEL" --force-reinstall
 
 echo "Running tests..."
 cd tests

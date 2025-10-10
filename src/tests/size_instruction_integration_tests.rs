@@ -363,7 +363,7 @@ async fn test_expandable_system_performance() {
     info!("Testing expandable system performance");
 
     let size_instruction = b"4.size,1.0,4.1920,4.1080;";
-    let normal_instruction = b"4.sync,4.1000;";
+    let sync_instruction = b"4.sync,4.1000;"; // Now classified as ServerSync for keepalive auto-response
     let error_instruction = b"5.error,11.Auth failed;";
 
     let iterations = 10000; // Higher iteration count for performance testing
@@ -384,11 +384,11 @@ async fn test_expandable_system_performance() {
             ),
         }
 
-        // Test normal instruction
-        match GuacdParser::validate_and_detect_special(normal_instruction) {
-            Ok((_, OpcodeAction::Normal)) => {} // Expected
+        // Test sync instruction (now ServerSync for keepalive auto-response)
+        match GuacdParser::validate_and_detect_special(sync_instruction) {
+            Ok((_, OpcodeAction::ServerSync)) => {} // Expected
             other => panic!(
-                "Normal instruction validation failed at iteration {}: {:?}",
+                "Sync instruction validation failed at iteration {}: {:?}",
                 i, other
             ),
         }
@@ -554,8 +554,8 @@ async fn test_expandable_system_extensibility_demonstration() {
         ),
         (
             b"4.sync,4.1000;" as &[u8],
-            OpcodeAction::Normal,
-            "Normal opcode",
+            OpcodeAction::ServerSync,
+            "Sync opcode (keepalive auto-response)",
         ),
         (
             b"4.copy,2.10,1.0,1.0,3.100,3.100;" as &[u8],

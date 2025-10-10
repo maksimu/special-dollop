@@ -747,6 +747,18 @@ impl Channel {
                 warn!("Failed to send Guacd disconnect message during immediate close (channel_id: {}, error: {})", self.channel_id, e);
             }
 
+            // CRITICAL: For Guacd sessions, wait for guacd to process disconnect and complete cleanup
+            // Guacd needs time to:
+            // 1. Receive the "10.disconnect;" instruction (already transmitted via conn.shutdown)
+            // 2. Parse the instruction
+            // 3. Execute session cleanup (close RDP/VNC/SSH, free resources, write audit logs)
+            // 4. Close the connection gracefully from its side
+            // Without this delay, we close TCP socket before guacd finishes cleanup
+            if self.active_protocol == ActiveProtocol::Guacd {
+                debug!("Waiting 500ms for guacd to process disconnect and complete cleanup (channel_id: {}, conn_no: {})", self.channel_id, conn_no);
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
                 // Shutdown the connection gracefully (closes channels and waits for tasks)
@@ -953,6 +965,15 @@ impl Channel {
                 .await
             {
                 warn!("Failed to send Guacd disconnect message during immediate close (no message) (channel_id: {}, error: {})", self.channel_id, e);
+            }
+
+            // CRITICAL: For Guacd sessions, wait for guacd to process disconnect and complete cleanup
+            // Guacd needs time to receive, parse, and execute cleanup after receiving "10.disconnect;"
+            // This matches the 500ms delay used for data connections (line 993) and prevents
+            // interrupting guacd's cleanup by closing TCP socket too early
+            if self.active_protocol == ActiveProtocol::Guacd {
+                debug!("Waiting 500ms for guacd to process disconnect and complete cleanup (channel_id: {}, conn_no: {})", self.channel_id, conn_no);
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
 
             // Immediate removal using DashMap

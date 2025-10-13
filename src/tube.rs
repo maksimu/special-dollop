@@ -31,7 +31,9 @@ pub struct ChannelMetadata {
 }
 
 // A single tube holding a WebRTC peer connection and channels
-#[derive(Clone)]
+// NOTE: Tube should NOT be Clone! It's always used inside Arc<Tube>.
+// Cloning Tube creates multiple instances that each call Drop, causing double-frees and premature cleanup.
+// Use Arc::clone() on Arc<Tube> instead.
 pub struct Tube {
     // Unique ID for this tube
     pub(crate) id: String,
@@ -55,6 +57,19 @@ pub struct Tube {
     pub(crate) original_conversation_id: Option<String>,
     // Client version for authentication
     pub(crate) client_version: Arc<TokioRwLock<Option<String>>>,
+
+    // ============================================================================
+    // RAII PATTERN: Lifecycle-bound resources owned by Tube
+    // When Tube drops, these automatically cleanup via Drop trait
+    // ============================================================================
+    /// Signal channel for Python communication - automatically closes when tube drops
+    pub(crate) signal_sender: Option<UnboundedSender<SignalMessage>>,
+
+    /// Metrics registration handle - automatically unregisters when tube drops
+    pub(crate) metrics_handle: Arc<TokioMutex<Option<crate::metrics::MetricsHandle>>>,
+
+    /// Keepalive task - automatically cancels when tube drops
+    pub(crate) keepalive_task: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Tube {
@@ -69,17 +84,26 @@ impl Tube {
         }
     }
 
-    // Create a new tube with the optional peer connection
+    // Create a new tube with RAII resource ownership
     pub fn new(
         is_server_mode_context: bool,
         original_conversation_id: Option<String>,
+        signal_sender: Option<UnboundedSender<SignalMessage>>,
         custom_tube_id: Option<String>,
     ) -> Result<Arc<Self>> {
         let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();
 
+        // Create metrics handle (auto-registers with METRICS_COLLECTOR)
+        let metrics_handle = original_conversation_id
+            .as_ref()
+            .map(|conv_id| crate::metrics::MetricsHandle::new(conv_id.clone(), id.clone()));
+
+        let has_signal = signal_sender.is_some();
+        let has_metrics = metrics_handle.is_some();
+
         let tube = Arc::new(Self {
-            id: id.clone(), // Clone ID to use below
+            id: id.clone(),
             peer_connection: Arc::new(TokioMutex::new(None)),
             data_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             control_channel: Arc::new(TokioRwLock::new(None)),
@@ -88,16 +112,26 @@ impl Tube {
             is_server_mode_context,
             status: Arc::new(TokioRwLock::new(TubeStatus::Initializing)),
             runtime,
-            original_conversation_id,
+            original_conversation_id: original_conversation_id.clone(),
             client_version: Arc::new(TokioRwLock::new(None)),
+
+            // RAII resources (owned by Tube):
+            signal_sender,
+            metrics_handle: Arc::new(TokioMutex::new(metrics_handle)),
+            keepalive_task: Arc::new(TokioMutex::new(None)),
         });
+
+        debug!(
+            "Tube created with RAII resources (tube_id: {}, has_signal: {}, has_metrics: {})",
+            id, has_signal, has_metrics
+        );
 
         Ok(tube)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_peer_connection(
-        &self,
+        self: &Arc<Self>,
         config: Option<RTCConfiguration>,
         trickle_ice: bool,
         turn_only: bool,
@@ -148,7 +182,7 @@ impl Tube {
 
         let status = self.status.clone();
 
-        let tube_arc_for_pc_state = self.clone();
+        let tube_arc_for_pc_state = Arc::clone(self);
 
         debug!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
         connection_arc.setup_ice_candidate_handler();
@@ -222,22 +256,14 @@ impl Tube {
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection failure. (tube_id: {})", tube_id_log);
 
-                                // CRITICAL: Add timeout to prevent indefinite blocking on lock acquisition
-                                // This spawned task runs in background - if it deadlocks, it's hard to detect
-                                match tokio::time::timeout(
-                                    Duration::from_secs(30),
-                                    crate::tube_registry::REGISTRY.write()
-                                ).await {
-                                    Ok(mut registry) => {
-                                        if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionFailed)).await {
-                                            error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
-                                        } else {
-                                            debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
-                                        }
-                                    }
-                                    Err(_) => {
-                                        error!("Timeout acquiring REGISTRY write lock for tube closure after 30s - possible deadlock (tube_id: {})", tube_id_log);
-                                    }
+                                // LOCK-FREE: Close via actor (no deadlock possible!)
+                                if let Err(e) = crate::tube_registry::REGISTRY
+                                    .close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionFailed))
+                                    .await
+                                {
+                                    error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
+                                } else {
+                                    debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
                                 }
                             });
                         } else {
@@ -263,11 +289,14 @@ impl Tube {
                             let runtime = get_runtime();
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection closure. (tube_id: {})", tube_id_log);
-                                let mut registry = crate::tube_registry::REGISTRY.write().await;
-                                if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::Normal)).await {
-                                     error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
+                                // LOCK-FREE: Close via actor (no deadlock possible!)
+                                if let Err(e) = crate::tube_registry::REGISTRY
+                                    .close_tube(&tube_id_log, Some(CloseConnectionReason::Normal))
+                                    .await
+                                {
+                                    error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
                                 } else {
-                                     debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
+                                    debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
                                 }
                             });
                         } else {
@@ -291,11 +320,14 @@ impl Tube {
                             let runtime = get_runtime();
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection disconnection. (tube_id: {})", tube_id_log);
-                                let mut registry = crate::tube_registry::REGISTRY.write().await;
-                                if let Err(e) = registry.close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionLost)).await {
-                                     error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
+                                // LOCK-FREE: Close via actor (no deadlock possible!)
+                                if let Err(e) = crate::tube_registry::REGISTRY
+                                    .close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionLost))
+                                    .await
+                                {
+                                    error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
                                 } else {
-                                     debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
+                                    debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
                                 }
                             });
                         } else {
@@ -439,7 +471,7 @@ impl Tube {
 
         // Set up a handler for incoming data channels
         debug!("[DATA_CHANNEL_SETUP] Registering on_data_channel callback (tube_id: {}, is_server_mode: {})", self.id, self.is_server_mode_context);
-        let tube_clone = self.clone();
+        let tube_clone = Arc::clone(self);
         let protocol_settings_clone_for_on_data_channel = protocol_settings.clone(); // Clone for the outer closure
         let callback_token_for_on_data_channel = callback_token.clone(); // Clone for on_data_channel
         let ksm_config_for_on_data_channel = ksm_config.clone(); // Clone for on_data_channel
@@ -577,7 +609,7 @@ impl Tube {
                 let runtime_for_run = get_runtime();
                 let tube_id_for_log = tube.id.clone();
                 // Clone references for spawned task - avoid double Arc wrapping
-                let tube_arc = Arc::new(tube.clone()); // Single Arc wrapping
+                let tube_arc = Arc::clone(&tube); // Clone the Arc, not the Tube
                 let peer_connection_for_signal = Arc::clone(&tube.peer_connection);
 
                 debug!("on_data_channel: Spawning channel.run() task. (tube_id: {}, channel_label: {})", tube.id, label_clone_for_run);
@@ -764,7 +796,7 @@ impl Tube {
 
     // Create a new data channel and add it to the tube
     pub(crate) async fn create_data_channel(
-        &self,
+        self: &Arc<Self>,
         label: &str,
         ksm_config: String,
         callback_token: String,
@@ -802,7 +834,7 @@ impl Tube {
 
     // Setup event handlers for a data channel
     fn setup_data_channel_handlers(
-        &self,
+        self: &Arc<Self>,
         data_channel: &WebRTCDataChannel,
         label: String,
         ksm_config: String,
@@ -817,7 +849,7 @@ impl Tube {
         let ksm_config_for_open = ksm_config.clone();
         let callback_token_for_open = callback_token.clone();
         let client_version_for_open = client_version.to_string();
-        let self_clone_for_open = self.clone();
+        let self_clone_for_open = Arc::clone(self);
 
         dc_ref.on_open(Box::new(move || {
             let label_clone = label_for_open.clone();
@@ -841,7 +873,7 @@ impl Tube {
             })
         }));
 
-        let self_clone_for_close = self.clone();
+        let self_clone_for_close = Arc::clone(self);
         let client_version_for_close = client_version.to_string();
 
         dc_ref.on_close(Box::new(move || {
@@ -959,7 +991,7 @@ impl Tube {
     // Create a channel with the given name, using an existing data channel
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_channel(
-        &self,
+        self: &Arc<Self>,
         name: &str,
         data_channel: &WebRTCDataChannel,
         timeout_seconds: Option<f64>,
@@ -1129,7 +1161,7 @@ impl Tube {
             "create_channel: Spawning channel.run() task. (tube_id: {}, channel_name: {})",
             self.id, name_clone
         );
-        let tube_arc = Arc::new(self.clone()); // Single Arc wrapping for callbacks
+        let tube_arc = Arc::clone(self); // Clone the Arc for the spawned task
         runtime_clone.spawn(async move {
             // Use the cloned tube_id_for_spawn which is 'static
             debug!("create_channel: channel.run() task started. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
@@ -1221,8 +1253,9 @@ impl Tube {
     }
 
     // Create the default control channel
+    #[cfg(test)] // Only used in tests
     pub(crate) async fn create_control_channel(
-        &self,
+        self: &Arc<Self>,
         ksm_config: String,
         callback_token: String,
         client_version: &str,
@@ -1278,11 +1311,9 @@ impl Tube {
             signal_arc.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         } else {
-            warn!("Tube {}: No shutdown signal found for channel '{}' during close_channel. It might have already been closed or never run.", self.id, name);
-            Err(anyhow!(
-                "No shutdown signal for channel not found: {}",
-                name
-            ))
+            // Idempotent: If channel already closed or never existed, that's OK
+            warn!("Tube {}: No shutdown signal found for channel '{}' during close_channel. Channel may be already closed or was never created. Treating as idempotent operation.", self.id, name);
+            Ok(()) // Don't error - close is idempotent
         }
     }
 
@@ -1359,165 +1390,6 @@ impl Tube {
         } else {
             Err("No peer connection available".to_string())
         }
-    }
-
-    // Get connection state
-    pub(crate) async fn connection_state(&self) -> String {
-        let pc_guard = self.peer_connection.lock().await;
-
-        if let Some(pc) = &*pc_guard {
-            pc.connection_state()
-        } else {
-            "closed".to_string()
-        }
-    }
-
-    // Close the entire tube with a specific reason
-    pub(crate) async fn close_with_reason(
-        &self,
-        registry: &mut crate::tube_registry::TubeRegistry,
-        reason: CloseConnectionReason,
-    ) -> Result<()> {
-        debug!("Closing tube with ID: {}", self.id);
-
-        // Set the status to Closed first to prevent Drop from trying to remove
-        *self.status.write().await = TubeStatus::Closed;
-        debug!("Set tube status to Closed");
-
-        // Unregister the original conversation from metrics if it exists
-        // This cleans up the monitoring registration created during start_monitoring()
-        if let Some(ref original_conv_id) = self.original_conversation_id {
-            crate::metrics::METRICS_COLLECTOR.unregister_connection(original_conv_id);
-            debug!("Unregistered original conversation from metrics (tube_id: {}, conversation_id: {})",
-                   self.id, original_conv_id);
-        }
-
-        // Send connection_close callbacks for all active channels
-        let channel_names: Vec<String> = {
-            let channels_guard = self.active_channels.read().await;
-            channels_guard.keys().cloned().collect()
-        };
-        for channel_name in &channel_names {
-            if let Err(e) = self.send_connection_close_callback(channel_name).await {
-                warn!("Failed to send connection_close callback during tube closure: {} (tube_id: {}, channel_name: {})", e, self.id, channel_name);
-            }
-        }
-
-        // Send "channel_closed" signals to Python for all channels before closing them
-        let signal_sender_opt = {
-            let pc_guard = self.peer_connection.lock().await;
-            if let Some(pc_instance_arc) = &*pc_guard {
-                pc_instance_arc.signal_sender.clone()
-            } else {
-                None
-            }
-        };
-
-        if let Some(signal_sender) = signal_sender_opt {
-            let data_channels_snapshot = self.data_channels.read().await.clone();
-            for (_channel_label, data_channel) in data_channels_snapshot.iter() {
-                let channel_label_str = data_channel.data_channel.label(); // Use the label which contains the original conversation_id from Python
-
-                // For the control channel, use the original conversation ID if available
-                let conversation_id = if channel_label_str == "control" {
-                    if let Some(ref original_id) = self.original_conversation_id {
-                        original_id.clone()
-                    } else {
-                        debug!("Skipping channel_closed signal for control channel - no original_conversation_id stored (tube_id: {})", self.id);
-                        continue;
-                    }
-                } else {
-                    channel_label_str.to_string()
-                };
-
-                let mut signal_json = serde_json::json!({
-                    "channel_id": conversation_id,
-                    "outcome": "tube_closed"
-                });
-                // Add close reason
-                signal_json["close_reason"] = serde_json::json!({
-                    "code": reason as u16,
-                    "name": format!("{:?}", reason),
-                    "is_critical": reason.is_critical(),
-                    "is_retryable": reason.is_retryable(),
-                });
-                let signal_data = signal_json.to_string();
-
-                let signal_msg = SignalMessage {
-                    tube_id: self.id.clone(),
-                    kind: "channel_closed".to_string(),
-                    data: signal_data,
-                    conversation_id: conversation_id.clone(),
-                    progress_flag: Some(0), // COMPLETE - channel closure due to tube closure is complete
-                    progress_status: Some("Tube closed".to_string()),
-                    is_ok: Some(true), // Tube closure is considered a normal operation
-                };
-
-                if let Err(e) = signal_sender.send(signal_msg) {
-                    error!("Failed to send channel_closed signal for tube closure: {} (tube_id: {}, channel_label: {}, conversation_id: {})", e, self.id, channel_label_str, conversation_id);
-                } else {
-                    debug!("Sent channel_closed signal due to tube closure (tube_id: {}, channel_label: {}, conversation_id: {})", self.id, channel_label_str, conversation_id);
-                }
-            }
-        } else {
-            warn!("No signal sender available to notify Python of channel closures during tube close (tube_id: {})", self.id);
-        }
-
-        // Close all channels with the specified reason before clearing
-        for channel_name in &channel_names {
-            if let Err(e) = self.close_channel(channel_name, Some(reason)).await {
-                warn!("Failed to close channel with reason during tube closure: {} (tube_id: {}, channel_name: {})", e, self.id, channel_name);
-            }
-        }
-
-        // Clear all channel shutdown signals
-        self.channel_shutdown_signals.write().await.clear();
-
-        // Clear all active channels
-        self.active_channels.write().await.clear();
-
-        // Close all data channels
-        for (_, dc) in self.data_channels.write().await.drain() {
-            let _ = dc.close().await;
-        }
-
-        // Close peer connection if exists
-        let mut pc = self.peer_connection.lock().await;
-        if let Some(pc_inner) = pc.take() {
-            let _ = pc_inner.close().await;
-        }
-
-        // Remove from the global registry using the passed-in mutable reference
-        debug!("Removing tube {} from registry via Tube::close()", self.id);
-        registry.remove_tube(&self.id);
-
-        // Verify removal
-        if registry.all_tube_ids_sync().contains(&self.id) {
-            warn!("WARNING: Failed to remove tube from registry!");
-            // Force removal in case it wasn't properly removed
-            registry.tubes_by_id.remove(&self.id);
-            registry
-                .conversation_mappings
-                .retain(|_, tid| tid != &self.id);
-        } else {
-            debug!("Successfully removed tube from registry");
-            debug!("TUBE CLEANUP COMPLETE: {} - This tube is now fully closed and removed from registry", self.id);
-        }
-
-        // Add a delay to ensure registry updates propagate
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        Ok(())
-    }
-
-    // Close the entire tube (defaults to AdminClosed reason)
-    #[cfg(test)]
-    pub(crate) async fn close(
-        &self,
-        registry: &mut crate::tube_registry::TubeRegistry,
-    ) -> Result<()> {
-        self.close_with_reason(registry, CloseConnectionReason::AdminClosed)
-            .await
     }
 
     // Get status
@@ -1864,23 +1736,112 @@ pub struct ConnectionStats {
 
 impl Drop for Tube {
     fn drop(&mut self) {
-        debug!("Drop called for tube with ID: {}", self.id);
-        // Note: This is called each time an Arc<Tube> reference is dropped.
-        // The actual Tube is only cleaned up when the last Arc reference is dropped.
-        // Multiple Drop messages are normal and expected due to Arc cloning in:
-        // - PyTubeRegistry::create_tube (Phase 1 and Phase 2)
-        // - on_data_channel callback
-        // - Various async operations
+        debug!("===============================================");
+        debug!("Tube {} entering RAII Drop cleanup", self.id);
+        debug!("===============================================");
 
-        // Try to get the strong count if we can access it through one of our Arc fields,
-        // This is just for debugging purposes
-        if let Ok(pc_guard) = self.peer_connection.try_lock() {
-            if let Some(ref _pc) = *pc_guard {
-                // We can't directly get Arc strong_count in Drop, but we can note this is happening
-                debug!("Tube {} Drop: peer_connection field is still Some", self.id);
-            } else {
-                debug!("Tube {} Drop: peer_connection field is None", self.id);
+        // Note: Drop is called when the LAST Arc<Tube> reference is dropped
+        // All cleanup happens automatically via RAII pattern
+
+        // 1. Signal sender drops automatically (no manual cleanup needed!)
+        // → Channel closes
+        // → Python receiver gets None
+        // → Python signal handler exits gracefully
+        if self.signal_sender.is_some() {
+            drop(self.signal_sender.take());
+            debug!("  ✓ Signal channel closed (tube_id: {})", self.id);
+        }
+
+        // 2. Metrics handle drops automatically
+        // → MetricsHandle::drop() fires
+        // → Auto-unregisters from METRICS_COLLECTOR
+        if let Ok(mut guard) = self.metrics_handle.try_lock() {
+            if guard.is_some() {
+                drop(guard.take());
+                debug!("  ✓ Metrics auto-unregistered (tube_id: {})", self.id);
             }
         }
+
+        // 3. Keepalive task cancelled
+        if let Ok(mut guard) = self.keepalive_task.try_lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+                debug!("  ✓ Keepalive task cancelled (tube_id: {})", self.id);
+            }
+        }
+
+        // 4. Clear channel shutdown signals and active channels (prevent leaks!)
+        if let Ok(mut signals) = self.channel_shutdown_signals.try_write() {
+            signals.clear();
+            debug!(
+                "  ✓ Channel shutdown signals cleared (tube_id: {})",
+                self.id
+            );
+        }
+        if let Ok(mut channels) = self.active_channels.try_write() {
+            channels.clear();
+            debug!("  ✓ Active channels cleared (tube_id: {})", self.id);
+        }
+
+        // 5. Close all data channels
+        let tube_id_for_dc_close = self.id.clone();
+        let data_channels = self.data_channels.clone();
+        tokio::spawn(async move {
+            let channels: Vec<_> = {
+                let mut guard = data_channels.write().await;
+                guard.drain().collect()
+            };
+
+            for (label, dc) in channels {
+                if let Err(e) = dc.close().await {
+                    warn!(
+                        "Error closing data channel in Drop: {} (tube_id: {}, label: {})",
+                        e, tube_id_for_dc_close, label
+                    );
+                } else {
+                    debug!(
+                        "  ✓ Data channel closed (tube_id: {}, label: {})",
+                        tube_id_for_dc_close, label
+                    );
+                }
+            }
+        });
+        debug!(
+            "  ✓ Data channel close tasks spawned (tube_id: {})",
+            self.id
+        );
+
+        // 5. Peer connection cleanup (async spawn since we can't await in Drop)
+        if let Ok(mut pc_guard) = self.peer_connection.try_lock() {
+            if let Some(pc) = pc_guard.take() {
+                debug!("  ✓ Peer connection closing (spawned async)");
+                // Spawn async cleanup (can't await in Drop)
+                let tube_id = self.id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pc.close().await {
+                        warn!(
+                            "Error closing peer connection in Drop: {} (tube_id: {})",
+                            e, tube_id
+                        );
+                    } else {
+                        debug!(
+                            "  ✓ Peer connection closed successfully (tube_id: {})",
+                            tube_id
+                        );
+                    }
+                });
+            }
+        }
+
+        debug!("===============================================");
+        debug!(
+            "Tube {} RAII Drop complete - all cleanup initiated",
+            self.id
+        );
+        debug!("  → Signal channel: auto-closed");
+        debug!("  → Metrics: auto-unregistered");
+        debug!("  → Keepalive: auto-cancelled");
+        debug!("  → Peer connection: async cleanup spawned");
+        debug!("===============================================");
     }
 }

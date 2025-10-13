@@ -717,16 +717,18 @@ pub async fn setup_outbound_task(
                                                                 .to_string();
 
                                                             tokio::spawn(async move {
+                                                                // LOCK-FREE: Iterate over tubes (DashMap)
                                                                 let registry =
-                                                                    crate::tube_registry::REGISTRY
-                                                                        .read()
-                                                                        .await;
+                                                                    &crate::tube_registry::REGISTRY;
 
                                                                 // Find which tube contains this channel
                                                                 let mut found_tube_id = None;
-                                                                for (tube_id, tube) in
-                                                                    &registry.tubes_by_id
+                                                                for entry in registry.tubes().iter()
                                                                 {
+                                                                    let (tube_id, tube) = (
+                                                                        entry.key(),
+                                                                        entry.value(),
+                                                                    );
                                                                     let channels_guard = tube
                                                                         .active_channels
                                                                         .read()
@@ -744,9 +746,9 @@ pub async fn setup_outbound_task(
                                                                 if let Some(tube_id) = found_tube_id
                                                                 {
                                                                     if let Some(signal_sender) =
-                                                                        registry
-                                                                            .signal_channels
-                                                                            .get(&tube_id)
+                                                                        registry.get_signal_sender(
+                                                                            &tube_id,
+                                                                        )
                                                                     {
                                                                         let signal_msg = crate::tube_registry::SignalMessage {
                                                                             tube_id: tube_id.clone(),

@@ -60,29 +60,31 @@ server_result = registry.create_tube(
 )
 
 # Get the offer SDP to send to the client
-server_offer = server_result['offer']
+# NOTE: All SDP (offers, answers) are base64-encoded - use them directly, don't decode!
+server_offer = server_result['offer']  # Base64-encoded WebRTC offer
 server_tube_id = server_result['tube_id']
 
 # Create a client-side tube with the offer
 client_result = registry.create_tube(
-    conversation_id="tunnel-client-123", 
+    conversation_id="tunnel-client-123",
     settings={
         "conversationType": "tunnel",
         "target_host": "192.168.1.100",
         "target_port": "22"
     },
     trickle_ice=True,
-    callback_token="client-token", 
+    callback_token="client-token",
     ksm_config="client-config",
-    offer=server_offer,  # Use server's offer
+    offer=server_offer,  # Pass base64-encoded offer directly (don't decode!)
     signal_callback=on_signal
 )
 
 # Get the answer SDP to send back to server
-client_answer = client_result['answer']
+client_answer = client_result['answer']  # Base64-encoded WebRTC answer
 client_tube_id = client_result['tube_id']
 
 # Set the remote description on the server
+# NOTE: Pass base64-encoded answer directly
 registry.set_remote_description(server_tube_id, client_answer, is_answer=True)
 
 # Check connection state
@@ -93,6 +95,40 @@ print(f"Connection state: {state}")
 registry.close_tube(server_tube_id)
 registry.close_tube(client_tube_id)
 ```
+
+### Server Mode with TCP Listener
+
+For server tubes that listen for external TCP connections:
+
+```python
+# Create server tube with TCP listener (dynamic port)
+server_result = registry.create_tube(
+    conversation_id="tcp-tunnel",
+    settings={
+        "conversationType": "tunnel",
+        "local_listen_addr": "127.0.0.1:0"  # 0 = dynamic port assignment
+    },
+    trickle_ice=True,
+    callback_token="token",
+    ksm_config="config",
+    signal_callback=on_signal
+)
+
+# Get actual listening address (port assigned by OS)
+listen_addr = server_result['actual_local_listen_addr']  # "127.0.0.1:59194"
+host, port = listen_addr.split(':')
+
+# External clients can now connect to this address
+import socket
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client.connect((host, int(port)))
+# Data flows: TCP → WebRTC → Remote tube → Remote target
+```
+
+**API Documentation**: See [docs/PYTHON_API_CONTRACT.md](docs/PYTHON_API_CONTRACT.md) for complete API reference including:
+- Base64 SDP encoding requirements
+- Return value specifications
+- Migration guides and common pitfalls
 
 ## Features
 

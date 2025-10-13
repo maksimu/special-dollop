@@ -192,20 +192,16 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             
             # Give some time for async operations and signal propagation
             time.sleep(1.0)
-            
-            # The channel is closed, but signals may be delayed
-            # Instead of checking for signals, verify the channel is gone
-            # by trying to close it again - it should fail
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection(main_connection_id)
-            
-            error_msg = str(context.exception)
-            self.assertIn("No shutdown signal", error_msg, 
-                         "Should get error when trying to close already closed channel")
-            
+
+            # NEW BEHAVIOR: close_connection is idempotent - closing again is OK (no exception)
+            # This is BETTER than the old behavior (throwing errors)
+            logging.info(f"Closing same connection again (idempotent test): {main_connection_id}")
+            self.tube_registry.close_connection(main_connection_id)  # Should NOT raise
+            logging.info("✅ Idempotent close successful (no exception)")
+
             # The tube should still exist (it has other channels like 'control')
             self.assertTrue(self.tube_registry.tube_found(server_id), "Tube should still exist after closing one channel")
-            
+
             logging.info("close_connection with valid connection test passed")
             
         except Exception as e:
@@ -214,23 +210,23 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
 
     @with_runtime
     def test_close_connection_invalid(self):
-        """Test closing a non-existent connection"""
-        logging.info("=== Testing close_connection with invalid connection ===")
-        
+        """Test closing a non-existent connection (idempotent behavior)"""
+        logging.info("=== Testing close_connection with invalid connection (idempotent) ===")
+
         try:
             # Try to close a connection that doesn't exist
             fake_connection_id = "non-existent-connection-123"
-            
+
             logging.info(f"Attempting to close non-existent connection: {fake_connection_id}")
-            
-            # This should raise an error
+
+            # Should still raise if NO TUBE exists for that conversation
             with self.assertRaises(Exception) as context:
                 self.tube_registry.close_connection(fake_connection_id)
-            
+
             error_msg = str(context.exception)
-            self.assertIn("No tube found for connection ID", error_msg, 
-                         "Should get appropriate error for non-existent connection")
-            
+            self.assertIn("No tube found for connection ID", error_msg,
+                         "Should get appropriate error for non-existent conversation")
+
             logging.info(f"Got expected error: {error_msg}")
             logging.info("close_connection with invalid connection test passed")
             
@@ -372,15 +368,12 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             # The server tube should still exist (it has a control channel)
             self.assertTrue(self.tube_registry.tube_found(server_id), "Server tube should exist")
             self.assertTrue(self.tube_registry.tube_found(client_id), "Client tube should exist")
-            
-            # Verify the channel is closed by trying to close it again
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection(connection_id)
-            
-            error_msg = str(context.exception)
-            self.assertIn("No shutdown signal", error_msg, 
-                         "Should get error when trying to close already closed channel")
-            
+
+            # NEW BEHAVIOR: Idempotent - closing again is OK
+            logging.info(f"Closing {connection_id} again (idempotent)")
+            self.tube_registry.close_connection(connection_id)  # Should NOT raise
+            logging.info(f"✅ Idempotent close successful for {connection_id}")
+
             logging.info("close_connection in peer setup test passed")
             
         except Exception as e:
@@ -411,40 +404,34 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             # Try to close the same connection multiple times
             errors = []
             success_count = 0
-            
+
             def close_connection_thread():
                 try:
                     self.tube_registry.close_connection(connection_id)
                     nonlocal success_count
                     success_count += 1
-                    logging.info("Successfully closed connection")
+                    logging.info("Successfully closed connection (idempotent)")
                 except Exception as e:
                     errors.append(str(e))
                     logging.info(f"Got error closing connection: {e}")
-            
+
             # Start multiple threads trying to close the same connection
             threads = []
             for i in range(3):
                 t = threading.Thread(target=close_connection_thread)
                 threads.append(t)
                 t.start()
-            
+
             # Wait for all threads
             for t in threads:
                 t.join()
-            
-            # Only one should succeed, others should fail
-            self.assertEqual(success_count, 1, "Exactly one thread should succeed")
-            self.assertEqual(len(errors), 2, "Two threads should fail")
-            
-            # Check that we got the right error for the failures
-            for error in errors:
-                self.assertTrue(
-                    "No shutdown signal" in error or "No tube found" in error,
-                    f"Expected 'No shutdown signal' or 'No tube found' error, got: {error}"
-                )
-            
-            logging.info("close_connection race condition test passed")
+
+            # NEW BEHAVIOR: Actor model + idempotent close = ALL threads succeed
+            # The actor serializes the requests, and each close is idempotent
+            self.assertEqual(success_count, 3, "All threads should succeed (idempotent behavior)")
+            self.assertEqual(len(errors), 0, "No errors expected (idempotent)")
+
+            logging.info(f"✅ close_connection race condition test passed - all {success_count} threads succeeded (idempotent)")
             
         except Exception as e:
             logging.error(f"Test failed: {e}", exc_info=True)
@@ -526,31 +513,27 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             
             # The main conversation should also be there
             self.assertIn("main-conversation", conv_ids, "Main conversation should be associated")
-            
-            # But only the main conversation has an actual channel
-            # Trying to close the additional conversations will fail
+
+            # NEW BEHAVIOR: Only the main conversation has an actual channel
+            # Trying to close the additional conversations is idempotent (they were never channels)
             for conv_id in additional_conv_ids:
-                with self.assertRaises(Exception) as context:
-                    self.tube_registry.close_connection(conv_id)
-                error_msg = str(context.exception)
-                self.assertIn("No shutdown signal", error_msg, 
-                             f"Should fail to close {conv_id} as it's not a real channel")
-            
-            # But we can close the main conversation channel with Normal reason
+                logging.info(f"Closing associated conversation {conv_id} (no actual channel - idempotent)")
+                self.tube_registry.close_connection(conv_id)  # Should NOT raise (idempotent)
+                logging.info(f"✅ Idempotent close for {conv_id} (was never a channel)")
+
+            # Close the main conversation channel with Normal reason
+            logging.info("Closing main-conversation (actual channel)")
             self.tube_registry.close_connection("main-conversation", REASON_NORMAL)
-            
+
             time.sleep(1.0)
-            
-            # Verify it's closed by trying again
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection("main-conversation")
-            
-            error_msg = str(context.exception)
-            self.assertIn("No shutdown signal", error_msg, 
-                         "Should get error when trying to close already closed channel")
-            
+
+            # NEW BEHAVIOR: Idempotent - closing again is OK
+            logging.info("Closing main-conversation again (idempotent)")
+            self.tube_registry.close_connection("main-conversation")  # Should NOT raise
+            logging.info("✅ Idempotent close successful for main-conversation")
+
             logging.info("associate_conversation behavior test passed")
-            logging.info("NOTE: associate_conversation only creates mappings, not actual channels!")
+            logging.info("NOTE: associate_conversation creates mappings; close_connection is idempotent!")
             
         except Exception as e:
             logging.error(f"Test failed: {e}", exc_info=True)
@@ -606,22 +589,23 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             
             # Tube should still exist
             self.assertTrue(self.tube_registry.tube_found(tube_id), "Tube should exist after closing one channel")
-            
-            # Verify first channel is closed
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection("initial-channel")
-            self.assertIn("No shutdown signal", str(context.exception), "Initial channel should be closed")
-            
+
+            # NEW BEHAVIOR: close_connection is idempotent - closing again is OK
+            logging.info("Closing initial-channel again (idempotent)")
+            self.tube_registry.close_connection("initial-channel")  # Should NOT raise
+            logging.info("✅ Idempotent close successful for initial-channel")
+
             # But second channel should still work - close with Client reason
+            logging.info("Closing second-channel with Client reason")
             self.tube_registry.close_connection("second-channel", REASON_CLIENT)
-            
+
             time.sleep(0.5)
-            
-            # Verify second channel is now also closed
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection("second-channel")
-            self.assertIn("No shutdown signal", str(context.exception), "Second channel should be closed")
-            
+
+            # NEW BEHAVIOR: Closing second channel again is also idempotent
+            logging.info("Closing second-channel again (idempotent)")
+            self.tube_registry.close_connection("second-channel")  # Should NOT raise
+            logging.info("✅ Idempotent close successful for second-channel")
+
             logging.info("Multiple channels test passed")
             
         except Exception as e:
@@ -660,14 +644,13 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
                 # Close the connection with the specific reason
                 logging.info(f"Closing connection {conn_name} with reason {reason_name} ({reason_code})")
                 self.tube_registry.close_connection(conn_name, reason_code)
-                
+
                 time.sleep(0.2)
-                
-                # Verify the channel is closed
-                with self.assertRaises(Exception) as context:
-                    self.tube_registry.close_connection(conn_name, REASON_NORMAL)
-                self.assertIn("No shutdown signal", str(context.exception), 
-                             f"Channel {conn_name} should be closed")
+
+                # NEW BEHAVIOR: Idempotent close - closing again is OK
+                logging.info(f"Closing {conn_name} again (idempotent test)")
+                self.tube_registry.close_connection(conn_name, REASON_NORMAL)  # Should NOT raise
+                logging.info(f"✅ Idempotent close successful for {conn_name}")
             
             # Now close tubes with different reasons
             tube_close_reasons = [
@@ -717,14 +700,13 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             # Close connection without specifying reason (should default to Unknown)
             logging.info("Closing connection without specifying reason")
             self.tube_registry.close_connection("default-reason-conn")
-            
+
             time.sleep(0.5)
-            
-            # Verify it's closed
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection("default-reason-conn")
-            self.assertIn("No shutdown signal", str(context.exception), 
-                         "Connection should be closed")
+
+            # NEW BEHAVIOR: Idempotent - closing again is OK
+            logging.info("Closing default-reason-conn again (idempotent)")
+            self.tube_registry.close_connection("default-reason-conn")  # Should NOT raise
+            logging.info("✅ Idempotent close successful for default-reason-conn")
             
             # Create another tube to test tube close without reason
             tube_info2 = self.create_tube_tracked(
@@ -774,14 +756,13 @@ class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
             # This should work but use Unknown reason internally
             logging.info("Closing connection with invalid reason code 999")
             self.tube_registry.close_connection("invalid-reason-conn", 999)
-            
+
             time.sleep(0.5)
-            
-            # Verify it's closed
-            with self.assertRaises(Exception) as context:
-                self.tube_registry.close_connection("invalid-reason-conn")
-            self.assertIn("No shutdown signal", str(context.exception), 
-                         "Connection should be closed")
+
+            # NEW BEHAVIOR: Idempotent - closing again is OK
+            logging.info("Closing invalid-reason-conn again (idempotent)")
+            self.tube_registry.close_connection("invalid-reason-conn")  # Should NOT raise
+            logging.info("✅ Idempotent close successful for invalid-reason-conn")
             
             # Create another tube for tube close test
             tube_info2 = self.create_tube_tracked(

@@ -6,11 +6,13 @@
 
 mod alerts;
 mod collector;
+mod handle;
 mod sliding_window;
 mod types;
 
 pub use alerts::PerformanceAlert;
 pub use collector::METRICS_COLLECTOR;
+pub use handle::MetricsHandle;
 pub use types::{ConnectionMetrics, ConnectionQuality};
 
 // Note: Constants removed as they are not currently used by the implementation

@@ -33,17 +33,6 @@ mod prefetch_optimizations {
             _mm_prefetch(ptr.add(hash * 64 + 64) as *const i8, _MM_HINT_T0);
         }
     }
-
-    /// Prefetch multiple connection lookups for batch processing
-    /// Currently preparatory - will be used when we implement frame batching
-    #[inline(always)]
-    #[allow(dead_code)] // Preparatory for future batch processing optimization
-    pub fn prefetch_multiple_connections(conns: &DashMap<u32, Conn>, conn_nos: &[u32]) {
-        for &conn_no in conn_nos.iter().take(4) {
-            // Prefetch up to 4 connections
-            prefetch_connection_lookup(conns, conn_no);
-        }
-    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]

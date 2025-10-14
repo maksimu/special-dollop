@@ -24,6 +24,13 @@ use tokio::time::timeout;
 
 use super::core::Channel;
 
+/// Determine if a connection event should be logged
+/// Returns true if verbose logging is enabled OR if it's a critical/disconnect event
+#[inline(always)]
+fn should_log_connection(is_critical: bool) -> bool {
+    crate::logger::is_verbose_logging() || is_critical
+}
+
 // Open a backend connection to a given address
 pub async fn open_backend(
     channel: &mut Channel,
@@ -31,10 +38,12 @@ pub async fn open_backend(
     addr: SocketAddr,
     active_protocol: ActiveProtocol,
 ) -> Result<()> {
-    debug!(
-        "Endpoint {}: Opening connection {} to {} for protocol {:?} (Channel ServerMode: {})",
-        channel.channel_id, conn_no, addr, active_protocol, channel.server_mode
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Endpoint {}: Opening connection {} to {} for protocol {:?} (Channel ServerMode: {})",
+            channel.channel_id, conn_no, addr, active_protocol, channel.server_mode
+        );
+    }
 
     // Check if the connection already exists
     if channel.conns.contains_key(&conn_no) {
@@ -50,14 +59,18 @@ pub async fn open_backend(
         let mut primary_conn_no_guard = channel.primary_guacd_conn_no.lock().await;
         if primary_conn_no_guard.is_none() {
             *primary_conn_no_guard = Some(conn_no);
-            debug!(
-                "Marked as primary Guacd data connection. (channel_id: {})",
-                channel.channel_id
-            );
+            if unlikely!(should_log_connection(false)) {
+                debug!(
+                    "Marked as primary Guacd data connection. (channel_id: {})",
+                    channel.channel_id
+                );
+            }
         } else if *primary_conn_no_guard != Some(conn_no) {
             // This case would be unusual - opening a new Guacd connection when one (potentially different conn_no) is already primary.
             // For now, log it. Depending on design, there might be an error or a secondary stream.
-            debug!("Opening additional Guacd connection; primary already set. (channel_id: {}, existing_primary: {:?})", channel.channel_id, *primary_conn_no_guard);
+            if unlikely!(should_log_connection(false)) {
+                debug!("Opening additional Guacd connection; primary already set. (channel_id: {}, existing_primary: {:?})", channel.channel_id, *primary_conn_no_guard);
+            }
         }
     }
 
@@ -77,14 +90,14 @@ pub async fn open_backend(
         "Gateway<->Target"
     };
 
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
         debug!(
             "Backend connection established (TCP_NODELAY) | channel_id: {} | {}: {:.1}ms | addr: {}",
             channel.channel_id, backend_type, connect_duration_ms, addr
         );
     }
 
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
         debug!(
             "PRE-CALL to setup_outbound_task (channel_id: {}, conn_no: {}, backend_addr: {}, active_protocol: {:?}, server_mode: {})",
             channel.channel_id,
@@ -123,10 +136,12 @@ pub async fn setup_outbound_task(
     );
 
     if active_protocol == ActiveProtocol::Guacd {
-        debug!(
-            "Channel({}): Performing Guacd handshake for conn_no {}",
-            channel_id_for_task, conn_no
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Channel({}): Performing Guacd handshake for conn_no {}",
+                channel_id_for_task, conn_no
+            );
+        }
 
         let channel_id_clone = channel_id_for_task.clone(); // Already have channel_id_for_task
         let guacd_params_clone = channel.guacd_params.clone();
@@ -147,10 +162,12 @@ pub async fn setup_outbound_task(
         .await
         {
             Ok(Ok(_)) => {
-                debug!(
-                    "Channel({}): Guacd handshake successful for conn_no {}",
-                    channel_id_clone, conn_no
-                );
+                if unlikely!(should_log_connection(false)) {
+                    debug!(
+                        "Channel({}): Guacd handshake successful for conn_no {}",
+                        channel_id_clone, conn_no
+                    );
+                }
             }
             Ok(Err(e)) => {
                 error!(
@@ -366,7 +383,7 @@ pub async fn setup_outbound_task(
             const BACKPRESSURE_THRESHOLD: usize = MAX_QUEUE_FRAMES / 2; // 50% = 5,000 frames (adjusted for faster drain rate)
 
             // Log queue status periodically for monitoring
-            if unlikely!(crate::logger::is_verbose_logging()) && loop_iterations % 1000 == 0 {
+            if unlikely!(should_log_connection(false)) && loop_iterations % 1000 == 0 {
                 debug!(
                     "Queue status check (channel_id: {}, conn_no: {}, queue_depth: {}/{}, fill: {:.1}%)",
                     channel_id_for_task, conn_no, queue_depth, MAX_QUEUE_FRAMES,
@@ -503,7 +520,7 @@ pub async fn setup_outbound_task(
                             let parse_start = std::time::Instant::now();
 
                             // **ULTRA-FAST PATH: Validate format and detect special opcodes**
-                            if unlikely!(crate::logger::is_verbose_logging()) {
+                            if unlikely!(should_log_connection(false)) {
                                 debug!("OUTBOUND: About to validate and detect special opcodes (channel_id: {}, conn_no: {}, slice_len: {}, first_bytes: {:?})",
                                        channel_id_for_task, conn_no, current_slice.len(), &current_slice[..std::cmp::min(50, current_slice.len())]);
                             }
@@ -522,7 +539,7 @@ pub async fn setup_outbound_task(
                                     }
 
                                     // Log opcode action for verbose debugging
-                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                    if unlikely!(should_log_connection(false)) {
                                         debug!("Opcode action dispatched by expandable system (channel_id: {}, conn_no: {}, action: {:?}, instruction_len: {})",
                                            channel_id_for_task, conn_no, action, instruction_len);
                                     }
@@ -619,8 +636,7 @@ pub async fn setup_outbound_task(
                                                 {
                                                     let timestamp = peeked_instr.args[0];
 
-                                                    if unlikely!(crate::logger::is_verbose_logging())
-                                                    {
+                                                    if unlikely!(should_log_connection(false)) {
                                                         debug!(
                                                             "KEEPALIVE: Detected guacd sync, auto-responding immediately (channel_id: {}, conn_no: {}, timestamp: {})",
                                                             channel_id_for_task, conn_no, timestamp
@@ -645,9 +661,9 @@ pub async fn setup_outbound_task(
                                                             "Failed to send sync auto-response to guacd: {} (channel_id: {}, conn_no: {})",
                                                             e, channel_id_for_task, conn_no
                                                         );
-                                                    } else if unlikely!(
-                                                        crate::logger::is_verbose_logging()
-                                                    ) {
+                                                    } else if unlikely!(should_log_connection(
+                                                        false
+                                                    )) {
                                                         debug!(
                                                             "KEEPALIVE: Sent sync auto-response to guacd (channel_id: {}, timestamp: {}, prevents 15s timeout)",
                                                             channel_id_for_task, timestamp
@@ -690,7 +706,11 @@ pub async fn setup_outbound_task(
                                             continue; // Process next instruction
                                         }
                                         OpcodeAction::ProcessSpecial(opcode) => {
-                                            debug!("OUTBOUND: Special opcode detected - dispatching to handler (channel_id: {}, conn_no: {}, opcode_name: {}, opcode: {:?})", channel_id_for_task, conn_no, opcode.as_str(), opcode);
+                                            // Note: Disconnect/close events use CloseConnection action (line 532) with warn! logging
+                                            // SpecialOpcode is for Size and other non-critical opcodes
+                                            if unlikely!(should_log_connection(false)) {
+                                                debug!("OUTBOUND: Special opcode detected - dispatching to handler (channel_id: {}, conn_no: {}, opcode_name: {}, opcode: {:?})", channel_id_for_task, conn_no, opcode.as_str(), opcode);
+                                            }
 
                                             // Dispatch to appropriate special handler
                                             match opcode {
@@ -700,7 +720,11 @@ pub async fn setup_outbound_task(
                                                         GuacdParser::peek_instruction(current_slice)
                                                     {
                                                         if peeked_instr.args.len() >= 2 {
-                                                            debug!("OUTBOUND: Server size instruction (actual session size) - sending to signal system (channel_id: {}, conn_no: {}, layer: {}, width: {}, height: {})", channel_id_for_task, conn_no, peeked_instr.args[0], peeked_instr.args.get(1).unwrap_or(&"unknown"), peeked_instr.args.get(2).unwrap_or(&"unknown"));
+                                                            if unlikely!(should_log_connection(
+                                                                false
+                                                            )) {
+                                                                debug!("OUTBOUND: Server size instruction (actual session size) - sending to signal system (channel_id: {}, conn_no: {}, layer: {}, width: {}, height: {})", channel_id_for_task, conn_no, peeked_instr.args[0], peeked_instr.args.get(1).unwrap_or(&"unknown"), peeked_instr.args.get(2).unwrap_or(&"unknown"));
+                                                            }
 
                                                             // Send it to the Python signal system
                                                             let channel_id_clone =
@@ -738,7 +762,13 @@ pub async fn setup_outbound_task(
                                                                     ) {
                                                                         found_tube_id =
                                                                             Some(tube_id.clone());
-                                                                        debug!("OUTBOUND: Found tube containing this channel (channel_id: {}, tube_id: {})", channel_id_clone, tube_id);
+                                                                        if unlikely!(
+                                                                            should_log_connection(
+                                                                                false
+                                                                            )
+                                                                        ) {
+                                                                            debug!("OUTBOUND: Found tube containing this channel (channel_id: {}, tube_id: {})", channel_id_clone, tube_id);
+                                                                        }
                                                                         break;
                                                                     }
                                                                 }
@@ -765,7 +795,11 @@ pub async fn setup_outbound_task(
                                                                                 .send(signal_msg)
                                                                         {
                                                                             warn!("OUTBOUND: Failed to send actual size signal to Python (tube_id: {}, channel_id: {}, error: {})", tube_id, channel_id_clone, e);
-                                                                        } else {
+                                                                        } else if unlikely!(
+                                                                            should_log_connection(
+                                                                                false
+                                                                            )
+                                                                        ) {
                                                                             debug!("OUTBOUND: Successfully sent actual size signal to Python (tube_id: {}, channel_id: {})", tube_id, channel_id_clone);
                                                                         }
                                                                     } else {
@@ -775,10 +809,14 @@ pub async fn setup_outbound_task(
                                                                     warn!("OUTBOUND: Could not find tube containing this channel");
                                                                 }
                                                             });
-                                                        } else {
+                                                        } else if unlikely!(should_log_connection(
+                                                            false
+                                                        )) {
                                                             debug!("OUTBOUND: Size instruction with insufficient args - skipping signal (channel_id: {}, opcode_name: {})", channel_id_for_task, SpecialOpcode::Size.as_str());
                                                         }
-                                                    } else {
+                                                    } else if unlikely!(should_log_connection(
+                                                        false
+                                                    )) {
                                                         debug!("OUTBOUND: Failed to parse size instruction - skipping signal (channel_id: {}, opcode_name: {})", channel_id_for_task, SpecialOpcode::Size.as_str());
                                                     }
                                                 }
@@ -1022,10 +1060,13 @@ pub async fn setup_outbound_task(
                 }
             }
         }
-        debug!(
-            "Endpoint {}: Backend→WebRTC task for connection {} exited",
-            channel_id_for_task, conn_no
-        );
+        if unlikely!(should_log_connection(true)) {
+            // Critical: connection closing
+            debug!(
+                "Endpoint {}: Backend→WebRTC task for connection {} exited",
+                channel_id_for_task, conn_no
+            );
+        }
         buffer_pool.release(main_read_buffer);
         buffer_pool.release(encode_buffer);
         buffer_pool.release(temp_read_buffer);
@@ -1042,7 +1083,8 @@ pub async fn setup_outbound_task(
                 warn!("Failed to send connection closure signal; channel might be shutting down. (channel_id: {}, conn_no: {}, error: {:?})", channel_id_for_task, conn_no, e
                 );
             }
-        } else {
+        } else if unlikely!(should_log_connection(true)) {
+            // Critical: disconnect event
             debug!(
                 "Sent connection closure signal to Channel run loop. (channel_id: {}, conn_no: {})",
                 channel_id_for_task, conn_no
@@ -1066,10 +1108,12 @@ pub async fn setup_outbound_task(
 
     channel.conns.insert(conn_no, conn);
 
-    debug!(
-        "Endpoint {}: Connection {} added to registry",
-        channel.channel_id, conn_no
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Endpoint {}: Connection {} added to registry",
+            channel.channel_id, conn_no
+        );
+    }
 
     Ok(())
 }
@@ -1190,7 +1234,7 @@ where
                     }
                     handshake_buffer.put_slice(&temp_read_buf[..n_read]);
                     *current_buffer_len += n_read;
-                    if unlikely!(crate::logger::is_verbose_logging()) {
+                    if unlikely!(should_log_connection(false)) {
                         debug!("Read more data for handshake, waiting for '{}' (channel_id: {}, conn_no: {}, bytes_read: {}, new_buffer_len: {})", expected_opcode, channel_id, conn_no, n_read, *current_buffer_len);
                     }
                 }
@@ -1209,12 +1253,16 @@ where
             if let Some(username) = guacd_params_locked.get("username").cloned() {
                 // Only split on backslash if it's NOT Azure AD format
                 if username.starts_with("AzureAD\\") || username.starts_with(".\\AzureAD\\") {
-                    debug!("Azure AD format detected - setting security to aad (channel_id: {}, conn_no: {}, username: {})", channel_id, conn_no, username);
+                    if unlikely!(should_log_connection(false)) {
+                        debug!("Azure AD format detected - setting security to aad (channel_id: {}, conn_no: {}, username: {})", channel_id, conn_no, username);
+                    }
                     guacd_params_locked.insert("security".to_string(), "aad".to_string());
                 } else if let Some(pos) = username.find('\\') {
                     let domain = &username[..pos];
                     let user = &username[pos + 1..];
-                    debug!("Traditional domain found - splitting (channel_id: {}, conn_no: {}, domain: {}, username: {})", channel_id, conn_no, domain, user);
+                    if unlikely!(should_log_connection(false)) {
+                        debug!("Traditional domain found - splitting (channel_id: {}, conn_no: {}, domain: {}, username: {})", channel_id, conn_no, domain, user);
+                    }
                     guacd_params_locked.insert("username".to_string(), user.to_string());
                     guacd_params_locked.insert("domain".to_string(), domain.to_string());
                 }
@@ -1229,7 +1277,7 @@ where
 
     let join_connection_id_key = "connectionid";
     let join_connection_id_opt = guacd_params_locked.get(join_connection_id_key).cloned();
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
         debug!(
             "Checked for join connection ID in guacd_params (channel_id: {}, key_looked_up: {})",
             channel_id, join_connection_id_key
@@ -1238,27 +1286,31 @@ where
 
     let select_arg: String;
     if let Some(id_to_join) = &join_connection_id_opt {
-        debug!("Guacd Handshake: Preparing to join existing session. (channel_id: {}, session_to_join: {})", channel_id, id_to_join);
+        if unlikely!(should_log_connection(false)) {
+            debug!("Guacd Handshake: Preparing to join existing session. (channel_id: {}, session_to_join: {})", channel_id, id_to_join);
+        }
         select_arg = id_to_join.clone();
     } else {
-        debug!("Guacd Handshake: Preparing for new session with protocol. (channel_id: {}, protocol: {})", channel_id, protocol_name_from_params);
+        if unlikely!(should_log_connection(false)) {
+            debug!("Guacd Handshake: Preparing for new session with protocol. (channel_id: {}, protocol: {})", channel_id, protocol_name_from_params);
+        }
         select_arg = protocol_name_from_params;
     }
 
     let readonly_param_key = "readonly";
     let readonly_param_value_from_map = guacd_params_locked.get(readonly_param_key).cloned();
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
         debug!("Initial 'readonly' value from guacd_params_locked for join attempt. (channel_id: {}, readonly_param_value_from_map: {:?})", channel_id, readonly_param_value_from_map);
     }
 
     let readonly_str_for_join =
         readonly_param_value_from_map.unwrap_or_else(|| "false".to_string());
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
         debug!("Effective 'readonly_str_for_join' (after unwrap_or_else) for join attempt. (channel_id: {}, readonly_str_for_join: {})", channel_id, readonly_str_for_join);
     }
 
     let is_readonly = readonly_str_for_join.eq_ignore_ascii_case("true");
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
         debug!(
             "Final 'is_readonly' boolean for join attempt. (channel_id: {}, is_readonly_bool: {})",
             channel_id, is_readonly
@@ -1298,19 +1350,23 @@ where
     drop(guacd_params_locked);
 
     let select_instruction = GuacdInstruction::new("select".to_string(), vec![select_arg.clone()]);
-    debug!(
-        "Guacd Handshake: Sending 'select' (channel_id: {}, instruction: {:?})",
-        channel_id, select_instruction
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Guacd Handshake: Sending 'select' (channel_id: {}, instruction: {:?})",
+            channel_id, select_instruction
+        );
+    }
     writer
         .write_all(&GuacdParser::guacd_encode_instruction(&select_instruction))
         .await?;
     writer.flush().await?;
 
-    debug!(
-        "Guacd Handshake: Waiting for 'args' (channel_id: {})",
-        channel_id
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Guacd Handshake: Waiting for 'args' (channel_id: {})",
+            channel_id
+        );
+    }
     let args_instruction = read_expected_instruction_stateless(
         reader,
         &mut handshake_buffer,
@@ -1320,10 +1376,12 @@ where
         "args",
     )
     .await?;
-    debug!(
-        "Guacd Handshake: Received 'args' from Guacd server (channel_id: {}, received_args: {:?})",
-        channel_id, args_instruction.args
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Guacd Handshake: Received 'args' from Guacd server (channel_id: {}, received_args: {:?})",
+            channel_id, args_instruction.args
+        );
+    }
 
     const EXPECTED_GUACD_VERSION: &str = "VERSION_1_5_0";
     let connect_version_arg = args_instruction.args.first().cloned().unwrap_or_else(|| {
@@ -1346,7 +1404,9 @@ where
             channel_id
         );
         let is_readonly = readonly_str_for_join.eq_ignore_ascii_case("true");
-        debug!("Readonly status for join. (channel_id: {}, requested_readonly_param: {}, is_readonly_for_connect: {})", channel_id, readonly_str_for_join, is_readonly);
+        if unlikely!(should_log_connection(false)) {
+            debug!("Readonly status for join. (channel_id: {}, requested_readonly_param: {}, is_readonly_for_connect: {})", channel_id, readonly_str_for_join, is_readonly);
+        }
 
         for (idx, arg_name_from_guacd) in args_instruction.args.iter().enumerate() {
             if idx == 0 {
@@ -1357,7 +1417,7 @@ where
             let is_current_arg_readonly_keyword =
                 arg_name_from_guacd == is_readonly_arg_name_literal;
 
-            if unlikely!(crate::logger::is_verbose_logging()) {
+            if unlikely!(should_log_connection(false)) {
                 debug!("Looping for connect_args (join). Comparing '{}' with '{}' (channel_id: {}, conn_no: {}, current_arg_name_from_guacd: {}, is_readonly_param_from_config: {}, is_current_arg_the_readonly_keyword: {})", arg_name_from_guacd, is_readonly_arg_name_literal, channel_id, conn_no, arg_name_from_guacd, is_readonly, is_current_arg_readonly_keyword);
             }
 
@@ -1367,17 +1427,21 @@ where
                 } else {
                     "".to_string()
                 };
-                debug!("Pushing to connect_args for 'read-only' keyword (channel_id: {}, conn_no: {}, arg_name_being_processed: {}, is_readonly_flag_for_push: {}, value_being_pushed_for_readonly_arg: {})", channel_id, conn_no, arg_name_from_guacd, is_readonly, value_to_push);
+                if unlikely!(should_log_connection(false)) {
+                    debug!("Pushing to connect_args for 'read-only' keyword (channel_id: {}, conn_no: {}, arg_name_being_processed: {}, is_readonly_flag_for_push: {}, value_being_pushed_for_readonly_arg: {})", channel_id, conn_no, arg_name_from_guacd, is_readonly, value_to_push);
+                }
                 connect_args.push(value_to_push);
             } else {
                 connect_args.push("".to_string());
             }
         }
     } else {
-        debug!(
-            "Guacd Handshake: Preparing 'connect' for NEW session. (channel_id: {})",
-            channel_id
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Guacd Handshake: Preparing 'connect' for NEW session. (channel_id: {})",
+                channel_id
+            );
+        }
 
         let parse_mimetypes = |mimetype_str: &str| -> Vec<String> {
             if mimetype_str.is_empty() {
@@ -1385,7 +1449,9 @@ where
             }
             serde_json::from_str::<Vec<String>>(mimetype_str)
                 .unwrap_or_else(|e| {
-                    debug!("Failed to parse mimetype string '{}' as JSON array, splitting by comma as fallback. (channel_id: {}, conn_no: {}, error: {})", mimetype_str, channel_id, conn_no, e);
+                    if unlikely!(should_log_connection(false)) {
+                        debug!("Failed to parse mimetype string '{}' as JSON array, splitting by comma as fallback. (channel_id: {}, conn_no: {}, error: {})", mimetype_str, channel_id, conn_no, e);
+                    }
                     mimetype_str.split(',').map(String::from).filter(|s| !s.is_empty()).collect()
                 })
         };
@@ -1396,14 +1462,16 @@ where
             .chain(dpi_for_new.split(','))
             .map(String::from)
             .collect();
-        debug!(
-            "Guacd Handshake (new): Sending 'size' (channel_id: {})",
-            channel_id
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Guacd Handshake (new): Sending 'size' (channel_id: {})",
+                channel_id
+            );
+        }
 
         // **HANDSHAKE SIZE INSTRUCTION DETECTION**: Log for debugging (no Python signal)
         let size_instruction = GuacdInstruction::new("size".to_string(), size_parts.clone());
-        if size_parts.len() >= 2 {
+        if size_parts.len() >= 2 && unlikely!(should_log_connection(false)) {
             debug!("HANDSHAKE: Client initial size instruction (debug only - not sent to signal system) (channel_id: {}, conn_no: {}, layer: {}, width: {}, height: {}, dpi: {})", channel_id, conn_no, "0", size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), size_parts.get(2).map(|s| s.as_str()).unwrap_or("96"));
         }
 
@@ -1413,10 +1481,12 @@ where
         writer.flush().await?;
 
         let audio_mimetypes = parse_mimetypes(&audio_mimetypes_str_for_new);
-        debug!(
-            "Guacd Handshake (new): Sending 'audio' (channel_id: {})",
-            channel_id
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Guacd Handshake (new): Sending 'audio' (channel_id: {})",
+                channel_id
+            );
+        }
         writer
             .write_all(&GuacdParser::guacd_encode_instruction(
                 &GuacdInstruction::new("audio".to_string(), audio_mimetypes),
@@ -1425,10 +1495,12 @@ where
         writer.flush().await?;
 
         let video_mimetypes = parse_mimetypes(&video_mimetypes_str_for_new);
-        debug!(
-            "Guacd Handshake (new): Sending 'video' (channel_id: {})",
-            channel_id
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Guacd Handshake (new): Sending 'video' (channel_id: {})",
+                channel_id
+            );
+        }
         writer
             .write_all(&GuacdParser::guacd_encode_instruction(
                 &GuacdInstruction::new("video".to_string(), video_mimetypes),
@@ -1437,10 +1509,12 @@ where
         writer.flush().await?;
 
         let image_mimetypes = parse_mimetypes(&image_mimetypes_str_for_new);
-        debug!(
-            "Guacd Handshake (new): Sending 'image' (channel_id: {})",
-            channel_id
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Guacd Handshake (new): Sending 'image' (channel_id: {})",
+                channel_id
+            );
+        }
         writer
             .write_all(&GuacdParser::guacd_encode_instruction(
                 &GuacdInstruction::new("image".to_string(), image_mimetypes),
@@ -1474,11 +1548,13 @@ where
     }
 
     let connect_instruction = GuacdInstruction::new("connect".to_string(), connect_args.clone());
-    debug!(
-        "Guacd Handshake: Sending 'connect' (channel_id: {})",
-        channel_id
-    );
-    if unlikely!(crate::logger::is_verbose_logging()) {
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Guacd Handshake: Sending 'connect' (channel_id: {})",
+            channel_id
+        );
+    }
+    if unlikely!(should_log_connection(false)) {
         debug!(
             "Guacd Handshake: params (channel_id: {}, instruction: {:?})",
             channel_id, connect_instruction
@@ -1489,10 +1565,12 @@ where
         .await?;
     writer.flush().await?;
 
-    debug!(
-        "Guacd Handshake: Waiting for 'ready' (channel_id: {})",
-        channel_id
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "Guacd Handshake: Waiting for 'ready' (channel_id: {})",
+            channel_id
+        );
+    }
     let ready_instruction = read_expected_instruction_stateless(
         reader,
         &mut handshake_buffer,
@@ -1503,11 +1581,13 @@ where
     )
     .await?;
     if let Some(client_id_from_ready) = ready_instruction.args.first() {
-        debug!(
-            "Guacd handshake completed. (channel_id: {}, guacd_client_id: {})",
-            channel_id, client_id_from_ready
-        );
-    } else {
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Guacd handshake completed. (channel_id: {}, guacd_client_id: {})",
+                channel_id, client_id_from_ready
+            );
+        }
+    } else if unlikely!(should_log_connection(false)) {
         debug!(
             "Guacd handshake completed. No client ID received with 'ready'. (channel_id: {})",
             channel_id

@@ -1,3 +1,4 @@
+use crate::unlikely;
 use bytes::Bytes;
 #[cfg(test)]
 use futures::future::BoxFuture;
@@ -356,10 +357,12 @@ impl EventDrivenSender {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     // Log the actual error with frame size for debugging
-                    debug!(
-                        "WebRTC send failed (frame_size: {} bytes), queueing for retry. Error: {}",
-                        frame_len, e
-                    );
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "WebRTC send failed (frame_size: {} bytes), queueing for retry. Error: {}",
+                            frame_len, e
+                        );
+                    }
 
                     // CRITICAL FIX: Queue ALL send failures to prevent connection stalls
                     // On localhost burst traffic, errors happen fast and error messages vary
@@ -385,11 +388,13 @@ impl EventDrivenSender {
                 );
             } else if queue_size > 5000 && queue_size.is_multiple_of(500) {
                 // Log every 500 frames after 50%
-                debug!(
-                    "EventDrivenSender queue growing: {}/10000 frames ({:.1}% full)",
-                    queue_size,
-                    (queue_size as f64 / 10000.0) * 100.0
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "EventDrivenSender queue growing: {}/10000 frames ({:.1}% full)",
+                        queue_size,
+                        (queue_size as f64 / 10000.0) * 100.0
+                    );
+                }
             }
 
             pending.push_back(frame);

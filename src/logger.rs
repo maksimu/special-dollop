@@ -1,6 +1,10 @@
-use log::Level;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(not(feature = "python"))]
+use log::Level;
+
+#[cfg(not(feature = "python"))]
 use tracing_subscriber::EnvFilter;
 
 #[cfg(not(feature = "python"))]
@@ -12,6 +16,10 @@ use pyo3::{exceptions::PyRuntimeError, prelude::*};
 /// Global flag for verbose logging (gated detailed logs)
 /// Defaults to false for optimal performance - detailed logs only when explicitly enabled
 pub static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
+
+/// Global flag tracking if logger has been initialized
+/// Used to make initialize_logger() idempotent for Commander compatibility
+static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Check if verbose logging is enabled (optimized for false case)
 #[inline(always)]
@@ -59,6 +67,23 @@ impl From<InitializeLoggerError> for PyErr {
     }
 }
 
+/// Initialize logger for keeper-pam-webrtc-rs
+///
+/// # Arguments
+/// * `logger_name` - Logger name (for debug messages only)
+/// * `verbose` - Enable verbose-gated debug logs (controls `is_verbose_logging()`)
+/// * `level` - Log level (Python int: 10=DEBUG, 20=INFO, etc.)
+///             **NOTE**: In Python mode, this is IGNORED. Rust always passes all logs
+///             to Python at TRACE level, and Python's logger config controls filtering.
+///             Only used in standalone Rust mode.
+///
+/// # Python Integration
+/// When running in gateway (Python mode):
+/// - Rust passes ALL logs to Python at TRACE level
+/// - Python filters based on stdio_config.py logger configuration:
+///   - keeper_pam_webrtc_rs: DEBUG (if --debug) or INFO
+///   - webrtc_ice, webrtc_sctp, etc.: WARNING (suppresses spam)
+/// - Verbose-gated logs still controlled by `is_verbose_logging()` checks in Rust
 #[cfg_attr(feature = "python", pyfunction)]
 #[cfg_attr(feature = "python", pyo3(signature = (logger_name, verbose=None, level=20)))]
 pub fn initialize_logger(
@@ -67,48 +92,77 @@ pub fn initialize_logger(
     level: i32,
 ) -> Result<(), InitializeLoggerError> {
     let is_verbose = verbose.unwrap_or(false);
-    let rust_level = convert_py_level_to_tracing_level(level, is_verbose);
 
-    // Let Python handle all filtering - just set a permissive filter in Rust
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if is_verbose {
-            // When verbose, pass everything through at TRACE level
-            EnvFilter::new("trace")
-        } else {
-            // Use the requested level as the baseline, let Python do the rest
-            EnvFilter::new(rust_level.to_string().to_lowercase())
-        }
-    });
-
-    // Get the filter's string representation for logging *before* it's consumed
-    let filter_str = filter.to_string();
+    // IDEMPOTENT: If already initialized, just update verbose flag and return
+    // This makes Commander's repeated calls safe and efficient
+    if LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
+        set_verbose_logging(is_verbose);
+        log::debug!(
+            "Logger already initialized for '{}', updated verbose={}",
+            logger_name,
+            is_verbose
+        );
+        return Ok(());
+    }
 
     #[cfg(feature = "python")]
     {
-        // Initialize pyo3_log bridge (log crate -> Python)
-        match pyo3_log::try_init() {
-            Ok(_handle) => {
-                log::debug!("pyo3_log bridge initialized successfully");
-            }
-            Err(e) => {
-                if e.to_string().contains("already initialized") {
-                    log::debug!("pyo3_log bridge already initialized");
-                } else {
-                    return Err(InitializeLoggerError::Pyo3LogError(e.to_string()));
-                }
-            }
-        }
+        // Convert Python level to Rust LevelFilter
+        let level_filter = match level {
+            50 | 40 => log::LevelFilter::Error,
+            30 => log::LevelFilter::Warn,
+            20 => log::LevelFilter::Info,
+            10 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        };
 
-        // Since we've converted all tracing! macros to log! macros, we no longer need LogTracer
+        // Initialize pyo3_log with explicit filter
+        Python::attach(|py| -> Result<(), InitializeLoggerError> {
+            // Create the logger (returns Result<Logger, PyErr>)
+            let logger = pyo3_log::Logger::new(py, pyo3_log::Caching::Loggers)
+                .map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?;
 
-        log::debug!("Logging bridge setup complete");
+            // Now configure and install it (returns Result<ResetHandle, SetLoggerError>)
+            logger
+                .filter(level_filter)
+                .install()
+                .map_err(|e| InitializeLoggerError::SetGlobalDefaultError(e.to_string()))?;
 
-        // Set global verbose flag AFTER bridge is ready (for Python logging)
+            Ok(()) // Explicitly return Ok(()) after discarding the ResetHandle
+        })?;
+
+        log::debug!(
+            "pyo3_log bridge initialized for '{}' with level {:?}",
+            logger_name,
+            level_filter
+        );
+
         set_verbose_logging(is_verbose);
     }
 
     #[cfg(not(feature = "python"))]
     {
+        let rust_level = convert_py_level_to_tracing_level(level, is_verbose);
+
+        // Non-Python mode: Use EnvFilter to control what gets logged
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            if is_verbose {
+                EnvFilter::new("trace")
+            } else {
+                // Suppress webrtc dependency spam while allowing keeper_pam_webrtc_rs
+                let keeper_level = rust_level.to_string().to_lowercase();
+                let filter_str = format!(
+                    "{keeper_level},\
+                    webrtc=error,\
+                    webrtc_ice=error,\
+                    webrtc_mdns=error,\
+                    webrtc_dtls=error,\
+                    webrtc_sctp=error"
+                );
+                EnvFilter::new(&filter_str)
+            }
+        });
+
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(filter)
             .with_span_events(FmtSpan::CLOSE)
@@ -125,19 +179,15 @@ pub fn initialize_logger(
 
         // Set global verbose flag AFTER subscriber is ready (for non-Python logging)
         set_verbose_logging(is_verbose);
-    }
 
-    log::debug!(
-        "Logger initialized for '{}' with level {:?} (effective filter: {})",
-        logger_name,
-        rust_level,
-        filter_str
-    );
+        log::debug!("Logger initialized for '{}'", logger_name);
+    }
 
     Ok(())
 }
 
 #[inline]
+#[cfg(not(feature = "python"))] // Only compiled in standalone mode (not used in Python builds)
 fn convert_py_level_to_tracing_level(level: i32, verbose: bool) -> Level {
     if verbose {
         return Level::Trace;

@@ -9,12 +9,13 @@ use crate::models::{
 use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
 use crate::tube_protocol::{try_parse_frame, CloseConnectionReason, ControlMessage, Frame};
+use crate::unlikely;
 use crate::webrtc_data_channel::{WebRTCDataChannel, STANDARD_BUFFER_THRESHOLD};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
 use std::collections::HashMap;
@@ -163,10 +164,12 @@ impl Channel {
             client_version,
         } = params;
         debug!("Channel::new called (channel_id: {})", channel_id);
-        trace!(
-            "Initial protocol_settings received by Channel::new (channel_id: {})",
-            channel_id
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Initial protocol_settings received by Channel::new (channel_id: {})",
+                channel_id
+            );
+        }
 
         let (server_conn_tx, server_conn_rx) = mpsc::channel(32);
         let (conn_closed_tx, conn_closed_rx) = mpsc::unbounded_channel::<(u32, String)>();
@@ -198,7 +201,9 @@ impl Channel {
                             if let Some(guacd_dedicated_settings_val) =
                                 protocol_settings.get("guacd")
                             {
-                                trace!("Found 'guacd' block in protocol_settings: {:?} (channel_id: {})", guacd_dedicated_settings_val, channel_id);
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!("Found 'guacd' block in protocol_settings: {:?} (channel_id: {})", guacd_dedicated_settings_val, channel_id);
+                                }
                                 if let JsonValue::Object(guacd_map) = guacd_dedicated_settings_val {
                                     guacd_host_setting = guacd_map
                                         .get("guacd_host")
@@ -215,8 +220,8 @@ impl Channel {
                                         channel_id
                                     );
                                 }
-                            } else {
-                                trace!("No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults. (channel_id: {})", channel_id);
+                            } else if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("No dedicated 'guacd' block found in protocol_settings. Guacd server host/port might come from guacd_params or defaults. (channel_id: {})", channel_id);
                             }
 
                             if let Some(guacd_params_json_val) =
@@ -226,7 +231,9 @@ impl Channel {
                                     "Found 'guacd_params' in protocol_settings. (channel_id: {})",
                                     channel_id
                                 );
-                                trace!("Raw guacd_params value for direct processing. (channel_id: {}, guacd_params_value: {:?})", channel_id, guacd_params_json_val);
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!("Raw guacd_params value for direct processing. (channel_id: {}, guacd_params_value: {:?})", channel_id, guacd_params_json_val);
+                                }
 
                                 if let JsonValue::Object(map) = guacd_params_json_val {
                                     temp_initial_guacd_params_map = map
@@ -430,16 +437,19 @@ impl Channel {
                 "Found 'connect_as_settings' in protocol_settings. (channel_id: {})",
                 channel_id
             );
-            trace!(
-                "Raw connect_as_settings value. (channel_id: {}, cas_value: {:?})",
-                channel_id,
-                connect_as_settings_val
-            );
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Raw connect_as_settings value. (channel_id: {}, cas_value: {:?})",
+                    channel_id, connect_as_settings_val
+                );
+            }
             match serde_json::from_value::<ConnectAsSettings>(connect_as_settings_val.clone()) {
                 Ok(parsed_settings) => {
                     final_connect_as_settings = parsed_settings;
                     debug!("Successfully deserialized connect_as_settings into ConnectAsSettings struct. (channel_id: {})", channel_id);
-                    trace!("Final connect_as_settings. (channel_id: {}, final_connect_as_settings: {:?})", channel_id, final_connect_as_settings);
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("Final connect_as_settings. (channel_id: {}, final_connect_as_settings: {:?})", channel_id, final_connect_as_settings);
+                    }
                 }
                 Err(e) => {
                     error!("CRITICAL: Failed to deserialize connect_as_settings: {}. Value was: {:?} (channel_id: {})", e, connect_as_settings_val, channel_id);
@@ -515,7 +525,7 @@ impl Channel {
         while !self.should_exit.load(std::sync::atomic::Ordering::Relaxed) {
             // Process any complete frames in the buffer
             while let Some(frame) = try_parse_frame(&mut buf) {
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("Received frame from WebRTC (channel_id: {}, connection_no: {}, payload_size: {})", self.channel_id, frame.connection_no, frame.payload.len());
                 }
 
@@ -533,7 +543,7 @@ impl Channel {
                 biased;
                 maybe_conn = async { server_conn_rx.as_mut()?.recv().await }, if server_conn_rx.is_some() => {
                     if let Some((conn_no, writer, task)) = maybe_conn {
-                        if tracing::enabled!(tracing::Level::DEBUG) {
+                        if unlikely!(crate::logger::is_verbose_logging()) {
                             debug!("Registering connection from server (channel_id: {})", self.channel_id);
                         }
 
@@ -563,16 +573,16 @@ impl Channel {
                 maybe_chunk = self.rx_from_dc.recv() => {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
-                            if tracing::enabled!(tracing::Level::DEBUG) {
+                            if unlikely!(crate::logger::is_verbose_logging()) {
                                 debug!("Received data from WebRTC (channel_id: {}, bytes_received: {})", self.channel_id, chunk.len());
 
-                                if !chunk.is_empty() {
-                                    trace!("First few bytes of received data (channel_id: {}, first_bytes: {:?})", self.channel_id, &chunk[..std::cmp::min(20, chunk.len())]);
+                                if !chunk.is_empty() && unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!("First few bytes of received data (channel_id: {}, first_bytes: {:?})", self.channel_id, &chunk[..std::cmp::min(20, chunk.len())]);
                                 }
                             }
 
                             buf.extend_from_slice(&chunk);
-                            if tracing::enabled!(tracing::Level::DEBUG) {
+                            if unlikely!(crate::logger::is_verbose_logging()) {
                                 debug!("Buffer size after adding chunk (channel_id: {}, buffer_size: {})", self.channel_id, buf.len());
                             }
 
@@ -680,7 +690,7 @@ impl Channel {
                 if ping_conn_no == 0 {
                     let mut sent_time = self.channel_ping_sent_time.lock().await;
                     *sent_time = Some(crate::tube_protocol::now_ms());
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
                             "Channel({}): Sent channel PING (conn_no=0), recorded send time.",
                             self.channel_id
@@ -691,14 +701,15 @@ impl Channel {
                 // Convention: empty data for Ping implies channel ping
                 let mut sent_time = self.channel_ping_sent_time.lock().await;
                 *sent_time = Some(crate::tube_protocol::now_ms());
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("Channel({}): Sent channel PING (conn_no=0, empty payload convention), recorded send time.", self.channel_id);
                 }
             }
         }
 
         let buffered_amount = self.webrtc.buffered_amount().await;
-        if buffered_amount >= STANDARD_BUFFER_THRESHOLD && tracing::enabled!(tracing::Level::DEBUG)
+        if buffered_amount >= STANDARD_BUFFER_THRESHOLD
+            && unlikely!(crate::logger::is_verbose_logging())
         {
             debug!(
                 "Control message buffer full, but sending control message anyway (channel_id: {})",
@@ -1177,6 +1188,7 @@ impl Drop for Channel {
         let channel_id = self.channel_id.clone();
         let conns_clone = Arc::clone(&self.conns); // Clone Arc for use in the spawned task
         let buffer_pool_clone = self.buffer_pool.clone();
+        let active_protocol = self.active_protocol;
 
         runtime.spawn(async move {
             // Collect connection numbers from DashMap
@@ -1199,7 +1211,38 @@ impl Drop for Channel {
                 }
                 buffer_pool_clone.release(close_buffer);
 
-                // Shutdown the connection gracefully
+                // Send graceful shutdown message before aborting tasks
+                if let Some(conn_ref) = conns_clone.get(&conn_no) {
+                    if active_protocol == ActiveProtocol::Guacd {
+                        // For guacd: send disconnect instruction
+                        let disconnect_instruction = crate::channel::guacd_parser::GuacdInstruction::new(
+                            "disconnect".to_string(),
+                            vec![]
+                        );
+                        let disconnect_bytes = crate::channel::guacd_parser::GuacdParser::guacd_encode_instruction(
+                            &disconnect_instruction
+                        );
+                        let disconnect_message = crate::models::ConnectionMessage::Data(disconnect_bytes);
+
+                        if let Err(e) = conn_ref.data_tx.send(disconnect_message) {
+                            debug!("Failed to send disconnect to guacd in drop (channel_id: {}, error: {})", channel_id, e);
+                        } else {
+                            debug!("Sent disconnect instruction to guacd (channel_id: {}, conn_no: {})", channel_id, conn_no);
+                        }
+                    } else {
+                        // For port forwarding/SOCKS5: send EOF for graceful TCP shutdown
+                        if let Err(e) = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
+                            debug!("Failed to send EOF in drop (channel_id: {}, error: {})", channel_id, e);
+                        } else {
+                            debug!("Sent EOF for graceful shutdown (channel_id: {}, conn_no: {}, protocol: {:?})", channel_id, conn_no, active_protocol);
+                        }
+                    }
+
+                    // Brief delay to allow shutdown message to be written before aborting tasks
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+
+                // Shutdown the connection (now aborts tasks immediately)
                 if let Some((_, conn)) = conns_clone.remove(&conn_no) {
                     if let Err(e) = conn.shutdown().await {
                         debug!("Error shutting down connection in drop (channel_id: {}, error: {})", channel_id, e);

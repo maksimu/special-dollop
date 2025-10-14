@@ -357,7 +357,7 @@ impl Tube {
                         debug!("ICE connection established (tube_id: {})", tube_id_for_ice_log);
 
                         // Enhanced candidate analysis at trace level for TURN detection
-                        if tracing::enabled!(tracing::Level::TRACE) {
+                        if unlikely!(crate::logger::is_verbose_logging()) {
                             // Helper function to parse candidate type from SDP
                             fn parse_candidate_type_from_sdp(sdp: &str) -> Option<String> {
                                 for line in sdp.lines() {

@@ -1,8 +1,9 @@
 use crate::debug_hot_path;
 use crate::runtime::get_runtime;
+use crate::unlikely;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::core::Channel;
@@ -192,7 +193,7 @@ impl Channel {
             CloseConnectionReason::Normal
         };
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Closing connection {} (reason: {:?}) (channel_id: {})",
                 target_connection_no, reason, self.channel_id
@@ -235,7 +236,7 @@ impl Channel {
         let mut cursor = std::io::Cursor::new(data);
         let target_connection_no = cursor.get_u32(); // Consumes first 4 bytes
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if unlikely!(crate::logger::is_verbose_logging()) {
             debug!("Endpoint Received OpenConnection request (channel_id: {}, conn_no: {}, payload_len: {}, server_mode: {}, active_protocol: {:?})", self.channel_id, target_connection_no, cursor.remaining(), self.server_mode, self.active_protocol);
         }
 
@@ -404,9 +405,11 @@ impl Channel {
         let guacd_params_for_log = format!("{:?}", *guacd_params_locked);
         drop(guacd_params_locked);
 
-        trace!("Channel state for OpenConnection (after potential ConnectAs) (channel_id: {}, conn_no: {}, effective_guacd_host: {:?}, effective_guacd_port: {:?}, connect_as_settings: {:?}, guacd_params_map: {})",
-            self.channel_id, target_connection_no, effective_guacd_host, effective_guacd_port, self.connect_as_settings, guacd_params_for_log
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("Channel state for OpenConnection (after potential ConnectAs) (channel_id: {}, conn_no: {}, effective_guacd_host: {:?}, effective_guacd_port: {:?}, connect_as_settings: {:?}, guacd_params_map: {})",
+                self.channel_id, target_connection_no, effective_guacd_host, effective_guacd_port, self.connect_as_settings, guacd_params_for_log
+            );
+        }
 
         if self.server_mode && self.active_protocol == super::types::ActiveProtocol::PortForward {
             debug!("Server-mode PortForward received OpenConnection for conn_no {}. Acknowledging with ConnectionOpened. (channel_id: {})", target_connection_no, self.channel_id);
@@ -639,7 +642,7 @@ impl Channel {
     async fn handle_ping(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
             // Basic ping without connection info
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
                     "Endpoint Received basic Ping request (channel_id: {})",
                     self.channel_id
@@ -677,13 +680,13 @@ impl Channel {
         // Handle timing information if present
         if data.len() > CONN_NO_LEN {
             response.extend_from_slice(&data[CONN_NO_LEN..]);
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
                     "Endpoint Received ACK request with timing data for {} (channel_id: {})",
                     conn_no, self.channel_id
                 );
             }
-        } else if tracing::enabled!(tracing::Level::DEBUG) {
+        } else if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Received ACK request for {} (channel_id: {})",
                 conn_no, self.channel_id
@@ -701,7 +704,7 @@ impl Channel {
     /// Handle a Pong control message
     async fn handle_pong(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < CONN_NO_LEN {
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
                     "Endpoint Received basic pong (channel_id: {})",
                     self.channel_id
@@ -717,16 +720,16 @@ impl Channel {
         // Simplified pong handling - no complex stats tracking
         if let Some(_conn_ref) = self.conns.get(&conn_no) {
             if conn_no == 0 {
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("Endpoint Received pong (channel_id: {})", self.channel_id);
                 }
-            } else if tracing::enabled!(tracing::Level::DEBUG) {
+            } else if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
                     "Endpoint Received ACK response for {} (channel_id: {})",
                     conn_no, self.channel_id
                 );
             }
-        } else if tracing::enabled!(tracing::Level::DEBUG) {
+        } else if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Received pong for unknown connection {} (channel_id: {})",
                 conn_no, self.channel_id
@@ -750,7 +753,7 @@ impl Channel {
 
         // Check if the connection exists and handle EOF
         if let Some(conn_ref) = self.conns.get(&conn_no) {
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!("Endpoint Received EOF from remote for connection {}, signaling backend to shutdown write side (channel_id: {})", conn_no, self.channel_id);
             }
 
@@ -758,13 +761,13 @@ impl Channel {
             // Send EOF signal to the backend task which will call backend.shutdown() (perfect for RDP!)
             match conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
                 Ok(_) => {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!("Endpoint Successfully sent EOF signal to backend for conn {} (channel_id: {})", conn_no, self.channel_id);
                     }
                 }
                 Err(_) => {
                     // Channel is closed, connection is already dead
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!("Endpoint EOF signal failed, connection {} already closed (channel_id: {})", conn_no, self.channel_id);
                     }
                 }
@@ -784,7 +787,7 @@ impl Channel {
         // This is called when we receive a ConnectionOpened control message from WebRTC
         // In server_mode, this completes the connection setup
         if !self.server_mode {
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
                     "Endpoint Received ConnectionOpened in client mode (ignoring) (channel_id: {})",
                     self.channel_id
@@ -798,7 +801,7 @@ impl Channel {
         }
 
         let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Starting reader for connection {} (channel_id: {})",
                 connection_no, self.channel_id
@@ -809,14 +812,14 @@ impl Channel {
         if let Some(conn_ref) = self.conns.get(&connection_no) {
             // If it's a SOCKS5 connection, send a success response to the client
             if self.active_protocol == super::types::ActiveProtocol::Socks5 {
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!(
                         "SOCKS5 Connection opened (channel_id: {}, conn_no: {})",
                         self.channel_id, connection_no
                     );
                 }
 
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("Endpoint Sending SOCKS5 success response to connection {} (channel_id: {})", connection_no, self.channel_id);
                 }
 
@@ -827,7 +830,7 @@ impl Channel {
                     .send(crate::models::ConnectionMessage::Data(response_bytes))
                 {
                     Ok(_) => {
-                        if tracing::enabled!(tracing::Level::DEBUG) {
+                        if unlikely!(crate::logger::is_verbose_logging()) {
                             debug!("Endpoint SOCKS5 success response queued for connection {} (channel_id: {})", connection_no, self.channel_id);
                         }
                     }

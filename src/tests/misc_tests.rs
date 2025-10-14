@@ -1,6 +1,5 @@
 //! Miscellaneous tests
 use crate::logger;
-use crate::logger::InitializeLoggerError;
 use log::{debug, error, info, trace, warn};
 
 #[test]
@@ -26,51 +25,32 @@ fn test_logger_enhancements() {
     warn!("Test warning message");
     error!("Test error message");
 
-    // Test that we can call initialize multiple times without error (should always fail)
+    // Test idempotent initialization (should succeed and update verbose flag)
     let reinit_result = logger::initialize_logger(test_module_name, Some(true), 10);
     assert!(
-        reinit_result.is_err(),
-        "Logger re-initialization should always fail"
+        reinit_result.is_ok(),
+        "Logger re-initialization should be idempotent (succeed without re-initializing)"
     );
-    if let Err(InitializeLoggerError::SetGlobalDefaultError(_)) = reinit_result {
-        println!("Re-initialization correctly failed as expected");
-    } else {
-        panic!(
-            "Logger re-initialization failed with unexpected error: {:?}",
-            reinit_result
-        );
-    }
+    println!("Re-initialization succeeded (idempotent behavior) - verbose flag updated");
 
-    // Test with a different module name - this should also fail as a logger is already set
+    // Test with a different module name - should be idempotent (succeed)
     let other_module = "other_module";
     let other_init = logger::initialize_logger(other_module, Some(true), 10);
     assert!(
-        other_init.is_err(),
-        "Logger initialization with different module should always fail"
+        other_init.is_ok(),
+        "Logger initialization with different module should be idempotent (succeed)"
     );
-    if let Err(InitializeLoggerError::SetGlobalDefaultError(_)) = other_init {
-        println!("Different module initialization correctly failed as expected");
-    } else {
-        panic!(
-            "Logger initialization with different module failed with unexpected error: {:?}",
-            other_init
-        );
-    }
+    println!("Different module initialization succeeded (idempotent)");
 
-    // Test with different parameters - this should also fail
-    let init_trace = logger::initialize_logger(test_module_name, Some(true), 10);
+    // Test with different parameters - should be idempotent (succeed, params ignored)
+    let init_trace = logger::initialize_logger(test_module_name, Some(false), 20);
     assert!(
-        init_trace.is_err(),
-        "Logger initialization with different params should always fail"
+        init_trace.is_ok(),
+        "Logger initialization with different params should be idempotent (succeed)"
     );
-    if let Err(InitializeLoggerError::SetGlobalDefaultError(_)) = init_trace {
-        println!("Different params initialization correctly failed as expected");
-    } else {
-        panic!(
-            "Logger initialization with different params failed with unexpected error: {:?}",
-            init_trace
-        );
-    }
+    println!(
+        "Different params initialization succeeded (idempotent, verbose flag updated to false)"
+    );
 
     // Create and log some messages
     trace!("This is a trace message that may not be shown");

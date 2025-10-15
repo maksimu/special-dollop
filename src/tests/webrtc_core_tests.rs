@@ -235,8 +235,8 @@ fn test_resource_limits_configuration() {
     assert!(limits.ice_keepalive_enabled, "Keepalive should be enabled");
     assert_eq!(
         limits.ice_keepalive_interval,
-        Duration::from_secs(300),
-        "Keepalive interval should be 5 minutes"
+        Duration::from_secs(60),
+        "Keepalive interval should be 60s to prevent NAT timeout failures (was 300s)"
     );
     assert_eq!(
         limits.session_timeout,

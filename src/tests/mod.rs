@@ -16,7 +16,11 @@ mod guacd_parser_tests;
 #[cfg(test)]
 mod misc_tests;
 #[cfg(test)]
+mod nat_keepalive_tests;
+#[cfg(test)]
 mod protocol_tests;
+#[cfg(test)]
+mod registry_actor_tests;
 #[cfg(test)]
 mod size_instruction_integration_tests;
 #[cfg(test)]

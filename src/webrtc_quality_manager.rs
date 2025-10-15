@@ -1,5 +1,6 @@
+use crate::unlikely;
 use crate::webrtc_errors::WebRTCResult;
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -360,16 +361,18 @@ impl BitrateController {
 
         *last_adjustment = now;
 
-        trace!(
-            "Bitrate adjusted: {} -> {} bps ({})",
-            current_bitrate,
-            new_bitrate,
-            if new_bitrate > current_bitrate {
-                "increased"
-            } else {
-                "decreased"
-            }
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Bitrate adjusted: {} -> {} bps ({})",
+                current_bitrate,
+                new_bitrate,
+                if new_bitrate > current_bitrate {
+                    "increased"
+                } else {
+                    "decreased"
+                }
+            );
+        }
 
         true
     }

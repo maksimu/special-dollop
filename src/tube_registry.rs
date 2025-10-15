@@ -1,17 +1,19 @@
 use crate::resource_manager::RESOURCE_MANAGER;
 use crate::router_helpers::get_relay_access_creds;
+use crate::tube_and_channel_helpers::TubeStatus;
 use crate::tube_protocol::CloseConnectionReason;
 use crate::Tube;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use log::{debug, error, info, trace, warn};
+use dashmap::DashMap;
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
-#[cfg(test)]
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::oneshot;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
@@ -28,279 +30,276 @@ pub struct SignalMessage {
     pub is_ok: Option<bool>,        // Success/failure indicator
 }
 
-// Global registry for all tubes - using Lazy with explicit thread safety
-pub(crate) static REGISTRY: Lazy<RwLock<TubeRegistry>> = Lazy::new(|| {
-    debug!("Initializing global tube registry");
-    RwLock::new(TubeRegistry::new())
-});
+// ============================================================================
+// ACTOR MODEL FOR COORDINATED REGISTRY OPERATIONS
+// ============================================================================
 
-// Unified registry for managing tubes with different lookup methods
-pub(crate) struct TubeRegistry {
-    // Primary storage of tubes by their ID
-    pub(crate) tubes_by_id: HashMap<String, Arc<Tube>>,
-    // Mapping of conversation IDs to tube IDs for lookup
-    pub(crate) conversation_mappings: HashMap<String, String>,
-    // Track whether we're in server mode (creates a server) or client mode (connects to servers)
-    pub(crate) server_mode: bool,
-    // Mapping of tube IDs to signaling channels
-    pub(crate) signal_channels: HashMap<String, UnboundedSender<SignalMessage>>,
+/// Registry metrics for observability and backpressure
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields are used in Python bindings
+pub struct RegistryMetrics {
+    pub active_creates: usize,
+    pub max_concurrent: usize,
+    pub command_queue_depth: usize,
+    pub avg_create_time: Duration,
+    pub total_creates: u64,
+    pub total_failures: u64,
 }
 
-impl TubeRegistry {
-    pub(crate) fn new() -> Self {
-        debug!("TubeRegistry::new() called");
+/// Request structure for tube creation
+#[derive(Debug)]
+pub struct CreateTubeRequest {
+    pub conversation_id: String,
+    pub settings: HashMap<String, serde_json::Value>,
+    pub initial_offer_sdp: Option<String>,
+    pub trickle_ice: bool,
+    pub callback_token: String,
+    pub krelay_server: String,
+    pub ksm_config: Option<String>,
+    pub client_version: String,
+    pub signal_sender: UnboundedSender<SignalMessage>,
+    pub tube_id: Option<String>,
+}
+
+/// Commands for the registry actor
+#[allow(dead_code)] // All variants are used in actor event loop and public API
+pub enum RegistryCommand {
+    CreateTube {
+        req: CreateTubeRequest,
+        resp: oneshot::Sender<Result<HashMap<String, String>>>,
+    },
+    // NOTE: GetTube/GetByConversation DELETED (use get_tube_fast() instead - lock-free!)
+    CloseTube {
+        tube_id: String,
+        reason: Option<CloseConnectionReason>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    SetServerMode {
+        server_mode: bool,
+    },
+    AssociateConversation {
+        tube_id: String,
+        conversation_id: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
+    GetMetrics {
+        resp: oneshot::Sender<RegistryMetrics>,
+    },
+    GetServerMode {
+        resp: oneshot::Sender<bool>,
+    },
+}
+
+/// Actor that manages tube registry with backpressure and coordination
+/// RAII Pattern: Tubes own their resources (signal_sender, metrics_handle, keepalive_task)
+/// Actor is just for coordination and storage - minimal state!
+struct RegistryActor {
+    /// Lock-free tube storage (shared with handle)
+    tubes: Arc<DashMap<String, Arc<Tube>>>,
+    /// Lock-free conversation mapping (reverse index: conversation_id → tube_id)
+    conversations: Arc<DashMap<String, String>>,
+    /// Server mode flag
+    server_mode: bool,
+    /// Command receiver
+    command_rx: mpsc::UnboundedReceiver<RegistryCommand>,
+    /// Admission control
+    active_creates: Arc<AtomicUsize>,
+    max_concurrent_creates: usize,
+    /// Metrics
+    total_creates: u64,
+    total_failures: u64,
+    create_times: Vec<Duration>,
+}
+
+impl RegistryActor {
+    fn new(command_rx: mpsc::UnboundedReceiver<RegistryCommand>, max_concurrent: usize) -> Self {
         Self {
-            tubes_by_id: HashMap::new(),
-            conversation_mappings: HashMap::new(),
-            server_mode: false, // Default to client mode
-            signal_channels: HashMap::new(),
+            tubes: Arc::new(DashMap::new()),
+            conversations: Arc::new(DashMap::new()),
+            server_mode: false,
+            command_rx,
+            active_creates: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_creates: max_concurrent,
+            total_creates: 0,
+            total_failures: 0,
+            create_times: Vec::with_capacity(100),
         }
     }
 
-    // Register a signal channel for a tube
-    #[cfg(test)]
-    pub(crate) fn register_signal_channel(
-        &mut self,
-        tube_id: &str,
-    ) -> UnboundedReceiver<SignalMessage> {
-        let (sender, receiver) = unbounded_channel::<SignalMessage>();
-        self.signal_channels.insert(tube_id.to_string(), sender);
-        receiver
-    }
-
-    // Remove a signal channel
-    pub(crate) fn remove_signal_channel(&mut self, tube_id: &str) {
-        self.signal_channels.remove(tube_id);
-    }
-
-    // Get a signal channel sender
-    #[cfg(test)]
-    pub(crate) fn get_signal_channel(
-        &self,
-        tube_id: &str,
-    ) -> Option<UnboundedSender<SignalMessage>> {
-        self.signal_channels.get(tube_id).cloned()
-    }
-
-    // Send a message to the signal channel for a tube
-    #[cfg(test)]
-    pub(crate) fn send_signal(&self, message: SignalMessage) -> Result<()> {
-        if let Some(sender) = self.signal_channels.get(&message.tube_id) {
-            sender
-                .send(message)
-                .map_err(|e| anyhow!("Failed to send signal, message was: {:?}", e.0))?;
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "No signal channel found for tube: {}",
-                message.tube_id
-            ))
-        }
-    }
-
-    // Add a tube to the registry
-    pub(crate) fn add_tube(&mut self, tube: Arc<Tube>) {
-        let id = tube.id();
-        debug!("TubeRegistry::add_tube - Adding tube (tube_id: {})", id);
-        self.tubes_by_id.insert(id.clone(), tube);
-    }
-
-    // Set server mode
-    pub(crate) fn set_server_mode(&mut self, server_mode: bool) {
-        self.server_mode = server_mode;
-    }
-
-    // Get server mode
-    pub(crate) fn is_server_mode(&self) -> bool {
-        self.server_mode
-    }
-
-    // Remove a tube from the registry
-    pub(crate) fn remove_tube(&mut self, tube_id: &str) {
-        self.tubes_by_id.remove(tube_id);
-
-        // Remove the signal channel
-        self.remove_signal_channel(tube_id);
-
-        // Also remove any conversation mappings pointing to this tube
-        self.conversation_mappings.retain(|_, tid| tid != tube_id);
-    }
-
-    pub(crate) fn get_by_tube_id(&self, tube_id: &str) -> Option<Arc<Tube>> {
-        debug!(
-            "TubeRegistry::get_by_tube_id - Looking for tube: {}",
-            tube_id
+    /// Main actor event loop
+    async fn run(mut self) {
+        info!(
+            "Registry actor started (max_concurrent: {})",
+            self.max_concurrent_creates
         );
-        match self.tubes_by_id.get(tube_id) {
-            Some(tube) => {
-                debug!("Found tube with ID: {}", tube_id);
-                Some(tube.clone())
-            }
-            None => {
-                debug!("Tube with ID {} not found in registry", tube_id);
-                None
-            }
-        }
-    }
 
-    // Get a tube by a conversation ID
-    pub(crate) fn get_by_conversation_id(&self, conversation_id: &str) -> Option<Arc<Tube>> {
-        if let Some(tube_id) = self.conversation_mappings.get(conversation_id) {
-            self.tubes_by_id.get(tube_id).cloned()
-        } else {
-            None
-        }
-    }
+        while let Some(cmd) = self.command_rx.recv().await {
+            match cmd {
+                RegistryCommand::CreateTube { req, resp } => {
+                    let active = self.active_creates.load(Ordering::Acquire);
 
-    // Associate a conversation ID with a tube
-    pub(crate) fn associate_conversation(
-        &mut self,
-        tube_id: &str,
-        conversation_id: &str,
-    ) -> Result<()> {
-        // Validate tube exists with single lookup instead of contains_key + potential second lookup
-        self.tubes_by_id
-            .get(tube_id)
-            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
-
-        self.conversation_mappings
-            .insert(conversation_id.to_string(), tube_id.to_string());
-        Ok(())
-    }
-
-    // Get all tube IDs
-    pub(crate) fn all_tube_ids_sync(&self) -> Vec<String> {
-        self.tubes_by_id.keys().cloned().collect()
-    }
-
-    // Find tubes by partial match of tube ID or conversation ID
-    pub(crate) fn find_tubes(&self, search_term: &str) -> Vec<String> {
-        let mut results = Vec::new();
-
-        // Search in tube IDs
-        for id in self.tubes_by_id.keys() {
-            if id.contains(search_term) {
-                results.push(id.clone());
-            }
-        }
-
-        // Search in conversation IDs
-        for (conv_id, tube_id) in &self.conversation_mappings {
-            if conv_id.contains(search_term) {
-                if let Some(tube) = self.tubes_by_id.get(tube_id) {
-                    // Only add if not already in results
-                    if !results.iter().any(|t| t == &tube.id()) {
-                        results.push(tube_id.clone());
+                    // BACKPRESSURE: Reject if overloaded
+                    if active >= self.max_concurrent_creates {
+                        warn!(
+                            "Registry at capacity: {}/{} creates active - rejecting new request",
+                            active, self.max_concurrent_creates
+                        );
+                        let _ = resp.send(Err(anyhow!(
+                            "System overloaded: {} active creates (max {}). Please retry with backoff.",
+                            active, self.max_concurrent_creates
+                        )));
+                        self.total_failures += 1;
+                        continue;
                     }
+
+                    // Accept and process
+                    self.active_creates.fetch_add(1, Ordering::Release);
+                    let start = Instant::now();
+
+                    let result = self.handle_create_tube(req).await;
+
+                    let duration = start.elapsed();
+                    self.active_creates.fetch_sub(1, Ordering::Release);
+                    self.total_creates += 1;
+
+                    // Track timing
+                    if self.create_times.len() >= 100 {
+                        self.create_times.remove(0);
+                    }
+                    self.create_times.push(duration);
+
+                    if result.is_err() {
+                        self.total_failures += 1;
+                    }
+
+                    let _ = resp.send(result);
+                }
+
+                // NOTE: GetTube/GetByConversation removed - use get_tube_fast() instead (lock-free!)
+                RegistryCommand::CloseTube {
+                    tube_id,
+                    reason,
+                    resp,
+                } => {
+                    let result = self.handle_close_tube(&tube_id, reason).await;
+                    let _ = resp.send(result);
+                }
+
+                RegistryCommand::SetServerMode { server_mode } => {
+                    self.server_mode = server_mode;
+                }
+
+                RegistryCommand::AssociateConversation {
+                    tube_id,
+                    conversation_id,
+                    resp,
+                } => {
+                    self.conversations.insert(conversation_id, tube_id);
+                    let _ = resp.send(Ok(()));
+                }
+
+                RegistryCommand::GetMetrics { resp } => {
+                    let avg_time = if !self.create_times.is_empty() {
+                        let sum: Duration = self.create_times.iter().sum();
+                        sum / self.create_times.len() as u32
+                    } else {
+                        Duration::from_secs(0)
+                    };
+
+                    let metrics = RegistryMetrics {
+                        active_creates: self.active_creates.load(Ordering::Acquire),
+                        max_concurrent: self.max_concurrent_creates,
+                        command_queue_depth: 0, // Approximation, hard to get exact
+                        avg_create_time: avg_time,
+                        total_creates: self.total_creates,
+                        total_failures: self.total_failures,
+                    };
+                    let _ = resp.send(metrics);
+                }
+
+                RegistryCommand::GetServerMode { resp } => {
+                    let _ = resp.send(self.server_mode);
                 }
             }
         }
 
-        results
+        warn!("Registry actor event loop terminated");
     }
 
-    /// get all conversations from a tube id
-    #[allow(dead_code)]
-    pub(crate) fn tube_id_from_conversation_id(&self, conversation_id: &str) -> Option<&String> {
-        self.conversation_mappings.get(conversation_id)
-    }
-
-    /// get all conversation ids by tube id
-    #[allow(dead_code)]
-    pub(crate) fn conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<&String> {
-        let mut results = Vec::new();
-        // Search in conversation IDs
-        for (conv_id, con_tube_id) in &self.conversation_mappings {
-            if tube_id == con_tube_id {
-                // Only add if not already in results
-                if !results.contains(&conv_id) {
-                    results.push(conv_id);
-                }
-            }
-        }
-        results
-    }
-
-    /// Create a tube with WebRTC connection and ICE configuration
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_tube(
+    /// Handle tube creation - all logic outside any locks
+    async fn handle_create_tube(
         &mut self,
-        conversation_id: &str,
-        settings: HashMap<String, serde_json::Value>,
-        initial_offer_sdp: Option<String>,
-        trickle_ice: bool,
-        callback_token: &str,
-        krelay_server: &str,
-        ksm_config: Option<&str>,
-        client_version: &str,
-        signal_sender: UnboundedSender<SignalMessage>,
-        tube_id: Option<String>,
+        req: CreateTubeRequest,
     ) -> Result<HashMap<String, String>> {
+        let conversation_id = &req.conversation_id;
+        let tube_id_opt = req.tube_id.clone();
+
         // Check if tube_id is provided and already exists
-        if let Some(ref provided_tube_id) = tube_id {
-            if let Some(existing_tube) = self.get_by_tube_id(provided_tube_id) {
-                // Tube already exists, use it
+        if let Some(ref provided_tube_id) = tube_id_opt {
+            if let Some(existing_tube) = self.tubes.get(provided_tube_id).map(|e| e.value().clone())
+            {
                 info!(
                     "Using existing tube for conversation (tube_id: {}, conversation_id: {})",
                     provided_tube_id, conversation_id
                 );
 
-                // Associate this conversation_id with the existing tube
-                self.associate_conversation(provided_tube_id, conversation_id)?;
+                // Associate conversation
+                self.conversations
+                    .insert(conversation_id.to_string(), provided_tube_id.clone());
 
-                // Register the signal channel for this tube
-                self.signal_channels
-                    .insert(provided_tube_id.clone(), signal_sender);
+                // NOTE: No need to register signal channel - Tube owns it! (RAII)
 
-                // Create a new data channel for this conversation on the existing tube
-                let ksm_config_for_channel = ksm_config.unwrap_or("").to_string();
+                // Create data channel on existing tube
+                let ksm_config_for_channel = req.ksm_config.clone().unwrap_or_default();
                 match existing_tube
                     .create_data_channel(
                         conversation_id,
                         ksm_config_for_channel.clone(),
-                        callback_token.to_string(),
-                        client_version,
+                        req.callback_token.clone(),
+                        &req.client_version,
                     )
                     .await
                 {
                     Ok(data_channel) => {
-                        // Create the logical channel handler
                         match existing_tube
                             .create_channel(
                                 conversation_id,
                                 &data_channel,
                                 None,
-                                settings.clone(),
-                                Some(callback_token.to_string()),
+                                req.settings.clone(),
+                                Some(req.callback_token.clone()),
                                 Some(ksm_config_for_channel),
-                                Some(client_version.to_string()),
+                                Some(req.client_version.clone()),
                             )
                             .await
                         {
                             Ok(_) => {
-                                info!("Successfully created new channel on existing tube (tube_id: {}, conversation_id: {})", provided_tube_id, conversation_id);
+                                info!("Successfully created new channel on existing tube (tube_id: {}, conversation_id: {})",
+                                      provided_tube_id, conversation_id);
                             }
                             Err(e) => {
-                                warn!("Failed to create logical channel on existing tube: {} (tube_id: {}, conversation_id: {})", e, provided_tube_id, conversation_id);
+                                warn!("Failed to create logical channel on existing tube: {} (tube_id: {}, conversation_id: {})",
+                                      e, provided_tube_id, conversation_id);
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to create data channel on existing tube: {} (tube_id: {}, conversation_id: {})", e, provided_tube_id, conversation_id);
+                        warn!("Failed to create data channel on existing tube: {} (tube_id: {}, conversation_id: {})",
+                              e, provided_tube_id, conversation_id);
                     }
                 }
 
-                // Return basic information about the existing tube
                 let mut result_map = HashMap::new();
                 result_map.insert("tube_id".to_string(), provided_tube_id.clone());
-                // Note: We don't generate new offer/answer for existing tubes
-                // The caller should handle WebRTC signaling separately if needed
-
                 return Ok(result_map);
             }
         }
 
-        let initial_offer_sdp_decoded = if let Some(ref b64_offer) = initial_offer_sdp {
+        // PHASE 1: ALL PREPARATION (NO LOCKS - 2-5 seconds)
+        // Decode offer, fetch TURN credentials, prepare ICE servers
+
+        // Decode offer from base64 (API contract: all SDP is base64-encoded over Python/Rust boundary)
+        let initial_offer_sdp_decoded = if let Some(ref b64_offer) = req.initial_offer_sdp {
             let bytes = BASE64_STANDARD
                 .decode(b64_offer)
                 .context("Failed to decode initial_offer_sdp from base64")?;
@@ -314,565 +313,686 @@ impl TubeRegistry {
 
         let is_server_mode = initial_offer_sdp_decoded.is_none();
 
-        let tube_arc = Tube::new(is_server_mode, Some(conversation_id.to_string()), tube_id)?;
+        // Create tube with signal sender (RAII - tube owns it!)
+        let tube_arc = Tube::new(
+            is_server_mode,
+            Some(conversation_id.to_string()),
+            Some(req.signal_sender.clone()),
+            tube_id_opt,
+        )?;
         let tube_id = tube_arc.id();
 
-        self.add_tube(Arc::clone(&tube_arc));
-        self.associate_conversation(&tube_id, conversation_id)?;
-        self.set_server_mode(is_server_mode);
-        self.signal_channels
-            .insert(tube_id.clone(), signal_sender.clone());
+        // Prepare ICE servers (includes TURN credential fetch - OUTSIDE locks!)
+        let ice_servers = self
+            .prepare_ice_servers_unlocked(
+                &tube_id,
+                &req.krelay_server,
+                &req.ksm_config,
+                &req.client_version,
+                &req.settings,
+            )
+            .await?;
 
-        // Log the received parameters differently based on mode
-        if is_server_mode {
-            trace!("Server mode: Received krelay_server for ICE server setup (tube_id: {}, krelay_server: {})", tube_id, krelay_server);
-        } else if let Some(ksm_cfg) = ksm_config {
-            trace!("Client mode: Received krelay_server and ksm_config for ICE server setup (tube_id: {}, krelay_server: {}, ksm_config: {})", tube_id, krelay_server, ksm_cfg);
+        let turn_credentials_timestamp = if ice_servers
+            .iter()
+            .any(|s| s.urls.iter().any(|u| u.contains("turn:")))
+        {
+            Some(Instant::now())
         } else {
-            trace!("Client mode: Received krelay_server for ICE server setup, no ksm_config provided (tube_id: {}, krelay_server: {})", tube_id, krelay_server);
+            None
+        };
+
+        // PHASE 2: FAST INSERT (DashMap - microseconds!)
+        self.tubes.insert(tube_id.clone(), Arc::clone(&tube_arc));
+        self.conversations
+            .insert(conversation_id.to_string(), tube_id.clone());
+        // NOTE: signal_channels no longer needed - Tube owns signal_sender now! (RAII)
+
+        if is_server_mode {
+            self.server_mode = true;
         }
 
-        let mut ice_servers = Vec::new();
-        let mut turn_credentials_timestamp: Option<std::time::Instant> = None; // Track when TURN credentials were created
-        let mut turn_only_for_config = settings
+        // PHASE 3: WEBRTC SETUP (NO LOCKS - 1-3 seconds)
+        // Create peer connection with ICE servers
+        let rtc_config = self.build_rtc_configuration(ice_servers, &req.settings);
+        let turn_only = req
+            .settings
             .get("turn_only")
             .is_some_and(|v| v.as_bool().unwrap_or(false));
-        debug!(
-            "Initial 'turn_only' setting from input (tube_id: {}, turn_only_setting: {})",
-            tube_id, turn_only_for_config
+
+        // Get signal sender from tube (RAII - tube owns it!)
+        let signal_sender_for_webrtc = tube_arc
+            .signal_sender
+            .clone()
+            .ok_or_else(|| anyhow!("Tube missing signal_sender"))?;
+
+        tube_arc
+            .create_peer_connection(
+                Some(rtc_config),
+                req.trickle_ice,
+                turn_only,
+                req.ksm_config.clone().unwrap_or_default(),
+                req.callback_token.clone(),
+                &req.client_version,
+                req.settings.clone(),
+                signal_sender_for_webrtc,
+                turn_credentials_timestamp,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to create peer connection: {}", e))?;
+
+        // Create data channel
+        let ksm_config_for_channel = req.ksm_config.clone().unwrap_or_default();
+        let data_channel = tube_arc
+            .create_data_channel(
+                conversation_id,
+                ksm_config_for_channel.clone(),
+                req.callback_token.clone(),
+                &req.client_version,
+            )
+            .await?;
+
+        // Create logical channel and capture actual listening port (if server mode)
+        let actual_listening_port = tube_arc
+            .create_channel(
+                conversation_id,
+                &data_channel,
+                None,
+                req.settings.clone(),
+                Some(req.callback_token.clone()),
+                Some(ksm_config_for_channel),
+                Some(req.client_version.clone()),
+            )
+            .await?;
+
+        // Generate offer/answer (BASE64-ENCODE for Python boundary)
+        let mut result_map = HashMap::new();
+        result_map.insert("tube_id".to_string(), tube_id.clone());
+
+        // Add actual listening address if server mode and port was assigned
+        if is_server_mode {
+            if let Some(port) = actual_listening_port {
+                // Extract host from settings or use default
+                let host = req
+                    .settings
+                    .get("local_listen_addr")
+                    .and_then(|v| v.as_str())
+                    .and_then(|addr| addr.split(':').next())
+                    .unwrap_or("127.0.0.1");
+
+                result_map.insert(
+                    "actual_local_listen_addr".to_string(),
+                    format!("{}:{}", host, port),
+                );
+                debug!(
+                    "Server tube listening on: {}:{} (tube_id: {})",
+                    host, port, tube_id
+                );
+            }
+        }
+
+        if is_server_mode {
+            let offer = tube_arc
+                .create_offer()
+                .await
+                .map_err(|e| anyhow!("Failed to create offer: {}", e))?;
+            // Encode to base64 for Python/Rust boundary (consistent with answer encoding)
+            let offer_base64 = BASE64_STANDARD.encode(&offer);
+            result_map.insert("offer".to_string(), offer_base64);
+        } else if let Some(offer_sdp) = initial_offer_sdp_decoded {
+            tube_arc
+                .set_remote_description(offer_sdp, false)
+                .await
+                .map_err(|e| anyhow!("Failed to set remote description: {}", e))?;
+            let answer = tube_arc
+                .create_answer()
+                .await
+                .map_err(|e| anyhow!("Failed to create answer: {}", e))?;
+            // Encode to base64 for Python/Rust boundary
+            let answer_base64 = BASE64_STANDARD.encode(&answer);
+            result_map.insert("answer".to_string(), answer_base64);
+        }
+
+        info!(
+            "Tube created successfully via actor (tube_id: {}, conversation_id: {}, mode: {})",
+            tube_id,
+            conversation_id,
+            if is_server_mode { "server" } else { "client" }
         );
 
-        // Check for test mode - ksm_config might be None in server mode, so check carefully
-        let is_test_mode = ksm_config.is_some_and(|cfg| cfg.starts_with("TEST_MODE_KSM_CONFIG"));
+        Ok(result_map)
+    }
+
+    /// Prepare ICE servers with TURN credential fetching - NO LOCKS
+    async fn prepare_ice_servers_unlocked(
+        &self,
+        tube_id: &str,
+        krelay_server: &str,
+        ksm_config: &Option<String>,
+        client_version: &str,
+        settings: &HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<RTCIceServer>> {
+        let mut ice_servers = Vec::new();
+        let turn_only = settings
+            .get("turn_only")
+            .is_some_and(|v| v.as_bool().unwrap_or(false));
+
+        // Check for test mode
+        let is_test_mode = ksm_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.starts_with("TEST_MODE_KSM_CONFIG"));
 
         if is_test_mode {
-            info!("TEST_MODE_KSM_CONFIG active: Using Google STUN server and disabling TURN for this test configuration. (tube_id: {})", tube_id);
-            turn_only_for_config = false;
+            info!(
+                "TEST_MODE_KSM_CONFIG active: Using Google STUN server (tube_id: {})",
+                tube_id
+            );
+            // Note: turn_only is not used after this point for test mode
             ice_servers.push(RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302?transport=udp&family=ipv4".to_string()],
                 username: String::new(),
                 credential: String::new(),
             });
-            info!("Added Google STUN server (tube_id: {}, stun_url: stun:stun.l.google.com:19302?transport=udp&family=ipv4)", tube_id);
             ice_servers.push(RTCIceServer {
                 urls: vec!["stun:stun1.l.google.com:19302?transport=udp&family=ipv4".to_string()],
                 username: String::new(),
                 credential: String::new(),
             });
-            info!("Added Google STUN server (tube_id: {}, stun_url: stun:stun1.l.google.com:19302?transport=udp&family=ipv4)", tube_id);
-        } else if !krelay_server.is_empty() {
-            debug!("Using provided krelay_server for ICE configuration (tube_id: {}, relay_server_host: {})", tube_id, krelay_server);
+            return Ok(ice_servers);
+        }
 
-            if !turn_only_for_config {
-                let stun_url_udp = format!("stun:{krelay_server}:3478");
-                ice_servers.push(RTCIceServer {
-                    urls: vec![stun_url_udp.clone()],
-                    username: String::new(),
-                    credential: String::new(),
-                });
-                debug!(
-                    "Added STUN server (UDP) (tube_id: {}, stun_url: {})",
-                    tube_id, stun_url_udp
-                );
-            }
+        if krelay_server.is_empty() {
+            warn!("No krelay_server provided (tube_id: {})", tube_id);
+            return Ok(ice_servers);
+        }
 
-            let use_turn_for_config_from_settings = settings
-                .get("use_turn")
-                .is_none_or(|v| v.as_bool().unwrap_or(true));
+        debug!(
+            "Using krelay_server for ICE configuration (tube_id: {}, relay: {})",
+            tube_id, krelay_server
+        );
+
+        // Add STUN if not turn-only
+        if !turn_only {
+            let stun_url = format!("stun:{}:3478", krelay_server);
+            ice_servers.push(RTCIceServer {
+                urls: vec![stun_url.clone()],
+                username: String::new(),
+                credential: String::new(),
+            });
             debug!(
-                "'use_turn' setting (tube_id: {}, use_turn_setting: {})",
-                tube_id, use_turn_for_config_from_settings
+                "Added STUN server (tube_id: {}, url: {})",
+                tube_id, stun_url
             );
+        }
 
-            if use_turn_for_config_from_settings {
-                // Priority 1: Check for explicit TURN credentials in settings FIRST
-                if let (Some(turn_url), Some(turn_username), Some(turn_password)) = (
-                    settings.get("turn_url").and_then(|v| v.as_str()),
-                    settings.get("turn_username").and_then(|v| v.as_str()),
-                    settings.get("turn_password").and_then(|v| v.as_str()),
-                ) {
-                    debug!(
-                        "Using explicit TURN credentials from settings (tube_id: {}, turn_url: {})",
-                        tube_id, turn_url
-                    );
-                    ice_servers.push(RTCIceServer {
-                        urls: vec![turn_url.to_string()],
-                        username: turn_username.to_string(),
-                        credential: turn_password.to_string(),
-                    });
-                }
-                // Priority 2: Fallback to ksm_config if no explicit credentials
-                else if let Some(ksm_cfg) = ksm_config {
-                    if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
-                        // First, check if we can reuse an existing TURN connection
-                        if let Some(existing_conn) =
-                            RESOURCE_MANAGER.get_turn_connection(krelay_server)
-                        {
-                            debug!("Reusing existing TURN connection from pool (tube_id: {}, relay_url: {}, username: {})", tube_id, krelay_server, existing_conn.username);
-                            ice_servers.push(RTCIceServer {
-                                urls: vec![format!("turn:{}", krelay_server)],
-                                username: existing_conn.username,
-                                credential: existing_conn.password, // Use pooled credential
-                            });
-                        } else {
-                            // Create new TURN connection
-                            debug!(
-                                "Fetching new TURN credentials from router (tube_id: {})",
-                                tube_id
-                            );
+        let use_turn = settings
+            .get("use_turn")
+            .is_none_or(|v| v.as_bool().unwrap_or(true));
 
-                            let turn_start_time = std::time::Instant::now();
-                            // Request 1-hour TTL for TURN credentials (on-demand refresh before ICE restart)
-                            match get_relay_access_creds(ksm_cfg, Some(3600), client_version).await
-                            {
-                                Ok(creds) => {
-                                    // Capture credential creation timestamp for on-demand refresh tracking
-                                    turn_credentials_timestamp = Some(std::time::Instant::now());
+        if use_turn {
+            // Priority 1: Explicit TURN credentials in settings
+            if let (Some(turn_url), Some(turn_username), Some(turn_password)) = (
+                settings.get("turn_url").and_then(|v| v.as_str()),
+                settings.get("turn_username").and_then(|v| v.as_str()),
+                settings.get("turn_password").and_then(|v| v.as_str()),
+            ) {
+                debug!(
+                    "Using explicit TURN credentials (tube_id: {}, url: {})",
+                    tube_id, turn_url
+                );
+                ice_servers.push(RTCIceServer {
+                    urls: vec![turn_url.to_string()],
+                    username: turn_username.to_string(),
+                    credential: turn_password.to_string(),
+                });
+            }
+            // Priority 2: Fetch from router via ksm_config
+            else if let Some(ksm_cfg) = ksm_config {
+                if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE") {
+                    // Check connection pool first
+                    if let Some(existing_conn) = RESOURCE_MANAGER.get_turn_connection(krelay_server)
+                    {
+                        debug!(
+                            "Reusing pooled TURN connection (tube_id: {}, username: {})",
+                            tube_id, existing_conn.username
+                        );
+                        ice_servers.push(RTCIceServer {
+                            urls: vec![format!("turn:{}", krelay_server)],
+                            username: existing_conn.username,
+                            credential: existing_conn.password,
+                        });
+                    } else {
+                        // Fetch new credentials - NETWORK I/O but no locks held!
+                        debug!(
+                            "Fetching new TURN credentials from router (tube_id: {})",
+                            tube_id
+                        );
+                        let turn_start = Instant::now();
 
-                                    let turn_duration_ms =
-                                        turn_start_time.elapsed().as_millis() as f64;
-                                    debug!(
-                                        "Successfully fetched TURN credentials (tube_id: {}, duration: {:.1}ms)",
-                                        tube_id, turn_duration_ms
-                                    );
-                                    trace!(
-                                        "Received TURN credentials (tube_id: {}, credentials: {})",
-                                        tube_id,
-                                        creds
-                                    );
+                        match get_relay_access_creds(ksm_cfg, Some(3600), client_version).await {
+                            Ok(creds) => {
+                                let turn_duration_ms = turn_start.elapsed().as_millis() as f64;
+                                debug!("Successfully fetched TURN credentials (tube_id: {}, duration: {:.1}ms)",
+                                       tube_id, turn_duration_ms);
 
-                                    // Extract and log TTL to understand router behavior
-                                    let ttl_seconds =
-                                        creds.get("ttl").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let ttl_seconds =
+                                    creds.get("ttl").and_then(|v| v.as_u64()).unwrap_or(3600);
+                                info!(
+                                    "TURN credentials TTL: {}s ({:.1}h) (tube_id: {})",
+                                    ttl_seconds,
+                                    ttl_seconds as f64 / 3600.0,
+                                    tube_id
+                                );
 
-                                    if ttl_seconds > 0 {
-                                        info!(
-                                            "TURN credentials TTL: {}s ({:.1}h) (tube_id: {}, will refresh on-demand before ICE restart if >50min old)",
-                                            ttl_seconds,
-                                            ttl_seconds as f64 / 3600.0,
-                                            tube_id
-                                        );
-                                    } else {
-                                        warn!(
-                                            "No TTL in TURN credentials response - assuming 1h default (tube_id: {})",
-                                            tube_id
-                                        );
-                                    }
+                                crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
+                                    tube_id,
+                                    turn_duration_ms,
+                                    true,
+                                );
 
-                                    // Record TURN allocation success metrics
-                                    crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
-                                        &tube_id,
-                                        turn_duration_ms,
-                                        true,
+                                if let (Some(username), Some(password)) = (
+                                    creds.get("username").and_then(|v| v.as_str()),
+                                    creds.get("password").and_then(|v| v.as_str()),
+                                ) {
+                                    // Add to connection pool
+                                    let _ = RESOURCE_MANAGER.add_turn_connection(
+                                        krelay_server.to_string(),
+                                        username.to_string(),
+                                        password.to_string(),
                                     );
 
-                                    // Extract username and password from credentials
-                                    if let (Some(username), Some(password)) = (
-                                        creds.get("username").and_then(|v| v.as_str()),
-                                        creds.get("password").and_then(|v| v.as_str()),
-                                    ) {
-                                        // Add to connection pool
-                                        let _ref_count = RESOURCE_MANAGER.add_turn_connection(
-                                            krelay_server.to_string(),
-                                            username.to_string(),
-                                            password.to_string(),
-                                        );
-
-                                        debug!("Created new TURN connection and added to pool (tube_id: {}, relay_url: {}, username: {})", tube_id, krelay_server, username);
-                                        ice_servers.push(RTCIceServer {
-                                            urls: vec![format!("turn:{}", krelay_server)],
-                                            username: username.to_string(),
-                                            credential: password.to_string(),
-                                        });
-                                    } else {
-                                        warn!(
-                                            "Invalid TURN credentials format (tube_id: {})",
-                                            tube_id
-                                        );
-                                    }
+                                    debug!("Created new TURN connection in pool (tube_id: {}, username: {})",
+                                           tube_id, username);
+                                    ice_servers.push(RTCIceServer {
+                                        urls: vec![format!("turn:{}", krelay_server)],
+                                        username: username.to_string(),
+                                        credential: password.to_string(),
+                                    });
+                                } else {
+                                    warn!("Invalid TURN credentials format (tube_id: {})", tube_id);
                                 }
-                                Err(e) => {
-                                    let turn_duration_ms =
-                                        turn_start_time.elapsed().as_millis() as f64;
-                                    error!(
-                                        "Failed to get TURN credentials: {} (tube_id: {}, duration: {:.1}ms)",
-                                        e, tube_id, turn_duration_ms
-                                    );
+                            }
+                            Err(e) => {
+                                let turn_duration_ms = turn_start.elapsed().as_millis() as f64;
+                                error!("Failed to get TURN credentials: {} (tube_id: {}, duration: {:.1}ms)",
+                                       e, tube_id, turn_duration_ms);
 
-                                    // Record TURN allocation failure metrics
-                                    crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
-                                        &tube_id,
-                                        turn_duration_ms,
-                                        false,
-                                    );
-                                    // Don't fail the entire operation, just log the error
-                                }
+                                crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
+                                    tube_id,
+                                    turn_duration_ms,
+                                    false,
+                                );
+                                // Don't fail entire operation
                             }
                         }
                     }
-                } else {
-                    debug!(
-                        "No TURN credentials available in settings or ksm_config (tube_id: {})",
-                        tube_id
-                    );
                 }
             }
-        } else {
-            warn!("No krelay_server provided. STUN/TURN servers will not be configured. (tube_id: {})", tube_id);
         }
 
-        let all_configured_urls: Vec<String> =
-            ice_servers.iter().flat_map(|s| s.urls.clone()).collect();
-        debug!(
-            "Final list of ICE server URLs to be used (tube_id: {}, configured_ice_urls: {:?})",
-            tube_id, all_configured_urls
-        );
+        Ok(ice_servers)
+    }
 
-        let rtc_config_obj = {
-            let mut rtc_config = RTCConfiguration {
-                ice_servers,
-                ..Default::default()
-            };
-            if turn_only_for_config {
-                rtc_config.ice_transport_policy = RTCIceTransportPolicy::Relay;
-            } else {
-                rtc_config.ice_transport_policy = RTCIceTransportPolicy::All;
-            }
+    /// Build RTCConfiguration from ICE servers and settings
+    fn build_rtc_configuration(
+        &self,
+        ice_servers: Vec<RTCIceServer>,
+        settings: &HashMap<String, serde_json::Value>,
+    ) -> RTCConfiguration {
+        let turn_only = settings
+            .get("turn_only")
+            .is_some_and(|v| v.as_bool().unwrap_or(false));
 
-            // Apply resource management RTCConfiguration tuning
-            let tuned_config = RESOURCE_MANAGER.apply_rtc_config_tuning(rtc_config, &tube_id);
-            Some(tuned_config)
+        let ice_transport_policy = if turn_only {
+            RTCIceTransportPolicy::Relay
+        } else {
+            RTCIceTransportPolicy::All
         };
 
-        // For server mode, use empty string for ksm_config when creating peer connection since it's not needed
-        let ksm_config_for_peer_connection = ksm_config.unwrap_or("");
-
-        tube_arc
-            .create_peer_connection(
-                rtc_config_obj,
-                trickle_ice,
-                turn_only_for_config,
-                ksm_config_for_peer_connection.to_string(),
-                callback_token.to_string(),
-                client_version,
-                settings.clone(),
-                signal_sender.clone(),
-                turn_credentials_timestamp, // Pass timestamp for on-demand credential refresh
-            )
-            .await
-            .context("Failed to create peer connection")?;
-
-        let mut listening_port_option: Option<u16> = None; // Initialize outside if
-
-        // Conditionally create channels only if in server mode (no initial offer from the client)
-        if is_server_mode {
-            debug!(
-                "Server mode: Proactively creating control and main data channels. (tube_id: {})",
-                tube_id
-            );
-            if let Err(e) = tube_arc
-                .create_control_channel(
-                    ksm_config_for_peer_connection.to_string(),
-                    callback_token.to_string(),
-                    client_version,
-                )
-                .await
-            {
-                warn!(
-                    "Failed to create control channel for tube {}: {}",
-                    tube_id, e
-                );
-                // Decide if this is a fatal error for server mode. For now, just a warning.
-            }
-
-            // Create the main data channel, using conversation_id as its label.
-            // The settings for this channel are also passed to tube_arc.create_channel
-            match tube_arc
-                .create_data_channel(
-                    conversation_id,
-                    ksm_config_for_peer_connection.to_string(),
-                    callback_token.to_string(),
-                    client_version,
-                )
-                .await
-            {
-                Ok(data_channel_arc) => {
-                    // Assign to listening_port_option here
-                    match tube_arc
-                        .create_channel(
-                            conversation_id,
-                            &data_channel_arc,
-                            None,
-                            settings.clone(),
-                            Some(callback_token.to_string()),
-                            Some(ksm_config_for_peer_connection.to_string()),
-                            Some(client_version.to_string()),
-                        )
-                        .await
-                    {
-                        Ok(port_opt) => listening_port_option = port_opt,
-                        Err(e) => {
-                            warn!("Server mode: Failed to create logical channel for main data channel: {} (tube_id: {}, channel_id: {})", e, tube_id, conversation_id);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Server mode: Failed to create main data channel: {} (tube_id: {}, channel_id: {})", e, tube_id, conversation_id);
-                }
-            }
-        } else {
-            debug!("Client mode: Expecting client to create data channels via its offer. (tube_id: {})", tube_id);
+        RTCConfiguration {
+            ice_servers,
+            ice_transport_policy,
+            ..Default::default()
         }
-
-        let mut result_map = HashMap::new();
-        result_map.insert("tube_id".to_string(), tube_id.clone());
-        if is_server_mode {
-            if let Some(port) = listening_port_option {
-                result_map.insert(
-                    "actual_local_listen_addr".to_string(),
-                    format!("127.0.0.1:{port}"),
-                );
-                debug!("Server mode: Reporting listening address. (tube_id: {}, listen_addr: 127.0.0.1:{})", tube_id, port);
-            } else {
-                warn!("Server mode: No listening port obtained for main data channel, not adding actual_local_listen_addr to result. (tube_id: {})", tube_id);
-            }
-        }
-
-        if is_server_mode {
-            let offer_sdp = tube_arc
-                .create_offer()
-                .await
-                .map_err(|e| anyhow!("Failed to create offer: {}", e))?;
-            result_map.insert("offer".to_string(), BASE64_STANDARD.encode(offer_sdp));
-        } else {
-            let offer_sdp_str = initial_offer_sdp_decoded.ok_or_else(|| anyhow!("Initial offer SDP is required for client mode (after potential base64 decoding)"))?;
-            tube_arc
-                .set_remote_description(offer_sdp_str, false)
-                .await
-                .map_err(|e| anyhow!("Client: Failed to set remote description (offer): {}", e))?;
-            let answer_sdp = tube_arc
-                .create_answer()
-                .await
-                .map_err(|e| anyhow!("Client: Failed to create answer: {}", e))?;
-            result_map.insert("answer".to_string(), BASE64_STANDARD.encode(answer_sdp));
-        }
-
-        debug!("Tube processing complete. (tube_id: {}, conversation_id: {}, mode: {}, result_keys: {:?}, settings_keys: {:?})",
-              tube_id, conversation_id, if is_server_mode {"Server"} else {"Client"}, result_map.keys().collect::<Vec<_>>(), settings.keys().collect::<Vec<_>>());
-
-        Ok(result_map)
     }
 
-    /// Set remote description and create answer if needed
-    pub(crate) async fn set_remote_description(
-        &self,
-        tube_id: &str,
-        sdp: &str,
-        is_answer: bool,
-    ) -> Result<Option<String>> {
-        let tube = self
-            .get_by_tube_id(tube_id)
-            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
-
-        let sdp_bytes = BASE64_STANDARD.decode(sdp).context(format!(
-            "Failed to decode SDP from base64 for tube_id: {tube_id}"
-        ))?;
-        let sdp_decoded = String::from_utf8(sdp_bytes).context(format!(
-            "Failed to convert decoded SDP to String for tube_id: {tube_id}"
-        ))?;
-
-        // Set the remote description
-        tube.set_remote_description(sdp_decoded, is_answer)
-            .await
-            .map_err(|e| anyhow!("Failed to set remote description: {}", e))?;
-
-        // If this is an offer, create an answer
-        if !is_answer {
-            let answer = tube
-                .create_answer()
-                .await
-                .map_err(|e| anyhow!("Failed to create answer: {}", e))?;
-
-            return Ok(Some(BASE64_STANDARD.encode(answer))); // Encode the answer to base64
-        }
-
-        Ok(None)
-    }
-
-    /// Get connection state
-    #[allow(dead_code)]
-    pub(crate) async fn get_connection_state(&self, tube_id: &str) -> Result<String> {
-        let tube = self
-            .get_by_tube_id(tube_id)
-            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
-
-        Ok(tube.connection_state().await)
-    }
-
-    /// Close a tube
-    pub(crate) async fn close_tube(
+    /// Handle tube closure - RAII makes this trivial!
+    async fn handle_close_tube(
         &mut self,
         tube_id: &str,
         reason: Option<CloseConnectionReason>,
     ) -> Result<()> {
-        let tube_arc = self.get_by_tube_id(tube_id).ok_or_else(|| {
-            warn!(
-                "close_tube: Tube not found in registry. (tube_id: {})",
-                tube_id
-            );
-            anyhow!("Tube not found: {}", tube_id)
-        })?;
+        debug!("Actor closing tube: {}", tube_id);
 
-        let current_status = *tube_arc.status.read().await;
-        debug!(
-            "close_tube: Attempting to close tube. (tube_id: {}, status: {})",
-            tube_id, current_status
-        );
-
-        match current_status {
-            crate::tube_and_channel_helpers::TubeStatus::Initializing => {
-                error!("close_tube: Attempted to close tube while it is still initializing. Operation aborted. (tube_id: {})", tube_id);
-                Err(anyhow!(
-                    "Cannot close tube {}: still initializing.",
-                    tube_id
-                ))
-            }
-            crate::tube_and_channel_helpers::TubeStatus::Closing
-            | crate::tube_and_channel_helpers::TubeStatus::Closed => {
-                info!("close_tube: Tube is already closing or closed. No action needed. (tube_id: {}, status: {})", tube_id, current_status);
-                Ok(())
-            }
-            _ => {
-                // New, Connecting, Active, Ready, Failed
-                // Transition to Closing state first
-                *tube_arc.status.write().await =
-                    crate::tube_and_channel_helpers::TubeStatus::Closing;
-                info!("close_tube: Transitioned tube status to Closing. Proceeding with close. (tube_id: {})", tube_id);
-
-                // Use the provided reason or default to AdminClosed
-                let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
-
-                // CRITICAL: Add timeout to prevent tube closure from hanging indefinitely
-                // RBI/HTTP sessions can block on channel_closed signal sending (WebRTC .label() calls)
-                // Without timeout, hung tubes never get removed from registry → Python threads exhaust → gateway dies
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    tube_arc.close_with_reason(self, close_reason),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        // Normal completion - tube.close_with_reason() finished
-                        result.map_err(|e| {
-                            error!(
-                                "close_tube: tube.close_with_reason() failed: {} (tube_id: {})",
-                                e, tube_id
-                            );
-                            anyhow!(
-                                "Failed during tube.close_with_reason() for {}: {}",
-                                tube_id,
-                                e
-                            )
-                        })
-                    }
-                    Err(_) => {
-                        // Timeout - tube.close_with_reason() hung (likely on channel signal sending)
-                        error!(
-                            "TIMEOUT: Tube closure hung after 10s, initiating emergency cleanup (tube_id: {})",
-                            tube_id
-                        );
-
-                        // EMERGENCY CLEANUP SEQUENCE - ensure resources are freed immediately
-
-                        // 1. Force all channel tasks to exit (non-blocking, best effort)
-                        if let Ok(signals) = tube_arc.channel_shutdown_signals.try_write() {
-                            let signal_count = signals.len();
-                            for (channel_name, signal) in signals.iter() {
-                                signal.store(true, std::sync::atomic::Ordering::Relaxed);
-                                debug!("Emergency: Set shutdown signal for channel (tube_id: {}, channel: {})", tube_id, channel_name);
-                            }
-                            info!(
-                                "Emergency: Signaled {} channels to exit (tube_id: {})",
-                                signal_count, tube_id
-                            );
-                        } else {
-                            warn!(
-                                "Emergency: Could not acquire shutdown signals lock (tube_id: {})",
-                                tube_id
-                            );
-                        }
-
-                        // 2. Close peer connection in background (don't block on it)
-                        if let Ok(mut pc_guard) = tube_arc.peer_connection.try_lock() {
-                            if let Some(pc) = pc_guard.take() {
-                                let tube_id_clone = tube_id.to_string();
-                                tokio::spawn(async move {
-                                    if let Err(e) = pc.close().await {
-                                        warn!("Emergency peer connection close failed: {} (tube_id: {})", e, tube_id_clone);
-                                    } else {
-                                        debug!(
-                                            "Emergency peer connection closed (tube_id: {})",
-                                            tube_id_clone
-                                        );
-                                    }
-                                });
-                                info!("Emergency: Spawned background task to close peer connection (tube_id: {})", tube_id);
-                            } else {
-                                debug!(
-                                    "Emergency: Peer connection already None (tube_id: {})",
-                                    tube_id
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "Emergency: Could not acquire peer connection lock (tube_id: {})",
-                                tube_id
-                            );
-                        }
-
-                        // 3. Remove tube from registry immediately
-                        self.remove_tube(tube_id);
-                        info!("Emergency: Removed tube from registry, resources will cleanup in background (tube_id: {})", tube_id);
-
-                        Ok(()) // Return Ok - tube is removed, gateway stays responsive, cleanup continues in background
-                    }
-                }
-            }
-        }
-    }
-
-    /// Add an ICE candidate received from the external source
-    #[allow(dead_code)]
-    pub(crate) async fn add_external_ice_candidate(
-        &self,
-        tube_id: &str,
-        candidate: &str,
-    ) -> Result<()> {
+        // Get tube to do graceful shutdown
         let tube = self
-            .get_by_tube_id(tube_id)
+            .tubes
+            .get(tube_id)
+            .map(|entry| entry.value().clone())
             .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
 
-        tube.add_ice_candidate(candidate.to_string())
-            .await
-            .map_err(|e| anyhow!("Failed to add ICE candidate: {}", e))?;
+        // 1. Set status to Closed (for status queries)
+        {
+            let mut status = tube.status.write().await;
+            *status = TubeStatus::Closed;
+            debug!("  ✓ Status set to Closed (tube_id: {})", tube_id);
+        }
+
+        // 2. Send connection_close callbacks for channels (graceful shutdown)
+        let channel_names: Vec<String> = {
+            let channels_guard = tube.active_channels.read().await;
+            channels_guard.keys().cloned().collect()
+        };
+        for channel_name in &channel_names {
+            if let Err(e) = tube.send_connection_close_callback(channel_name).await {
+                warn!(
+                    "Failed to send close callback: {} (tube_id: {}, channel: {})",
+                    e, tube_id, channel_name
+                );
+            }
+        }
+
+        // 2b. Send "channel_closed" signals to Python (CRITICAL for Python integration!)
+        // This logic was in old Tube::close_with_reason() - Python depends on it!
+        if let Some(ref signal_sender) = tube.signal_sender {
+            let data_channels_snapshot = tube.data_channels.read().await.clone();
+            for (label, _dc) in data_channels_snapshot.iter() {
+                // Determine conversation_id from channel label
+                let conversation_id = if label == "control" {
+                    tube.original_conversation_id
+                        .clone()
+                        .unwrap_or_else(|| tube.id())
+                } else {
+                    label.to_string()
+                };
+
+                // Build signal payload (matches old format exactly)
+                let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
+                let signal_data = serde_json::json!({
+                    "channel_id": conversation_id,
+                    "outcome": "tube_closed",
+                    "close_reason": {
+                        "code": close_reason as u16,
+                        "name": format!("{:?}", close_reason),
+                        "is_critical": close_reason.is_critical(),
+                        "is_retryable": close_reason.is_retryable(),
+                    }
+                })
+                .to_string();
+
+                let signal_msg = SignalMessage {
+                    tube_id: tube.id(),
+                    kind: "channel_closed".to_string(),
+                    data: signal_data,
+                    conversation_id: conversation_id.clone(),
+                    progress_flag: Some(0), // COMPLETE
+                    progress_status: Some("Tube closed".to_string()),
+                    is_ok: Some(true),
+                };
+
+                if let Err(e) = signal_sender.send(signal_msg) {
+                    error!(
+                        "Failed to send channel_closed signal: {} (tube_id: {}, label: {})",
+                        e,
+                        tube.id(),
+                        label
+                    );
+                } else {
+                    debug!(
+                        "Sent channel_closed signal to Python (tube_id: {}, label: {}, conv_id: {})",
+                        tube.id(),
+                        label,
+                        conversation_id
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "No signal sender on tube - cannot notify Python of channel closures (tube_id: {})",
+                tube_id
+            );
+        }
+
+        // 3. Close WebRTC peer connection (graceful)
+        {
+            let mut pc_guard = tube.peer_connection.lock().await;
+            if let Some(pc) = pc_guard.take() {
+                let _ = pc.close().await;
+                debug!("  ✓ WebRTC peer connection closed (tube_id: {})", tube_id);
+            }
+        }
+
+        // 4. Remove from registry (ONE LINE!)
+        self.tubes.remove(tube_id);
+        self.conversations.retain(|_, tid| tid != tube_id);
+        // NOTE: No signal_channels.remove() - Tube owns it! (RAII)
+
+        info!(
+            "Tube closed via actor - Tube::drop() will handle final cleanup (tube_id: {})",
+            tube_id
+        );
+
+        // When tube Arc drops:
+        // → Tube::drop() fires automatically
+        // → signal_sender closes
+        // → metrics_handle unregisters
+        // → keepalive_task cancels
+        // ALL AUTOMATIC! ✨
 
         Ok(())
     }
+}
 
-    /// Clean up stale tubes that have no active channels and are in terminal states
-    /// Returns the list of tube IDs that were successfully cleaned up
-    pub(crate) async fn cleanup_stale_tubes(&mut self) -> Vec<String> {
+/// Public handle to the registry actor
+#[derive(Clone)]
+pub struct RegistryHandle {
+    command_tx: mpsc::UnboundedSender<RegistryCommand>,
+    /// Direct access to tubes for hot-path reads (no actor overhead)
+    tubes: Arc<DashMap<String, Arc<Tube>>>,
+    /// Direct access to conversations
+    conversations: Arc<DashMap<String, String>>,
+}
+
+impl RegistryHandle {
+    fn new(
+        command_tx: mpsc::UnboundedSender<RegistryCommand>,
+        tubes: Arc<DashMap<String, Arc<Tube>>>,
+        conversations: Arc<DashMap<String, String>>,
+    ) -> Self {
+        Self {
+            command_tx,
+            tubes,
+            conversations,
+        }
+    }
+
+    /// Hot path: Get tube without going through actor (lock-free!)
+    pub fn get_tube_fast(&self, tube_id: &str) -> Option<Arc<Tube>> {
+        self.tubes.get(tube_id).map(|entry| entry.value().clone())
+    }
+
+    /// Hot path: Get tube by conversation (lock-free!)
+    pub fn get_by_conversation_fast(&self, conversation_id: &str) -> Option<Arc<Tube>> {
+        self.conversations
+            .get(conversation_id)
+            .and_then(|tube_id| self.tubes.get(tube_id.value()).map(|e| e.value().clone()))
+    }
+
+    /// Cold path: Create tube through actor (with backpressure)
+    pub async fn create_tube(&self, req: CreateTubeRequest) -> Result<HashMap<String, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(RegistryCommand::CreateTube { req, resp: tx })
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("Registry actor response channel closed"))?
+    }
+
+    /// Get metrics for backpressure coordination
+    pub async fn get_metrics(&self) -> Result<RegistryMetrics> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(RegistryCommand::GetMetrics { resp: tx })
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("Registry actor response channel closed"))
+    }
+
+    /// Close a tube
+    pub async fn close_tube(
+        &self,
+        tube_id: &str,
+        reason: Option<CloseConnectionReason>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(RegistryCommand::CloseTube {
+                tube_id: tube_id.to_string(),
+                reason,
+                resp: tx,
+            })
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("Registry actor response channel closed"))?
+    }
+
+    /// Set server mode
+    #[allow(dead_code)] // Used by Python bindings
+    pub async fn set_server_mode(&self, server_mode: bool) -> Result<()> {
+        self.command_tx
+            .send(RegistryCommand::SetServerMode { server_mode })
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        Ok(())
+    }
+
+    /// Associate conversation with tube
+    #[allow(dead_code)] // Used by Python bindings
+    pub async fn associate_conversation(&self, tube_id: &str, conversation_id: &str) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(RegistryCommand::AssociateConversation {
+                tube_id: tube_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                resp: tx,
+            })
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("Registry actor response channel closed"))?
+    }
+
+    // ===== COMPATIBILITY LAYER =====
+    // These methods provide backward compatibility with old TubeRegistry API
+
+    /// Get tube by ID (compatibility alias for get_tube_fast)
+    pub fn get_by_tube_id(&self, tube_id: &str) -> Option<Arc<Tube>> {
+        self.get_tube_fast(tube_id)
+    }
+
+    /// Get tube by conversation ID (compatibility alias)
+    pub fn get_by_conversation_id(&self, conversation_id: &str) -> Option<Arc<Tube>> {
+        self.get_by_conversation_fast(conversation_id)
+    }
+
+    /// Get all tube IDs (lock-free iteration)
+    pub fn all_tube_ids_sync(&self) -> Vec<String> {
+        self.tubes.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// Find tubes by search term (lock-free iteration)
+    pub fn find_tubes(&self, search_term: &str) -> Vec<String> {
+        self.tubes
+            .iter()
+            .filter(|entry| entry.key().contains(search_term))
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Get conversation IDs for a tube (lock-free iteration)
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn conversation_ids_by_tube_id(&self, tube_id: &str) -> Vec<String> {
+        self.conversations
+            .iter()
+            .filter(|entry| entry.value() == tube_id)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Get tube count (lock-free)
+    pub fn tube_count(&self) -> usize {
+        self.tubes.len()
+    }
+
+    /// Check if any tubes exist (lock-free)
+    pub fn has_tubes(&self) -> bool {
+        !self.tubes.is_empty()
+    }
+
+    /// Direct access to tubes DashMap for advanced operations
+    pub fn tubes(&self) -> &Arc<DashMap<String, Arc<Tube>>> {
+        &self.tubes
+    }
+
+    /// Direct access to conversations DashMap
+    #[allow(dead_code)] // Used by Python bindings
+    pub fn conversations(&self) -> &Arc<DashMap<String, String>> {
+        &self.conversations
+    }
+
+    /// Get signal sender for a tube (RAII - stored on Tube itself!)
+    pub fn get_signal_sender(&self, tube_id: &str) -> Option<UnboundedSender<SignalMessage>> {
+        self.get_tube_fast(tube_id)
+            .and_then(|tube| tube.signal_sender.clone())
+    }
+
+    /// Get connection state for a tube
+    #[allow(dead_code)] // Used by Python bindings
+    pub async fn get_connection_state(&self, tube_id: &str) -> Result<String> {
+        let tube = self
+            .get_tube_fast(tube_id)
+            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
+
+        match tube.get_connection_state().await {
+            Some(state) => Ok(format!("{:?}", state)),
+            None => Ok("Unknown".to_string()),
+        }
+    }
+
+    /// Add external ICE candidate to a tube
+    #[allow(dead_code)] // Used by Python bindings
+    pub async fn add_external_ice_candidate(&self, tube_id: &str, candidate: &str) -> Result<()> {
+        let tube = self
+            .get_tube_fast(tube_id)
+            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
+        tube.add_ice_candidate(candidate.to_string())
+            .await
+            .map_err(|e| anyhow!("Failed to add ICE candidate: {}", e))
+    }
+
+    /// Check server mode (queries actor for authoritative state)
+    #[allow(dead_code)] // Used by Python bindings
+    pub async fn is_server_mode(&self) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(RegistryCommand::GetServerMode { resp: tx })
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow!("Registry actor response channel closed"))
+    }
+
+    /// Cleanup stale tubes (lock-free iteration + coordinated cleanup)
+    pub async fn cleanup_stale_tubes(&self) -> Vec<String> {
         let mut stale_tube_ids = Vec::new();
 
-        // Collect stale tube IDs
-        for (tube_id, tube) in &self.tubes_by_id {
+        // LOCK-FREE: Collect stale tube IDs from DashMap
+        for entry in self.tubes.iter() {
+            let (tube_id, tube) = (entry.key(), entry.value());
             if tube.is_stale().await {
                 debug!("Detected stale tube (tube_id: {})", tube_id);
                 stale_tube_ids.push(tube_id.clone());
             }
         }
 
-        // Close stale tubes
+        // Close stale tubes via actor (coordinated)
         let mut closed_tubes = Vec::new();
         for tube_id in stale_tube_ids {
             debug!("Auto-closing stale tube (tube_id: {})", tube_id);
@@ -896,3 +1016,40 @@ impl TubeRegistry {
         closed_tubes
     }
 }
+
+// Global registry handle - initialized once
+pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
+    debug!("Initializing global tube registry with actor model");
+
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+    // Get max concurrent from environment or default to 100
+    let max_concurrent = std::env::var("WEBRTC_MAX_CONCURRENT_CREATES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+
+    info!(
+        "Registry configured with max_concurrent_creates: {}",
+        max_concurrent
+    );
+
+    let actor = RegistryActor::new(command_rx, max_concurrent);
+    let tubes = Arc::clone(&actor.tubes);
+    let conversations = Arc::clone(&actor.conversations);
+
+    // CRITICAL FIX: Spawn actor on global runtime
+    // This ensures actor actually starts even during static init
+    std::thread::spawn(move || {
+        let rt = crate::runtime::get_runtime();
+        rt.spawn(async move {
+            info!("Registry actor event loop starting");
+            actor.run().await;
+            // If actor exits, this is catastrophic
+            error!("CRITICAL: Registry actor event loop terminated!");
+            error!("All future tube operations will fail!");
+        });
+    });
+
+    RegistryHandle::new(command_tx, tubes, conversations)
+});

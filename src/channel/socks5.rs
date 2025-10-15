@@ -1,6 +1,7 @@
 // SOCKS5 server functionality extracted from server.rs
 
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
+use crate::unlikely;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
@@ -235,7 +236,7 @@ pub(crate) async fn handle_socks5_connection(
             match reader.read(read_slice).await {
                 Ok(0) => {
                     // EOF
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
                             "Channel({}): Client connection {} closed",
                             endpoint_name, conn_no
@@ -350,7 +351,7 @@ pub(crate) async fn handle_socks5_connection(
         buffer_pool_clone.release(read_buffer);
         buffer_pool_clone.release(encode_buffer);
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Channel({}): Client read task for connection {} exited",
                 endpoint_name, conn_no

@@ -193,29 +193,20 @@ impl Conn {
         }
     }
 
-    /// Shutdown the connection gracefully
+    /// Shutdown the connection immediately by aborting tasks
+    ///
+    /// This prevents zombie connections where backend tasks continue
+    /// reading from/writing to guacd even after the tube is closed.
+    /// Aborting ensures immediate cleanup of TCP connections.
     pub async fn shutdown(self) -> Result<()> {
         // Close the data channel
         drop(self.data_tx);
 
-        // Wait for tasks to complete
-        if let Err(e) = self.backend_task.await {
-            if !e.is_cancelled() {
-                warn!(
-                    "Backend task ended with error during shutdown (error: {})",
-                    e
-                );
-            }
-        }
-
-        if let Err(e) = self.to_webrtc.await {
-            if !e.is_cancelled() {
-                warn!(
-                    "to_webrtc task ended with error during shutdown (error: {})",
-                    e
-                );
-            }
-        }
+        // Abort tasks immediately to prevent zombie keepalive responses
+        // The outbound task (to_webrtc) reads from guacd and auto-responds to sync messages
+        // If we await instead of abort, it can run forever since guacd keeps sending syncs
+        self.backend_task.abort();
+        self.to_webrtc.abort();
 
         Ok(())
     }

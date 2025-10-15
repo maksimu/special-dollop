@@ -66,8 +66,8 @@ impl Default for ResourceLimits {
             ice_backup_candidate_pair_ping_interval: Some(Duration::from_secs(25)),
             // Session keepalive defaults to prevent NAT timeouts
             ice_keepalive_enabled: true,
-            ice_keepalive_interval: Duration::from_secs(300), // 5 minutes - well below NAT timeout
-            session_timeout: Duration::from_secs(3600),       // 1 hour - longer than NAT timeout
+            ice_keepalive_interval: Duration::from_secs(60), // 60 seconds - CRITICAL: Frequent keepalive prevents NAT table expiry
+            session_timeout: Duration::from_secs(3600),      // 1 hour - longer than NAT timeout
             turn_credential_refresh_interval: Duration::from_secs(600), // 10 minutes
             connection_health_check_interval: Duration::from_secs(120), // 2 minutes
         }

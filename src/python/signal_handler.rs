@@ -1,3 +1,4 @@
+use crate::unlikely;
 use log::{debug, warn};
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
@@ -17,7 +18,9 @@ pub fn setup_signal_handler(
         let mut signal_count = 0;
         while let Some(signal) = signal_receiver.recv().await {
             signal_count += 1;
-            debug!("Rust task received signal {}: {:?} for tube {}. Preparing Python callback.", signal_count, signal.kind, task_tube_id);
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("Rust task received signal {}: {:?} for tube {}. Preparing Python callback.", signal_count, signal.kind, task_tube_id);
+            }
 
             Python::attach(|py| {
                 let py_dict = PyDict::new(py);
@@ -58,7 +61,9 @@ pub fn setup_signal_handler(
                     warn!("Skipping Python callback for tube {} due to error setting dict items for signal {:?}", task_tube_id, signal.kind);
                 }
             });
-            debug!("Rust task completed Python callback GIL block for signal {}: {:?} for tube {}", signal_count, signal.kind, task_tube_id);
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("Rust task completed Python callback GIL block for signal {}: {:?} for tube {}", signal_count, signal.kind, task_tube_id);
+            }
         }
         // Only log termination if it's not a normal closure
         if signal_count > 0 {

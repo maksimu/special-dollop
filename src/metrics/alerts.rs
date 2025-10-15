@@ -316,7 +316,7 @@ impl AlertManager {
                 );
             }
             AlertSeverity::Critical => {
-                tracing::error!(
+                log::error!(
                     "{} (alert_type: {}, conversation_id: {:?})",
                     message,
                     alert_type,

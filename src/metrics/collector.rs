@@ -918,12 +918,8 @@ impl MetricsCollector {
                 continue;
             }
 
-            // CRITICAL FIX: Clone tube Arc BEFORE doing any awaits to avoid holding read lock
-            // Holding read lock across await points can block write lock acquisitions and cause deadlocks
-            let tube_arc: Option<Arc<crate::Tube>> = {
-                let registry = crate::tube_registry::REGISTRY.read().await;
-                registry.get_by_tube_id(&tube_id)
-            }; // Read lock released here - crucial for allowing write locks (create_tube, close_tube)
+            // LOCK-FREE: Get tube from DashMap-based registry (no locks!)
+            let tube_arc = crate::tube_registry::REGISTRY.get_by_tube_id(&tube_id);
 
             if let Some(tube) = tube_arc {
                 // Now we can safely await without holding the registry lock
@@ -964,39 +960,28 @@ impl MetricsCollector {
                         conversation_id, tube_id, connection_state, has_active_channels
                     );
 
-                    // Force close the zombie tube via registry
+                    // Force close the zombie tube via registry (actor-based, no locks!)
                     let tube_id_clone = tube_id.clone();
                     let conversation_id_clone = conversation_id.clone();
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        crate::tube_registry::REGISTRY.write(),
-                    )
-                    .await
+
+                    match crate::tube_registry::REGISTRY
+                        .close_tube(
+                            &tube_id_clone,
+                            Some(crate::tube_protocol::CloseConnectionReason::Timeout),
+                        )
+                        .await
                     {
-                        Ok(mut registry) => {
-                            match registry
-                                .close_tube(
-                                    &tube_id_clone,
-                                    Some(crate::tube_protocol::CloseConnectionReason::Timeout),
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    info!(
-                                        "Successfully force-closed zombie tube (tube_id: {})",
-                                        tube_id_clone
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to force-close zombie tube: {} (tube_id: {})",
-                                        e, tube_id_clone
-                                    );
-                                }
-                            }
+                        Ok(_) => {
+                            info!(
+                                "Successfully force-closed zombie tube (tube_id: {})",
+                                tube_id_clone
+                            );
                         }
-                        Err(_) => {
-                            error!("Timeout acquiring REGISTRY write lock for zombie cleanup (tube_id: {})", tube_id_clone);
+                        Err(e) => {
+                            error!(
+                                "Failed to force-close zombie tube: {} (tube_id: {})",
+                                e, tube_id_clone
+                            );
                         }
                     }
 
@@ -1046,12 +1031,9 @@ impl MetricsCollector {
         // Clean up old alerts
         self.alert_manager.cleanup_old_alerts();
 
-        // Trigger stale tube cleanup in the registry
-        let cleaned_count = {
-            let mut registry = crate::tube_registry::REGISTRY.write().await;
-            let cleaned_tubes = registry.cleanup_stale_tubes().await;
-            cleaned_tubes.len()
-        };
+        // Trigger stale tube cleanup in the registry (lock-free!)
+        let cleaned_tubes = crate::tube_registry::REGISTRY.cleanup_stale_tubes().await;
+        let cleaned_count = cleaned_tubes.len();
 
         if cleaned_count > 0 {
             debug!(
@@ -1105,19 +1087,14 @@ impl MetricsCollector {
             debug!("Zombie tube sweeper: Starting periodic sweep");
 
             // Get all tube IDs from registry
-            let tube_ids: Vec<String> = {
-                let registry = crate::tube_registry::REGISTRY.read().await;
-                registry.tubes_by_id.keys().cloned().collect()
-            };
+            // LOCK-FREE: Get all tube IDs from DashMap
+            let tube_ids = crate::tube_registry::REGISTRY.all_tube_ids_sync();
 
             let mut zombies_found = 0;
 
             for tube_id in tube_ids {
-                // Clone tube Arc before awaits to release read lock
-                let tube_arc: Option<Arc<crate::Tube>> = {
-                    let registry = crate::tube_registry::REGISTRY.read().await;
-                    registry.get_by_tube_id(&tube_id)
-                };
+                // LOCK-FREE: Get tube from DashMap
+                let tube_arc = crate::tube_registry::REGISTRY.get_by_tube_id(&tube_id);
 
                 if let Some(tube) = tube_arc {
                     let state = tube.get_connection_state().await;
@@ -1141,39 +1118,24 @@ impl MetricsCollector {
                             tube_id, state
                         );
 
-                        // Force close the zombie tube
-                        match tokio::time::timeout(
-                            Duration::from_secs(10),
-                            crate::tube_registry::REGISTRY.write(),
-                        )
-                        .await
+                        // Force close the zombie tube (actor-based, no locks!)
+                        match crate::tube_registry::REGISTRY
+                            .close_tube(
+                                &tube_id,
+                                Some(crate::tube_protocol::CloseConnectionReason::Timeout),
+                            )
+                            .await
                         {
-                            Ok(mut registry) => {
-                                match registry
-                                    .close_tube(
-                                        &tube_id,
-                                        Some(crate::tube_protocol::CloseConnectionReason::Timeout),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        info!(
-                                            "Zombie sweeper: Closed zombie tube (tube_id: {})",
-                                            tube_id
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Zombie sweeper: Failed to close tube: {} (tube_id: {})",
-                                            e, tube_id
-                                        );
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                error!(
-                                    "Zombie sweeper: Timeout acquiring registry lock (tube_id: {})",
+                            Ok(_) => {
+                                info!(
+                                    "Zombie sweeper: Closed zombie tube (tube_id: {})",
                                     tube_id
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Zombie sweeper: Failed to close tube: {} (tube_id: {})",
+                                    e, tube_id
                                 );
                             }
                         }

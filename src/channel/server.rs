@@ -1,6 +1,7 @@
 // Server functionality for the Channel implementation
 
 use crate::tube_protocol::{ControlMessage, Frame};
+use crate::unlikely;
 use crate::webrtc_data_channel::{EventDrivenSender, WebRTCDataChannel, STANDARD_BUFFER_THRESHOLD};
 use anyhow::{anyhow, Result};
 use bytes::BufMut;
@@ -320,7 +321,7 @@ async fn handle_generic_server_connection(
             EventDrivenSender::new(Arc::new(dc_clone.clone()), STANDARD_BUFFER_THRESHOLD);
 
         // Add a print statement to see the conn_no being used
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Server-side TCP reader task started for conn_no: {} with EventDrivenSender",
                 conn_no
@@ -347,7 +348,7 @@ async fn handle_generic_server_connection(
 
             match reader.read(read_slice).await {
                 Ok(0) => {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
                             "Server-side TCP reader received EOF for conn_no: {}",
                             conn_no
@@ -382,7 +383,7 @@ async fn handle_generic_server_connection(
                         read_buffer.advance_mut(n);
                     }
 
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
                             "Server-side TCP reader received {} bytes for conn_no: {}",
                             n, conn_no
@@ -409,7 +410,7 @@ async fn handle_generic_server_connection(
                     encode_buffer.clear();
                     let bytes_written = data_frame.encode_into(&mut encode_buffer);
 
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!("Encoded frame with conn_no {} and {} bytes payload into {} total bytes",
                             conn_no, n, bytes_written);
                     }
@@ -433,7 +434,7 @@ async fn handle_generic_server_connection(
                                 Some(send_latency),
                             );
 
-                            if tracing::enabled!(tracing::Level::DEBUG) {
+                            if unlikely!(crate::logger::is_verbose_logging()) {
                                 debug!("Successfully sent data frame via EventDrivenSender for conn_no {}", conn_no);
                             }
                         }
@@ -442,7 +443,7 @@ async fn handle_generic_server_connection(
                             crate::metrics::METRICS_COLLECTOR
                                 .record_error(&channel_id_clone, "webrtc_send_failed");
 
-                            if tracing::enabled!(tracing::Level::DEBUG) {
+                            if unlikely!(crate::logger::is_verbose_logging()) {
                                 debug!("Failed to send data frame via EventDrivenSender for conn_no {}: {}", conn_no, e);
                             }
                             break;
@@ -452,7 +453,7 @@ async fn handle_generic_server_connection(
                 Ok(_) => { /* n == 0 but not EOF, should not happen with read_buf if it doesn't return Ok(0) */
                 }
                 Err(e) => {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
                             "Error reading from client on server port (conn_no {}): {}",
                             conn_no, e
@@ -469,7 +470,7 @@ async fn handle_generic_server_connection(
         buffer_pool_clone.release(read_buffer);
         buffer_pool_clone.release(encode_buffer);
         // Add a print statement to see the conn_no being used
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if unlikely!(crate::logger::is_verbose_logging()) {
             debug!("Server-side TCP reader task for conn_no {} exited", conn_no);
             debug!(
                 "Channel({}): Server-side TCP reader task for conn_no {} ({:?}) exited.",

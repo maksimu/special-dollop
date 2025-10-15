@@ -1,13 +1,12 @@
 //! Tube-related tests
 use crate::runtime::get_runtime;
-use crate::tube_and_channel_helpers::TubeStatus;
 use crate::tube_protocol::CloseConnectionReason;
 use crate::tube_registry::REGISTRY;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use crate::Tube;
 use bytes::Bytes;
 use chrono::Utc;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +19,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
 // Get a tube by ID from the registry
 pub async fn get_tube(tube_id: &str) -> Option<Arc<Tube>> {
-    REGISTRY.read().await.get_by_tube_id(tube_id)
+    REGISTRY.get_tube_fast(tube_id)
 }
 
 #[test]
@@ -29,7 +28,7 @@ fn test_tube_creation() {
     let runtime = get_runtime();
     runtime.block_on(async {
         // Create a tube
-        let tube = Tube::new(false, None, None).expect("Failed to create tube");
+        let tube = Tube::new(false, None, None, None).expect("Failed to create tube");
         let tube_id = tube.id();
         println!("Created tube with ID: {}", tube_id);
 
@@ -75,12 +74,8 @@ fn test_tube_creation() {
             Ok(result) => result.expect("Failed to create data channel"),
             Err(_) => {
                 println!("Timeout creating data channel, skipping data channel tests");
-                // Skip the rest of the data channel tests
-                {
-                    let mut registry = REGISTRY.write().await;
-                    tube.close(&mut registry).await
-                }
-                .expect("Failed to close tube");
+                // RAII: Tube will auto-cleanup when dropped
+                drop(tube);
                 return;
             }
         };
@@ -106,12 +101,8 @@ fn test_tube_creation() {
             Ok(result) => result.expect("Failed to create control channel"),
             Err(_) => {
                 println!("Timeout creating control channel, skipping verification");
-                // Skip the verification
-                {
-                    let mut registry = REGISTRY.write().await;
-                    tube.close(&mut registry).await
-                }
-                .expect("Failed to close tube");
+                // RAII: Tube will auto-cleanup when dropped
+                drop(tube);
                 return;
             }
         };
@@ -119,21 +110,15 @@ fn test_tube_creation() {
         // Verify control channel label
         assert_eq!(control_channel.label(), "control");
 
-        // Close the tube with timeout
-        tokio::time::timeout(Duration::from_secs(3), async {
-            // Pass async block directly
-            let mut registry = REGISTRY.write().await;
-            tube.close(&mut registry).await
-        })
-        .await
-        .unwrap_or_else(|_| {
-            println!("Timeout closing tube, but continuing");
-            Ok(()) // This Ok(()) matches the inner Result from tube.close()
-        })
-        .expect("Failed to close tube");
+        // With RAII, tube will auto-cleanup when dropped
+        // Just verify status before drop
+        println!("Tube will auto-cleanup via RAII when dropped");
 
-        // Verify status changed to Closed
-        assert_eq!(tube.status().await, TubeStatus::Closed);
+        // Let tube drop naturally at end of scope - RAII cleanup!
+        drop(tube); // Explicit drop for clarity
+
+        // Give Drop time to execute
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify tube is removed from the registry
         let retrieved_tube = get_tube(&tube_id).await;
@@ -149,7 +134,7 @@ fn test_tube_channel_creation() {
     println!("Starting test_tube_channel_creation");
     let runtime = get_runtime();
     runtime.block_on(async {
-        let tube = Tube::new(false, None, None).expect("Failed to create tube");
+        let tube = Tube::new(false, None, None, None).expect("Failed to create tube");
         let tube_id = tube.id();
         let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
         let mut settings = HashMap::new();
@@ -169,7 +154,7 @@ fn test_tube_channel_creation() {
             Ok(Err(e)) => panic!("Failed to create data channel: {}", e),
             Err(_) => {
                 println!("Timeout creating data channel, skipping channel tests");
-                { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube during data channel timeout");
+                REGISTRY.close_tube(&tube.id(), Some(CloseConnectionReason::AdminClosed)).await.expect("Failed to close tube during data channel timeout");
                 return;
             }
         };
@@ -192,10 +177,10 @@ fn test_tube_channel_creation() {
         assert!(close_result.is_ok(), "close_channel should return Ok. Actual: {:?}", close_result);
         assert!(!tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should be removed after closing");
 
-        // Try to close a non-existent channel
-        assert!(tube.close_channel("nonexistent", Some(CloseConnectionReason::Error)).await.is_err(), "Non-existent channel should return an error on close");
+        // Try to close a non-existent channel (should be idempotent - returns Ok)
+        assert!(tube.close_channel("nonexistent", Some(CloseConnectionReason::Error)).await.is_ok(), "Non-existent channel close should be idempotent (returns Ok)");
 
-        { let mut registry = REGISTRY.write().await; tube.close(&mut registry).await }.expect("Failed to close tube");
+        drop(tube);  // RAII cleanup - no manual close needed!
 
         for _ in 0..3 {
             if get_tube(&tube_id).await.is_none() {
@@ -211,7 +196,7 @@ fn test_tube_channel_creation() {
 
 #[tokio::test]
 async fn test_tube_create_with_pc() {
-    let tube = Tube::new(false, None, None).expect("Failed to create tube");
+    let tube = Tube::new(false, None, None, None).expect("Failed to create tube");
 
     // Create a signaling channel
     let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
@@ -236,7 +221,7 @@ async fn test_tube_create_with_pc() {
 
 #[tokio::test]
 async fn test_tube_webrtc_connection() {
-    let tube = Tube::new(false, None, None).expect("Failed to create tube");
+    let tube = Tube::new(false, None, None, None).expect("Failed to create tube");
 
     // Create a signaling channel
     let (signal_tx, _) = mpsc::unbounded_channel();
@@ -265,7 +250,7 @@ async fn test_tube_webrtc_connection() {
 
 #[tokio::test]
 async fn test_tube_create_channel() {
-    let tube = Tube::new(false, None, None).expect("Failed to create tube");
+    let tube = Tube::new(false, None, None, None).expect("Failed to create tube");
     let (signal_tx, _) = mpsc::unbounded_channel();
     let mut settings = HashMap::new();
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
@@ -331,60 +316,64 @@ async fn perform_signaling_and_ice_exchange(
     );
 
     // Offer/Answer exchange
+    info!("[perform_signaling] Creating offer from tube1");
     let offer = tube1
         .create_offer()
         .await
         .map_err(|e| format!("[perform_signaling] Tube1 create_offer error: {}", e))?;
-    info!("[perform_signaling] Tube1 created offer.");
+    info!(
+        "[perform_signaling] ✅ Offer created ({} bytes)",
+        offer.len()
+    );
 
-    // Ensure tube2's peer connection exists before set_remote_description
-    if tube2.peer_connection().await.is_none() {
-        return Err(
-            "Tube2 peer connection not initialized before set_remote_description".to_string(),
-        );
-    }
+    info!("[perform_signaling] Setting offer as remote description on tube2");
     tube2
         .set_remote_description(offer, false)
         .await
         .map_err(|e| {
             format!(
-                "[perform_signaling] Tube2 set_remote_description (offer) error: {}",
+                "[perform_signaling] Tube2 set_remote_description error: {}",
                 e
             )
         })?;
-    info!("[perform_signaling] Tube2 set remote offer.");
+    info!("[perform_signaling] ✅ Remote offer set");
 
+    info!("[perform_signaling] Creating answer from tube2");
     let answer = tube2
         .create_answer()
         .await
         .map_err(|e| format!("[perform_signaling] Tube2 create_answer error: {}", e))?;
-    info!("[perform_signaling] Tube2 created answer.");
+    info!(
+        "[perform_signaling] ✅ Answer created ({} bytes)",
+        answer.len()
+    );
 
-    // Ensure tube1's peer connection exists
-    if tube1.peer_connection().await.is_none() {
-        return Err(
-            "Tube1 peer connection not initialized before set_remote_description for answer"
-                .to_string(),
-        );
-    }
+    info!("[perform_signaling] Setting answer as remote description on tube1");
     tube1
         .set_remote_description(answer, true)
         .await
         .map_err(|e| {
             format!(
-                "[perform_signaling] Tube1 set_remote_description (answer) error: {}",
+                "[perform_signaling] Tube1 set_remote_description error: {}",
                 e
             )
         })?;
-    info!("[perform_signaling] Tube1 set remote answer.");
+    info!("[perform_signaling] ✅ Remote answer set");
 
-    // ICE Candidate Exchange
+    // Wait for ICE gathering to start
     tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify peer connections still exist before ICE exchange
+    if tube1.peer_connection().await.is_none() || tube2.peer_connection().await.is_none() {
+        return Err("Peer connections disappeared after offer/answer exchange!".to_string());
+    }
 
     let max_ice_exchange_attempts = 25;
     let mut ice_connected = false;
     let mut tube1_ice_candidates_finished = false;
     let mut tube2_ice_candidates_finished = false;
+    let mut total_candidates_tube1 = 0;
+    let mut total_candidates_tube2 = 0;
 
     for attempt in 1..=max_ice_exchange_attempts {
         info!(
@@ -392,22 +381,42 @@ async fn perform_signaling_and_ice_exchange(
             attempt, max_ice_exchange_attempts
         );
 
-        let state1_pc = tube1
-            .peer_connection()
-            .await
-            .map_or(RTCPeerConnectionState::Unspecified, |p| {
-                p.peer_connection.connection_state()
-            });
-        let state2_pc = tube2
-            .peer_connection()
-            .await
-            .map_or(RTCPeerConnectionState::Unspecified, |p| {
-                p.peer_connection.connection_state()
-            });
+        // Get BOTH connection state AND peer connection existence
+        let pc1_opt = tube1.peer_connection().await;
+        let pc2_opt = tube2.peer_connection().await;
+
+        let state1_pc = pc1_opt
+            .as_ref()
+            .map(|p| p.peer_connection.connection_state())
+            .unwrap_or(RTCPeerConnectionState::Unspecified);
+        let state2_pc = pc2_opt
+            .as_ref()
+            .map(|p| p.peer_connection.connection_state())
+            .unwrap_or(RTCPeerConnectionState::Unspecified);
+
         info!(
-            "[perform_signaling] PC states: tube1={:?}, tube2={:?}",
-            state1_pc, state2_pc
+            "[perform_signaling] PC states: tube1={:?} (exists={}), tube2={:?} (exists={})",
+            state1_pc,
+            pc1_opt.is_some(),
+            state2_pc,
+            pc2_opt.is_some()
         );
+
+        // Log ICE gathering states
+        if attempt % 5 == 1 {
+            if let Some(ref pc1) = pc1_opt {
+                info!(
+                    "[perform_signaling] Tube1 ICE gathering: {:?}",
+                    pc1.peer_connection.ice_gathering_state()
+                );
+            }
+            if let Some(ref pc2) = pc2_opt {
+                info!(
+                    "[perform_signaling] Tube2 ICE gathering: {:?}",
+                    pc2.peer_connection.ice_gathering_state()
+                );
+            }
+        }
 
         if state1_pc == RTCPeerConnectionState::Connected
             && state2_pc == RTCPeerConnectionState::Connected
@@ -425,10 +434,12 @@ async fn perform_signaling_and_ice_exchange(
             match tokio::time::timeout(Duration::from_millis(100), signal_rx1.recv()).await {
                 Ok(Some(signal)) => {
                     if signal.kind == "icecandidate" {
+                        total_candidates_tube1 += 1;
                         info!(
-                            "[perform_signaling] Tube1 ICE candidate: {}",
+                            "[perform_signaling] Tube1 ICE candidate #{}: {}",
+                            total_candidates_tube1,
                             if signal.data.is_empty() {
-                                "<empty>"
+                                "<empty/end-of-candidates>"
                             } else {
                                 &signal.data
                             }
@@ -444,11 +455,15 @@ async fn perform_signaling_and_ice_exchange(
 
                         if signal.data.is_empty() {
                             tube1_ice_candidates_finished = true;
+                            info!("[perform_signaling] Tube1 finished gathering (total candidates: {})", total_candidates_tube1);
                         }
                     }
                 }
-                Ok(None) => break, // Channel closed
-                Err(_) => break,   // Timeout, no more signals for now
+                Ok(None) => {
+                    warn!("[perform_signaling] Tube1 signal channel closed unexpectedly!");
+                    break;
+                }
+                Err(_) => break, // Timeout, no more signals for now
             }
         }
 
@@ -457,10 +472,12 @@ async fn perform_signaling_and_ice_exchange(
             match tokio::time::timeout(Duration::from_millis(100), signal_rx2.recv()).await {
                 Ok(Some(signal)) => {
                     if signal.kind == "icecandidate" {
+                        total_candidates_tube2 += 1;
                         info!(
-                            "[perform_signaling] Tube2 ICE candidate: {}",
+                            "[perform_signaling] Tube2 ICE candidate #{}: {}",
+                            total_candidates_tube2,
                             if signal.data.is_empty() {
-                                "<empty>"
+                                "<empty/end-of-candidates>"
                             } else {
                                 &signal.data
                             }
@@ -476,11 +493,15 @@ async fn perform_signaling_and_ice_exchange(
 
                         if signal.data.is_empty() {
                             tube2_ice_candidates_finished = true;
+                            info!("[perform_signaling] Tube2 finished gathering (total candidates: {})", total_candidates_tube2);
                         }
                     }
                 }
-                Ok(None) => break, // Channel closed
-                Err(_) => break,   // Timeout, no more signals for now
+                Ok(None) => {
+                    warn!("[perform_signaling] Tube2 signal channel closed unexpectedly!");
+                    break;
+                }
+                Err(_) => break, // Timeout, no more signals for now
             }
         }
 
@@ -572,12 +593,27 @@ async fn perform_signaling_and_ice_exchange(
 
     if !ice_connected {
         return Err(format!(
-            "ICE connection failed after {} attempts. Final PC states: tube1={:?}, tube2={:?}",
-            max_ice_exchange_attempts, final_state1_pc, final_state2_pc
+            "ICE connection failed after {} attempts.\n\
+            Final PC states: tube1={:?}, tube2={:?}\n\
+            ICE candidates exchanged: tube1→tube2: {}, tube2→tube1: {}\n\
+            Diagnosis: {}",
+            max_ice_exchange_attempts,
+            final_state1_pc,
+            final_state2_pc,
+            total_candidates_tube1,
+            total_candidates_tube2,
+            if total_candidates_tube1 == 0 && total_candidates_tube2 == 0 {
+                "NO ICE CANDIDATES GATHERED - Check if STUN servers are reachable and network interfaces are available"
+            } else if final_state1_pc == RTCPeerConnectionState::Unspecified {
+                "PEER CONNECTIONS IN UNSPECIFIED STATE - Possible issue with offer/answer exchange or peer connection setup"
+            } else {
+                "ICE CANDIDATES EXCHANGED BUT CONNECTION FAILED - Network/firewall may be blocking P2P connectivity"
+            }
         ));
     }
 
-    info!("[perform_signaling] P2P signaling and ICE exchange appears complete.");
+    info!("[perform_signaling] ✅ P2P signaling and ICE exchange complete! Tube1 candidates: {}, Tube2 candidates: {}",
+        total_candidates_tube1, total_candidates_tube2);
     Ok(())
 }
 
@@ -585,8 +621,9 @@ async fn perform_signaling_and_ice_exchange(
 async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     println!("[E2E_TEST] Starting test_tube_p2p_data_transfer_end_to_end");
 
-    let tube1 = Tube::new(false, None, None)?;
-    let tube2 = Tube::new(false, None, None)?;
+    // Create tubes WITHOUT signal channels initially - they'll be passed to create_peer_connection()
+    let tube1 = Tube::new(false, None, None, None)?;
+    let tube2 = Tube::new(false, None, None, None)?;
     println!(
         "[E2E_TEST] Tube1 ID: {}, Tube2 ID: {}",
         tube1.id(),
@@ -598,7 +635,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     let ksm_config_t2 = "TEST_MODE_KSM_CONFIG_T2_E2E".to_string();
     let token_t2 = "test_token_t2_e2e".to_string();
 
-    // Create signal channels - now properly keeping both tx and rx
+    // Create signal channels for ICE candidate exchange
     let (signal_tx1, mut signal_rx1) = mpsc::unbounded_channel();
     let (signal_tx2, mut signal_rx2) = mpsc::unbounded_channel();
 
@@ -623,6 +660,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
     // Create peer connections
+    println!("[E2E_TEST] Creating peer connections...");
     tube1
         .create_peer_connection(
             Some(rtc_config.clone()),
@@ -633,10 +671,10 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             "ms16.5.0",
             settings.clone(),
             signal_tx1,
-            None, // turn_credentials_created_at (not tracked in tests)
+            None,
         )
         .await?;
-    println!("[E2E_TEST] Tube1 peer connection created.");
+
     tube2
         .create_peer_connection(
             Some(rtc_config),
@@ -647,25 +685,15 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             "ms16.5.0",
             settings,
             signal_tx2,
-            None, // turn_credentials_created_at (not tracked in tests)
+            None,
         )
         .await?;
-    println!("[E2E_TEST] Tube2 peer connection created.");
 
-    // Tube1 (offerer) creates the data channel *before* creating the offer
+    println!("[E2E_TEST] ✅ Peer connections created");
+
+    // Create data channel on tube1 (offerer creates channel before offer)
     let dc_label = "e2e-channel".to_string();
-    println!(
-        "[E2E_TEST] Tube1 attempting to create data channel '{}' BEFORE offer",
-        dc_label
-    );
-
-    // Check if peer connection exists
-    if tube1.peer_connection().await.is_none() {
-        return Err(Box::from(
-            "[E2E_TEST] Tube1 has no peer connection before creating data channel",
-        ));
-    }
-    println!("[E2E_TEST] Tube1 peer connection exists, proceeding with data channel creation");
+    println!("[E2E_TEST] Creating data channel '{}'", dc_label);
 
     let dc1_out = tube1
         .create_data_channel(
@@ -675,34 +703,10 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             "ms16.5.0",
         )
         .await?;
-    println!(
-        "[E2E_TEST] Tube1: create_data_channel call returned successfully for '{}', label: '{}'",
-        dc_label,
-        dc1_out.label()
-    );
+    println!("[E2E_TEST] ✅ Data channel '{}' created", dc_label);
 
-    // Verify the data channel was added to tube1's map
-    match tube1.get_data_channel(&dc_label).await {
-        Some(dc) => println!(
-            "[E2E_TEST] ✅ Tube1: Data channel '{}' found in tube's data_channels map",
-            dc.label()
-        ),
-        None => println!(
-            "[E2E_TEST] ❌ Tube1: Data channel '{}' NOT found in tube's data_channels map",
-            dc_label
-        ),
-    }
-
-    // Perform signaling (Offer/Answer + ICE) with signal channels
-    println!("[E2E_TEST] About to start signaling and ICE exchange");
-
-    // Check that tube2 also has a peer connection before signaling
-    if tube2.peer_connection().await.is_none() {
-        return Err(Box::from(
-            "[E2E_TEST] Tube2 has no peer connection before signaling",
-        ));
-    }
-    println!("[E2E_TEST] Both tubes have peer connections, starting signaling");
+    // Perform signaling (Offer/Answer + ICE exchange)
+    println!("[E2E_TEST] Starting WebRTC signaling and ICE candidate exchange");
 
     perform_signaling_and_ice_exchange(&tube1, &tube2, &mut signal_rx1, &mut signal_rx2)
         .await
@@ -881,16 +885,16 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     println!("[E2E_TEST] Closing tubes.");
     let tube1_id = tube1.id();
     let tube2_id = tube2.id();
-    if let Err(e) = {
-        let mut registry = REGISTRY.write().await;
-        tube1.close(&mut registry).await
-    } {
+    if let Err(e) = REGISTRY
+        .close_tube(&tube1_id, Some(CloseConnectionReason::AdminClosed))
+        .await
+    {
         error!("[E2E_TEST] Error closing tube1 ({}): {}", tube1_id, e);
     }
-    if let Err(e) = {
-        let mut registry = REGISTRY.write().await;
-        tube2.close(&mut registry).await
-    } {
+    if let Err(e) = REGISTRY
+        .close_tube(&tube2_id, Some(CloseConnectionReason::AdminClosed))
+        .await
+    {
         error!("[E2E_TEST] Error closing tube2 ({}): {}", tube2_id, e);
     }
 

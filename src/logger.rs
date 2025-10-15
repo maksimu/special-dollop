@@ -118,13 +118,38 @@ pub fn initialize_logger(
 
         // Initialize pyo3_log with explicit filter
         Python::attach(|py| -> Result<(), InitializeLoggerError> {
-            // Create the logger (returns Result<Logger, PyErr>)
-            let logger = pyo3_log::Logger::new(py, pyo3_log::Caching::Loggers)
-                .map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?;
+            // Create the logger with global level filter
+            let mut logger = pyo3_log::Logger::new(py, pyo3_log::Caching::Loggers)
+                .map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?
+                .filter(level_filter);
 
-            // Now configure and install it (returns Result<ResetHandle, SetLoggerError>)
+            // **CRITICAL: Suppress WebRTC ecosystem spam unless verbose mode**
+            // WebRTC + dependencies have 1000+ debug/trace logs that fire constantly (per-packet!)
+            // TURN client dumps full packet data: "try_send data = [0, 1, 0, 88, ...]" (200 bytes/log!)
+            // Without suppression: 60 gateways * 40 packets/sec * 3 logs = 36GB+ in Docker logs
+            // With suppression: Only errors from these crates pass through
+            if !is_verbose {
+                logger = logger
+                    // WebRTC core library
+                    .filter_target("webrtc".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_ice".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_sctp".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_dtls".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_mdns".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_data".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_srtp".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_media".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc_util".to_owned(), log::LevelFilter::Warn)
+                    // TURN/STUN libraries (MASSIVE spam - logs full packet data!)
+                    .filter_target("turn".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("stun".to_owned(), log::LevelFilter::Warn)
+                    // RTP/RTCP libraries
+                    .filter_target("rtp".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("rtcp".to_owned(), log::LevelFilter::Warn);
+            }
+
+            // Install the configured logger
             logger
-                .filter(level_filter)
                 .install()
                 .map_err(|e| InitializeLoggerError::SetGlobalDefaultError(e.to_string()))?;
 
@@ -132,9 +157,10 @@ pub fn initialize_logger(
         })?;
 
         log::debug!(
-            "pyo3_log bridge initialized for '{}' with level {:?}",
+            "pyo3_log bridge initialized for '{}' with level {:?}, webrtc_* suppression: {}",
             logger_name,
-            level_filter
+            level_filter,
+            !is_verbose
         );
 
         set_verbose_logging(is_verbose);

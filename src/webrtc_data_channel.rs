@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use log::{debug, warn};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use webrtc::data_channel::RTCDataChannel;
@@ -293,7 +293,8 @@ pub struct EventDrivenSender {
     data_channel: Arc<WebRTCDataChannel>,
     pending_frames: Arc<Mutex<VecDeque<Bytes>>>,
     can_send: Arc<AtomicBool>,
-    threshold: u64, // Backpressure threshold for monitoring
+    threshold: u64,               // Backpressure threshold for monitoring
+    queue_size: Arc<AtomicUsize>, // Lock-free queue depth counter
 }
 
 impl EventDrivenSender {
@@ -304,6 +305,7 @@ impl EventDrivenSender {
             pending_frames: Arc::new(Mutex::new(VecDeque::new())),
             can_send: Arc::new(AtomicBool::new(true)),
             threshold,
+            queue_size: Arc::new(AtomicUsize::new(0)),
         };
 
         // Set up WebRTC native event handling
@@ -311,6 +313,7 @@ impl EventDrivenSender {
 
         let can_send_clone = sender.can_send.clone();
         let pending_clone = sender.pending_frames.clone();
+        let queue_size_clone = sender.queue_size.clone();
         let dc_clone = data_channel.clone();
 
         // EVENT-DRIVEN: Only wake up when buffer space available
@@ -321,7 +324,9 @@ impl EventDrivenSender {
             let to_send = {
                 let mut pending = pending_clone.lock().unwrap();
                 let batch_size = std::cmp::min(pending.len(), 500); // Max 500 frames per batch (increased from 100 for bulk transfers)
-                pending.drain(..batch_size).collect::<Vec<_>>()
+                let drained = pending.drain(..batch_size).collect::<Vec<_>>();
+                queue_size_clone.store(pending.len(), Ordering::Release); // Update atomic counter
+                drained
             };
 
             if !to_send.is_empty() {
@@ -410,14 +415,17 @@ impl EventDrivenSender {
                     dropped_frame.as_ref().map(|f| f.len()).unwrap_or(0)
                 );
             }
+
+            // Update atomic counter after modifications
+            self.queue_size.store(pending.len(), Ordering::Release);
         }
 
         Ok(()) // Queued successfully - no blocking!
     }
 
-    /// Get queue depth for monitoring
+    /// Get queue depth for monitoring (lock-free)
     pub fn queue_depth(&self) -> usize {
-        self.pending_frames.lock().unwrap().len()
+        self.queue_size.load(Ordering::Acquire)
     }
 
     /// Check if sender can send immediately (useful for monitoring)

@@ -230,6 +230,14 @@ pub(crate) async fn backend_task_runner(
                 // Write to backend without complex stats tracking
                 match backend.write_all(payload.as_ref()).await {
                     Ok(_) => {
+                        // **CRITICAL: Flush immediately for interactive latency (keyboard/mouse)**
+                        // Flush overhead (~5μs) is negligible vs human input rate (~60 msg/sec = 0.03% CPU)
+                        // Without this, characters are buffered and only appear on next keystroke!
+                        if let Err(flush_err) = backend.flush().await {
+                            debug!("Backend flush error, client disconnected (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, flush_err);
+                            break; // Exit the task on flush error
+                        }
+
                         debug!("Backend write successful (channel_id: {}, conn_no: {}, bytes_written: {})", channel_id, conn_no, payload.len());
                     }
                     Err(write_err) => {

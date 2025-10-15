@@ -15,6 +15,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -30,6 +31,9 @@ use super::core::Channel;
 fn should_log_connection(is_critical: bool) -> bool {
     crate::logger::is_verbose_logging() || is_critical
 }
+
+/// Last backpressure log timestamp (rate limiting)
+static LAST_BACKPRESSURE_LOG: AtomicU64 = AtomicU64::new(0);
 
 // Open a backend connection to a given address
 pub async fn open_backend(
@@ -337,7 +341,7 @@ pub async fn setup_outbound_task(
 
         let mut main_read_buffer = buffer_pool.acquire();
         let mut encode_buffer = buffer_pool.acquire();
-        const MAX_READ_SIZE: usize = 64 * 1024; // 64KB - safe under message size limit
+        const MAX_READ_SIZE: usize = 16 * 1024; // 16KB - matches STANDARD_BUFFER_THRESHOLD (WebRTC optimal drain rate)
         const GUACD_BATCH_SIZE: usize = 8 * 1024; // Batch up to 8KB of Guacd instructions
         const LARGE_INSTRUCTION_THRESHOLD: usize = 16 * 1024; // If a single Guacd instruction is >16KB, send it directly without batching
 
@@ -393,12 +397,21 @@ pub async fn setup_outbound_task(
 
             // If queue is > 50% full (5,000 frames), pause reading to prevent overflow
             if queue_depth > BACKPRESSURE_THRESHOLD {
-                warn!(
-                    "⚠️  BACKPRESSURE ENGAGED: Queue filling up (channel_id: {}, conn_no: {}, queue_depth: {}/{} = {:.1}%, threshold: {}, pausing reads)",
-                    channel_id_for_task, conn_no, queue_depth, MAX_QUEUE_FRAMES,
-                    (queue_depth as f64 / MAX_QUEUE_FRAMES as f64) * 100.0,
-                    BACKPRESSURE_THRESHOLD
-                );
+                // Rate-limited logging (once every 5 seconds max)
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let last = LAST_BACKPRESSURE_LOG.load(Ordering::Relaxed);
+
+                if now - last >= 5 {
+                    LAST_BACKPRESSURE_LOG.store(now, Ordering::Relaxed);
+                    debug!(
+                        "Backpressure active: Queue filling up (channel_id: {}, conn_no: {}, queue: {}/{} = {:.1}%)",
+                        channel_id_for_task, conn_no, queue_depth, MAX_QUEUE_FRAMES,
+                        (queue_depth as f64 / MAX_QUEUE_FRAMES as f64) * 100.0
+                    );
+                }
 
                 // Brief pause to let queue drain
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -530,7 +543,7 @@ pub async fn setup_outbound_task(
                                     {
                                         let parse_duration = parse_start.elapsed();
                                         if parse_duration.as_micros() > 100 {
-                                            warn!(
+                                            debug!(
                                                 "Channel({}): Slow Guacd validate: {}μs",
                                                 channel_id_for_task,
                                                 parse_duration.as_micros()
@@ -794,7 +807,7 @@ pub async fn setup_outbound_task(
                                                                             signal_sender
                                                                                 .send(signal_msg)
                                                                         {
-                                                                            warn!("OUTBOUND: Failed to send actual size signal to Python (tube_id: {}, channel_id: {}, error: {})", tube_id, channel_id_clone, e);
+                                                                            debug!("OUTBOUND: Failed to send actual size signal to Python (tube_id: {}, channel_id: {}, error: {})", tube_id, channel_id_clone, e);
                                                                         } else if unlikely!(
                                                                             should_log_connection(
                                                                                 false
@@ -803,10 +816,10 @@ pub async fn setup_outbound_task(
                                                                             debug!("OUTBOUND: Successfully sent actual size signal to Python (tube_id: {}, channel_id: {})", tube_id, channel_id_clone);
                                                                         }
                                                                     } else {
-                                                                        warn!("OUTBOUND: No signal sender found for tube (tube_id: {})", tube_id);
+                                                                        debug!("OUTBOUND: No signal sender found for tube (tube_id: {})", tube_id);
                                                                     }
                                                                 } else {
-                                                                    warn!("OUTBOUND: Could not find tube containing this channel");
+                                                                    debug!("OUTBOUND: Could not find tube containing this channel");
                                                                 }
                                                             });
                                                         } else if unlikely!(should_log_connection(
@@ -1080,7 +1093,7 @@ pub async fn setup_outbound_task(
         if let Err(e) = conn_closed_tx_for_task.send((conn_no, channel_id_for_task.clone())) {
             // Only log if the error is not related to an expected channel closure
             if !e.to_string().contains("channel closed") {
-                warn!("Failed to send connection closure signal; channel might be shutting down. (channel_id: {}, conn_no: {}, error: {:?})", channel_id_for_task, conn_no, e
+                debug!("Failed to send connection closure signal; channel might be shutting down. (channel_id: {}, conn_no: {}, error: {:?})", channel_id_for_task, conn_no, e
                 );
             }
         } else if unlikely!(should_log_connection(true)) {

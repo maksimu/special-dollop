@@ -110,11 +110,13 @@ pub struct Channel {
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
-    // UDP associations for SOCKS5 UDP ASSOCIATE response handling
+    // UDP associations for SOCKS5 UDP ASSOCIATE response handling (server mode)
     pub(crate) udp_associations: super::udp::UdpAssociations,
     // Reverse index: conn_no -> set of destination addresses for efficient cleanup
     pub(crate) udp_conn_index:
         Arc<std::sync::Mutex<HashMap<u32, std::collections::HashSet<std::net::SocketAddr>>>>,
+    // UDP receiver tasks for client mode (RAII: ensures proper cleanup)
+    pub(crate) udp_receiver_tasks: Arc<Mutex<HashMap<u32, tokio::task::JoinHandle<()>>>>,
     // Timestamp for the last channel-level ping sent (conn_no=0)
     pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
 
@@ -489,6 +491,7 @@ impl Channel {
             buffer_pool,
             udp_associations: Arc::new(Mutex::new(HashMap::new())),
             udp_conn_index: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            udp_receiver_tasks: Arc::new(Mutex::new(HashMap::new())), // RAII: Track client-side UDP receiver tasks
             channel_ping_sent_time: Mutex::new(None),
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
@@ -539,8 +542,7 @@ impl Channel {
 
             tokio::select! {
                 // Check for any new connections from the server
-                // Use biasedly selects to prioritize existing connections over new ones if server_conn_rx is Some
-                biased;
+                // Fair scheduling: random polling order prevents keyboard input starvation
                 maybe_conn = async { server_conn_rx.as_mut()?.recv().await }, if server_conn_rx.is_some() => {
                     if let Some((conn_no, writer, task)) = maybe_conn {
                         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -1250,6 +1252,27 @@ impl Drop for Channel {
                 }
             }
             info!("Channel cleanup completed (channel_id: {})", channel_id);
+        });
+
+        // RAII FIX: Clean up ALL UDP receiver tasks in Drop (client mode)
+        let udp_receiver_tasks = self.udp_receiver_tasks.clone();
+        let channel_id_for_udp = self.channel_id.clone();
+        runtime.spawn(async move {
+            let mut tasks = udp_receiver_tasks.lock().await;
+            let task_count = tasks.len();
+            for (conn_no, task) in tasks.drain() {
+                task.abort();
+                debug!(
+                    "Channel({}): Aborted UDP receiver task in Drop (conn_no: {})",
+                    channel_id_for_udp, conn_no
+                );
+            }
+            if task_count > 0 {
+                info!(
+                    "Channel({}): Cleaned up {} UDP receiver tasks in Drop (RAII)",
+                    channel_id_for_udp, task_count
+                );
+            }
         });
     }
 }

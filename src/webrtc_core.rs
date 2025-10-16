@@ -2151,17 +2151,24 @@ impl WebRTCPeerConnection {
                     collected_stats
                 };
 
-                // Log collected stats to verify real data is being gathered
-                debug!(
-                    "Collected WebRTC stats (tube_id: {}, bytes_sent: {}, bytes_received: {}, packets_sent: {}, packets_received: {}, rtt_ms: {:?}, bitrate_bps: {:?})",
-                    tube_id,
-                    webrtc_stats.bytes_sent,
-                    webrtc_stats.bytes_received,
-                    webrtc_stats.packets_sent,
-                    webrtc_stats.packets_received,
-                    webrtc_stats.rtt_ms,
-                    webrtc_stats.bitrate_bps
-                );
+                // Log collected stats only if there's activity
+                let has_activity = webrtc_stats.bytes_sent > 0
+                    || webrtc_stats.bytes_received > 0
+                    || webrtc_stats.packets_sent > 0
+                    || webrtc_stats.packets_received > 0;
+
+                if unlikely!(crate::logger::is_verbose_logging()) && has_activity {
+                    debug!(
+                        "Collected WebRTC stats (tube_id: {}, bytes_sent: {}, bytes_received: {}, packets_sent: {}, packets_received: {}, rtt_ms: {:?}, bitrate_bps: {:?})",
+                        tube_id,
+                        webrtc_stats.bytes_sent,
+                        webrtc_stats.bytes_received,
+                        webrtc_stats.packets_sent,
+                        webrtc_stats.packets_received,
+                        webrtc_stats.rtt_ms,
+                        webrtc_stats.bitrate_bps
+                    );
+                }
 
                 // Store current stats for next cycle's bitrate calculation
                 previous_stats = Some(webrtc_stats.clone());
@@ -2453,10 +2460,13 @@ impl WebRTCPeerConnection {
         // Update both activity timestamps in a single lock acquisition (deadlock-safe)
         if let Ok(mut activity_state) = self.activity_state.lock() {
             activity_state.update_both(now);
-            debug!(
-                "Activity updated - connection active (tube_id: {})",
-                self.tube_id
-            );
+            // HOT PATH: Activity update happens
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Activity updated - connection active (tube_id: {})",
+                    self.tube_id
+                );
+            }
         } else {
             warn!(
                 "Failed to acquire lock for activity update (tube_id: {})",

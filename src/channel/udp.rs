@@ -70,7 +70,7 @@ impl Channel {
         let buffer_pool_clone = self.buffer_pool.clone();
         let channel_id_clone = self.channel_id.clone();
 
-        let _udp_task = tokio::spawn(async move {
+        let udp_receiver_task = tokio::spawn(async move {
             let mut buf = [0u8; 65536];
 
             loop {
@@ -113,8 +113,16 @@ impl Channel {
             );
         });
 
-        // Store the task handle so we can clean it up later
-        // This would normally go in the connection map, but for now we'll let it run
+        // RAII FIX: Store task handle for proper cleanup
+        self.udp_receiver_tasks
+            .lock()
+            .await
+            .insert(conn_no, udp_receiver_task);
+
+        debug!(
+            "Channel({}): UDP receiver task tracked for connection {} (RAII)",
+            self.channel_id, conn_no
+        );
 
         Ok(())
     }
@@ -347,6 +355,16 @@ impl Channel {
                     self.channel_id, dest_addr, conn_no
                 );
             }
+        }
+
+        // RAII FIX: Clean up client-side UDP receiver task if present
+        let mut receiver_tasks = self.udp_receiver_tasks.lock().await;
+        if let Some(receiver_task) = receiver_tasks.remove(&conn_no) {
+            receiver_task.abort();
+            debug!(
+                "Channel({}): Aborted UDP receiver task for connection {} (RAII cleanup)",
+                self.channel_id, conn_no
+            );
         }
 
         debug!(

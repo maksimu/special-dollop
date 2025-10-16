@@ -1723,6 +1723,85 @@ impl Tube {
             Err("Peer connection not available".to_string())
         }
     }
+
+    /// Explicit async close - MUST be called before dropping Tube
+    ///
+    /// This ensures proper cleanup in the correct order:
+    /// 1. Stop keepalive task (prevents spurious activity)
+    /// 2. Close data channels (sends CloseConnection to remote peers)
+    /// 3. Close peer connection (releases TURN allocations, stops refresh timers)
+    ///
+    /// CRITICAL: Prevents TURN "400 Bad Request" errors by ensuring allocations
+    /// are properly deallocated before permission refresh timers fire.
+    pub async fn close(&self) -> Result<(), String> {
+        let tube_id = self.id.clone();
+        info!("Tube {} explicit close starting", tube_id);
+
+        // 1. Stop keepalive task to prevent spurious activity during shutdown
+        if let Ok(mut task_guard) = self.keepalive_task.try_lock() {
+            if let Some(task) = task_guard.take() {
+                task.abort();
+                debug!("Keepalive task stopped for tube {}", tube_id);
+            }
+        }
+
+        // 2. Close all data channels (sends CloseConnection to downstream peers)
+        let channels: Vec<_> = {
+            let mut guard = self.data_channels.write().await;
+            guard.drain().collect()
+        };
+
+        let mut closed_count = 0;
+        for (label, dc) in channels {
+            match tokio::time::timeout(Duration::from_secs(3), dc.close()).await {
+                Ok(Ok(_)) => {
+                    closed_count += 1;
+                    debug!("Data channel {} closed for tube {}", label, tube_id);
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Error closing data channel {} for tube {}: {}",
+                        label, tube_id, e
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "Timeout closing data channel {} for tube {} after 3s",
+                        label, tube_id
+                    );
+                }
+            }
+        }
+
+        // 3. Close peer connection (releases TURN allocation, stops refresh timers)
+        let mut pc_guard = self.peer_connection.lock().await;
+        if let Some(pc) = pc_guard.take() {
+            match tokio::time::timeout(Duration::from_secs(5), pc.close()).await {
+                Ok(Ok(_)) => {
+                    info!(
+                        "Tube {} closed successfully (data_channels: {}, TURN allocation released)",
+                        tube_id, closed_count
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(format!(
+                        "Failed to close peer connection for tube {}: {}",
+                        tube_id, e
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "Timeout closing peer connection for tube {} after 5s",
+                        tube_id
+                    ));
+                }
+            }
+        } else {
+            debug!("Peer connection already closed for tube {}", tube_id);
+        }
+
+        Ok(())
+    }
 }
 
 // Connection statistics structure
@@ -1737,111 +1816,65 @@ pub struct ConnectionStats {
 impl Drop for Tube {
     fn drop(&mut self) {
         debug!("===============================================");
-        debug!("Tube {} entering RAII Drop cleanup", self.id);
+        debug!("Tube {} entering RAII Drop (safety net)", self.id);
         debug!("===============================================");
 
-        // Note: Drop is called when the LAST Arc<Tube> reference is dropped
-        // All cleanup happens automatically via RAII pattern
+        // ARCHITECTURE NOTE: Tube::close() should be called BEFORE dropping!
+        // Drop is now just a safety net that cleans up what it can and warns about leaks.
 
-        // 1. Signal sender drops automatically (no manual cleanup needed!)
-        // → Channel closes
-        // → Python receiver gets None
-        // → Python signal handler exits gracefully
+        // 1. Signal sender drops automatically (RAII)
         if self.signal_sender.is_some() {
             drop(self.signal_sender.take());
-            debug!("  ✓ Signal channel closed (tube_id: {})", self.id);
+            debug!("Signal channel auto-closed (tube_id: {})", self.id);
         }
 
-        // 2. Metrics handle drops automatically
-        // → MetricsHandle::drop() fires
-        // → Auto-unregisters from METRICS_COLLECTOR
+        // 2. Metrics handle drops automatically (RAII)
         if let Ok(mut guard) = self.metrics_handle.try_lock() {
             if guard.is_some() {
                 drop(guard.take());
-                debug!("  ✓ Metrics auto-unregistered (tube_id: {})", self.id);
+                debug!("Metrics auto-unregistered (tube_id: {})", self.id);
             }
         }
 
-        // 3. Keepalive task cancelled
+        // 3. Keepalive task cancelled (best-effort)
         if let Ok(mut guard) = self.keepalive_task.try_lock() {
             if let Some(task) = guard.take() {
                 task.abort();
-                debug!("  ✓ Keepalive task cancelled (tube_id: {})", self.id);
+                debug!("Keepalive task cancelled (tube_id: {})", self.id);
             }
         }
 
-        // 4. Clear channel shutdown signals and active channels (prevent leaks!)
+        // 4. Clear channel maps
         if let Ok(mut signals) = self.channel_shutdown_signals.try_write() {
             signals.clear();
-            debug!(
-                "  ✓ Channel shutdown signals cleared (tube_id: {})",
-                self.id
-            );
         }
         if let Ok(mut channels) = self.active_channels.try_write() {
             channels.clear();
-            debug!("  ✓ Active channels cleared (tube_id: {})", self.id);
         }
 
-        // 5. Close all data channels
-        let tube_id_for_dc_close = self.id.clone();
-        let data_channels = self.data_channels.clone();
-        tokio::spawn(async move {
-            let channels: Vec<_> = {
-                let mut guard = data_channels.write().await;
-                guard.drain().collect()
-            };
-
-            for (label, dc) in channels {
-                if let Err(e) = dc.close().await {
-                    warn!(
-                        "Error closing data channel in Drop: {} (tube_id: {}, label: {})",
-                        e, tube_id_for_dc_close, label
-                    );
-                } else {
-                    debug!(
-                        "  ✓ Data channel closed (tube_id: {}, label: {})",
-                        tube_id_for_dc_close, label
-                    );
-                }
-            }
-        });
-        debug!(
-            "  ✓ Data channel close tasks spawned (tube_id: {})",
-            self.id
-        );
-
-        // 5. Peer connection cleanup (async spawn since we can't await in Drop)
-        if let Ok(mut pc_guard) = self.peer_connection.try_lock() {
-            if let Some(pc) = pc_guard.take() {
-                debug!("  ✓ Peer connection closing (spawned async)");
-                // Spawn async cleanup (can't await in Drop)
-                let tube_id = self.id.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pc.close().await {
-                        warn!(
-                            "Error closing peer connection in Drop: {} (tube_id: {})",
-                            e, tube_id
-                        );
-                    } else {
-                        debug!(
-                            "  ✓ Peer connection closed successfully (tube_id: {})",
-                            tube_id
-                        );
-                    }
-                });
+        // 5. SAFETY NET: Check if close() was called (should be empty)
+        if let Ok(guard) = self.data_channels.try_read() {
+            if !guard.is_empty() {
+                warn!(
+                    "LEAK WARNING: Tube {} dropped without calling close() - {} data channels not properly closed! Downstream peers may not be notified.",
+                    self.id, guard.len()
+                );
             }
         }
 
-        debug!("===============================================");
+        // 6. SAFETY NET: Check if peer connection was closed
+        if let Ok(guard) = self.peer_connection.try_lock() {
+            if guard.is_some() {
+                warn!(
+                    "LEAK WARNING: Tube {} dropped without calling close() - peer connection not properly closed! TURN allocation may leak, causing 400 Bad Request errors.",
+                    self.id
+                );
+            }
+        }
+
         debug!(
-            "Tube {} RAII Drop complete - all cleanup initiated",
+            "Tube {} Drop complete (close() should have been called first)",
             self.id
         );
-        debug!("  → Signal channel: auto-closed");
-        debug!("  → Metrics: auto-unregistered");
-        debug!("  → Keepalive: auto-cancelled");
-        debug!("  → Peer connection: async cleanup spawned");
-        debug!("===============================================");
     }
 }

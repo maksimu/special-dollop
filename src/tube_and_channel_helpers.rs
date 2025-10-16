@@ -1,7 +1,7 @@
 use crate::channel::Channel;
 use crate::models::{NetworkAccessChecker, TunnelTimeouts};
+use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::WebRTCDataChannel;
-use crate::{debug_hot_path, trace_hot_path};
 use log::{debug, error};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,10 +77,6 @@ pub(crate) async fn setup_channel_for_data_channel(
     // Tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
     let peer_connection_clone = peer_connection.clone();
     data_channel_ref.on_message(Box::new(move |msg| {
-        trace_hot_path!(
-            "Channel got message (message_size: {})",
-            msg.data.len()
-        );
         let tx_clone = tx.clone(); // Clone tx for the async block
         let buffer_pool_clone = buffer_pool.clone();
         let label_clone = label.clone(); // Clone label for the async block
@@ -100,11 +96,14 @@ pub(crate) async fn setup_channel_for_data_channel(
                 None, // latency calculation could be added later if needed
             );
 
-            debug_hot_path!(
-                "Channel: Received bytes from WebRTC data channel (channel_id: {}, bytes_count: {})",
-                label_clone,
-                message_len
-            );
+            // HOT PATH: Only log WebRTC receives in verbose mode
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Channel: Received bytes from WebRTC data channel (channel_id: {}, bytes_count: {})",
+                    label_clone,
+                    message_len
+                );
+            }
 
             if let Err(_e) = tx_clone.send(message_bytes) {
                 error!(

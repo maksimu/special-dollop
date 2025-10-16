@@ -203,11 +203,14 @@ impl BandwidthEstimator {
             .store(new_estimate, Ordering::Relaxed);
         *last_update = now;
 
-        debug!(
-            "Bandwidth estimate updated: {} bps (samples: {})",
-            new_estimate,
-            self.throughput_history.len()
-        );
+        // Only log bandwidth updates if verbose logging is enabled
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Bandwidth estimate updated: {} bps (samples: {})",
+                new_estimate,
+                self.throughput_history.len()
+            );
+        }
     }
 
     fn calculate_bandwidth_estimate(&self) -> u64 {
@@ -819,7 +822,8 @@ impl AdaptiveQualityManager {
             *current = metrics;
         }
 
-        if adjusted_bitrate {
+        // Only log quality adjustments if verbose logging is enabled
+        if adjusted_bitrate && unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Quality adjustment for tube {}: bandwidth={} Mbps, bitrate={} kbps",
                 self.tube_id,

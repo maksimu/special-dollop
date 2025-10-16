@@ -1,4 +1,3 @@
-use crate::debug_hot_path;
 use crate::runtime::get_runtime;
 use crate::unlikely;
 use anyhow::{anyhow, Result};
@@ -866,10 +865,12 @@ impl Channel {
 
     /// Handle a MetricsRequest control message
     async fn handle_metrics_request(&mut self, data: &[u8]) -> Result<()> {
-        debug_hot_path!(
-            "Processing metrics request (channel_id: {})",
-            self.channel_id
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Processing metrics request (channel_id: {})",
+                self.channel_id
+            );
+        }
 
         // Extract request type from data (if any)
         let request_type = if !data.is_empty() { data[0] } else { 0 };
@@ -925,34 +926,35 @@ impl Channel {
         self.send_control_message(ControlMessage::MetricsResponse, &response_data)
             .await?;
 
-        debug_hot_path!(
-            "Sent metrics response (channel_id: {}, response_bytes: {})",
-            self.channel_id,
-            response_data.len()
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Sent metrics response (channel_id: {}, response_bytes: {})",
+                self.channel_id,
+                response_data.len()
+            );
+        }
 
         Ok(())
     }
 
     /// Handle a MetricsResponse control message
     async fn handle_metrics_response(&mut self, data: &[u8]) -> Result<()> {
-        debug_hot_path!(
-            "Received metrics response (channel_id: {}, response_bytes: {})",
-            self.channel_id,
-            data.len()
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Received metrics response (channel_id: {}, response_bytes: {})",
+                self.channel_id,
+                data.len()
+            );
+        }
 
         // Parse and process metrics response
-        if !data.is_empty() {
+        if !data.is_empty() && unlikely!(crate::logger::is_verbose_logging()) {
             match serde_json::from_slice::<serde_json::Value>(data) {
                 Ok(metrics) => {
                     debug!(
                         "Parsed metrics response (channel_id: {}, metrics: {:?})",
                         self.channel_id, metrics
                     );
-
-                    // Could store or forward metrics here
-                    // For now, just log that we received them
                 }
                 Err(e) => {
                     debug!(
@@ -968,11 +970,13 @@ impl Channel {
 
     /// Handle a MetricsConfig control message
     async fn handle_metrics_config(&mut self, data: &[u8]) -> Result<()> {
-        debug_hot_path!(
-            "Processing metrics config (channel_id: {}, config_bytes: {})",
-            self.channel_id,
-            data.len()
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Processing metrics config (channel_id: {}, config_bytes: {})",
+                self.channel_id,
+                data.len()
+            );
+        }
 
         // Parse metrics configuration
         if !data.is_empty() {

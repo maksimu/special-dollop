@@ -130,7 +130,7 @@ Configuration JSON format:
 ✅ **Real-time Metrics Collection**: Aggregated metrics, live connection stats, system uptime
 ✅ **JSON-based Communication**: Structured metrics data exchange via control messages
 ✅ **Performance Monitoring**: DEBUG level heartbeat logging every 10 seconds
-✅ **Hot Path Optimized**: Uses `debug_hot_path!` macros with ~1ns overhead when disabled
+✅ **Hot Path Optimized**: Uses unified `unlikely!(is_verbose_logging())` gating with ~1-2ns overhead when disabled
 ✅ **Request/Response Pattern**: Supports metrics requests, responses, and configuration updates  
 
 ### **Critical Corporate Features Now Working**

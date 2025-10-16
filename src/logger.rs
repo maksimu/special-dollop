@@ -17,6 +17,11 @@ use pyo3::{exceptions::PyRuntimeError, prelude::*};
 /// Defaults to false for optimal performance - detailed logs only when explicitly enabled
 pub static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
 
+/// Global flag for including WebRTC library logs (separate from verbose)
+/// Defaults to false - WebRTC library logs are EXTREMELY noisy (1000+ logs/sec)
+/// Set KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS=1 to enable for deep protocol debugging
+pub static INCLUDE_WEBRTC_LOGS: AtomicBool = AtomicBool::new(false);
+
 /// Global flag tracking if logger has been initialized
 /// Used to make initialize_logger() idempotent for Commander compatibility
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -35,6 +40,16 @@ pub fn set_verbose_logging(enabled: bool) {
         "Verbose logging {}",
         if enabled { "enabled" } else { "disabled" }
     );
+}
+
+/// Set WebRTC library logging flag (internal use only - set once at init)
+fn set_webrtc_logging(enabled: bool) {
+    INCLUDE_WEBRTC_LOGS.store(enabled, Ordering::Relaxed);
+    if enabled {
+        log::warn!(
+            "WebRTC library logging ENABLED - expect 1000+ logs/sec from webrtc-rs internals"
+        );
+    }
 }
 
 // Custom error type for logger initialization
@@ -93,14 +108,21 @@ pub fn initialize_logger(
 ) -> Result<(), InitializeLoggerError> {
     let is_verbose = verbose.unwrap_or(false);
 
-    // IDEMPOTENT: If already initialized, just update verbose flag and return
+    // Check environment variable for WebRTC library logging
+    let include_webrtc_logs = std::env::var("KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    // IDEMPOTENT: If already initialized, just update flags and return
     // This makes Commander's repeated calls safe and efficient
     if LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
         set_verbose_logging(is_verbose);
+        set_webrtc_logging(include_webrtc_logs);
         log::debug!(
-            "Logger already initialized for '{}', updated verbose={}",
+            "Logger already initialized for '{}', updated verbose={}, webrtc_logs={}",
             logger_name,
-            is_verbose
+            is_verbose,
+            include_webrtc_logs
         );
         return Ok(());
     }
@@ -123,29 +145,32 @@ pub fn initialize_logger(
                 .map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?
                 .filter(level_filter);
 
-            // **CRITICAL: Suppress WebRTC ecosystem spam unless verbose mode**
+            // **CRITICAL: Suppress WebRTC ecosystem spam unless explicitly requested**
             // WebRTC + dependencies have 1000+ debug/trace logs that fire constantly (per-packet!)
             // TURN client dumps full packet data: "try_send data = [0, 1, 0, 88, ...]" (200 bytes/log!)
             // Without suppression: 60 gateways * 40 packets/sec * 3 logs = 36GB+ in Docker logs
             // With suppression: Only errors from these crates pass through
-            if !is_verbose {
+            //
+            // NOTE: Controlled by KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS env var, NOT verbose flag
+            // This keeps WebRTC library debugging separate from application verbose logging
+            if !include_webrtc_logs {
                 logger = logger
                     // WebRTC core library
-                    .filter_target("webrtc".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_ice".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_sctp".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_dtls".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_mdns".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_data".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_srtp".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_media".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("webrtc_util".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("webrtc".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_ice".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_sctp".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_dtls".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_mdns".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_data".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_srtp".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_media".to_owned(), log::LevelFilter::Error)
+                    .filter_target("webrtc_util".to_owned(), log::LevelFilter::Error)
                     // TURN/STUN libraries (MASSIVE spam - logs full packet data!)
-                    .filter_target("turn".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("stun".to_owned(), log::LevelFilter::Warn)
+                    .filter_target("turn".to_owned(), log::LevelFilter::Error)
+                    .filter_target("stun".to_owned(), log::LevelFilter::Error)
                     // RTP/RTCP libraries
-                    .filter_target("rtp".to_owned(), log::LevelFilter::Warn)
-                    .filter_target("rtcp".to_owned(), log::LevelFilter::Warn);
+                    .filter_target("rtp".to_owned(), log::LevelFilter::Error)
+                    .filter_target("rtcp".to_owned(), log::LevelFilter::Error);
             }
 
             // Install the configured logger
@@ -160,20 +185,31 @@ pub fn initialize_logger(
             "pyo3_log bridge initialized for '{}' with level {:?}, webrtc_* suppression: {}",
             logger_name,
             level_filter,
-            !is_verbose
+            !include_webrtc_logs
         );
 
         set_verbose_logging(is_verbose);
+        set_webrtc_logging(include_webrtc_logs);
     }
 
     #[cfg(not(feature = "python"))]
     {
         let rust_level = convert_py_level_to_tracing_level(level, is_verbose);
 
+        // Check environment variable for WebRTC library logging (non-Python mode)
+        let include_webrtc_logs_standalone = std::env::var("KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         // Non-Python mode: Use EnvFilter to control what gets logged
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             if is_verbose {
-                EnvFilter::new("trace")
+                // Verbose mode: show application logs, but still gate WebRTC unless explicitly enabled
+                if include_webrtc_logs_standalone {
+                    EnvFilter::new("trace")
+                } else {
+                    EnvFilter::new("trace,webrtc=error,webrtc_ice=error,webrtc_mdns=error,webrtc_dtls=error,webrtc_sctp=error,turn=error,stun=error")
+                }
             } else {
                 // Suppress webrtc dependency spam while allowing keeper_pam_webrtc_rs
                 let keeper_level = rust_level.to_string().to_lowercase();
@@ -183,7 +219,9 @@ pub fn initialize_logger(
                     webrtc_ice=error,\
                     webrtc_mdns=error,\
                     webrtc_dtls=error,\
-                    webrtc_sctp=error"
+                    webrtc_sctp=error,\
+                    turn=error,\
+                    stun=error"
                 );
                 EnvFilter::new(&filter_str)
             }
@@ -203,10 +241,16 @@ pub fn initialize_logger(
             InitializeLoggerError::SetGlobalDefaultError(e.to_string())
         })?;
 
-        // Set global verbose flag AFTER subscriber is ready (for non-Python logging)
+        // Set global flags AFTER subscriber is ready (for non-Python logging)
         set_verbose_logging(is_verbose);
+        set_webrtc_logging(include_webrtc_logs_standalone);
 
-        log::debug!("Logger initialized for '{}'", logger_name);
+        log::debug!(
+            "Logger initialized for '{}' (verbose: {}, webrtc_logs: {})",
+            logger_name,
+            is_verbose,
+            include_webrtc_logs_standalone
+        );
     }
 
     Ok(())

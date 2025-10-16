@@ -1,3 +1,4 @@
+use crate::unlikely; // Branch prediction optimization for verbose logging checks
 use anyhow::Result;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -167,7 +168,7 @@ impl Conn {
     /// Create a new connection with a dedicated backend task
     pub async fn new_with_backend(
         backend: Box<dyn AsyncReadWrite>,
-        _existing_task: JoinHandle<()>, // Ignored - we create our own
+        outbound_task: JoinHandle<()>,
         conn_no: u32,
         channel_id: String,
     ) -> Self {
@@ -181,15 +182,17 @@ impl Conn {
             channel_id.clone(),
         ));
 
-        // Create placeholder for the to_webrtc task (backend->WebRTC handled by setup_outbound_task)
-        let to_webrtc = tokio::spawn(async move {
-            debug!("to_webrtc task started (backend->WebRTC handled by setup_outbound_task) (channel_id: {}, conn_no: {})", channel_id, conn_no);
-        });
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Connection created with real outbound task (channel_id: {}, conn_no: {})",
+                channel_id, conn_no
+            );
+        }
 
         Self {
             data_tx,
             backend_task,
-            to_webrtc,
+            to_webrtc: outbound_task, // Save the task handle
         }
     }
 
@@ -219,10 +222,12 @@ pub(crate) async fn backend_task_runner(
     conn_no: u32,
     channel_id: String,
 ) {
-    debug!(
-        "Backend task started (channel_id: {}, conn_no: {})",
-        channel_id, conn_no
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Backend task started (channel_id: {}, conn_no: {})",
+            channel_id, conn_no
+        );
+    }
 
     while let Some(message) = data_rx.recv().await {
         match message {
@@ -238,7 +243,10 @@ pub(crate) async fn backend_task_runner(
                             break; // Exit the task on flush error
                         }
 
-                        debug!("Backend write successful (channel_id: {}, conn_no: {}, bytes_written: {})", channel_id, conn_no, payload.len());
+                        // HOT PATH: Only log successful writes in verbose mode (can be 1000s/sec with video)
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!("Backend write successful (channel_id: {}, conn_no: {}, bytes_written: {})", channel_id, conn_no, payload.len());
+                        }
                     }
                     Err(write_err) => {
                         warn!("Backend write error, client disconnected (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, write_err);

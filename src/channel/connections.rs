@@ -6,9 +6,8 @@ use crate::channel::guacd_parser::{
 };
 use crate::channel::types::ActiveProtocol;
 use crate::models::Conn;
-use crate::trace_hot_path;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
-use crate::unlikely; // Import branch prediction macros
+use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
@@ -131,13 +130,16 @@ pub async fn setup_outbound_task(
     let buffer_pool = channel.buffer_pool.clone();
     let is_channel_server_mode = channel.server_mode;
 
-    trace_hot_path!(
-        "ENTERING setup_outbound_task function (channel_id: {}, conn_no: {}, active_protocol: {:?}, server_mode: {})",
-        channel_id_for_task,
-        conn_no,
-        active_protocol,
-        is_channel_server_mode
-    );
+    // TRACE: Ultra-verbose task lifecycle logging (only in verbose mode)
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        log::trace!(
+            "ENTERING setup_outbound_task function (channel_id: {}, conn_no: {}, active_protocol: {:?}, server_mode: {})",
+            channel_id_for_task,
+            conn_no,
+            active_protocol,
+            is_channel_server_mode
+        );
+    }
 
     if active_protocol == ActiveProtocol::Guacd {
         if unlikely!(should_log_connection(false)) {
@@ -246,15 +248,15 @@ pub async fn setup_outbound_task(
         }
     }
 
-    let channel_id_for_log_after_spawn = channel.channel_id.clone();
-
-    trace_hot_path!(
-        "PRE-SPAWN (outer scope) in setup_outbound_task (channel_id: {}, conn_no: {}, active_protocol: {:?}, server_mode: {})",
-        channel.channel_id,
-        conn_no,
-        active_protocol,
-        is_channel_server_mode
-    );
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        log::trace!(
+            "PRE-SPAWN (outer scope) in setup_outbound_task (channel_id: {}, conn_no: {}, active_protocol: {:?}, server_mode: {})",
+            channel.channel_id,
+            conn_no,
+            active_protocol,
+            is_channel_server_mode
+        );
+    }
 
     // Create channel for backend task (client→guacd direction)
     let (data_tx, data_rx) = mpsc::unbounded_channel::<crate::models::ConnectionMessage>();
@@ -277,14 +279,16 @@ pub async fn setup_outbound_task(
     ));
 
     let outbound_handle = tokio::spawn(async move {
-        // This is the very first log inside the spawned task
-        trace_hot_path!(
-            "setup_outbound_task TASK SPAWNED (channel_id: {}, conn_no: {}, active_protocol: {:?}, server_mode: {})",
-            channel_id_for_task,
-            conn_no,
-            active_protocol,
-            is_channel_server_mode
-        );
+        // TRACE: Task lifecycle logging (ultra-verbose, only in verbose mode)
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            log::trace!(
+                "setup_outbound_task TASK SPAWNED (channel_id: {}, conn_no: {}, active_protocol: {:?}, server_mode: {})",
+                channel_id_for_task,
+                conn_no,
+                active_protocol,
+                is_channel_server_mode
+            );
+        }
 
         // Create event-driven sender for zero-polling backpressure
         let event_sender = EventDrivenSender::new(Arc::new(dc.clone()), STANDARD_BUFFER_THRESHOLD);
@@ -304,16 +308,19 @@ pub async fn setup_outbound_task(
                 .await
             {
                 Ok(_) => {
-                    trace_hot_path!(
-                        "Event-driven send successful (0ms latency) (channel_id: {}, conn_no: {}, context: {}, queue_depth: {}, can_send_immediate: {}, is_over_threshold: {}, threshold: {})",
-                        channel_id_local,
-                        conn_no_local,
-                        context_msg,
-                        event_sender.queue_depth(),
-                        event_sender.can_send_immediate(),
-                        event_sender.is_over_threshold(),
-                        event_sender.get_threshold()
-                    );
+                    // TRACE: Ultra-verbose send tracking (suppressed unless verbose mode)
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        log::trace!(
+                            "Event-driven send successful (0ms latency) (channel_id: {}, conn_no: {}, context: {}, queue_depth: {}, can_send_immediate: {}, is_over_threshold: {}, threshold: {})",
+                            channel_id_local,
+                            conn_no_local,
+                            context_msg,
+                            event_sender.queue_depth(),
+                            event_sender.can_send_immediate(),
+                            event_sender.is_over_threshold(),
+                            event_sender.get_threshold()
+                        );
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -329,11 +336,6 @@ pub async fn setup_outbound_task(
         }
 
         // Original task logic starts here
-        trace_hot_path!(
-            "setup_outbound_task ORIGINAL LOGIC START (channel_id: {}, conn_no: {})",
-            channel_id_for_task,
-            conn_no
-        );
 
         let mut reader = backend_reader;
         let mut eof_sent = false;
@@ -341,9 +343,19 @@ pub async fn setup_outbound_task(
 
         let mut main_read_buffer = buffer_pool.acquire();
         let mut encode_buffer = buffer_pool.acquire();
-        const MAX_READ_SIZE: usize = 16 * 1024; // 16KB - matches STANDARD_BUFFER_THRESHOLD (WebRTC optimal drain rate)
-        const GUACD_BATCH_SIZE: usize = 8 * 1024; // Batch up to 8KB of Guacd instructions
-        const LARGE_INSTRUCTION_THRESHOLD: usize = 16 * 1024; // If a single Guacd instruction is >16KB, send it directly without batching
+
+        // **SCIENTIFICALLY DERIVED VALUES FROM WEBRTC-RS SOURCE + PROTOCOL ANALYSIS**
+        // WebRTC-rs internals: RECEIVE_MTU = 8KB (webrtc-data/src/data_channel/mod.rs)
+        // Threshold: STANDARD_BUFFER_THRESHOLD = 8KB (event fires when buffer < 8KB free)
+        // Guacamole protocol analysis:
+        //   - SSH/telnet: 90% instructions < 100 bytes (key, mouse, sync)
+        //   - RDP/VNC: Mixed - small copy (64B) + large img (1-16KB PNG tiles)
+        // Strategy: Per-read flush makes batch size irrelevant for SSH (always flushes immediately)
+        //           while allowing RDP to batch efficiently within one screen update burst
+
+        const MAX_READ_SIZE: usize = 8 * 1024; // 8KB - matches WebRTC RECEIVE_MTU and threshold (prevents 2x rate mismatch)
+        const GUACD_BATCH_SIZE: usize = 16 * 1024; // 16KB - optimal for RDP tile batching, SSH flushes immediately anyway
+        const LARGE_INSTRUCTION_THRESHOLD: usize = 32 * 1024; // 32KB - bypass batching for rare huge blob/img instructions
 
         // **BOLD WARNING: HOT PATH - NO STRING/OBJECT ALLOCATIONS ALLOWED IN THE MAIN LOOP**
         // **USE BUFFER POOL FOR ALL ALLOCATIONS**
@@ -362,24 +374,16 @@ pub async fn setup_outbound_task(
             None
         };
 
-        trace_hot_path!(
-            "setup_outbound_task BEFORE main loop (channel_id: {}, conn_no: {})",
-            channel_id_for_task,
-            conn_no
-        );
-
         // **BOLD WARNING: ENTERING HOT PATH - BACKEND→WEBRTC MAIN LOOP**
         // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**
         // **USE BORROWED DATA, BUFFER POOLS, AND ZERO-COPY TECHNIQUES**
+
+        // Zombie prevention: Track backpressure stall iterations
+        let mut backpressure_stall_counter = 0;
+        const BACKPRESSURE_STALL_LIMIT: usize = 100; // 100 * 10ms = 1 second between channel state checks
+
         loop {
             loop_iterations += 1;
-            trace_hot_path!(
-                "setup_outbound_task loop iteration (channel_id: {}, conn_no: {}, loop_iteration: {}, buffer_len: {})",
-                channel_id_for_task,
-                conn_no,
-                loop_iterations,
-                main_read_buffer.len()
-            );
 
             // **CRITICAL: TCP BACKPRESSURE - Check queue depth before reading more data**
             let queue_depth = event_sender.queue_depth();
@@ -397,6 +401,22 @@ pub async fn setup_outbound_task(
 
             // If queue is > 50% full (5,000 frames), pause reading to prevent overflow
             if queue_depth > BACKPRESSURE_THRESHOLD {
+                backpressure_stall_counter += 1;
+
+                // ZOMBIE PREVENTION: Check if data channel closed (efficient - once per second, not every 10ms)
+                if backpressure_stall_counter >= BACKPRESSURE_STALL_LIMIT {
+                    let channel_state = dc.ready_state();
+
+                    if channel_state != "Open" {
+                        warn!(
+                            "Data channel closed during backpressure - exiting zombie task (channel_id: {}, conn_no: {}, queue: {}, state: {})",
+                            channel_id_for_task, conn_no, queue_depth, channel_state
+                        );
+                        break; // Exit zombie task immediately
+                    }
+                    backpressure_stall_counter = 0; // Reset for next interval
+                }
+
                 // Rate-limited logging (once every 5 seconds max)
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -416,6 +436,9 @@ pub async fn setup_outbound_task(
                 // Brief pause to let queue drain
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue; // Skip this read iteration, check queue again
+            } else {
+                // Reset stall counter when queue is healthy
+                backpressure_stall_counter = 0;
             }
 
             if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE / 2 {
@@ -430,13 +453,6 @@ pub async fn setup_outbound_task(
                     temp_read_buffer.reserve(MAX_READ_SIZE - temp_read_buffer.capacity());
                 }
             }
-
-            trace_hot_path!(
-                "setup_outbound_task PRE-READ from backend (channel_id: {}, conn_no: {}, active_protocol: {:?})",
-                channel_id_for_task,
-                conn_no,
-                active_protocol
-            );
 
             // **ZERO-COPY READ: Use buffer pool buffer directly**
             // For Guacd, read directly into main_read_buffer to append.
@@ -474,13 +490,6 @@ pub async fn setup_outbound_task(
 
             match n_read {
                 0 => {
-                    trace_hot_path!(
-                        "setup_outbound_task POST-READ 0 bytes (EOF) (channel_id: {}, conn_no: {}, eof_sent: {})",
-                        channel_id_for_task,
-                        conn_no,
-                        eof_sent
-                    );
-
                     if !eof_sent {
                         let eof_frame = Frame::new_control_with_pool(
                             ControlMessage::SendEOF,
@@ -505,14 +514,6 @@ pub async fn setup_outbound_task(
                     continue;
                 }
                 _ => {
-                    trace_hot_path!(
-                        "setup_outbound_task POST-READ bytes from backend (channel_id: {}, conn_no: {}, bytes_read: {}, eof_sent: {})",
-                        channel_id_for_task,
-                        conn_no,
-                        n_read,
-                        eof_sent
-                    );
-
                     eof_sent = false;
                     let mut close_conn_and_break = false;
 
@@ -640,6 +641,38 @@ pub async fn setup_outbound_task(
                                             // Guacd sends sync every ~5s as keepalive ping, client must respond within 15s
                                             // When browser is backgrounded (throttled to 1 FPS), response is delayed 10-16s → timeout
                                             // We intercept and respond immediately to prevent false "User is not responding" disconnects
+
+                                            // **CRITICAL FIX: Flush batch buffer BEFORE handling sync**
+                                            // Bug (commit 196ba77): sync handler would continue without flushing batch,
+                                            // causing keystroke echoes to wait ~1 second for next read/sync
+                                            if let Some(ref mut batch_buffer) = guacd_batch_buffer {
+                                                if !batch_buffer.is_empty() {
+                                                    encode_buffer.clear();
+                                                    let bytes_written =
+                                                        Frame::encode_data_frame_from_slice(
+                                                            &mut encode_buffer,
+                                                            conn_no,
+                                                            &batch_buffer[..],
+                                                        );
+                                                    let batch_frame_bytes = encode_buffer
+                                                        .split_to(bytes_written)
+                                                        .freeze();
+                                                    if send_with_event_backpressure(
+                                                        batch_frame_bytes,
+                                                        conn_no,
+                                                        &event_sender,
+                                                        &channel_id_for_task,
+                                                        "pre-sync batch flush",
+                                                    )
+                                                    .await
+                                                    .is_err()
+                                                    {
+                                                        close_conn_and_break = true;
+                                                        break;
+                                                    }
+                                                    batch_buffer.clear();
+                                                }
+                                            }
 
                                             if let Ok(peeked_instr) =
                                                 GuacdParser::peek_instruction(current_slice)
@@ -986,7 +1019,13 @@ pub async fn setup_outbound_task(
                             }
                         } // End of inner Guacd processing loop
 
-                        // Flush any remaining batched Guacd data
+                        // **CRITICAL: PER-READ FLUSH - Prevents SSH latency accumulation**
+                        // After processing all complete instructions from THIS TCP read, flush the batch immediately.
+                        // This is the key to making large batch sizes work for both protocols:
+                        //   - SSH: One keystroke = one TCP read → flushes 150 bytes immediately (instant!)
+                        //   - RDP: Screen update = one TCP read with many tiles → batches efficiently, then flushes
+                        // Without per-read flush: SSH keystrokes would wait for 16KB accumulation = MASSIVE lag
+                        // With per-read flush: Batch size becomes "maximum within one read burst", not "target to wait for"
                         if let Some(ref mut batch_buffer) = guacd_batch_buffer {
                             if !batch_buffer.is_empty() && !close_conn_and_break {
                                 encode_buffer.clear();
@@ -1002,7 +1041,7 @@ pub async fn setup_outbound_task(
                                     conn_no,
                                     &event_sender,
                                     &channel_id_for_task,
-                                    "final batch",
+                                    "per-read flush",
                                 )
                                 .await
                                 .is_err()
@@ -1026,13 +1065,6 @@ pub async fn setup_outbound_task(
                         // **SEND DIRECTLY - NO INTERMEDIATE VECTOR**
                         encode_buffer.clear();
 
-                        trace_hot_path!(
-                            "PortForward/SOCKS5 zero-copy encode (channel_id: {}, conn_no: {}, bytes_read: {})",
-                            channel_id_for_task,
-                            conn_no,
-                            n_read
-                        );
-
                         // Encode directly from temp_read_buffer (which was filled by read_buf)
                         let bytes_written = Frame::encode_data_frame_from_slice(
                             &mut encode_buffer,
@@ -1041,13 +1073,6 @@ pub async fn setup_outbound_task(
                         );
 
                         let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
-
-                        trace_hot_path!(
-                            "PortForward/SOCKS5 POST-ENCODE (channel_id: {}, conn_no: {}, bytes_written: {})",
-                            channel_id_for_task,
-                            conn_no,
-                            bytes_written
-                        );
 
                         // **PERFORMANCE: Send with event-driven backpressure - zero polling!**
                         if send_with_event_backpressure(
@@ -1104,12 +1129,6 @@ pub async fn setup_outbound_task(
             );
         }
     });
-
-    trace_hot_path!(
-        "setup_outbound_task tokio::spawn COMPLETE (outer scope). Outbound handle created (channel_id: {}, conn_no: {})",
-        channel_id_for_log_after_spawn,
-        conn_no
-    );
 
     // Create connection struct with our pre-created backend task and data_tx channel
     // Note: outbound_handle is the to_webrtc task (guacd→client)

@@ -753,31 +753,34 @@ impl RegistryActor {
             );
         }
 
-        // 3. Close WebRTC peer connection (graceful)
-        {
-            let mut pc_guard = tube.peer_connection.lock().await;
-            if let Some(pc) = pc_guard.take() {
-                let _ = pc.close().await;
-                debug!("  ✓ WebRTC peer connection closed (tube_id: {})", tube_id);
-            }
+        // 3. Explicit close (closes data channels + peer connection properly)
+        // CRITICAL: This must be called BEFORE dropping the tube to ensure:
+        // - Data channels send CloseConnection to downstream peers
+        // - TURN allocations are released (prevents 400 Bad Request errors)
+        // - Permission refresh timers are stopped
+        if let Err(e) = tube.close().await {
+            warn!(
+                "Error during explicit tube close: {} (tube_id: {}) - proceeding with removal",
+                e, tube_id
+            );
+        } else {
+            info!("Tube {} explicit close completed successfully", tube_id);
         }
 
-        // 4. Remove from registry (ONE LINE!)
+        // 4. Remove from registry
         self.tubes.remove(tube_id);
         self.conversations.retain(|_, tid| tid != tube_id);
-        // NOTE: No signal_channels.remove() - Tube owns it! (RAII)
 
         info!(
-            "Tube closed via actor - Tube::drop() will handle final cleanup (tube_id: {})",
+            "Tube {} removed from registry - Drop will verify cleanup",
             tube_id
         );
 
-        // When tube Arc drops:
-        // → Tube::drop() fires automatically
-        // → signal_sender closes
-        // → metrics_handle unregisters
-        // → keepalive_task cancels
-        // ALL AUTOMATIC! ✨
+        // When tube Arc drops (after removal):
+        // → Tube::drop() fires as safety net
+        // → Verifies everything was closed by explicit close()
+        // → Logs warnings if cleanup was missed
+        // → Auto-cleanup for RAII resources (signal_sender, metrics)
 
         Ok(())
     }

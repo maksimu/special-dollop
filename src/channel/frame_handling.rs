@@ -2,10 +2,10 @@
 
 use super::core::Channel;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame, CTRL_NO_LEN};
-use crate::{debug_hot_path, warn_hot_path};
+use crate::unlikely; // Branch prediction optimization
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use log::{debug, error}; // Import centralized hot path macros
+use log::{debug, error, warn};
 
 // Memory prefetching optimizations
 #[cfg(target_arch = "x86_64")]
@@ -84,35 +84,32 @@ fn unlikely(condition: bool) -> bool {
 // **BOLD WARNING: HOT PATH - CALLED FOR EVERY INCOMING FRAME**
 // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
 pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Result<()> {
-    debug_hot_path!(
-        "handle_incoming_frame received frame (channel_id: {}, conn_no: {}, payload_len: {})",
-        channel.channel_id,
-        frame.connection_no,
-        frame.payload.len()
-    );
+    // HOT PATH: Only log frame reception in verbose mode (can be 1000s/sec)
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "handle_incoming_frame received frame (channel_id: {}, conn_no: {}, payload_len: {})",
+            channel.channel_id,
+            frame.connection_no,
+            frame.payload.len()
+        );
 
-    if log::log_enabled!(log::Level::Debug) && frame.payload.len() <= 100 {
-        debug!(
-            "Frame payload (channel_id: {}, payload: {:?})",
-            channel.channel_id, frame.payload
-        );
-    } else if log::log_enabled!(log::Level::Debug) && frame.payload.len() > 100 {
-        let first_bytes = &frame.payload[..std::cmp::min(50, frame.payload.len())];
-        debug!(
-            "Large frame first bytes (channel_id: {}, first_bytes: {:?})",
-            channel.channel_id, first_bytes
-        );
+        if frame.payload.len() <= 100 {
+            debug!(
+                "Frame payload (channel_id: {}, payload: {:?})",
+                channel.channel_id, frame.payload
+            );
+        } else {
+            let first_bytes = &frame.payload[..std::cmp::min(50, frame.payload.len())];
+            debug!(
+                "Large frame first bytes (channel_id: {}, first_bytes: {:?})",
+                channel.channel_id, first_bytes
+            );
+        }
     }
 
     // **BRANCH PREDICTION OPTIMIZATION**: Connection 1 is ULTRA HOT PATH (90%+ of data)
     if likely(frame.connection_no == 1) {
         // **ULTRA HOT PATH**: Connection 1 - main data traffic (most optimized)
-        let conn_no = frame.connection_no;
-        debug_hot_path!(
-            "ULTRA HOT PATH: Connection 1 main traffic (channel_id: {}, conn_no: {})",
-            channel.channel_id,
-            conn_no
-        );
 
         // **HYPER-OPTIMIZED**: Inline everything for Connection 1
         #[inline(always)]
@@ -125,23 +122,25 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
 
         forward_connection1_ultra_fast(channel, frame.payload).await?;
     } else if frame.connection_no == 0 {
-        // **CONTROL PATH**: Connection 0 - control messages
-        debug_hot_path!(
-            "Handling control frame (channel_id: {})",
-            channel.channel_id
-        );
+        // **CONTROL PATH**: Connection 0 - control messages (infrequent, OK to log)
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Handling control frame (channel_id: {})",
+                channel.channel_id
+            );
+        }
         handle_control(channel, frame).await?;
     } else if frame.connection_no > 1 {
         // **WARM PATH**: Other connections - short-lived traffic
-        let conn_no = frame.connection_no;
-        debug_hot_path!(
-            "Routing short-lived connection frame (channel_id: {}, conn_no: {})",
-            channel.channel_id,
-            conn_no
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Routing short-lived connection frame (channel_id: {}, conn_no: {})",
+                channel.channel_id, frame.connection_no
+            );
+        }
 
         // **OPTIMIZED**: Regular data path for other connections
-        forward_to_protocol(channel, conn_no, frame.payload).await?;
+        forward_to_protocol(channel, frame.connection_no, frame.payload).await?;
     } else {
         // **ERROR PATH**: Should never happen
         return Err(anyhow::anyhow!(
@@ -164,21 +163,23 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
     let cmd = ControlMessage::try_from(code)?;
     let data_bytes = frame.payload.slice(CTRL_NO_LEN..);
 
-    // Log the control message for debugging
-    debug_hot_path!(
-        "Processing control message (channel_id: {}, message_type: {:?})",
-        channel.channel_id,
-        cmd
-    );
+    // Control messages are infrequent - only log in verbose mode
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Processing control message (channel_id: {}, message_type: {:?})",
+            channel.channel_id, cmd
+        );
+    }
 
     // Use the channel's control message handling methods
     match channel.process_control_message(cmd, &data_bytes).await {
         Ok(_) => {
-            debug_hot_path!(
-                "Successfully processed control message (channel_id: {}, message_type: {:?})",
-                channel.channel_id,
-                cmd
-            );
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Successfully processed control message (channel_id: {}, message_type: {:?})",
+                    channel.channel_id, cmd
+                );
+            }
             Ok(())
         }
         Err(e) => {
@@ -198,25 +199,26 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
 async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes) -> Result<()> {
     let payload_len = payload.len(); // Store length before moving
 
-    debug_hot_path!(
-        "Forwarding bytes via lock-free channel (channel_id: {}, conn_no: {}, payload_len: {})",
-        channel.channel_id,
-        conn_no,
-        payload_len
-    );
+    // HOT PATH: Only log in verbose mode (suppress 1000s/sec spam with video workloads)
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Forwarding bytes via lock-free channel (channel_id: {}, conn_no: {}, payload_len: {})",
+            channel.channel_id, conn_no, payload_len
+        );
 
-    if log::log_enabled!(log::Level::Debug) && payload_len > 0 && payload_len <= 100 {
-        debug!(
-            "Payload for backend (channel_id: {}, payload: {:?})",
-            channel.channel_id, payload
-        );
-    } else if log::log_enabled!(log::Level::Debug) && payload_len > 100 {
-        let first_bytes = payload.slice(..std::cmp::min(50, payload_len));
-        debug!(
-            "Large payload first bytes (channel_id: {}, first_bytes: {:?})",
-            channel.channel_id, first_bytes
-        );
-    }
+        if payload_len > 0 && payload_len <= 100 {
+            debug!(
+                "Payload for backend (channel_id: {}, payload: {:?})",
+                channel.channel_id, payload
+            );
+        } else if payload_len > 100 {
+            let first_bytes = payload.slice(..std::cmp::min(50, payload_len));
+            debug!(
+                "Large payload first bytes (channel_id: {}, first_bytes: {:?})",
+                channel.channel_id, first_bytes
+            );
+        }
+    } // Close the is_verbose_logging() block
 
     // Skip inbound special instruction detection - user only wants outbound and handshake sizes
 
@@ -250,20 +252,13 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
 
     match send_result {
         Some(Ok(_)) => {
-            debug_hot_path!(
-                "Successfully queued bytes for backend task (channel_id: {}, conn_no: {}, payload_len: {})",
-                channel.channel_id,
-                conn_no,
-                payload_len
-            );
             return Ok(());
         }
         Some(Err(_)) => {
             // **COLD PATH**: Channel closed - rare error case
-            warn_hot_path!(
+            warn!(
                 "Backend task is dead, closing connection (channel_id: {}, conn_no: {})",
-                channel.channel_id,
-                conn_no
+                channel.channel_id, conn_no
             );
             // Connection reference is dropped, safe to call close_backend
             channel
@@ -279,10 +274,9 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     // **COLD PATH**: Connection not found - should be rare in normal operation
     #[cold]
     fn log_connection_not_found(channel_id: &str, conn_no: u32) {
-        warn_hot_path!(
+        warn!(
             "Connection not found for forwarding data, data lost (channel_id: {}, conn_no: {})",
-            channel_id,
-            conn_no
+            channel_id, conn_no
         );
     }
 

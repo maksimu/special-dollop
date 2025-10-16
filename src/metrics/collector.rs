@@ -410,11 +410,14 @@ impl MetricsCollector {
         conversation_id: &str,
         webrtc_stats: &HashMap<String, StatsReportType>,
     ) {
-        debug!(
-            "update_webrtc_stats called (conversation_id: {}, stats_count: {})",
-            conversation_id,
-            webrtc_stats.len()
-        );
+        // Only log if verbose logging is enabled
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "update_webrtc_stats called (conversation_id: {}, stats_count: {})",
+                conversation_id,
+                webrtc_stats.len()
+            );
+        }
         if let Ok(mut states) = self.connection_states.write() {
             if let Some(state) = states.get_mut(conversation_id) {
                 let now = Instant::now();
@@ -994,10 +997,13 @@ impl MetricsCollector {
                 match tube.get_connection_stats().await {
                     Ok(_) => {
                         stats_collected += 1;
-                        debug!(
-                            "Collected WebRTC stats (conversation_id: {}, tube_id: {})",
-                            conversation_id, tube_id
-                        );
+                        // Only log if verbose logging is enabled
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!(
+                                "Collected WebRTC stats (conversation_id: {}, tube_id: {})",
+                                conversation_id, tube_id
+                            );
+                        }
                     }
                     Err(e) => {
                         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -1018,7 +1024,8 @@ impl MetricsCollector {
             }
         }
 
-        if stats_collected > 0 {
+        // Only log if verbose logging is enabled
+        if stats_collected > 0 && unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "WebRTC stats collection completed (stats_collected: {})",
                 stats_collected

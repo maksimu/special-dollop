@@ -1679,7 +1679,7 @@ impl Tube {
     }
 
     /// Check if tube has been inactive for specified duration
-    /// Used for zombie detection when data channel close events don't fire
+    /// Used for stale tube detection when data channel close events don't fire
     /// Returns true if no WebRTC activity for the given duration
     pub async fn is_inactive_for_duration(&self, duration: std::time::Duration) -> bool {
         if let Ok(pc_guard) = self.peer_connection.try_lock() {
@@ -1690,7 +1690,7 @@ impl Tube {
         false // Can't check, assume active to be safe
     }
 
-    /// Get current peer connection state (for zombie detection)
+    /// Get current peer connection state (for stale tube detection)
     /// Returns None if peer connection is not available or locked
     pub async fn get_connection_state(&self) -> Option<RTCPeerConnectionState> {
         if let Ok(pc_guard) = self.peer_connection.try_lock() {

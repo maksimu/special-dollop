@@ -378,7 +378,7 @@ pub async fn setup_outbound_task(
         // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**
         // **USE BORROWED DATA, BUFFER POOLS, AND ZERO-COPY TECHNIQUES**
 
-        // Zombie prevention: Track backpressure stall iterations
+        // Orphaned task prevention: Track backpressure stall iterations
         let mut backpressure_stall_counter = 0;
         const BACKPRESSURE_STALL_LIMIT: usize = 100; // 100 * 10ms = 1 second between channel state checks
 
@@ -403,16 +403,16 @@ pub async fn setup_outbound_task(
             if queue_depth > BACKPRESSURE_THRESHOLD {
                 backpressure_stall_counter += 1;
 
-                // ZOMBIE PREVENTION: Check if data channel closed (efficient - once per second, not every 10ms)
+                // ORPHANED TASK PREVENTION: Check if data channel closed (efficient - once per second, not every 10ms)
                 if backpressure_stall_counter >= BACKPRESSURE_STALL_LIMIT {
                     let channel_state = dc.ready_state();
 
                     if channel_state != "Open" {
                         warn!(
-                            "Data channel closed during backpressure - exiting zombie task (channel_id: {}, conn_no: {}, queue: {}, state: {})",
+                            "Data channel closed during backpressure - exiting orphaned task (channel_id: {}, conn_no: {}, queue: {}, state: {})",
                             channel_id_for_task, conn_no, queue_depth, channel_state
                         );
-                        break; // Exit zombie task immediately
+                        break; // Exit orphaned task immediately
                     }
                     backpressure_stall_counter = 0; // Reset for next interval
                 }

@@ -1059,13 +1059,13 @@ async fn test_drop_without_close_warns() {
 /// This Rust test documents the expected behavior and validates the fix conceptually
 #[tokio::test]
 async fn test_backpressure_zombie_detection_logic() {
-    println!("=== TEST: Backpressure Zombie Detection Logic ===");
+    println!("=== TEST: Backpressure Stale Connection Detection Logic ===");
 
-    // This validates the zombie prevention fix in connections.rs:407-419
+    // This validates the stale connection prevention fix in connections.rs:407-419
     // The fix checks data channel state every 1 second when stuck in backpressure
 
-    println!("✓ Backpressure zombie detection test PASSED (logic validation)");
-    println!("  - Zombie detection: checks channel state every 1 second");
+    println!("✓ Backpressure stale connection detection test PASSED (logic validation)");
+    println!("  - Stale connection detection: checks channel state every 1 second");
     println!("  - Implementation: connections.rs:407-419");
     println!("  - Exit condition: dc.ready_state() != Open");
     println!("  - Timeout: 1 second between checks");
@@ -1080,5 +1080,5 @@ async fn test_backpressure_zombie_detection_logic() {
     println!("       tube2.close()");
     println!("       # Verify tube1 outbound task exits within 1 second");
     println!("       time.sleep(1.5)");
-    println!("       assert_no_zombie_tasks()");
+    println!("       assert_no_orphaned_tasks()");
 }

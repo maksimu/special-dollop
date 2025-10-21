@@ -64,12 +64,12 @@ async fn test_actor_doesnt_leak_threads_on_create() {
     println!("✓ No thread leaks detected");
 }
 
-/// Test 2: Zombie Tokio Task Detection
+/// Test 2: Orphaned Tokio Task Detection
 /// Verifies that closing tubes doesn't leak tokio tasks
 /// This test would have caught the orphaned task handle bugs (server mode + UDP)
 #[tokio::test]
 async fn test_no_zombie_tasks_after_tube_close() {
-    println!("=== TEST: Zombie Task Detection ===");
+    println!("=== TEST: Orphaned Task Detection ===");
 
     // Note: We can't easily count tokio tasks without tokio-console or metrics
     // But we can verify cleanup happens by checking for specific resources
@@ -91,7 +91,7 @@ async fn test_no_zombie_tasks_after_tube_close() {
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
     let req = CreateTubeRequest {
-        conversation_id: "zombie-task-test".to_string(),
+        conversation_id: "orphaned-task-test".to_string(),
         settings,
         initial_offer_sdp: None,
         trickle_ice: true,
@@ -140,7 +140,7 @@ async fn test_no_zombie_tasks_after_tube_close() {
         tube_id
     );
 
-    println!("✓ Zombie task detection test PASSED");
+    println!("✓ Orphaned task detection test PASSED");
     println!("  - Tube {} properly removed from registry", tube_id);
     println!("  - No orphaned task handles");
     println!("  - Cleanup completed synchronously");

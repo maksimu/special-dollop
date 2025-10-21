@@ -290,8 +290,8 @@ pub fn initialize_logger(
         );
         log::debug!("Activity timeout: {:?}", crate::config::activity_timeout());
         log::debug!(
-            "Zombie sweep interval: {:?}",
-            crate::config::zombie_sweep_interval()
+            "Stale tube sweep interval: {:?}",
+            crate::config::stale_tube_sweep_interval()
         );
         log::debug!(
             "Max concurrent creates: {}",

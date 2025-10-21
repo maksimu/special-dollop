@@ -198,14 +198,14 @@ impl Conn {
 
     /// Shutdown the connection immediately by aborting tasks
     ///
-    /// This prevents zombie connections where backend tasks continue
+    /// This prevents orphaned connections where backend tasks continue
     /// reading from/writing to guacd even after the tube is closed.
     /// Aborting ensures immediate cleanup of TCP connections.
     pub async fn shutdown(self) -> Result<()> {
         // Close the data channel
         drop(self.data_tx);
 
-        // Abort tasks immediately to prevent zombie keepalive responses
+        // Abort tasks immediately to prevent orphaned keepalive responses
         // The outbound task (to_webrtc) reads from guacd and auto-responds to sync messages
         // If we await instead of abort, it can run forever since guacd keeps sending syncs
         self.backend_task.abort();

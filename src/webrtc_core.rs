@@ -2783,7 +2783,7 @@ impl WebRTCPeerConnection {
         *activity_guard = time;
     }
 
-    /// Get time since last activity (for zombie tube detection)
+    /// Get time since last activity (for stale tube detection)
     /// Returns duration since last successful data channel activity
     /// Used by metrics collector to detect inactive Failed/Disconnected tubes
     pub fn time_since_last_activity(&self) -> Duration {

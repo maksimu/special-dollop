@@ -291,21 +291,22 @@ pub fn activity_timeout() -> Duration {
     )
 }
 
-/// How often zombie sweeper runs.
+/// How often stale tube sweeper runs.
 ///
 /// **Default**: 300 seconds (5 minutes)
 ///
 /// **Rationale**: 5 minutes balances resource cleanup vs sweep overhead.
-/// Zombie sweeper is a safety net for edge cases, not primary cleanup.
+/// Stale tube sweeper is a safety net for edge cases, not primary cleanup.
+/// Finds tubes in Failed/Disconnected state with prolonged inactivity.
 ///
 /// **Tuning**:
 /// - High churn: 60-120s (more frequent)
 /// - Stable: 600s (less overhead)
 ///
-/// **Env**: `KEEPER_GATEWAY_ZOMBIE_SWEEP_INTERVAL_SECS`
-pub fn zombie_sweep_interval() -> Duration {
+/// **Env**: `KEEPER_GATEWAY_STALE_TUBE_SWEEP_INTERVAL_SECS`
+pub fn stale_tube_sweep_interval() -> Duration {
     Duration::from_secs(
-        std::env::var("KEEPER_GATEWAY_ZOMBIE_SWEEP_INTERVAL_SECS")
+        std::env::var("KEEPER_GATEWAY_STALE_TUBE_SWEEP_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),

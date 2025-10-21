@@ -6,13 +6,33 @@ use base64::{
 use crate::unlikely;
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use log::{debug, error};
+use log::{debug, error, info, warn};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+
+// ============================================================================
+// ROUTER CIRCUIT BREAKER STATE
+// ============================================================================
+// Protects against cascading failures when router is down/slow.
+// Opens after consecutive failures, closes after cooldown period.
+
+/// Circuit breaker state (true = open/failing-fast, false = closed/normal)
+static ROUTER_CIRCUIT_BREAKER_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Consecutive failure counter for circuit breaker threshold
+static ROUTER_CONSECUTIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Timestamp of last router failure (for cooldown calculation)
+static ROUTER_LAST_FAILURE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Timestamp of last router success (for monitoring)
+static ROUTER_LAST_SUCCESS: Mutex<Option<Instant>> = Mutex::new(None);
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -366,6 +386,40 @@ async fn router_request(
         );
     }
 
+    // ============================================================================
+    // CIRCUIT BREAKER CHECK
+    // ============================================================================
+    // If router is failing repeatedly, fail fast to prevent actor freeze
+    if ROUTER_CIRCUIT_BREAKER_OPEN.load(Ordering::Acquire) {
+        // Check if cooldown period has elapsed
+        if let Ok(last_failure_guard) = ROUTER_LAST_FAILURE.lock() {
+            if let Some(failure_time) = *last_failure_guard {
+                let cooldown = crate::config::router_circuit_breaker_cooldown();
+                let elapsed = failure_time.elapsed();
+
+                if elapsed < cooldown {
+                    let remaining = cooldown.saturating_sub(elapsed);
+                    warn!(
+                        "Router circuit breaker OPEN - failing fast (cooldown remaining: {:?}, path: {})",
+                        remaining, url_path
+                    );
+                    return Err(Box::new(KRouterError(format!(
+                        "Router circuit breaker open - failing fast (cooldown: {:?} remaining)",
+                        remaining
+                    ))));
+                } else {
+                    // Cooldown expired - try again
+                    info!(
+                        "Router circuit breaker closing - cooldown expired ({:?}), retrying (path: {})",
+                        cooldown, url_path
+                    );
+                    ROUTER_CIRCUIT_BREAKER_OPEN.store(false, Ordering::Release);
+                    // Continue with request below
+                }
+            }
+        }
+    }
+
     let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
     let ksm_config_parsed: KsmConfig = serde_json::from_str(ksm_config)?;
     let client_id = &ksm_config_parsed.client_id;
@@ -375,8 +429,10 @@ async fn router_request(
     let (challenge_str, signature) =
         challenge_response::ChallengeResponse::fetch(ksm_config).await?;
 
+    // Use config timeout (5s default) instead of hardcoded 30s
+    // This prevents actor from freezing for 30s on slow/dead router
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(crate::config::router_http_timeout())
         .danger_accept_invalid_certs(!VERIFY_SSL)
         .build()?;
 
@@ -410,27 +466,88 @@ async fn router_request(
         request_builder = request_builder.json(&json_body);
     }
 
-    // Send the request
-    let response = request_builder.send().await?;
+    // ============================================================================
+    // EXECUTE HTTP REQUEST WITH CIRCUIT BREAKER TRACKING
+    // ============================================================================
 
-    // Check status and handle errors
-    if !response.status().is_success() {
-        return Err(Box::new(KRouterError(format!(
-            "Request failed with status: {}",
-            response.status()
-        ))));
+    // Send the request and track result for circuit breaker
+    let request_result: Result<serde_json::Value, Box<dyn Error>> = async {
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+
+        // Check status and handle errors
+        if !response.status().is_success() {
+            return Err(Box::new(KRouterError(format!(
+                "Request failed with status: {}",
+                response.status()
+            ))) as Box<dyn Error>);
+        }
+
+        // Parse response text
+        if response.content_length().unwrap_or(0) > 0 {
+            let text = response
+                .text()
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+            if !text.is_empty() {
+                return serde_json::from_str(&text).map_err(|e| Box::new(e) as Box<dyn Error>);
+            }
+        }
+
+        // Return an empty JSON object if no content
+        Ok(serde_json::json!({}))
     }
+    .await;
 
-    // Parse response text
-    if response.content_length().unwrap_or(0) > 0 {
-        let text = response.text().await?;
-        if !text.is_empty() {
-            return Ok(serde_json::from_str(&text)?);
+    // Track result for circuit breaker
+    match &request_result {
+        Ok(_) => {
+            // SUCCESS - Reset circuit breaker
+            let old_failures = ROUTER_CONSECUTIVE_FAILURES.swap(0, Ordering::Release);
+            if old_failures > 0 {
+                info!(
+                    "Router request succeeded after {} failures - circuit breaker reset (path: {})",
+                    old_failures, url_path
+                );
+            }
+
+            // Record success timestamp
+            if let Ok(mut last_success_guard) = ROUTER_LAST_SUCCESS.lock() {
+                *last_success_guard = Some(Instant::now());
+            }
+
+            // Ensure circuit breaker is closed
+            ROUTER_CIRCUIT_BREAKER_OPEN.store(false, Ordering::Release);
+        }
+        Err(e) => {
+            // FAILURE - Increment counter and maybe open circuit breaker
+            let failures = ROUTER_CONSECUTIVE_FAILURES.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record failure timestamp
+            if let Ok(mut last_failure_guard) = ROUTER_LAST_FAILURE.lock() {
+                *last_failure_guard = Some(Instant::now());
+            }
+
+            // Check if should open circuit breaker
+            let threshold = crate::config::router_circuit_breaker_threshold();
+            if failures >= threshold {
+                ROUTER_CIRCUIT_BREAKER_OPEN.store(true, Ordering::Release);
+                error!(
+                    "Router circuit breaker OPENED after {} consecutive failures (threshold: {}, path: {}, error: {})",
+                    failures, threshold, url_path, e
+                );
+            } else {
+                warn!(
+                    "Router request failed ({}/{} failures before circuit breaker, path: {}, error: {})",
+                    failures, threshold, url_path, e
+                );
+            }
         }
     }
 
-    // Return an empty JSON object if no content
-    Ok(serde_json::json!({}))
+    request_result
 }
 
 // Function to get relay access credentials

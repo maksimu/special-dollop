@@ -117,14 +117,21 @@ impl IsolatedWebRTCAPI {
         // Default is 7 seconds for disconnected and 25 seconds for failed
         // We extend these significantly to accommodate slow candidate trickling
         setting_engine.set_ice_timeouts(
-            Some(Duration::from_secs(30)), // disconnected_timeout: 30s instead of 7s
-            Some(Duration::from_secs(60)), // failed_timeout: 60s instead of 25s
-            Some(Duration::from_millis(200)), // keepalive_interval: check connectivity every 200ms
+            Some(Duration::from_secs(
+                crate::config::ICE_DISCONNECTED_TIMEOUT_SECS,
+            )),
+            Some(Duration::from_secs(crate::config::ICE_FAILED_TIMEOUT_SECS)),
+            Some(Duration::from_millis(
+                crate::config::ICE_KEEPALIVE_INTERVAL_MS,
+            )),
         );
 
         debug!(
-            "Configured ICE timeouts for tube {} (disconnected: 30s, failed: 60s, keepalive: 200ms)",
-            tube_id
+            "Configured ICE timeouts for tube {} (disconnected: {}s, failed: {}s, keepalive: {}ms)",
+            tube_id,
+            crate::config::ICE_DISCONNECTED_TIMEOUT_SECS,
+            crate::config::ICE_FAILED_TIMEOUT_SECS,
+            crate::config::ICE_KEEPALIVE_INTERVAL_MS
         );
 
         // Build API with custom settings
@@ -873,7 +880,10 @@ impl WebRTCPeerConnection {
                 let candidate_count = pending_candidates.len();
                 tokio::spawn(async move {
                     // Small delay to allow all candidates to be fully processed
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        crate::config::PROTOCOL_MESSAGE_DELAY_MS,
+                    ))
+                    .await;
 
                     // Getting stats triggers internal ICE agent processing
                     let _ = peer_conn_clone.get_stats().await;
@@ -1124,12 +1134,13 @@ impl WebRTCPeerConnection {
                 let peer_connection = Arc::clone(&self.peer_connection);
 
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    tokio::time::sleep(crate::config::ice_restart_answer_timeout()).await;
 
-                    // If restart still in progress after 15s, assume answer won't come
+                    // If restart still in progress after timeout, assume answer won't come
                     if restart_flag.swap(false, Ordering::AcqRel) {
                         warn!(
-                            "ICE restart answer timeout - no response from remote peer after 15s. Closing connection. (tube_id: {})",
+                            "ICE restart answer timeout - no response from remote peer after {:?}. Closing connection. (tube_id: {})",
+                            crate::config::ice_restart_answer_timeout(),
                             tube_id
                         );
 
@@ -1584,7 +1595,10 @@ impl WebRTCPeerConnection {
                             let tube_id_clone = self.tube_id.clone();
                             tokio::spawn(async move {
                                 // Small delay to allow the candidate to be fully processed
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                tokio::time::sleep(Duration::from_millis(
+                                    crate::config::PROTOCOL_MESSAGE_DELAY_MS,
+                                ))
+                                .await;
 
                                 // Getting stats triggers internal ICE agent processing
                                 let _ = peer_conn_clone.get_stats().await;
@@ -1687,7 +1701,7 @@ impl WebRTCPeerConnection {
                         if trickle_ice {
                             info!("Connection disconnected for tube {}, considering ICE restart (trickle_ice enabled)", tube_id);
                             // Wait a moment to see if connection recovers
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(crate::config::ice_disconnected_wait()).await;
                             network_integration.trigger_ice_restart(&tube_id, "connection disconnected");
                         } else {
                             info!("Connection disconnected for tube {} - ICE restart not available (trickle_ice disabled)", tube_id);
@@ -1878,10 +1892,11 @@ impl WebRTCPeerConnection {
         // If no timestamp recorded, we don't know credential age - assume fresh
         if let Ok(guard) = self.turn_credentials_created_at.lock() {
             if let Some(created_at) = *guard {
-                // Check if credentials are >50 minutes old (3000 seconds)
+                // Check if credentials are >50 minutes old
                 // This provides a 10-minute safety margin before 1-hour expiry
                 let age = created_at.elapsed();
-                if age > Duration::from_secs(3000) {
+                if age > Duration::from_secs(crate::config::TURN_CREDENTIAL_REFRESH_THRESHOLD_SECS)
+                {
                     debug!(
                         "TURN credentials are {}s old (>50min threshold), refresh needed (tube_id: {})",
                         age.as_secs(),
@@ -2005,7 +2020,9 @@ impl WebRTCPeerConnection {
         let is_server_mode = self.is_server_mode;
 
         let stats_task_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5)); // Collect stats every 5 seconds
+            let mut interval = tokio::time::interval(Duration::from_secs(
+                crate::config::STATS_COLLECTION_INTERVAL_SECS,
+            ));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             let ipv6_binding_failures = std::sync::atomic::AtomicU32::new(0);
@@ -2324,11 +2341,17 @@ impl WebRTCPeerConnection {
         }
 
         // Then close the connection with a timeout to avoid hanging
-        match tokio::time::timeout(Duration::from_secs(5), self.peer_connection.close()).await {
+        match tokio::time::timeout(
+            crate::config::peer_connection_close_timeout(),
+            self.peer_connection.close(),
+        )
+        .await
+        {
             Ok(result) => result.map_err(|e| format!("Failed to close peer connection: {e}")),
             Err(_) => {
                 // The timeout elapsed.
-                warn!("Close operation timed out for peer connection. The underlying webrtc-rs close() did not complete in 5 seconds. (tube_id: {})", self.tube_id);
+                warn!("Close operation timed out for peer connection. The underlying webrtc-rs close() did not complete in {:?}. (tube_id: {})",
+                     crate::config::peer_connection_close_timeout(), self.tube_id);
                 // Return an error instead of Ok(())
                 Err(format!(
                     "Peer connection close operation timed out for tube {}",

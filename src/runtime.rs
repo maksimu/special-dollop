@@ -90,7 +90,6 @@ impl RuntimeManager {
         let runtime = if let Some(existing) = &*state {
             existing.clone()
         } else {
-            eprintln!("RUNTIME: Creating new global runtime");
             let new_runtime = Arc::new(
                 Builder::new_multi_thread()
                     .enable_all()

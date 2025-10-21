@@ -29,7 +29,7 @@ This guide documents the **registry layer refactoring** that eliminates deadlock
 ```
 Oct 10 22:27-23:04: Multiple WebRTC tubes created
 Oct 10 23:03:57: ICE disconnected (36 minutes later - NAT timeout!)
-Oct 10 23:04:29: ZOMBIE TUBE DETECTED (60s cleanup delay)
+Oct 10 23:04:29: STALE TUBE DETECTED (60s cleanup delay)
 Oct 10 23:05:29: Timeout waiting for cleanup
 ERROR: Timeout acquiring REGISTRY write lock after 30s
 
@@ -67,7 +67,7 @@ registry.signal_channels.remove(tube_id);      // Forgot this? LEAK!
 METRICS_COLLECTOR.unregister(conversation_id); // Forgot this? LEAK!
 registry.conversations.remove(...);             // Forgot this? LEAK!
 registry.tubes.remove(tube_id);
-// Easy to miss steps = zombie tubes
+// Easy to miss steps = stale/leaked tubes
 ```
 
 **4. Python Blocking** 🔴
@@ -316,7 +316,7 @@ tube_registry.close_tube(tube_id)
 | Python blocking per create | 2-5 seconds | ~100μs | **20,000x** |
 | Bulk create (50 tubes) | 150s (serial) | 3-5s (parallel) | **30-50x** |
 | Cleanup steps | 5 manual (leak-prone) | 1 automatic (Drop) | **100% safe** |
-| Zombie risk | High (manual cleanup) | Zero (RAII guarantees) | **Impossible** |
+| Resource leak risk | High (manual cleanup) | Zero (RAII guarantees) | **Impossible** |
 
 ---
 
@@ -387,7 +387,7 @@ export WEBRTC_MAX_CONCURRENT_CREATES=200
 - **After:** No locks - DashMap + actor
 - **Result:** Impossible to timeout
 
-**2. "ZOMBIE TUBE DETECTED: Connection in failed/disconnected state with 60s inactivity"** ✅
+**2. "STALE TUBE DETECTED: Connection in failed/disconnected state with 60s inactivity"** ✅
 - **Before:** Manual cleanup - easy to forget steps
 - **After:** RAII Drop - compiler enforces cleanup
 - **Result:** Impossible to leak tubes
@@ -911,7 +911,7 @@ Critical Fixes:
 **What We Fixed:**
 - Deadlocks at 50+ concurrent (was common)
 - Lock timeout warnings (was every minute)
-- Zombie tubes (was frequent)
+- Stale/leaked tubes (was frequent)
 - NAT failures at 36 min (was predictable)
 - Gateway restarts (was daily)
 

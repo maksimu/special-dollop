@@ -7,6 +7,7 @@ mod tests;
 
 mod buffer_pool;
 mod channel;
+mod config;
 mod error;
 pub mod hot_path_macros;
 mod metrics;

@@ -276,7 +276,7 @@ backend.flush().await?;  // Instant response
 1. **Use the actor** - Don't bypass RegistryActor for coordination
 2. **Preserve RAII** - Resources must be owned by Tube for automatic cleanup
 3. **Test backpressure** - Verify system rejects gracefully when overloaded
-4. **Check zombies** - Ensure no resource leaks (RAII makes this automatic)
+4. **Check for leaks** - Ensure no resource leaks (RAII makes this automatic)
 
 ### When Changing WebRTC Layer
 
@@ -315,7 +315,7 @@ RUST_LOG=debug  # Enable debug logging for troubleshooting
 **Cause**: This was fixed in the actor model refactor
 **Solution**: Upgrade to the latest version with RegistryActor
 
-### Issue: "ZOMBIE TUBE DETECTED"
+### Issue: "STALE TUBE DETECTED"
 **Cause**: This was fixed by RAII pattern
 **Solution**: Tubes now automatically cleanup via `Drop` implementation
 

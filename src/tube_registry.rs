@@ -128,7 +128,7 @@ impl RegistryActor {
 
     /// Main actor event loop
     async fn run(mut self) {
-        info!(
+        debug!(
             "Registry actor started (max_concurrent: {})",
             self.max_concurrent_creates
         );
@@ -156,11 +156,30 @@ impl RegistryActor {
                     self.active_creates.fetch_add(1, Ordering::Release);
                     let start = Instant::now();
 
-                    let result = self.handle_create_tube(req).await;
+                    // Timeout tube creation to prevent actor freeze on slow I/O (router, DNS, etc)
+                    let timeout_duration = crate::config::tube_creation_timeout();
+                    let result =
+                        tokio::time::timeout(timeout_duration, self.handle_create_tube(req)).await;
 
                     let duration = start.elapsed();
                     self.active_creates.fetch_sub(1, Ordering::Release);
                     self.total_creates += 1;
+
+                    // Convert timeout error to regular error
+                    let result = match result {
+                        Ok(Ok(tube_info)) => Ok(tube_info),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => {
+                            warn!(
+                                "Tube creation timed out after {:?} - likely router slowness or network issues",
+                                timeout_duration
+                            );
+                            Err(anyhow!(
+                                "Tube creation timed out after {:?} - check router connectivity and network",
+                                timeout_duration
+                            ))
+                        }
+                    };
 
                     // Track timing
                     if self.create_times.len() >= 100 {
@@ -453,7 +472,7 @@ impl RegistryActor {
             result_map.insert("answer".to_string(), answer_base64);
         }
 
-        info!(
+        debug!(
             "Tube created successfully via actor (tube_id: {}, conversation_id: {}, mode: {})",
             tube_id,
             conversation_id,
@@ -1027,13 +1046,11 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     // Get max concurrent from environment or default to 100
-    let max_concurrent = std::env::var("WEBRTC_MAX_CONCURRENT_CREATES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+    // Uses KEEPER_GATEWAY_MAX_CONCURRENT_CREATES (see src/config.rs)
+    let max_concurrent = crate::config::max_concurrent_creates();
 
-    info!(
-        "Registry configured with max_concurrent_creates: {}",
+    debug!(
+        "Registry configured with max_concurrent_creates: {} (KEEPER_GATEWAY_MAX_CONCURRENT_CREATES)",
         max_concurrent
     );
 
@@ -1046,7 +1063,7 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     std::thread::spawn(move || {
         let rt = crate::runtime::get_runtime();
         rt.spawn(async move {
-            info!("Registry actor event loop starting");
+            debug!("Registry actor event loop starting");
             actor.run().await;
             // If actor exits, this is catastrophic
             error!("CRITICAL: Registry actor event loop terminated!");

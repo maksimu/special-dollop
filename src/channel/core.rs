@@ -897,6 +897,19 @@ impl Channel {
                         self.channel_id
                     );
                 }
+
+                // Send EOF after disconnect for consistent TCP-level shutdown
+                if let Err(e) = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
+                    debug!(
+                        "Failed to send EOF to guacd server after disconnect (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
+                } else {
+                    debug!(
+                        "Successfully sent EOF to Guacd server after disconnect (channel_id: {})",
+                        self.channel_id
+                    );
+                }
             }
         }
 
@@ -1216,7 +1229,7 @@ impl Drop for Channel {
                 // Send graceful shutdown message before aborting tasks
                 if let Some(conn_ref) = conns_clone.get(&conn_no) {
                     if active_protocol == ActiveProtocol::Guacd {
-                        // For guacd: send disconnect instruction
+                        // For guacd: send disconnect instruction first (protocol-level)
                         let disconnect_instruction = crate::channel::guacd_parser::GuacdInstruction::new(
                             "disconnect".to_string(),
                             vec![]
@@ -1231,6 +1244,13 @@ impl Drop for Channel {
                         } else {
                             debug!("Sent disconnect instruction to guacd (channel_id: {}, conn_no: {})", channel_id, conn_no);
                         }
+
+                        // THEN send EOF for TCP-level shutdown (consistent with other protocols)
+                        if let Err(e) = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
+                            debug!("Failed to send EOF to guacd in drop (channel_id: {}, error: {})", channel_id, e);
+                        } else {
+                            debug!("Sent EOF after disconnect for guacd (channel_id: {}, conn_no: {})", channel_id, conn_no);
+                        }
                     } else {
                         // For port forwarding/SOCKS5: send EOF for graceful TCP shutdown
                         if let Err(e) = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
@@ -1241,7 +1261,7 @@ impl Drop for Channel {
                     }
 
                     // Brief delay to allow shutdown message to be written before aborting tasks
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(crate::config::disconnect_to_eof_delay()).await;
                 }
 
                 // Shutdown the connection (now aborts tasks immediately)

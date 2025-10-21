@@ -1679,7 +1679,7 @@ impl Tube {
     }
 
     /// Check if tube has been inactive for specified duration
-    /// Used for zombie detection when data channel close events don't fire
+    /// Used for stale tube detection when data channel close events don't fire
     /// Returns true if no WebRTC activity for the given duration
     pub async fn is_inactive_for_duration(&self, duration: std::time::Duration) -> bool {
         if let Ok(pc_guard) = self.peer_connection.try_lock() {
@@ -1690,7 +1690,7 @@ impl Tube {
         false // Can't check, assume active to be safe
     }
 
-    /// Get current peer connection state (for zombie detection)
+    /// Get current peer connection state (for stale tube detection)
     /// Returns None if peer connection is not available or locked
     pub async fn get_connection_state(&self) -> Option<RTCPeerConnectionState> {
         if let Ok(pc_guard) = self.peer_connection.try_lock() {
@@ -1745,7 +1745,39 @@ impl Tube {
             }
         }
 
-        // 2. Close all data channels (sends CloseConnection to downstream peers)
+        // 2. Signal all channels to exit their main loops
+        // This ensures TCP servers and other resources are properly cleaned up
+        let channel_count = self.channel_shutdown_signals.read().await.len();
+        if channel_count > 0 {
+            info!(
+                "Tube {}: Signaling {} channels to shut down (after {:?} grace period)",
+                tube_id,
+                channel_count,
+                crate::config::channel_shutdown_grace_period()
+            );
+
+            // Grace period for in-progress operations (DNS, TCP handshake, TLS, Guacd handshake)
+            // Prevents race where channels are signaled before fully initialized on slow networks
+            tokio::time::sleep(crate::config::channel_shutdown_grace_period()).await;
+
+            let signals: Vec<Arc<AtomicBool>> = {
+                self.channel_shutdown_signals
+                    .read()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect()
+            };
+            for signal in signals {
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            debug!(
+                "Tube {}: All {} channel shutdown signals set",
+                tube_id, channel_count
+            );
+        }
+
+        // 3. Close all data channels (sends CloseConnection to downstream peers)
         let channels: Vec<_> = {
             let mut guard = self.data_channels.write().await;
             guard.drain().collect()
@@ -1753,7 +1785,9 @@ impl Tube {
 
         let mut closed_count = 0;
         for (label, dc) in channels {
-            match tokio::time::timeout(Duration::from_secs(3), dc.close()).await {
+            match tokio::time::timeout(crate::config::data_channel_close_timeout(), dc.close())
+                .await
+            {
                 Ok(Ok(_)) => {
                     closed_count += 1;
                     debug!("Data channel {} closed for tube {}", label, tube_id);
@@ -1773,10 +1807,12 @@ impl Tube {
             }
         }
 
-        // 3. Close peer connection (releases TURN allocation, stops refresh timers)
+        // 4. Close peer connection (releases TURN allocation, stops refresh timers)
         let mut pc_guard = self.peer_connection.lock().await;
         if let Some(pc) = pc_guard.take() {
-            match tokio::time::timeout(Duration::from_secs(5), pc.close()).await {
+            match tokio::time::timeout(crate::config::peer_connection_close_timeout(), pc.close())
+                .await
+            {
                 Ok(Ok(_)) => {
                     info!(
                         "Tube {} closed successfully (data_channels: {}, TURN allocation released)",
@@ -1844,7 +1880,19 @@ impl Drop for Tube {
             }
         }
 
-        // 4. Clear channel maps
+        // 4. Signal and clear channel maps
+        // First signal all channels to exit (in case close() wasn't called)
+        if let Ok(signals_guard) = self.channel_shutdown_signals.try_read() {
+            for signal in signals_guard.values() {
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            debug!(
+                "Drop: Signaled {} channels to exit (tube_id: {})",
+                signals_guard.len(),
+                self.id
+            );
+        }
+        // Then clear the maps
         if let Ok(mut signals) = self.channel_shutdown_signals.try_write() {
             signals.clear();
         }

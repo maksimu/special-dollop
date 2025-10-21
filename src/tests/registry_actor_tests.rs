@@ -233,11 +233,21 @@ async fn test_tube_raii_metrics_cleanup() {
 async fn test_registry_all_tube_ids_lock_free() {
     // Test that all_tube_ids_sync() works without locks
 
+    // CRITICAL: Wait for pending tube cleanups from previous tests to complete
+    // Our channel cleanup changes made tube removal asynchronous:
+    // - 100ms grace period before signaling channels (prevents race on slow networks)
+    // - Channels then exit their main loops and run cleanup
+    // - TCP servers stop, ports released
+    // - Tube removed from registry ~200-300ms after close_tube() call
+    // Without this delay, count_before might include tubes that are mid-cleanup,
+    // which then complete during our test, causing the count to go DOWN instead of UP.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
     // Get IDs before creating tubes
     let ids_before = REGISTRY.all_tube_ids_sync();
     let count_before = ids_before.len();
 
-    println!("Tubes before test: {}", count_before);
+    println!("Tubes before test (after cleanup wait): {}", count_before);
 
     // Create a test tube
     let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
@@ -265,15 +275,17 @@ async fn test_registry_all_tube_ids_lock_free() {
             // Get IDs after
             let ids_after = REGISTRY.all_tube_ids_sync();
 
+            // IMPORTANT: Don't assert on absolute count - async cleanup from other tests
+            // makes this non-deterministic. We just verify our tube exists and the API works.
             assert!(
-                ids_after.len() >= count_before,
-                "Should have at least same tubes"
+                ids_after.contains(&tube_id),
+                "Should contain our newly created tube"
             );
-            assert!(ids_after.contains(&tube_id), "Should contain our tube");
 
             println!(
-                "✓ all_tube_ids_sync() works (found {} tubes)",
-                ids_after.len()
+                "✓ all_tube_ids_sync() works - found our tube among {} total (started with {})",
+                ids_after.len(),
+                count_before
             );
 
             // Cleanup

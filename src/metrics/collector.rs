@@ -142,13 +142,13 @@ impl MetricsCollector {
             }
         });
 
-        // Start zombie tube sweeper (backstop for missed cleanups)
+        // Start stale tube sweeper (backstop for missed cleanups)
         let collector_for_sweeper = self.clone();
         runtime_handle.spawn(async move {
-            collector_for_sweeper.zombie_tube_sweeper().await;
+            collector_for_sweeper.stale_tube_sweeper().await;
         });
 
-        debug!("Background metrics tasks started (aggregation, cleanup, stats collection, zombie sweeper)");
+        debug!("Background metrics tasks started (aggregation, cleanup, stats collection, stale tube sweeper)");
     }
 
     /// Register a new connection for metrics tracking
@@ -927,7 +927,7 @@ impl MetricsCollector {
             if let Some(tube) = tube_arc {
                 // Now we can safely await without holding the registry lock
 
-                // MULTI-FACTOR ZOMBIE TUBE DETECTION
+                // MULTI-FACTOR STALE TUBE DETECTION
                 // Factor 1: Check if tube has active channels (classic check)
                 let has_active_channels = tube.has_active_channels().await;
 
@@ -955,15 +955,15 @@ impl MetricsCollector {
                     }
                 }
 
-                // PATH 2: ZOMBIE CLEANUP - Failed/Disconnected + inactive for 60s
+                // PATH 2: STALE TUBE CLEANUP - Failed/Disconnected + inactive for 60s
                 // This catches tubes where data channel on_close event didn't fire (browser force-close, network drop)
                 if is_failed_or_disconnected && inactive_60s {
                     warn!(
-                        "ZOMBIE TUBE DETECTED: Connection in failed/disconnected state with 60s inactivity - force closing (conversation_id: {}, tube_id: {}, state: {:?}, has_channels: {})",
+                        "STALE TUBE DETECTED: Connection in failed/disconnected state with 60s inactivity - force closing (conversation_id: {}, tube_id: {}, state: {:?}, has_channels: {})",
                         conversation_id, tube_id, connection_state, has_active_channels
                     );
 
-                    // Force close the zombie tube via registry (actor-based, no locks!)
+                    // Force close the stale tube via registry (actor-based, no locks!)
                     let tube_id_clone = tube_id.clone();
                     let conversation_id_clone = conversation_id.clone();
 
@@ -976,13 +976,13 @@ impl MetricsCollector {
                     {
                         Ok(_) => {
                             info!(
-                                "Successfully force-closed zombie tube (tube_id: {})",
+                                "Successfully force-closed stale tube (tube_id: {})",
                                 tube_id_clone
                             );
                         }
                         Err(e) => {
                             error!(
-                                "Failed to force-close zombie tube: {} (tube_id: {})",
+                                "Failed to force-close stale tube: {} (tube_id: {})",
                                 e, tube_id_clone
                             );
                         }
@@ -1084,20 +1084,20 @@ impl MetricsCollector {
         }
     }
 
-    /// Background task to sweep for zombie tubes every 5 minutes
+    /// Background task to sweep for stale tubes every 5 minutes
     /// This is a safety net for tubes that slip through metrics-based detection
-    /// Zombies are tubes in Failed/Disconnected state with prolonged inactivity
-    async fn zombie_tube_sweeper(&self) {
+    /// Stale tubes are tubes in Failed/Disconnected state with prolonged inactivity
+    async fn stale_tube_sweeper(&self) {
         loop {
-            tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
+            tokio::time::sleep(crate::config::stale_tube_sweep_interval()).await;
 
-            debug!("Zombie tube sweeper: Starting periodic sweep");
+            debug!("Stale tube sweeper: Starting periodic sweep");
 
             // Get all tube IDs from registry
             // LOCK-FREE: Get all tube IDs from DashMap
             let tube_ids = crate::tube_registry::REGISTRY.all_tube_ids_sync();
 
-            let mut zombies_found = 0;
+            let mut stale_tubes_found = 0;
 
             for tube_id in tube_ids {
                 // LOCK-FREE: Get tube from DashMap
@@ -1109,7 +1109,7 @@ impl MetricsCollector {
                         .is_inactive_for_duration(Duration::from_secs(300))
                         .await;
 
-                    // Zombie criteria: Failed/Disconnected + 5min inactivity
+                    // Stale tube criteria: Failed/Disconnected + 5min inactivity
                     if matches!(
                         state,
                         Some(
@@ -1119,13 +1119,13 @@ impl MetricsCollector {
                         )
                     ) && inactive_5min
                     {
-                        zombies_found += 1;
+                        stale_tubes_found += 1;
                         warn!(
-                            "Zombie sweeper: Found zombie tube (tube_id: {}, state: {:?}, inactive: 5min+)",
+                            "Stale tube sweeper: Found stale tube (tube_id: {}, state: {:?}, inactive: 5min+)",
                             tube_id, state
                         );
 
-                        // Force close the zombie tube (actor-based, no locks!)
+                        // Force close the stale tube (actor-based, no locks!)
                         match crate::tube_registry::REGISTRY
                             .close_tube(
                                 &tube_id,
@@ -1135,13 +1135,13 @@ impl MetricsCollector {
                         {
                             Ok(_) => {
                                 info!(
-                                    "Zombie sweeper: Closed zombie tube (tube_id: {})",
+                                    "Stale tube sweeper: Closed stale tube (tube_id: {})",
                                     tube_id
                                 );
                             }
                             Err(e) => {
                                 error!(
-                                    "Zombie sweeper: Failed to close tube: {} (tube_id: {})",
+                                    "Stale tube sweeper: Failed to close tube: {} (tube_id: {})",
                                     e, tube_id
                                 );
                             }
@@ -1150,10 +1150,13 @@ impl MetricsCollector {
                 }
             }
 
-            if zombies_found > 0 {
-                debug!("Zombie sweeper: Cleaned {} zombie tubes", zombies_found);
+            if stale_tubes_found > 0 {
+                debug!(
+                    "Stale tube sweeper: Cleaned {} stale tubes",
+                    stale_tubes_found
+                );
             } else {
-                debug!("Zombie sweeper: No zombies found");
+                debug!("Stale tube sweeper: No stale tubes found");
             }
         }
     }

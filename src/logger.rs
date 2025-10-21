@@ -36,7 +36,7 @@ pub fn is_verbose_logging() -> bool {
 #[cfg_attr(feature = "python", pyo3::pyfunction)]
 pub fn set_verbose_logging(enabled: bool) {
     VERBOSE_LOGGING.store(enabled, Ordering::Relaxed);
-    log::info!(
+    log::debug!(
         "Verbose logging {}",
         if enabled { "enabled" } else { "disabled" }
     );
@@ -109,9 +109,7 @@ pub fn initialize_logger(
     let is_verbose = verbose.unwrap_or(false);
 
     // Check environment variable for WebRTC library logging
-    let include_webrtc_logs = std::env::var("KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
+    let include_webrtc_logs = crate::config::include_webrtc_logs();
 
     // IDEMPOTENT: If already initialized, just update flags and return
     // This makes Commander's repeated calls safe and efficient
@@ -166,7 +164,7 @@ pub fn initialize_logger(
                     .filter_target("webrtc_media".to_owned(), log::LevelFilter::Error)
                     .filter_target("webrtc_util".to_owned(), log::LevelFilter::Error)
                     // TURN/STUN libraries (MASSIVE spam - logs full packet data!)
-                    .filter_target("turn".to_owned(), log::LevelFilter::Error)
+                    .filter_target("turn".to_owned(), log::LevelFilter::Off)
                     .filter_target("stun".to_owned(), log::LevelFilter::Error)
                     // RTP/RTCP libraries
                     .filter_target("rtp".to_owned(), log::LevelFilter::Error)
@@ -197,9 +195,7 @@ pub fn initialize_logger(
         let rust_level = convert_py_level_to_tracing_level(level, is_verbose);
 
         // Check environment variable for WebRTC library logging (non-Python mode)
-        let include_webrtc_logs_standalone = std::env::var("KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+        let include_webrtc_logs_standalone = crate::config::include_webrtc_logs();
 
         // Non-Python mode: Use EnvFilter to control what gets logged
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -251,6 +247,77 @@ pub fn initialize_logger(
             is_verbose,
             include_webrtc_logs_standalone
         );
+    }
+
+    // Log configuration in debug/verbose mode only
+    if is_verbose {
+        log::debug!("=== Gateway WebRTC Configuration (Verbose Mode) ===");
+        log::debug!(
+            "Backend flush timeout: {:?}",
+            crate::config::backend_flush_timeout()
+        );
+        log::debug!(
+            "Max flush failures: {}",
+            crate::config::max_flush_failures()
+        );
+        log::debug!(
+            "Channel shutdown grace: {:?}",
+            crate::config::channel_shutdown_grace_period()
+        );
+        log::debug!(
+            "Data channel close timeout: {:?}",
+            crate::config::data_channel_close_timeout()
+        );
+        log::debug!(
+            "Peer connection close timeout: {:?}",
+            crate::config::peer_connection_close_timeout()
+        );
+        log::debug!(
+            "Disconnect to EOF delay: {:?}",
+            crate::config::disconnect_to_eof_delay()
+        );
+        log::debug!(
+            "ICE gather timeout: {:?}",
+            crate::config::ice_gather_timeout()
+        );
+        log::debug!(
+            "ICE restart answer timeout: {:?}",
+            crate::config::ice_restart_answer_timeout()
+        );
+        log::debug!(
+            "ICE disconnected wait: {:?}",
+            crate::config::ice_disconnected_wait()
+        );
+        log::debug!("Activity timeout: {:?}", crate::config::activity_timeout());
+        log::debug!(
+            "Stale tube sweep interval: {:?}",
+            crate::config::stale_tube_sweep_interval()
+        );
+        log::debug!(
+            "Max concurrent creates: {}",
+            crate::config::max_concurrent_creates()
+        );
+        log::debug!(
+            "Router HTTP timeout: {:?}",
+            crate::config::router_http_timeout()
+        );
+        log::debug!(
+            "Tube creation timeout: {:?}",
+            crate::config::tube_creation_timeout()
+        );
+        log::debug!(
+            "Router circuit breaker threshold: {}",
+            crate::config::router_circuit_breaker_threshold()
+        );
+        log::debug!(
+            "Router circuit breaker cooldown: {:?}",
+            crate::config::router_circuit_breaker_cooldown()
+        );
+        log::debug!(
+            "Include WebRTC logs: {}",
+            crate::config::include_webrtc_logs()
+        );
+        log::debug!("=============================================");
     }
 
     Ok(())

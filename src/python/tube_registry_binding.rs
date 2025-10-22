@@ -102,15 +102,18 @@ impl PyTubeRegistry {
             })
         });
 
-        // Now shutdown the runtime - this ensures all async tasks are properly terminated
-        debug!("Shutting down runtime after tube cleanup");
-        crate::runtime::shutdown_runtime_from_python();
+        // Runtime is kept alive for reuse (enables test isolation and service restart)
+        // For explicit runtime shutdown, call shutdown_runtime() before process exit
+        debug!("Registry cleanup complete (runtime kept alive for reuse)");
 
         Ok(())
     }
 
     /// Clean up specific tubes by ID
     fn cleanup_tubes(&self, py: Python<'_>, tube_ids: Vec<String>) -> PyResult<()> {
+        // Mark that explicit cleanup was called (prevents Drop from running force cleanup)
+        self.explicit_cleanup_called.store(true, Ordering::SeqCst);
+
         let master_runtime = get_runtime();
         Python::detach(py, || {
             master_runtime.clone().block_on(async move {
@@ -177,9 +180,9 @@ impl PyTubeRegistry {
             })
         });
 
-        // Force shutdown the runtime - this is the safety net for thread cleanup
-        warn!("Force shutting down runtime in __del__");
-        crate::runtime::shutdown_runtime_from_python();
+        // Runtime is kept alive even in __del__ (enables test isolation)
+        // Python process termination will clean up runtime automatically
+        debug!("Force cleanup complete in __del__ (runtime kept alive)");
 
         Ok(())
     }
@@ -2046,12 +2049,12 @@ impl PyTubeRegistry {
 impl Drop for PyTubeRegistry {
     fn drop(&mut self) {
         if !self.explicit_cleanup_called.load(Ordering::SeqCst) {
-            eprintln!("FORCE CLOSE: PyTubeRegistry Drop - forcing immediate cleanup!");
+            warn!("PyTubeRegistry Drop triggered without explicit cleanup - forcing immediate cleanup");
 
             // LOCK-FREE: Direct access to registry DashMaps (no locks!)
             let tube_count = REGISTRY.tube_count();
             if tube_count > 0 {
-                eprintln!("FORCE CLOSE: Clearing {tube_count} tubes immediately");
+                debug!("Force cleanup: Clearing {} tubes immediately", tube_count);
 
                 // 1. Clean up metrics for all conversations before clearing tubes
                 let all_tube_ids = REGISTRY.all_tube_ids_sync();
@@ -2071,12 +2074,13 @@ impl Drop for PyTubeRegistry {
                 // When Tubes drop, their signal_senders auto-close (RAII handles it!)
                 REGISTRY.tubes().clear();
 
-                eprintln!("FORCE CLOSE: Registry cleaned up successfully");
+                debug!("Force cleanup: Registry cleaned up successfully");
             }
 
-            // CRITICAL: Force shutdown the runtime to prevent hanging threads
-            eprintln!("FORCE CLOSE: Shutting down runtime to prevent hanging threads");
-            crate::runtime::shutdown_runtime_from_python();
+            // Runtime kept alive even in Drop (test isolation + service restart support)
+            // Python process termination will clean up runtime automatically
+            // For explicit shutdown, call registry.shutdown_runtime() before process exit
+            debug!("Force cleanup complete (runtime kept alive for reuse)");
         }
     }
 }

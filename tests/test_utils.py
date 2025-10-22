@@ -33,8 +33,36 @@ def with_runtime(func):
 
 class BaseWebRTCTest:
     """Base class with common WebRTC test functionality"""
-    
+
+    # ✅ ONE shared registry for all tests (process-wide singleton)
+    _shared_registry = None
+    _registry_lock = threading.Lock()
+
     def setUp(self):
+        # Initialize shared registry once (thread-safe)
+        with BaseWebRTCTest._registry_lock:
+            if BaseWebRTCTest._shared_registry is None:
+                BaseWebRTCTest._shared_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+                # Configure higher resource limits for testing
+                test_config = {
+                    "max_concurrent_ice_agents": 128,  # Increased from 32 for tests
+                    "max_concurrent_sockets": 256,     # Increased from 64 for tests
+                    "max_interfaces_per_agent": 16,    # Increased from 8 for tests
+                    "max_turn_connections_per_server": 8  # Increased from 4 for tests
+                }
+                try:
+                    BaseWebRTCTest._shared_registry.configure_resource_limits(test_config)
+                    logging.info(f"Configured shared test registry with limits: {test_config}")
+                except Exception as e:
+                    logging.warning(f"Failed to configure shared registry limits: {e}")
+
+        # Each test gets reference to THE shared registry
+        self.tube_registry = BaseWebRTCTest._shared_registry
+
+        # ✅ Track tubes created by THIS test for cleanup
+        self.my_tube_ids = []
+
+        # Existing setUp code
         self.ice_candidates1 = Queue()
         self.ice_candidates2 = Queue()
         self.data_channel_received = Queue()
@@ -42,22 +70,55 @@ class BaseWebRTCTest:
         self.connection_established = threading.Event()
         logging.info(f"{self.__class__.__name__} setup completed")
 
-    def configure_test_resource_limits(self, registry):
-        """Configure higher resource limits on the given registry for testing purposes.
-        Logs a warning and continues if configuration fails."""
-        test_config = {
-            "max_concurrent_ice_agents": 128,  # Increased from 32 for tests
-            "max_concurrent_sockets": 256,     # Increased from 64 for tests
-            "max_interfaces_per_agent": 16,    # Increased from 8 for tests
-            "max_turn_connections_per_server": 8  # Increased from 4 for tests
-        }
-        
+    def create_and_track_tube(self, **kwargs):
+        """
+        Helper to create tube and automatically track for cleanup.
+        Use this instead of self.tube_registry.create_tube() directly.
+        """
+        tube_info = self.tube_registry.create_tube(**kwargs)
+        tube_id = tube_info['tube_id']
+        self.my_tube_ids.append(tube_id)
+        logging.debug(f"Created and tracking tube: {tube_id}")
+        return tube_info
+
+    def close_and_untrack_tube(self, tube_id):
+        """
+        Helper to close tube and remove from tracking.
+        Safe to call even if tube is already closed.
+        """
         try:
-            registry.configure_resource_limits(test_config)
-            logging.info(f"Configured test resource limits: {test_config}")
+            self.tube_registry.close_tube(tube_id)
+            if tube_id in self.my_tube_ids:
+                self.my_tube_ids.remove(tube_id)
+            logging.debug(f"Closed and untracked tube: {tube_id}")
         except Exception as e:
-            logging.warning(f"Failed to configure test resource limits: {e}")
-            # Continue with default limits
+            # Tube already closed - that's fine
+            logging.debug(f"Tube {tube_id} already closed or not found: {e}")
+            # Still remove from tracking
+            if tube_id in self.my_tube_ids:
+                self.my_tube_ids.remove(tube_id)
+
+    def tearDown(self):
+        """Clean up tubes created by THIS test only"""
+        # Close all tubes created by THIS specific test
+        for tube_id in list(self.my_tube_ids):  # Copy to avoid modification during iteration
+            try:
+                self.tube_registry.close_tube(tube_id)
+                logging.debug(f"tearDown: Closed tube {tube_id}")
+            except Exception as e:
+                # Tube might already be closed in test - that's fine
+                logging.debug(f"tearDown: Tube {tube_id} already closed: {e}")
+
+        self.my_tube_ids.clear()
+        logging.info(f"{self.__class__.__name__} tearDown: cleaned up tracked tubes")
+
+    def configure_test_resource_limits(self, registry):
+        """
+        DEPRECATED: Configuration now done in setUp() for shared registry.
+        This method kept for compatibility but does nothing.
+        """
+        # No-op - shared registry is already configured in setUp()
+        pass
 
     def on_ice_candidate1(self, candidate):
         if candidate:

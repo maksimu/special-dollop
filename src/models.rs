@@ -229,67 +229,20 @@ pub(crate) async fn backend_task_runner(
         );
     }
 
-    // Track consecutive flush failures for resilience on slow networks
-    let mut flush_failures: usize = 0;
-
     while let Some(message) = data_rx.recv().await {
         match message {
             ConnectionMessage::Data(payload) => {
                 // Write to backend without complex stats tracking
                 match backend.write_all(payload.as_ref()).await {
                     Ok(_) => {
-                        // **CRITICAL: Flush immediately for interactive latency (keyboard/mouse)**
-                        // Flush overhead (~5μs) is negligible vs human input rate (~60 msg/sec = 0.03% CPU)
-                        // Without this, characters are buffered and only appear on next keystroke!
-                        //
-                        // **RESILIENCE**: Use timeout to survive slow networks
-                        // - Timeout: Accept lag rather than kill connection
-                        // - Errors: Tolerate transient failures (WiFi handoff, etc)
-                        // - Persistent failures: Eventually disconnect
-                        let flush_result = tokio::time::timeout(
-                            crate::config::backend_flush_timeout(),
-                            backend.flush(),
-                        )
-                        .await;
-
-                        match flush_result {
-                            Ok(Ok(_)) => {
-                                // Flush succeeded - reset failure counter
-                                flush_failures = 0;
-
-                                // HOT PATH: Only log successful writes in verbose mode (can be 1000s/sec with video)
-                                if unlikely!(crate::logger::is_verbose_logging()) {
-                                    debug!("Backend write+flush successful (channel_id: {}, conn_no: {}, bytes: {})",
-                                           channel_id, conn_no, payload.len());
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                // Actual flush error (not timeout) - increment failures
-                                flush_failures += 1;
-                                debug!(
-                                    "Backend flush error (channel_id: {}, conn_no: {}, error: {}, failures: {}/{})",
-                                    channel_id, conn_no, e, flush_failures, crate::config::max_flush_failures()
-                                );
-
-                                // Only disconnect after repeated errors
-                                if flush_failures >= crate::config::max_flush_failures() {
-                                    warn!(
-                                        "Backend flush failed {} times (max: {}), disconnecting (channel_id: {}, conn_no: {})",
-                                        flush_failures, crate::config::max_flush_failures(), channel_id, conn_no
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                // Timeout = slow network, not a failure
-                                // Accept lag, keep connection alive, don't increment counter
-                                if unlikely!(crate::logger::is_verbose_logging()) {
-                                    debug!(
-                                        "Backend flush timeout (slow network), continuing (channel_id: {}, conn_no: {}, timeout: {:?})",
-                                        channel_id, conn_no, crate::config::backend_flush_timeout()
-                                    );
-                                }
-                            }
+                        // HOT PATH: Only log successful writes in verbose mode (can be 1000s/sec with video)
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!(
+                                "Backend write successful (channel_id: {}, conn_no: {}, bytes: {})",
+                                channel_id,
+                                conn_no,
+                                payload.len()
+                            );
                         }
                     }
                     Err(write_err) => {

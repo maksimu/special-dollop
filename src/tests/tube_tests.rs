@@ -170,12 +170,12 @@ fn test_tube_channel_creation() {
         ).await.expect("Call to create_channel itself failed");
 
         // Verify channel shutdown signal exists
-        assert!(tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should exist after creation");
+        assert!(tube.channel_shutdown_notifiers.read().await.contains_key("test"), "Channel shutdown signal should exist after creation");
 
         // Close the channel and verify the signal is acted upon (signal removed from the map)
         let close_result = tube.close_channel("test", Some(CloseConnectionReason::Normal)).await;
         assert!(close_result.is_ok(), "close_channel should return Ok. Actual: {:?}", close_result);
-        assert!(!tube.channel_shutdown_signals.read().await.contains_key("test"), "Channel shutdown signal should be removed after closing");
+        assert!(!tube.channel_shutdown_notifiers.read().await.contains_key("test"), "Channel shutdown signal should be removed after closing");
 
         // Try to close a non-existent channel (should be idempotent - returns Ok)
         assert!(tube.close_channel("nonexistent", Some(CloseConnectionReason::Error)).await.is_ok(), "Non-existent channel close should be idempotent (returns Ok)");
@@ -294,7 +294,7 @@ async fn test_tube_create_channel() {
 
     // Assert that the channel shutdown signal exists in the tube's map
     assert!(
-        tube.channel_shutdown_signals
+        tube.channel_shutdown_notifiers
             .read()
             .await
             .contains_key("test"),

@@ -1835,6 +1835,10 @@ impl Tube {
             debug!("Peer connection already closed for tube {}", tube_id);
         }
 
+        // Drain thread-local buffer pools to release memory
+        let buffer_pool = BufferPool::default();
+        buffer_pool.drain_thread_local();
+
         Ok(())
     }
 }

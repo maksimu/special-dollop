@@ -195,23 +195,14 @@ impl Conn {
             to_webrtc: outbound_task, // Save the task handle
         }
     }
+}
 
-    /// Shutdown the connection immediately by aborting tasks
-    ///
-    /// This prevents orphaned connections where backend tasks continue
-    /// reading from/writing to guacd even after the tube is closed.
-    /// Aborting ensures immediate cleanup of TCP connections.
-    pub async fn shutdown(self) -> Result<()> {
-        // Close the data channel
-        drop(self.data_tx);
-
-        // Abort tasks immediately to prevent orphaned keepalive responses
-        // The outbound task (to_webrtc) reads from guacd and auto-responds to sync messages
-        // If we await instead of abort, it can run forever since guacd keeps sending syncs
+/// Each task holds ~225 KB (stack + buffers + async state)
+impl Drop for Conn {
+    fn drop(&mut self) {
+        // Abort both tasks to prevent orphaned task memory leak
         self.backend_task.abort();
         self.to_webrtc.abort();
-
-        Ok(())
     }
 }
 

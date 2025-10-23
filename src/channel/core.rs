@@ -784,18 +784,12 @@ impl Channel {
 
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
-                // Shutdown the connection gracefully (closes channels and waits for tasks)
-                if let Err(e) = conn.shutdown().await {
-                    warn!(
-                        "Error during connection shutdown (channel_id: {}, error: {})",
-                        self.channel_id, e
-                    );
-                } else {
-                    debug!(
-                        "Successfully closed connection and tasks (channel_id: {})",
-                        self.channel_id
-                    );
-                }
+                // Conn Drop will abort tasks automatically (RAII fix for memory leak)
+                drop(conn);
+                debug!(
+                    "Successfully closed connection and tasks (channel_id: {})",
+                    self.channel_id
+                );
             }
         } else {
             // Delayed removal - signal shutdown but keep in map briefly for pending messages
@@ -826,18 +820,12 @@ impl Channel {
 
                 // Now remove from maps
                 if let Some((_, conn)) = conns_arc.remove(&conn_no) {
-                    // Shutdown the connection gracefully
-                    if let Err(e) = conn.shutdown().await {
-                        warn!(
-                            "Error during delayed connection shutdown (channel_id: {}, error: {})",
-                            channel_id_clone, e
-                        );
-                    } else {
-                        debug!(
-                            "Successfully closed connection after grace period (channel_id: {})",
-                            channel_id_clone
-                        );
-                    }
+                    // Conn Drop will abort tasks automatically (RAII fix for memory leak)
+                    drop(conn);
+                    debug!(
+                        "Connection {} removed and tasks aborted (channel_id: {})",
+                        conn_no, channel_id_clone
+                    );
                 }
             });
         }
@@ -1014,18 +1002,12 @@ impl Channel {
 
             // Immediate removal using DashMap
             if let Some((_, conn)) = self.conns.remove(&conn_no) {
-                // Shutdown the connection gracefully (closes channels and waits for tasks)
-                if let Err(e) = conn.shutdown().await {
-                    warn!(
-                        "Error during connection shutdown (channel_id: {}, error: {})",
-                        self.channel_id, e
-                    );
-                } else {
-                    debug!(
-                        "Successfully closed connection and tasks (channel_id: {})",
-                        self.channel_id
-                    );
-                }
+                // Conn Drop will abort tasks automatically (RAII fix for memory leak)
+                drop(conn);
+                debug!(
+                    "Successfully closed connection and tasks (channel_id: {})",
+                    self.channel_id
+                );
             }
         } else {
             // Delayed removal - signal shutdown but keep in map briefly for pending messages
@@ -1056,18 +1038,12 @@ impl Channel {
 
                 // Now remove from maps
                 if let Some((_, conn)) = conns_arc.remove(&conn_no) {
-                    // Shutdown the connection gracefully
-                    if let Err(e) = conn.shutdown().await {
-                        warn!(
-                            "Error during delayed connection shutdown (channel_id: {}, error: {})",
-                            channel_id_clone, e
-                        );
-                    } else {
-                        debug!(
-                            "Successfully closed connection after grace period (channel_id: {})",
-                            channel_id_clone
-                        );
-                    }
+                    // Conn Drop will abort tasks automatically (RAII fix for memory leak)
+                    drop(conn);
+                    debug!(
+                        "Connection {} removed and tasks aborted (channel_id: {})",
+                        conn_no, channel_id_clone
+                    );
                 }
             });
         }
@@ -1274,11 +1250,10 @@ impl Drop for Channel {
                     tokio::time::sleep(crate::config::disconnect_to_eof_delay()).await;
                 }
 
-                // Shutdown the connection (now aborts tasks immediately)
+                // Remove connection from registry (Conn Drop will abort tasks automatically)
                 if let Some((_, conn)) = conns_clone.remove(&conn_no) {
-                    if let Err(e) = conn.shutdown().await {
-                        debug!("Error shutting down connection in drop (channel_id: {}, error: {})", channel_id, e);
-                    }
+                    drop(conn); // Conn::Drop aborts tasks synchronously (RAII fix)
+                    debug!("Connection {} removed and tasks aborted (channel_id: {})", conn_no, channel_id);
                 }
             }
             info!("Channel cleanup completed (channel_id: {})", channel_id);

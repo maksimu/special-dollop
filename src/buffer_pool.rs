@@ -179,6 +179,14 @@ impl BufferPool {
         LOCAL_BUFFERS.with(|buffers| buffers.borrow().len())
     }
 
+    /// Drain thread-local buffer pool to release memory
+    /// Called after tube close to prevent buffer accumulation
+    pub fn drain_thread_local(&self) {
+        LOCAL_BUFFERS.with(|buffers| {
+            buffers.borrow_mut().clear();
+        });
+    }
+
     /// Warm up the thread-local pool by pre-allocating buffers
     pub fn warm_up(&self, count: usize) {
         LOCAL_BUFFERS.with(|buffers| {

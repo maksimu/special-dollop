@@ -2097,55 +2097,62 @@ impl WebRTCPeerConnection {
                     };
 
                     // Parse WebRTC stats reports for relevant metrics
+                    // Strategy:
+                    //   - CandidatePair (nominated) → Network-level stats (real packets, RTT, bandwidth)
+                    //   - DataChannel → Per-channel stats (application-level messages)
+                    //   - Transport → Sanity check only (logged if verbose)
                     for (_id, report) in reports.reports.iter() {
                         match report {
-                            webrtc::stats::StatsReportType::InboundRTP(inbound) => {
-                                collected_stats.bytes_received = inbound.bytes_received;
-                                collected_stats.packets_received = inbound.packets_received;
-                            }
-                            webrtc::stats::StatsReportType::OutboundRTP(outbound) => {
-                                collected_stats.bytes_sent = outbound.bytes_sent;
-                                collected_stats.packets_sent = outbound.packets_sent;
-                            }
-                            webrtc::stats::StatsReportType::DataChannel(data_channel) => {
-                                // Data channel message and byte counts (for non-media traffic like nops, sync, etc.)
-                                collected_stats.bytes_sent = collected_stats
-                                    .bytes_sent
-                                    .max(data_channel.bytes_sent as u64);
-                                collected_stats.packets_sent = collected_stats
-                                    .packets_sent
-                                    .max(data_channel.messages_sent as u64);
-                            }
-                            webrtc::stats::StatsReportType::Transport(transport) => {
-                                // Transport-level bytes (includes all data channel traffic)
-                                collected_stats.bytes_sent =
-                                    collected_stats.bytes_sent.max(transport.bytes_sent as u64);
-                                collected_stats.bytes_received = collected_stats
-                                    .bytes_received
-                                    .max(transport.bytes_received as u64);
-                            }
-                            webrtc::stats::StatsReportType::RemoteInboundRTP(remote_inbound) => {
-                                // Use remote inbound stats for RTT and packet loss (more accurate)
-                                if let Some(rtt) = remote_inbound.round_trip_time {
-                                    collected_stats.rtt_ms = Some(rtt * 1000.0);
-                                }
-                                // Calculate packets lost from fraction_lost if available
-                                if collected_stats.packets_sent > 0 {
-                                    collected_stats.packets_lost = (collected_stats.packets_sent
-                                        as f64
-                                        * remote_inbound.fraction_lost)
-                                        as u64;
-                                }
-                            }
                             webrtc::stats::StatsReportType::CandidatePair(pair) => {
                                 if pair.nominated {
-                                    // Use nominated candidate pair for RTT if remote stats unavailable
-                                    if collected_stats.rtt_ms.is_none() {
-                                        collected_stats.rtt_ms =
-                                            Some(pair.current_round_trip_time * 1000.0);
+                                    // Use the nominated candidate pair for REAL network-level stats
+                                    // This is the active UDP connection carrying all data channels
+                                    collected_stats.packets_sent = pair.packets_sent as u64;
+                                    collected_stats.packets_received = pair.packets_received as u64;
+                                    collected_stats.bytes_sent = pair.bytes_sent;
+                                    collected_stats.bytes_received = pair.bytes_received;
+                                    collected_stats.rtt_ms =
+                                        Some(pair.current_round_trip_time * 1000.0);
+
+                                    // Optional: Log available bandwidth estimates from ICE
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!(
+                                            "ICE bandwidth estimates (tube_id: {}): outgoing={:.2} Mbps, incoming={:.2} Mbps",
+                                            tube_id,
+                                            pair.available_outgoing_bitrate / 1_000_000.0,
+                                            pair.available_incoming_bitrate / 1_000_000.0
+                                        );
                                     }
                                 }
                             }
+                            webrtc::stats::StatsReportType::DataChannel(data_channel) => {
+                                // Collect per-channel stats (not aggregated)
+                                // This gives us visibility into individual channel activity
+                                let channel_stats = crate::webrtc_quality_manager::ChannelStats {
+                                    label: data_channel.label.clone(),
+                                    messages_sent: data_channel.messages_sent as u64,
+                                    messages_received: data_channel.messages_received as u64,
+                                    bytes_sent: data_channel.bytes_sent as u64,
+                                    bytes_received: data_channel.bytes_received as u64,
+                                    state: format!("{:?}", data_channel.state),
+                                };
+                                collected_stats
+                                    .per_channel_stats
+                                    .insert(data_channel.label.clone(), channel_stats);
+                            }
+                            webrtc::stats::StatsReportType::Transport(transport) => {
+                                // Transport stats are useful for sanity checks (logged if verbose)
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!(
+                                        "Transport totals (tube_id: {}): sent={} bytes, received={} bytes",
+                                        tube_id,
+                                        transport.bytes_sent,
+                                        transport.bytes_received
+                                    );
+                                }
+                            }
+                            // Note: InboundRTP/OutboundRTP only exist for media streams (audio/video)
+                            // They do NOT exist for pure data channel connections, so we ignore them
                             _ => {} // Ignore other stat types
                         }
                     }
@@ -2175,16 +2182,33 @@ impl WebRTCPeerConnection {
                     || webrtc_stats.packets_received > 0;
 
                 if unlikely!(crate::logger::is_verbose_logging()) && has_activity {
+                    // Log aggregate network stats from CandidatePair
                     debug!(
-                        "Collected WebRTC stats (tube_id: {}, bytes_sent: {}, bytes_received: {}, packets_sent: {}, packets_received: {}, rtt_ms: {:?}, bitrate_bps: {:?})",
+                        "WebRTC Network Stats (tube_id: {}): packets_sent={}, packets_received={}, bytes_sent={}, bytes_received={}, rtt_ms={:.2}, bitrate_bps={}",
                         tube_id,
-                        webrtc_stats.bytes_sent,
-                        webrtc_stats.bytes_received,
                         webrtc_stats.packets_sent,
                         webrtc_stats.packets_received,
-                        webrtc_stats.rtt_ms,
-                        webrtc_stats.bitrate_bps
+                        webrtc_stats.bytes_sent,
+                        webrtc_stats.bytes_received,
+                        webrtc_stats.rtt_ms.unwrap_or(0.0),
+                        webrtc_stats.bitrate_bps.map_or("N/A".to_string(), |b| format!("{:.2} Mbps", b as f64 / 1_000_000.0))
                     );
+
+                    // Log per-channel stats from DataChannel
+                    if !webrtc_stats.per_channel_stats.is_empty() {
+                        debug!("Per-Channel Stats (tube_id: {}):", tube_id);
+                        for (label, channel) in webrtc_stats.per_channel_stats.iter() {
+                            debug!(
+                                "  - '{}': msgs_sent={}, msgs_recv={}, bytes_sent={:.2} KB, bytes_recv={:.2} KB, state={}",
+                                label,
+                                channel.messages_sent,
+                                channel.messages_received,
+                                channel.bytes_sent as f64 / 1024.0,
+                                channel.bytes_received as f64 / 1024.0,
+                                channel.state
+                            );
+                        }
+                    }
                 }
 
                 // Store current stats for next cycle's bitrate calculation

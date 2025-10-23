@@ -53,6 +53,9 @@ pub(crate) async fn setup_channel_for_data_channel(
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
 
+    // Create shutdown notifier for clean async cancellation
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+
     // Create the channel
     let channel_instance = Channel::new(crate::channel::core::ChannelParams {
         webrtc: data_channel.clone(),
@@ -61,6 +64,7 @@ pub(crate) async fn setup_channel_for_data_channel(
         timeouts,
         protocol_settings,
         server_mode,
+        shutdown_notify,
         callback_token,
         ksm_config,
         client_version,

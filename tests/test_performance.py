@@ -16,49 +16,41 @@ TEST_CALLBACK_TOKEN = "TEST_MODE_CALLBACK_TOKEN"
 
 class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
     """Performance tests for WebRTC data channels"""
-    
+
     def setUp(self):
-        super().setUp()
-        self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        # Configure higher resource limits for testing
-        self.configure_test_resource_limits(self.tube_registry)
+        super().setUp()  # ← This now sets self.tube_registry to shared instance
+        # Removed: self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        # Removed: self.configure_test_resource_limits(self.tube_registry)
+        # Both handled by BaseWebRTCTest.setUp()
+
         self.tube_states = {}  # Stores current state of each tube_id
         self.tube_connection_events = {} # tube_id -> threading.Event for connected state
         self._lock = threading.Lock() # To protect access to shared tube_states and events
         self.peer_map = {} # To map a tube_id to its peer for ICE candidate relay
 
     def tearDown(self):
-        super().tearDown()
+        # ✅ CRITICAL: Close tubes BEFORE clearing state
+        super().tearDown()  # ← This closes self.my_tube_ids tubes
+
         # Give more time for OS to release ports, especially mDNS
-        # Value can be tuned or made configurable via environment variable
-        delay = float(os.getenv("PYTEST_INTER_TEST_DELAY", "0.5")) # Default 0.5 seconds
+        delay = float(os.getenv("PYTEST_INTER_TEST_DELAY", "0.5"))
         if delay > 0:
             logging.info(f"Waiting {delay}s for resource cleanup before next test...")
             time.sleep(delay)
-        
-        # Clear shared Python-side state more explicitly
-        # Although individual tests have finally blocks, this ensures cleanup
-        # even if a test fails before its finally block or if the setUp itself had issues.
+
+        # Clear test-specific state
         with self._lock:
-            # Close any tubes that might still be open due to test errors,
-            # This requires knowing all created tube_ids.
-            # If tests reliably clean up their own tubes, this might be redundant
-            # but can act as a fallback.
-            # For now, focus on clearing the maps used by the shared signal handler.
-            
             self.tube_states.clear()
             logging.debug("Cleared tube_states in tearDown.")
-            
-            # Clear events; new ones will be created in setUp or signal_handler
+
             for event in self.tube_connection_events.values():
-                event.clear() # Clear any set events
+                event.clear()
             self.tube_connection_events.clear()
             logging.debug("Cleared tube_connection_events in tearDown.")
 
-            # peer_map is typically cleared by tests, but ensure it here too.
             self.peer_map.clear()
             logging.debug("Cleared peer_map in tearDown.")
-            
+
         logging.info(f"{self.__class__.__name__} tearDown completed.")
 
     def _signal_handler(self, signal_dict):
@@ -155,7 +147,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         settings = {"conversationType": "tunnel"}
         
         # Create a server tube
-        server_tube_info = self.tube_registry.create_tube(
+        server_tube_info = self.create_and_track_tube(
             conversation_id="performance-test-server",
             settings=settings,
             trickle_ice=True,
@@ -173,7 +165,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         logging.info(f"Server Offer SDP:\n{offer}") # Log the server's offer SDP
         
         # Create a client tube with the offer
-        client_tube_info = self.tube_registry.create_tube(
+        client_tube_info = self.create_and_track_tube(
             conversation_id="performance-test-client",
             settings=settings,
             trickle_ice=True,
@@ -242,8 +234,8 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
         
         # Clean up
         self.tube_registry.close_connection(channel_name)
-        self.tube_registry.close_tube(server_id)
-        self.tube_registry.close_tube(client_id)
+        self.close_and_untrack_tube(server_id)
+        self.close_and_untrack_tube(client_id)
         with self._lock:
             self.peer_map.pop(server_id, None)
             self.peer_map.pop(client_id, None)
@@ -318,7 +310,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             # The existing tests use self.tube_registry.get_connection_state, implying ICE is handled.
 
             logging.info(f"[E2E_Test] Creating server tube with settings: {server_settings}")
-            server_tube_info = self.tube_registry.create_tube(
+            server_tube_info = self.create_and_track_tube(
                 conversation_id=server_conv_id,
                 settings=server_settings,
                 trickle_ice=True,
@@ -346,7 +338,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                 "target_port": str(ack_server.actual_port) # Connect to AckServer
             }
             logging.info(f"[E2E_Test] Creating client tube with offer and settings: {client_settings}")
-            client_tube_info = self.tube_registry.create_tube(
+            client_tube_info = self.create_and_track_tube(
                 conversation_id=client_conv_id,
                 settings=client_settings,
                 trickle_ice=True,
@@ -484,21 +476,17 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
                     logging.info("[E2E_Test] External client socket closed.")
                 except Exception as e:
                     logging.error(f"[E2E_Test] Error closing external client socket: {e}")
-            
-            if self.tube_registry and server_tube_id:
-                try:
-                    self.tube_registry.close_tube(server_tube_id)
-                    logging.info(f"[E2E_Test] Server tube {server_tube_id} closed.")
-                except Exception as e:
-                    logging.error(f"[E2E_Test] Error closing server tube {server_tube_id}: {e}")
-            
-            if self.tube_registry and client_tube_id:
-                try:
-                    self.tube_registry.close_tube(client_tube_id)
-                    logging.info(f"[E2E_Test] Client tube {client_tube_id} closed.")
-                except Exception as e:
-                    logging.error(f"[E2E_Test] Error closing client tube {client_tube_id}: {e}")
-            
+
+            # Close and untrack tubes (tearDown will handle them if this fails)
+            if server_tube_id:
+                self.close_and_untrack_tube(server_tube_id)
+                logging.info(f"[E2E_Test] Server tube {server_tube_id} closed.")
+
+            if client_tube_id:
+                self.close_and_untrack_tube(client_tube_id)
+                logging.info(f"[E2E_Test] Client tube {client_tube_id} closed.")
+
+            # Clear peer map
             with self._lock:
                 if server_tube_id: self.peer_map.pop(server_tube_id, None)
                 if client_tube_id: self.peer_map.pop(client_tube_id, None)
@@ -510,20 +498,23 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
 
 class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
     """Tests for tube connection with different settings"""
-    
+
     def setUp(self):
-        super().setUp() 
-        self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        # Configure higher resource limits for testing
-        self.configure_test_resource_limits(self.tube_registry)
+        super().setUp()  # ← This now sets self.tube_registry to shared instance
+        # Removed: self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+        # Removed: self.configure_test_resource_limits(self.tube_registry)
+        # Both handled by BaseWebRTCTest.setUp()
+
         self.tube_states = {}  # Stores current state of each tube_id
         self.tube_connection_events = {} # tube_id -> threading.Event for connected state
         self._lock = threading.Lock() # To protect access to shared tube_states and events
         self.peer_map = {} # To map a tube_id to its peer for ICE candidate relay
 
     def tearDown(self):
-        super().tearDown()
-        delay = float(os.getenv("PYTEST_INTER_TEST_DELAY", "0.5")) 
+        # ✅ CRITICAL: Close tubes BEFORE clearing state
+        super().tearDown()  # ← This closes self.my_tube_ids tubes
+
+        delay = float(os.getenv("PYTEST_INTER_TEST_DELAY", "0.5"))
         if delay > 0:
             logging.info(f"Waiting {delay}s for resource cleanup before next test...")
             time.sleep(delay)
@@ -543,7 +534,7 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         settings = {"conversationType": "tunnel"}
         
         # Create a server tube with non-trickle ICE
-        server_tube_info = self.tube_registry.create_tube(
+        server_tube_info = self.create_and_track_tube(
             conversation_id="fragmentation-test-server",
             settings=settings,
             trickle_ice=False,  # Use non-trickle ICE
@@ -571,7 +562,7 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         
         # Create a client tube with the offer
         client_settings = {"conversationType": "tunnel"} # Ensure the client also has its own settings if needed
-        client_tube_info = self.tube_registry.create_tube(
+        client_tube_info = self.create_and_track_tube(
             conversation_id="fragmentation-test-client",
             settings=client_settings, # Pass original settings, not modified ones
             trickle_ice=False,  # Use non-trickle ICE
@@ -629,8 +620,8 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
         # TODO: send different sized messages through the tube and verify we got them
         
         # Clean up
-        self.tube_registry.close_tube(server_id)
-        self.tube_registry.close_tube(client_id)
+        self.close_and_untrack_tube(server_id)
+        self.close_and_untrack_tube(client_id)
         
         logging.info("Tube connection reliability test completed")
     

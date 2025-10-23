@@ -101,9 +101,21 @@ impl CongestionLevel {
     }
 }
 
-/// WebRTC statistics snapshot
+/// Per-channel statistics (application layer)
+#[derive(Debug, Clone)]
+pub struct ChannelStats {
+    pub label: String,
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub state: String,
+}
+
+/// WebRTC statistics snapshot (network + per-channel)
 #[derive(Debug, Clone)]
 pub struct WebRTCStats {
+    // Network-level stats (from CandidatePair - aggregate across all channels)
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub packets_sent: u64,
@@ -113,6 +125,9 @@ pub struct WebRTCStats {
     pub jitter_ms: Option<f64>,
     pub bitrate_bps: Option<u64>,
     pub timestamp: Instant,
+
+    // Per-channel stats (from DataChannel - individual channel visibility)
+    pub per_channel_stats: std::collections::HashMap<String, ChannelStats>,
 }
 
 impl Default for WebRTCStats {
@@ -127,6 +142,7 @@ impl Default for WebRTCStats {
             jitter_ms: None,
             bitrate_bps: None,
             timestamp: Instant::now(),
+            per_channel_stats: std::collections::HashMap::new(),
         }
     }
 }

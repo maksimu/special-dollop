@@ -1,4 +1,5 @@
 // runtime.rs - Proper reference counting architecture with Python-callable cleanup
+use log::{debug, warn};
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,20 +49,20 @@ impl Drop for DropGuard {
 
         if count == 1 {
             // This was the last reference
-            eprintln!("RUNTIME: Last reference dropped - scheduling runtime cleanup");
+            debug!("Runtime: Last reference dropped - scheduling cleanup");
 
             // Clear the global runtime state and schedule cleanup
             let mut state = RUNTIME_MANAGER.state.lock().unwrap_or_else(|poisoned| {
-                eprintln!("RUNTIME: Lock was poisoned during drop, recovering...");
+                warn!("Runtime: Lock was poisoned during drop, recovering");
                 poisoned.into_inner()
             });
 
             // Schedule cleanup in a separate thread to avoid async context issues
             if let Some(runtime) = state.take() {
-                eprintln!("RUNTIME: Scheduling runtime cleanup in separate thread");
+                debug!("Runtime: Scheduling cleanup in separate thread");
                 RUNTIME_MANAGER.schedule_cleanup(runtime);
             }
-            eprintln!("RUNTIME: Runtime state cleared - cleanup scheduled");
+            debug!("Runtime: State cleared - cleanup scheduled");
         }
     }
 }

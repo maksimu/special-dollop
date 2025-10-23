@@ -11,7 +11,6 @@ use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -43,8 +42,8 @@ pub struct Tube {
     pub(crate) data_channels: Arc<TokioRwLock<HashMap<String, WebRTCDataChannel>>>,
     // Control channel (special default channel)
     pub(crate) control_channel: Arc<TokioRwLock<Option<WebRTCDataChannel>>>,
-    // Map of channel names to their shutdown signals
-    pub channel_shutdown_signals: Arc<TokioRwLock<HashMap<String, Arc<AtomicBool>>>>,
+    // Map of channel names to their shutdown notifiers (idiomatic async cancellation)
+    pub channel_shutdown_notifiers: Arc<TokioRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
     // Active channel metadata for tracking callbacks and config
     pub(crate) active_channels: Arc<TokioRwLock<HashMap<String, ChannelMetadata>>>,
     // Indicates if this tube was created in a server or client context by its registry
@@ -107,7 +106,7 @@ impl Tube {
             peer_connection: Arc::new(TokioMutex::new(None)),
             data_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             control_channel: Arc::new(TokioRwLock::new(None)),
-            channel_shutdown_signals: Arc::new(TokioRwLock::new(HashMap::new())),
+            channel_shutdown_notifiers: Arc::new(TokioRwLock::new(HashMap::new())),
             active_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             is_server_mode_context,
             status: Arc::new(TokioRwLock::new(TubeStatus::Initializing)),
@@ -573,10 +572,10 @@ impl Tube {
                     debug!("on_data_channel: Channel details after setup. (tube_id: {}, channel_label: {}, active_protocol: {:?}, local_listen_addr: {:?})", tube.id, rtc_data_channel_label, owned_channel.active_protocol, owned_channel.local_listen_addr);
                 }
 
-                // Store the shutdown signal for this newly created channel
-                let shutdown_signal = Arc::clone(&owned_channel.should_exit);
-                tube.channel_shutdown_signals.write().await.insert(rtc_data_channel_label.clone(), shutdown_signal);
-                debug!("on_data_channel: Shutdown signal stored for channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                // Store the shutdown notifier for this newly created channel
+                let shutdown_notifier = Arc::clone(&owned_channel.shutdown_notify);
+                tube.channel_shutdown_notifiers.write().await.insert(rtc_data_channel_label.clone(), shutdown_notifier);
+                debug!("on_data_channel: Shutdown notifier stored for channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
 
 
                 if owned_channel.server_mode {
@@ -591,7 +590,7 @@ impl Tube {
                                 }
                                 Err(e) => {
                                     error!("on_data_channel: Failed to start server: {}. Channel will not run effectively. (tube_id: {}, channel_label: {}, listen_addr: {})", e, tube.id, rtc_data_channel_label, listen_addr_str);
-                                    tube.channel_shutdown_signals.write().await.remove(&rtc_data_channel_label);
+                                    tube.channel_shutdown_notifiers.write().await.remove(&rtc_data_channel_label);
                                     return;
                                 }
                             }
@@ -1100,12 +1099,12 @@ impl Tube {
             debug!("create_channel: Channel details after setup. (tube_id: {}, channel_name: {}, active_protocol: {:?}, local_listen_addr: {:?}, server_mode: {})", self.id, name, owned_channel.active_protocol, owned_channel.local_listen_addr, owned_channel.server_mode);
         }
 
-        // Store the shutdown signal for this channel
-        let shutdown_signal = Arc::clone(&owned_channel.should_exit);
-        self.channel_shutdown_signals
+        // Store the shutdown notifier for this channel
+        let shutdown_notifier = Arc::clone(&owned_channel.shutdown_notify);
+        self.channel_shutdown_notifiers
             .write()
             .await
-            .insert(name.to_string(), shutdown_signal);
+            .insert(name.to_string(), shutdown_notifier);
         debug!(
             "create_channel: Shutdown signal stored for channel. (tube_id: {}, channel_name: {})",
             self.id, name
@@ -1132,7 +1131,7 @@ impl Tube {
                         }
                         Err(e) => {
                             error!("create_channel: Failed to start server: {}. Channel will not listen. (tube_id: {}, channel_name: {}, listen_addr: {})", e, self.id, name, listen_addr_str);
-                            self.channel_shutdown_signals.write().await.remove(name);
+                            self.channel_shutdown_notifiers.write().await.remove(name);
                             return Err(anyhow!(
                                 "Failed to start server for channel {}: {}",
                                 name,
@@ -1300,19 +1299,19 @@ impl Tube {
         }
         drop(data_channels);
 
-        // Then signal the channel to exit
-        let mut signals = self.channel_shutdown_signals.write().await;
-        if let Some(signal_arc) = signals.remove(name) {
+        // Then signal the channel to exit via Notify (idiomatic async cancellation)
+        let mut notifiers = self.channel_shutdown_notifiers.write().await;
+        if let Some(notifier_arc) = notifiers.remove(name) {
             // Remove from the map once signaled
             info!(
                 "Tube {}: Signaling channel '{}' to close with {:?} reason.",
                 self.id, name, reason
             );
-            signal_arc.store(true, std::sync::atomic::Ordering::Relaxed);
+            notifier_arc.notify_one(); // Instant wakeup of channel.run() select!
             Ok(())
         } else {
             // Idempotent: If channel already closed or never existed, that's OK
-            warn!("Tube {}: No shutdown signal found for channel '{}' during close_channel. Channel may be already closed or was never created. Treating as idempotent operation.", self.id, name);
+            warn!("Tube {}: No shutdown notifier found for channel '{}' during close_channel. Channel may be already closed or was never created. Treating as idempotent operation.", self.id, name);
             Ok(()) // Don't error - close is idempotent
         }
     }
@@ -1432,12 +1431,12 @@ impl Tube {
         }
     }
 
-    // Remove shutdown signal for a channel
+    // Remove shutdown notifier for a channel
     pub async fn remove_channel_shutdown_signal(&self, channel_name: &str) {
-        let mut signals_guard = self.channel_shutdown_signals.write().await;
-        if signals_guard.remove(channel_name).is_some() {
+        let mut notifiers_guard = self.channel_shutdown_notifiers.write().await;
+        if notifiers_guard.remove(channel_name).is_some() {
             debug!(
-                "Removed shutdown signal for channel (tube_id: {}, channel_name: {})",
+                "Removed shutdown notifier for channel (tube_id: {}, channel_name: {})",
                 self.id, channel_name
             );
         } else {
@@ -1747,7 +1746,7 @@ impl Tube {
 
         // 2. Signal all channels to exit their main loops
         // This ensures TCP servers and other resources are properly cleaned up
-        let channel_count = self.channel_shutdown_signals.read().await.len();
+        let channel_count = self.channel_shutdown_notifiers.read().await.len();
         if channel_count > 0 {
             info!(
                 "Tube {}: Signaling {} channels to shut down (after {:?} grace period)",
@@ -1760,19 +1759,19 @@ impl Tube {
             // Prevents race where channels are signaled before fully initialized on slow networks
             tokio::time::sleep(crate::config::channel_shutdown_grace_period()).await;
 
-            let signals: Vec<Arc<AtomicBool>> = {
-                self.channel_shutdown_signals
+            let notifiers: Vec<Arc<tokio::sync::Notify>> = {
+                self.channel_shutdown_notifiers
                     .read()
                     .await
                     .values()
                     .cloned()
                     .collect()
             };
-            for signal in signals {
-                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            for notifier in notifiers {
+                notifier.notify_one(); // Instant wakeup - idiomatic async cancellation
             }
             debug!(
-                "Tube {}: All {} channel shutdown signals set",
+                "Tube {}: All {} channels notified to shut down",
                 tube_id, channel_count
             );
         }
@@ -1882,19 +1881,19 @@ impl Drop for Tube {
 
         // 4. Signal and clear channel maps
         // First signal all channels to exit (in case close() wasn't called)
-        if let Ok(signals_guard) = self.channel_shutdown_signals.try_read() {
-            for signal in signals_guard.values() {
-                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(notifiers_guard) = self.channel_shutdown_notifiers.try_read() {
+            for notifier in notifiers_guard.values() {
+                notifier.notify_one(); // Instant async cancellation
             }
             debug!(
-                "Drop: Signaled {} channels to exit (tube_id: {})",
-                signals_guard.len(),
+                "Drop: Notified {} channels to exit (tube_id: {})",
+                notifiers_guard.len(),
                 self.id
             );
         }
         // Then clear the maps
-        if let Ok(mut signals) = self.channel_shutdown_signals.try_write() {
-            signals.clear();
+        if let Ok(mut notifiers) = self.channel_shutdown_notifiers.try_write() {
+            notifiers.clear();
         }
         if let Ok(mut channels) = self.active_channels.try_write() {
             channels.clear();

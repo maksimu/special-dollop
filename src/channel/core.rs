@@ -87,6 +87,7 @@ pub struct Channel {
     pub(crate) ping_attempt: u32,
     pub(crate) is_connected: bool,
     pub(crate) should_exit: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
     pub(crate) server_mode: bool,
     // Server-related fields
     pub(crate) local_listen_addr: Option<String>,
@@ -147,6 +148,7 @@ pub struct ChannelParams {
     pub timeouts: Option<TunnelTimeouts>,
     pub protocol_settings: HashMap<String, JsonValue>,
     pub server_mode: bool,
+    pub shutdown_notify: Arc<tokio::sync::Notify>, // For async cancellation
     pub callback_token: Option<String>,
     pub ksm_config: Option<String>,
     pub client_version: String,
@@ -161,6 +163,7 @@ impl Channel {
             timeouts,
             protocol_settings,
             server_mode,
+            shutdown_notify,
             callback_token,
             ksm_config,
             client_version,
@@ -473,6 +476,7 @@ impl Channel {
             ping_attempt: 0,
             is_connected: true,
             should_exit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_notify,
             server_mode,
             local_listen_addr: local_listen_addr_setting,
             actual_listen_addr: None,
@@ -541,6 +545,12 @@ impl Channel {
             }
 
             tokio::select! {
+                // Shutdown notification - highest priority, instant wakeup
+                _ = self.shutdown_notify.notified() => {
+                    info!("Shutdown notification received, exiting channel run loop (channel_id: {})", self.channel_id);
+                    break;
+                }
+
                 // Check for any new connections from the server
                 // Fair scheduling: random polling order prevents keyboard input starvation
                 maybe_conn = async { server_conn_rx.as_mut()?.recv().await }, if server_conn_rx.is_some() => {

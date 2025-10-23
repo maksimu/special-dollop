@@ -6,6 +6,7 @@ use crate::tube_protocol::{ControlMessage, Frame};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -92,9 +93,10 @@ async fn test_server_mode_data_flow() -> Result<()> {
         webrtc: webrtc.clone(),
         rx_from_dc,
         channel_id: "test_server_mode".to_string(),
-        timeouts: None,              // default timeouts
-        protocol_settings: settings, // protocol_settings
-        server_mode: true,           // server_mode=true
+        timeouts: None,                                        // default timeouts
+        protocol_settings: settings,                           // protocol_settings
+        server_mode: true,                                     // server_mode=true
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()), // For async cancellation
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
@@ -277,9 +279,10 @@ async fn test_client_mode_data_flow() -> Result<()> {
         webrtc: webrtc.clone(),
         rx_from_dc,
         channel_id: "test_client_mode".to_string(),
-        timeouts: None,              // default timeouts
-        protocol_settings: settings, // protocol_settings
-        server_mode: false,          // server_mode=false
+        timeouts: None,                                        // default timeouts
+        protocol_settings: settings,                           // protocol_settings
+        server_mode: false,                                    // server_mode=false
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()), // For async cancellation
         callback_token: Some("test_callback_token".to_string()),
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),

@@ -120,6 +120,21 @@ impl MetricsCollector {
             let mut interval = interval(Duration::from_secs(METRICS_AGGREGATION_INTERVAL_SECS));
             loop {
                 interval.tick().await;
+
+                // Check exit flag to prevent orphaned infinite loop task
+                let should_continue = {
+                    if let Ok(running) = collector_for_aggregation.background_task_running.read() {
+                        *running
+                    } else {
+                        false
+                    }
+                };
+
+                if !should_continue {
+                    debug!("Metrics aggregation task exiting");
+                    break;
+                }
+
                 collector_for_aggregation.aggregate_metrics().await;
             }
         });
@@ -129,6 +144,21 @@ impl MetricsCollector {
             let mut interval = interval(Duration::from_secs(METRICS_CLEANUP_INTERVAL_SECS));
             loop {
                 interval.tick().await;
+
+                // Check exit flag to prevent orphaned infinite loop task
+                let should_continue = {
+                    if let Ok(running) = collector_for_cleanup.background_task_running.read() {
+                        *running
+                    } else {
+                        false
+                    }
+                };
+
+                if !should_continue {
+                    debug!("Metrics cleanup task exiting");
+                    break;
+                }
+
                 collector_for_cleanup.cleanup_old_data().await;
             }
         });
@@ -138,6 +168,21 @@ impl MetricsCollector {
             let mut interval = interval(Duration::from_secs(WEBRTC_STATS_COLLECTION_INTERVAL_SECS));
             loop {
                 interval.tick().await;
+
+                // Check exit flag to prevent orphaned infinite loop task
+                let should_continue = {
+                    if let Ok(running) = collector_for_stats.background_task_running.read() {
+                        *running
+                    } else {
+                        false
+                    }
+                };
+
+                if !should_continue {
+                    debug!("WebRTC stats collection task exiting");
+                    break;
+                }
+
                 collector_for_stats.collect_webrtc_stats().await;
             }
         });
@@ -149,6 +194,20 @@ impl MetricsCollector {
         });
 
         debug!("Background metrics tasks started (aggregation, cleanup, stats collection, stale tube sweeper)");
+    }
+
+    /// Shutdown all background metrics tasks
+    /// Call this before process exit to cleanly stop all 4 orphaned tasks
+    #[allow(dead_code)] // Will be used by Python bindings or shutdown handler
+    pub fn shutdown(&self) {
+        info!("Shutting down metrics collector background tasks");
+
+        if let Ok(mut running) = self.background_task_running.write() {
+            *running = false;
+        }
+
+        // Tasks will exit on their next interval tick (5-300 seconds max delay)
+        debug!("Metrics collector shutdown initiated - tasks will exit on next tick");
     }
 
     /// Register a new connection for metrics tracking
@@ -1090,6 +1149,20 @@ impl MetricsCollector {
     async fn stale_tube_sweeper(&self) {
         loop {
             tokio::time::sleep(crate::config::stale_tube_sweep_interval()).await;
+
+            // Check exit flag to prevent orphaned infinite loop task
+            let should_continue = {
+                if let Ok(running) = self.background_task_running.read() {
+                    *running
+                } else {
+                    false
+                }
+            };
+
+            if !should_continue {
+                debug!("Stale tube sweeper task exiting");
+                break;
+            }
 
             debug!("Stale tube sweeper: Starting periodic sweep");
 

@@ -296,7 +296,7 @@ pub async fn create_data_channel(
 ) -> webrtc::error::Result<Arc<RTCDataChannel>> {
     let config = RTCDataChannelInit {
         ordered: Some(true),   // Guarantee message order (required for TCP tunneling)
-        max_retransmits: None, // CRITICAL FIX: Unlimited retransmits for fully reliable delivery
+        max_retransmits: None, // Unlimited retransmits for fully reliable delivery
         max_packet_life_time: None, // No timeout for packets
         protocol: None,        // No specific protocol
         negotiated: None,      // Let WebRTC handle negotiation
@@ -873,7 +873,7 @@ impl WebRTCPeerConnection {
                 }
             }
 
-            // TRICKLE ICE FIX: After flushing all buffered candidates, trigger ICE connectivity checks
+            // After flushing all buffered candidates, trigger ICE connectivity checks
             if self.trickle_ice && !pending_candidates.is_empty() {
                 let peer_conn_clone = self.peer_connection.clone();
                 let tube_id_clone = self.tube_id.clone();
@@ -1585,7 +1585,7 @@ impl WebRTCPeerConnection {
                         // Enhanced debugging: Log candidate details and analyze pairs
                         self.log_candidate_details(&candidate_str, "INCOMING");
 
-                        // TRICKLE ICE FIX: Trigger ICE agent to re-evaluate candidate pairs
+                        // Trigger ICE agent to re-evaluate candidate pairs
                         // In webrtc-rs 0.14.0, adding candidates after set_remote_description()
                         // doesn't automatically trigger connectivity checks on newly formed pairs.
                         // We work around this by getting stats, which internally causes the ICE

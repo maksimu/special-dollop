@@ -10,6 +10,8 @@ mod channel_tests;
 #[cfg(test)]
 mod common_tests;
 #[cfg(test)]
+mod concurrent_close_tests;
+#[cfg(test)]
 pub mod guacd_handshake_tests;
 #[cfg(test)]
 mod guacd_parser_tests;

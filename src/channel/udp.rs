@@ -113,7 +113,7 @@ impl Channel {
             );
         });
 
-        // RAII FIX: Store task handle for proper cleanup
+        // Store task handle for proper cleanup
         self.udp_receiver_tasks
             .lock()
             .await
@@ -357,7 +357,7 @@ impl Channel {
             }
         }
 
-        // RAII FIX: Clean up client-side UDP receiver task if present
+        // Clean up client-side UDP receiver task if present
         let mut receiver_tasks = self.udp_receiver_tasks.lock().await;
         if let Some(receiver_task) = receiver_tasks.remove(&conn_no) {
             receiver_task.abort();
@@ -564,7 +564,7 @@ pub(crate) async fn forward_udp_packet_to_destination(
         let buffer_pool_clone = channel.buffer_pool.clone();
         let channel_id_clone = channel.channel_id.clone();
         let udp_associations_clone = udp_associations.clone();
-        let udp_conn_index_for_task = udp_conn_index.clone(); // FIX: Clone before async move
+        let udp_conn_index_for_task = udp_conn_index.clone();
 
         let response_task = tokio::spawn(async move {
             let mut response_buf = [0u8; 65536];

@@ -712,6 +712,7 @@ pub struct AdaptiveQualityManager {
     stats_history: Arc<Mutex<VecDeque<WebRTCStats>>>,
     monitoring_active: Arc<Mutex<bool>>,
     config: QualityManagerConfig,
+    monitoring_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +765,7 @@ impl AdaptiveQualityManager {
             ))),
             monitoring_active: Arc::new(Mutex::new(false)),
             config,
+            monitoring_task: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -782,19 +784,37 @@ impl AdaptiveQualityManager {
             self.tube_id
         );
 
-        // Start background monitoring task
+        // Store JoinHandle to prevent task leak
         let manager = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             manager.monitoring_loop().await;
         });
 
+        // Store handle for cleanup
+        *self.monitoring_task.lock().await = Some(handle);
+
+        debug!("Quality monitoring started (task tracked)");
         Ok(())
     }
 
     /// Stop quality monitoring
     pub fn stop_monitoring(&self) {
+        // Step 1: Set flag - task will exit on next interval tick (1 second max)
         let mut active = self.monitoring_active.lock().unwrap();
         *active = false;
+        drop(active); // Release lock before try_lock
+
+        // Step 2: Best-effort immediate abort (non-blocking)
+        // If lock is held, task will exit via flag check anyway
+        if let Ok(mut task_guard) = self.monitoring_task.try_lock() {
+            if let Some(handle) = task_guard.take() {
+                handle.abort(); // Synchronous - just sets cancellation flag
+                debug!("Quality monitoring: Aborted monitoring task immediately");
+            }
+        } else {
+            debug!("Quality monitoring: Lock held, task will exit via flag (max 1s delay)");
+        }
+
         info!(
             "Stopped adaptive quality monitoring for tube {}",
             self.tube_id
@@ -1061,6 +1081,7 @@ impl Clone for AdaptiveQualityManager {
             stats_history: Arc::clone(&self.stats_history),
             monitoring_active: Arc::clone(&self.monitoring_active),
             config: self.config.clone(),
+            monitoring_task: Arc::clone(&self.monitoring_task),
         }
     }
 }

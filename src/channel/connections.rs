@@ -642,7 +642,7 @@ pub async fn setup_outbound_task(
                                             // When browser is backgrounded (throttled to 1 FPS), response is delayed 10-16s → timeout
                                             // We intercept and respond immediately to prevent false "User is not responding" disconnects
 
-                                            // **CRITICAL FIX: Flush batch buffer BEFORE handling sync**
+                                            // Flush batch buffer BEFORE handling sync**
                                             // Bug (commit 196ba77): sync handler would continue without flushing batch,
                                             // causing keystroke echoes to wait ~1 second for next read/sync
                                             if let Some(ref mut batch_buffer) = guacd_batch_buffer {
@@ -1133,9 +1133,9 @@ pub async fn setup_outbound_task(
     // Create connection struct with our pre-created backend task and data_tx channel
     // Note: outbound_handle is the to_webrtc task (guacd→client)
     let conn = Conn {
-        data_tx,                    // Channel for sending data to guacd (including sync responses)
-        backend_task,               // Task that writes client data to guacd
-        to_webrtc: outbound_handle, // Task that reads guacd data and sends to client
+        data_tx, // Channel for sending data to guacd (including sync responses)
+        backend_task: Some(backend_task), // Task that writes client data to guacd
+        to_webrtc: Some(outbound_handle), // Task that reads guacd data and sends to client
     };
 
     channel.conns.insert(conn_no, conn);

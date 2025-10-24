@@ -178,6 +178,8 @@ pub struct NetworkMonitor {
     primary_interface: Arc<Mutex<Option<String>>>,
     /// Quality history for predictive analysis
     quality_history: Arc<Mutex<HashMap<String, Vec<NetworkQualityMetrics>>>>,
+    /// Track spawned tasks to prevent leaks
+    monitoring_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +609,7 @@ impl NetworkMonitor {
             config,
             last_connectivity_check: Arc::new(Mutex::new(None)),
             monitoring_active: Arc::new(Mutex::new(false)),
+            monitoring_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -632,27 +635,53 @@ impl NetworkMonitor {
         let monitor = self.clone_for_task();
         let (error_tx, mut error_rx) = mpsc::unbounded_channel();
 
-        // Spawn background task
-        tokio::spawn(async move {
+        // Store JoinHandles to prevent task leaks
+        let handle1 = tokio::spawn(async move {
             monitor.monitoring_loop_with_error_reporting(error_tx).await;
         });
 
         // Spawn error handler task (runs in main context with Python logging)
-        tokio::spawn(async move {
+        let handle2 = tokio::spawn(async move {
             while let Some(error_msg) = error_rx.recv().await {
                 error!("Network monitoring: {}", error_msg);
             }
         });
 
-        debug!("Network monitoring started");
+        // Store handles for cleanup
+        self.monitoring_tasks.lock().await.push(handle1);
+        self.monitoring_tasks.lock().await.push(handle2);
+
+        debug!("Network monitoring started (2 tasks tracked)");
         Ok(())
     }
 
     /// Stop network monitoring
     pub fn stop_monitoring(&self) {
+        // Step 1: Set flag - tasks will exit on next interval tick (5 seconds max)
+        // This is the PRIMARY shutdown mechanism
         if let Ok(mut active) = self.monitoring_active.lock() {
             *active = false;
         }
+
+        // Step 2: Best-effort immediate abort (non-blocking)
+        // If lock is held, tasks will exit via flag check anyway
+        if let Ok(mut tasks_guard) = self.monitoring_tasks.try_lock() {
+            let task_count = tasks_guard.len();
+
+            for task in tasks_guard.drain(..) {
+                task.abort(); // Synchronous - just sets cancellation flag (~1μs)
+            }
+
+            if task_count > 0 {
+                debug!(
+                    "Network monitoring: Aborted {} tasks immediately",
+                    task_count
+                );
+            }
+        } else {
+            debug!("Network monitoring: Lock held, tasks will exit via flag (max 5s delay)");
+        }
+
         debug!("Network monitoring stopped");
     }
 

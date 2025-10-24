@@ -362,17 +362,31 @@ impl EventDrivenSender {
             match self.data_channel.send(frame.clone()).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    // Log the actual error with frame size for debugging
+                    let error_str = e.to_string();
+
+                    // Detect permanent failures (WebRTC closed) vs temporary failures (buffer full)
+                    // When WebRTC is permanently closed, we must return error to trigger cleanup
+                    // Otherwise backend tasks become zombies, guacd keeps responding, 15s timeout leak
+                    if error_str.contains("DataChannel is not opened")
+                        || error_str.contains("Channel is closing")
+                        || error_str.contains("closed")
+                    {
+                        // Permanent failure - WebRTC is dead, don't queue
+                        debug!(
+                            "WebRTC permanently closed, failing send to trigger cleanup (frame_size: {} bytes, error: {})",
+                            frame_len, e
+                        );
+                        return Err(error_str);
+                    }
+
+                    // Temporary failure (buffer full, congestion) - queue for retry
                     if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
-                            "WebRTC send failed (frame_size: {} bytes), queueing for retry. Error: {}",
+                            "WebRTC send failed temporarily (frame_size: {} bytes), queueing for retry. Error: {}",
                             frame_len, e
                         );
                     }
 
-                    // Queue ALL send failures to prevent connection stalls
-                    // On localhost burst traffic, errors happen fast and error messages vary
-                    // Don't try to differentiate error types - just queue and retry when buffer drains
                     self.can_send.store(false, Ordering::Release);
                     // Fall through to queueing
                 }

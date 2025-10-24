@@ -783,11 +783,11 @@ impl Channel {
             }
 
             // Immediate removal using DashMap
-            if let Some((_, conn)) = self.conns.remove(&conn_no) {
-                // Conn Drop will abort tasks automatically (RAII fix for memory leak)
-                drop(conn);
+            if let Some((_, mut conn)) = self.conns.remove(&conn_no) {
+                // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
+                conn.graceful_shutdown(conn_no, &self.channel_id).await;
                 debug!(
-                    "Successfully closed connection and tasks (channel_id: {})",
+                    "Successfully closed connection with graceful TCP shutdown (channel_id: {})",
                     self.channel_id
                 );
             }
@@ -819,11 +819,11 @@ impl Channel {
                 );
 
                 // Now remove from maps
-                if let Some((_, conn)) = conns_arc.remove(&conn_no) {
-                    // Conn Drop will abort tasks automatically (RAII fix for memory leak)
-                    drop(conn);
+                if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
+                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
+                    conn.graceful_shutdown(conn_no, &channel_id_clone).await;
                     debug!(
-                        "Connection {} removed and tasks aborted (channel_id: {})",
+                        "Connection {} removed with graceful TCP shutdown (channel_id: {})",
                         conn_no, channel_id_clone
                     );
                 }
@@ -976,6 +976,16 @@ impl Channel {
         debug!("Closing connection (no message) - Connection summary (channel_id: {}, conn_no: {}, reason: {:?}, total_connections: {}, remaining_connections: {:?})",
               self.channel_id, conn_no, reason, total_connections, remaining_connections);
 
+        // Save primary status BEFORE calling internal_handle_connection_close
+        // internal_handle_connection_close clears primary_guacd_conn_no, which breaks
+        // the later primary check in send_guacd_disconnect_message!
+        let is_primary_guacd = if self.active_protocol == ActiveProtocol::Guacd {
+            let primary_opt = self.primary_guacd_conn_no.lock().await;
+            *primary_opt == Some(conn_no)
+        } else {
+            false
+        };
+
         self.internal_handle_connection_close(conn_no, reason)
             .await?;
 
@@ -983,30 +993,45 @@ impl Channel {
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
         if !should_delay_removal {
-            // Send Guacd disconnect message with specific reason before removing connection
-            if let Err(e) = self
-                .send_guacd_disconnect_message(conn_no, &reason.to_message())
-                .await
-            {
-                warn!("Failed to send Guacd disconnect message during immediate close (no message) (channel_id: {}, error: {})", self.channel_id, e);
-            }
+            // Send Guacd disconnect message ONLY if this was the primary connection
+            // We use the saved is_primary_guacd flag since internal_handle_connection_close cleared it
+            if is_primary_guacd {
+                debug!(
+                    "Sending disconnect to primary Guacd connection (channel_id: {}, conn_no: {})",
+                    self.channel_id, conn_no
+                );
 
-            // CRITICAL: For Guacd sessions, wait for guacd to process disconnect and complete cleanup
-            // Guacd needs time to receive, parse, and execute cleanup after receiving "10.disconnect;"
-            // This matches the 500ms delay used for data connections (line 993) and prevents
-            // interrupting guacd's cleanup by closing TCP socket too early
-            if self.active_protocol == ActiveProtocol::Guacd {
-                debug!("Waiting 500ms for guacd to process disconnect and complete cleanup (channel_id: {}, conn_no: {})", self.channel_id, conn_no);
+                if let Err(e) = self
+                    .send_guacd_disconnect_message(conn_no, &reason.to_message())
+                    .await
+                {
+                    warn!(
+                        "Failed to send Guacd disconnect message (channel_id: {}, error: {})",
+                        self.channel_id, e
+                    );
+                }
+
+                // CRITICAL: Wait for guacd to process disconnect
+                debug!(
+                    "Waiting 500ms for guacd to process disconnect (channel_id: {}, conn_no: {})",
+                    self.channel_id, conn_no
+                );
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
 
-            // Immediate removal using DashMap
-            if let Some((_, conn)) = self.conns.remove(&conn_no) {
-                // Conn Drop will abort tasks automatically (RAII fix for memory leak)
-                drop(conn);
+            // ALWAYS remove connection from DashMap (don't skip based on primary status!)
+            // This is the critical fix - connection MUST be removed
+            if let Some((_, mut conn)) = self.conns.remove(&conn_no) {
+                // Gracefully shutdown to ensure TCP cleanup completes
+                conn.graceful_shutdown(conn_no, &self.channel_id).await;
                 debug!(
-                    "Successfully closed connection and tasks (channel_id: {})",
-                    self.channel_id
+                    "Successfully closed connection with graceful TCP shutdown (channel_id: {}, conn_no: {})",
+                    self.channel_id, conn_no
+                );
+            } else {
+                warn!(
+                    "Connection {} not found in DashMap during removal (channel_id: {})",
+                    conn_no, self.channel_id
                 );
             }
         } else {
@@ -1037,11 +1062,11 @@ impl Channel {
                 );
 
                 // Now remove from maps
-                if let Some((_, conn)) = conns_arc.remove(&conn_no) {
-                    // Conn Drop will abort tasks automatically (RAII fix for memory leak)
-                    drop(conn);
+                if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
+                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
+                    conn.graceful_shutdown(conn_no, &channel_id_clone).await;
                     debug!(
-                        "Connection {} removed and tasks aborted (channel_id: {})",
+                        "Connection {} removed with graceful TCP shutdown (channel_id: {})",
                         conn_no, channel_id_clone
                     );
                 }
@@ -1250,10 +1275,11 @@ impl Drop for Channel {
                     tokio::time::sleep(crate::config::disconnect_to_eof_delay()).await;
                 }
 
-                // Remove connection from registry (Conn Drop will abort tasks automatically)
-                if let Some((_, conn)) = conns_clone.remove(&conn_no) {
-                    drop(conn); // Conn::Drop aborts tasks synchronously (RAII fix)
-                    debug!("Connection {} removed and tasks aborted (channel_id: {})", conn_no, channel_id);
+                // Remove connection from registry with graceful shutdown
+                if let Some((_, mut conn)) = conns_clone.remove(&conn_no) {
+                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
+                    conn.graceful_shutdown(conn_no, &channel_id).await;
+                    debug!("Connection {} removed with graceful TCP shutdown (channel_id: {})", conn_no, channel_id);
                 }
             }
             info!("Channel cleanup completed (channel_id: {})", channel_id);

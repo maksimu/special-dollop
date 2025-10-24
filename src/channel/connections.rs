@@ -1133,9 +1133,9 @@ pub async fn setup_outbound_task(
     // Create connection struct with our pre-created backend task and data_tx channel
     // Note: outbound_handle is the to_webrtc task (guacd→client)
     let conn = Conn {
-        data_tx,                    // Channel for sending data to guacd (including sync responses)
-        backend_task,               // Task that writes client data to guacd
-        to_webrtc: outbound_handle, // Task that reads guacd data and sends to client
+        data_tx, // Channel for sending data to guacd (including sync responses)
+        backend_task: Some(backend_task), // Task that writes client data to guacd
+        to_webrtc: Some(outbound_handle), // Task that reads guacd data and sends to client
     };
 
     channel.conns.insert(conn_no, conn);

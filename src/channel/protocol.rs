@@ -844,7 +844,12 @@ impl Channel {
 
             // The conn.to_webrtc and backend tasks are already set up by the connection creation
             // to handle reading from the backend and sending to WebRTC. No need to spawn more tasks here.
-            if conn_ref.to_webrtc.is_finished() {
+            let task_finished = conn_ref
+                .to_webrtc
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true);
+            if task_finished {
                 warn!("In ConnectionOpened, to_webrtc task was already finished. This is unexpected. (channel_id: {}, conn_no: {})", self.channel_id, connection_no);
             }
 

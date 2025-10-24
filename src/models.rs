@@ -2,7 +2,7 @@ use crate::unlikely; // Branch prediction optimization for verbose logging check
 use anyhow::Result;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -160,8 +160,10 @@ impl AsyncReadWrite for TcpStream {
 // Simplified connection with event-driven sending
 pub(crate) struct Conn {
     pub(crate) data_tx: mpsc::UnboundedSender<ConnectionMessage>,
-    pub(crate) backend_task: JoinHandle<()>,
-    pub(crate) to_webrtc: JoinHandle<()>,
+    /// Backend task handle - Option allows consuming via graceful_shutdown()
+    pub(crate) backend_task: Option<JoinHandle<()>>,
+    /// WebRTC outbound task handle - Option allows consuming via graceful_shutdown()
+    pub(crate) to_webrtc: Option<JoinHandle<()>>,
 }
 
 impl Conn {
@@ -191,8 +193,68 @@ impl Conn {
 
         Self {
             data_tx,
-            backend_task,
-            to_webrtc: outbound_task, // Save the task handle
+            backend_task: Some(backend_task), // Wrap in Option
+            to_webrtc: Some(outbound_task),   // Wrap in Option
+        }
+    }
+
+    /// Gracefully shutdown the connection, ensuring TCP cleanup completes
+    ///
+    /// This method ensures that:
+    /// 1. The backend task receives signal to exit (data_tx is closed)
+    /// 2. The backend task has time to complete TCP shutdown (line 257-263 in backend_task_runner)
+    /// 3. Guacd receives proper TCP FIN packet (not abrupt RST)
+    ///
+    /// After this completes, the connection can be dropped safely.
+    /// Gracefully shutdown the connection, ensuring TCP cleanup completes
+    ///
+    /// This method ensures that:
+    /// 1. The backend task receives signal to exit (data_tx is closed)
+    /// 2. The backend task has time to complete TCP shutdown (proper FIN packet)
+    /// 3. Guacd receives proper disconnect notification
+    ///
+    /// Uses proper Rust async patterns (no polling loop!)
+    pub async fn graceful_shutdown(&mut self, conn_no: u32, channel_id: &str) {
+        // Step 1: Close data_tx channel to signal backend_task to exit naturally
+        // When data_rx.recv() returns None, backend_task will run its cleanup code
+        let (dummy_tx, _dummy_rx) = mpsc::unbounded_channel();
+        let old_tx = std::mem::replace(&mut self.data_tx, dummy_tx);
+        drop(old_tx); // Dropping the sender signals the receiver to close
+
+        // Step 2: Abort to_webrtc immediately (read-only task, safe to kill)
+        if let Some(task) = self.to_webrtc.take() {
+            task.abort();
+        }
+
+        // Step 3: Await backend_task to complete TCP shutdown (with timeout)
+        // Proper Rust way: consume JoinHandle via take() and await it
+        if let Some(backend_task) = self.backend_task.take() {
+            match tokio::time::timeout(Duration::from_secs(2), backend_task).await {
+                Ok(Ok(())) => {
+                    debug!(
+                        "Backend task completed gracefully with TCP shutdown (channel_id: {}, conn_no: {})",
+                        channel_id, conn_no
+                    );
+                }
+                Ok(Err(join_err)) => {
+                    warn!(
+                        "Backend task panicked during shutdown: {:?} (channel_id: {}, conn_no: {})",
+                        join_err, channel_id, conn_no
+                    );
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "Backend shutdown timeout (2s) (channel_id: {}, conn_no: {})",
+                        channel_id, conn_no
+                    );
+                    // Task is automatically cancelled by timeout wrapper
+                }
+            }
+        } else {
+            debug!(
+                "Backend task already consumed or aborted (channel_id: {}, conn_no: {})",
+                channel_id, conn_no
+            );
         }
     }
 }
@@ -200,9 +262,16 @@ impl Conn {
 /// Each task holds ~225 KB (stack + buffers + async state)
 impl Drop for Conn {
     fn drop(&mut self) {
-        // Abort both tasks to prevent orphaned task memory leak
-        self.backend_task.abort();
-        self.to_webrtc.abort();
+        // Abort tasks only if not already consumed by graceful_shutdown()
+        // This provides a safety net for cases where graceful_shutdown wasn't called
+
+        if let Some(task) = &self.backend_task {
+            task.abort();
+        }
+
+        if let Some(task) = &self.to_webrtc {
+            task.abort();
+        }
     }
 }
 
@@ -247,7 +316,10 @@ pub(crate) async fn backend_task_runner(
                 if let Err(e) = AsyncReadWrite::shutdown(&mut backend).await {
                     warn!("Failed to shutdown backend on EOF (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, e);
                 } else {
-                    info!("Backend shutdown on EOF (connection remains alive for RDP patterns) (channel_id: {}, conn_no: {})", channel_id, conn_no);
+                    debug!(
+                        "Backend shutdown on EOF (channel_id: {}, conn_no: {})",
+                        channel_id, conn_no
+                    );
                 }
                 // Note: We don't break here - connection stays alive after EOF for RDP
             }

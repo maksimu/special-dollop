@@ -370,7 +370,7 @@ impl EventDrivenSender {
                         );
                     }
 
-                    // CRITICAL FIX: Queue ALL send failures to prevent connection stalls
+                    // Queue ALL send failures to prevent connection stalls
                     // On localhost burst traffic, errors happen fast and error messages vary
                     // Don't try to differentiate error types - just queue and retry when buffer drains
                     self.can_send.store(false, Ordering::Release);

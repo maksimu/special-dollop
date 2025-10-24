@@ -177,6 +177,13 @@ impl PyTubeRegistry {
                 }
 
                 debug!("Force cleanup complete (actor handles all cleanup)");
+
+                // Shutdown METRICS_COLLECTOR to save memory (~900KB + CPU)
+                // NOTE: DON'T shutdown REGISTRY actor - it's a process-level singleton!
+                // Shutting down the actor prevents all subsequent tube operations.
+                // The actor is lightweight and designed to live for process lifetime.
+                debug!("Shutting down METRICS_COLLECTOR background tasks in __del__");
+                crate::metrics::METRICS_COLLECTOR.shutdown();
             })
         });
 

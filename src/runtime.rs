@@ -95,7 +95,7 @@ impl RuntimeManager {
                 Builder::new_multi_thread()
                     .enable_all()
                     .build()
-                    .expect("failed to build global Tokio runtime"),
+                    .expect("Failed to create Tokio runtime (OOM or thread limit exceeded). Check system resources."),
             );
             *state = Some(new_runtime.clone());
             new_runtime

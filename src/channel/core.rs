@@ -1259,7 +1259,7 @@ impl Drop for Channel {
             info!("Channel cleanup completed (channel_id: {})", channel_id);
         });
 
-        // RAII FIX: Clean up ALL UDP receiver tasks in Drop (client mode)
+        // Clean up ALL UDP receiver tasks in Drop (client mode)
         let udp_receiver_tasks = self.udp_receiver_tasks.clone();
         let channel_id_for_udp = self.channel_id.clone();
         runtime.spawn(async move {

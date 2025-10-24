@@ -2,6 +2,7 @@ use crate::resource_manager::RESOURCE_MANAGER;
 use crate::router_helpers::get_relay_access_creds;
 use crate::tube_and_channel_helpers::TubeStatus;
 use crate::tube_protocol::CloseConnectionReason;
+use crate::unlikely;
 use crate::Tube;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -88,6 +89,8 @@ pub enum RegistryCommand {
     GetServerMode {
         resp: oneshot::Sender<bool>,
     },
+    /// Graceful shutdown command to exit actor loop
+    Shutdown,
 }
 
 /// Actor that manages tube registry with backpressure and coordination
@@ -109,6 +112,153 @@ struct RegistryActor {
     total_creates: u64,
     total_failures: u64,
     create_times: Vec<Duration>,
+}
+
+// ============================================================================
+// STANDALONE CLOSE FUNCTION (Spawnable - doesn't block actor)
+// ============================================================================
+
+/// Standalone async function for closing a tube.
+/// This is spawned as a separate task so the actor doesn't block.
+///
+/// # Concurrent Close Protection
+/// Uses atomic `closing` flag on Tube to prevent double-close races.
+async fn close_tube_async(
+    tubes: Arc<DashMap<String, Arc<Tube>>>,
+    conversations: Arc<DashMap<String, String>>,
+    tube_id: String,
+    reason: Option<CloseConnectionReason>,
+) -> Result<()> {
+    debug!("Spawned task closing tube: {}", tube_id);
+
+    // Get tube to do graceful shutdown
+    let tube = tubes
+        .get(&tube_id)
+        .map(|entry| entry.value().clone())
+        .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
+
+    // CONCURRENT CLOSE PROTECTION: Check if already closing
+    // Use compare_exchange to atomically check-and-set
+    let already_closing = tube
+        .closing
+        .compare_exchange(
+            false,                                // expected: not closing
+            true,                                 // desired: now closing
+            std::sync::atomic::Ordering::Acquire, // success ordering
+            std::sync::atomic::Ordering::Relaxed, // failure ordering
+        )
+        .is_err(); // is_err() means it was already true
+
+    if already_closing {
+        warn!(
+            "Tube {} is already being closed by another task - skipping duplicate close",
+            tube_id
+        );
+        return Ok(());
+    }
+
+    // From here on, we're the ONLY task closing this tube (atomic flag set)
+
+    // 1. Set status to Closed (for status queries)
+    {
+        let mut status = tube.status.write().await;
+        *status = TubeStatus::Closed;
+        debug!("  ✓ Status set to Closed (tube_id: {})", tube_id);
+    }
+
+    // 2. Send connection_close callbacks for channels (graceful shutdown)
+    let channel_names: Vec<String> = {
+        let channels_guard = tube.active_channels.read().await;
+        channels_guard.keys().cloned().collect()
+    };
+    for channel_name in &channel_names {
+        if let Err(e) = tube.send_connection_close_callback(channel_name).await {
+            warn!(
+                "Failed to send close callback: {} (tube_id: {}, channel: {})",
+                e, tube_id, channel_name
+            );
+        }
+    }
+
+    // 2b. Send "channel_closed" signals to Python (CRITICAL for Python integration!)
+    if let Some(ref signal_sender) = tube.signal_sender {
+        let data_channels_snapshot = tube.data_channels.read().await.clone();
+        for (label, _dc) in data_channels_snapshot.iter() {
+            let conversation_id = if label == "control" {
+                tube.original_conversation_id
+                    .clone()
+                    .unwrap_or_else(|| tube.id())
+            } else {
+                label.to_string()
+            };
+
+            let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
+            let signal_data = serde_json::json!({
+                "channel_id": conversation_id,
+                "outcome": "tube_closed",
+                "close_reason": {
+                    "code": close_reason as u16,
+                    "name": format!("{:?}", close_reason),
+                    "is_critical": close_reason.is_critical(),
+                    "is_retryable": close_reason.is_retryable(),
+                }
+            })
+            .to_string();
+
+            let signal_msg = SignalMessage {
+                tube_id: tube.id(),
+                kind: "channel_closed".to_string(),
+                data: signal_data,
+                conversation_id: conversation_id.clone(),
+                progress_flag: Some(0), // COMPLETE
+                progress_status: Some("Tube closed".to_string()),
+                is_ok: Some(true),
+            };
+
+            if let Err(e) = signal_sender.send(signal_msg) {
+                error!(
+                    "Failed to send channel_closed signal: {} (tube_id: {}, label: {})",
+                    e,
+                    tube.id(),
+                    label
+                );
+            } else {
+                debug!(
+                    "Sent channel_closed signal to Python (tube_id: {}, label: {}, conv_id: {})",
+                    tube.id(),
+                    label,
+                    conversation_id
+                );
+            }
+        }
+    } else {
+        warn!(
+            "No signal sender on tube - cannot notify Python of channel closures (tube_id: {})",
+            tube_id
+        );
+    }
+
+    // 3. Explicit close (closes data channels + peer connection properly)
+    if let Err(e) = tube.close().await {
+        warn!(
+            "Error during explicit tube close: {} (tube_id: {}) - proceeding with removal",
+            e, tube_id
+        );
+    } else {
+        info!("Tube {} explicit close completed successfully", tube_id);
+    }
+
+    // 4. Remove from registry
+    tubes.remove(&tube_id);
+    conversations.retain(|_, tid| tid != &tube_id);
+
+    info!(
+        "Tube {} removed from registry - Drop will verify cleanup",
+        tube_id
+    );
+
+    // closing flag remains true (tube is being dropped anyway)
+    Ok(())
 }
 
 impl RegistryActor {
@@ -200,8 +350,38 @@ impl RegistryActor {
                     reason,
                     resp,
                 } => {
-                    let result = self.handle_close_tube(&tube_id, reason).await;
-                    let _ = resp.send(result);
+                    // CONCURRENT CLOSE PROTECTION:
+                    // - Atomic `closing` flag on Tube prevents double-close races
+                    // - compare_exchange ensures only ONE task closes each tube
+                    //
+                    // RESULT DELIVERY:
+                    // - Spawned task sends result through oneshot channel
+                    // - Python gets immediate "close initiated" response
+                    // - Actual cleanup happens asynchronously
+
+                    let tubes = self.tubes.clone();
+                    let conversations = self.conversations.clone();
+                    let tube_id_clone = tube_id.clone();
+
+                    // Spawn cleanup task - actor returns IMMEDIATELY
+                    tokio::spawn(async move {
+                        let result =
+                            close_tube_async(tubes, conversations, tube_id_clone.clone(), reason)
+                                .await;
+
+                        // Send result back
+                        let _ = resp.send(result);
+
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!(
+                                "Close task completed for tube {} (spawned task)",
+                                tube_id_clone
+                            );
+                        }
+                    });
+
+                    // Actor immediately continues processing next command!
+                    // No blocking, no timeout needed here.
                 }
 
                 RegistryCommand::SetServerMode { server_mode } => {
@@ -239,10 +419,15 @@ impl RegistryActor {
                 RegistryCommand::GetServerMode { resp } => {
                     let _ = resp.send(self.server_mode);
                 }
+
+                RegistryCommand::Shutdown => {
+                    info!("Registry actor received shutdown command - exiting gracefully");
+                    break; // Exit the while loop
+                }
             }
         }
 
-        warn!("Registry actor event loop terminated");
+        info!("Registry actor event loop terminated gracefully");
     }
 
     /// Handle tube creation - all logic outside any locks
@@ -674,135 +859,6 @@ impl RegistryActor {
             ..Default::default()
         }
     }
-
-    /// Handle tube closure - RAII makes this trivial!
-    async fn handle_close_tube(
-        &mut self,
-        tube_id: &str,
-        reason: Option<CloseConnectionReason>,
-    ) -> Result<()> {
-        debug!("Actor closing tube: {}", tube_id);
-
-        // Get tube to do graceful shutdown
-        let tube = self
-            .tubes
-            .get(tube_id)
-            .map(|entry| entry.value().clone())
-            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
-
-        // 1. Set status to Closed (for status queries)
-        {
-            let mut status = tube.status.write().await;
-            *status = TubeStatus::Closed;
-            debug!("  ✓ Status set to Closed (tube_id: {})", tube_id);
-        }
-
-        // 2. Send connection_close callbacks for channels (graceful shutdown)
-        let channel_names: Vec<String> = {
-            let channels_guard = tube.active_channels.read().await;
-            channels_guard.keys().cloned().collect()
-        };
-        for channel_name in &channel_names {
-            if let Err(e) = tube.send_connection_close_callback(channel_name).await {
-                warn!(
-                    "Failed to send close callback: {} (tube_id: {}, channel: {})",
-                    e, tube_id, channel_name
-                );
-            }
-        }
-
-        // 2b. Send "channel_closed" signals to Python (CRITICAL for Python integration!)
-        // This logic was in old Tube::close_with_reason() - Python depends on it!
-        if let Some(ref signal_sender) = tube.signal_sender {
-            let data_channels_snapshot = tube.data_channels.read().await.clone();
-            for (label, _dc) in data_channels_snapshot.iter() {
-                // Determine conversation_id from channel label
-                let conversation_id = if label == "control" {
-                    tube.original_conversation_id
-                        .clone()
-                        .unwrap_or_else(|| tube.id())
-                } else {
-                    label.to_string()
-                };
-
-                // Build signal payload (matches old format exactly)
-                let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
-                let signal_data = serde_json::json!({
-                    "channel_id": conversation_id,
-                    "outcome": "tube_closed",
-                    "close_reason": {
-                        "code": close_reason as u16,
-                        "name": format!("{:?}", close_reason),
-                        "is_critical": close_reason.is_critical(),
-                        "is_retryable": close_reason.is_retryable(),
-                    }
-                })
-                .to_string();
-
-                let signal_msg = SignalMessage {
-                    tube_id: tube.id(),
-                    kind: "channel_closed".to_string(),
-                    data: signal_data,
-                    conversation_id: conversation_id.clone(),
-                    progress_flag: Some(0), // COMPLETE
-                    progress_status: Some("Tube closed".to_string()),
-                    is_ok: Some(true),
-                };
-
-                if let Err(e) = signal_sender.send(signal_msg) {
-                    error!(
-                        "Failed to send channel_closed signal: {} (tube_id: {}, label: {})",
-                        e,
-                        tube.id(),
-                        label
-                    );
-                } else {
-                    debug!(
-                        "Sent channel_closed signal to Python (tube_id: {}, label: {}, conv_id: {})",
-                        tube.id(),
-                        label,
-                        conversation_id
-                    );
-                }
-            }
-        } else {
-            warn!(
-                "No signal sender on tube - cannot notify Python of channel closures (tube_id: {})",
-                tube_id
-            );
-        }
-
-        // 3. Explicit close (closes data channels + peer connection properly)
-        // CRITICAL: This must be called BEFORE dropping the tube to ensure:
-        // - Data channels send CloseConnection to downstream peers
-        // - TURN allocations are released (prevents 400 Bad Request errors)
-        // - Permission refresh timers are stopped
-        if let Err(e) = tube.close().await {
-            warn!(
-                "Error during explicit tube close: {} (tube_id: {}) - proceeding with removal",
-                e, tube_id
-            );
-        } else {
-            info!("Tube {} explicit close completed successfully", tube_id);
-        }
-
-        // 4. Remove from registry
-        self.tubes.remove(tube_id);
-        self.conversations.retain(|_, tid| tid != tube_id);
-
-        info!(
-            "Tube {} removed from registry - Drop will verify cleanup",
-            tube_id
-        );
-
-        // When tube Arc drops (after removal):
-        // → Tube::drop() fires as safety net
-        // → Verifies everything was closed by explicit close()
-        // → Logs warnings if cleanup was missed
-        // → Auto-cleanup for RAII resources (signal_sender, metrics)
-
-        Ok(())
-    }
 }
 
 /// Public handle to the registry actor
@@ -900,6 +956,15 @@ impl RegistryHandle {
             .map_err(|_| anyhow!("Registry actor unavailable"))?;
         rx.await
             .map_err(|_| anyhow!("Registry actor response channel closed"))?
+    }
+
+    /// Stops the actor event loop cleanly. Call before process exit.
+    #[allow(dead_code)] // Will be used by Python bindings or shutdown handler
+    pub fn shutdown(&self) -> Result<()> {
+        self.command_tx
+            .send(RegistryCommand::Shutdown)
+            .map_err(|_| anyhow!("Registry actor unavailable"))?;
+        Ok(())
     }
 
     // ===== COMPATIBILITY LAYER =====
@@ -1058,7 +1123,7 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     let tubes = Arc::clone(&actor.tubes);
     let conversations = Arc::clone(&actor.conversations);
 
-    // CRITICAL FIX: Spawn actor on global runtime
+    // Spawn actor on global runtime
     // This ensures actor actually starts even during static init
     std::thread::spawn(move || {
         let rt = crate::runtime::get_runtime();

@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock as TokioRwLock;
@@ -69,6 +69,13 @@ pub struct Tube {
 
     /// Keepalive task - automatically cancels when tube drops
     pub(crate) keepalive_task: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
+
+    // ============================================================================
+    // CONCURRENT CLOSE PROTECTION
+    // ============================================================================
+    /// Flag to prevent concurrent close operations on the same tube
+    /// When set to true, indicates a close is in progress
+    pub(crate) closing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Tube {
@@ -118,6 +125,9 @@ impl Tube {
             signal_sender,
             metrics_handle: Arc::new(TokioMutex::new(metrics_handle)),
             keepalive_task: Arc::new(TokioMutex::new(None)),
+
+            // Concurrent close protection:
+            closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         debug!(
@@ -1734,13 +1744,18 @@ impl Tube {
     /// are properly deallocated before permission refresh timers fire.
     pub async fn close(&self) -> Result<(), String> {
         let tube_id = self.id.clone();
+        let start_time = Instant::now();
         info!("Tube {} explicit close starting", tube_id);
 
         // 1. Stop keepalive task to prevent spurious activity during shutdown
         if let Ok(mut task_guard) = self.keepalive_task.try_lock() {
             if let Some(task) = task_guard.take() {
                 task.abort();
-                debug!("Keepalive task stopped for tube {}", tube_id);
+                debug!(
+                    "Keepalive task stopped for tube {} ({:?} elapsed)",
+                    tube_id,
+                    start_time.elapsed()
+                );
             }
         }
 
@@ -1771,8 +1786,11 @@ impl Tube {
                 notifier.notify_one(); // Instant wakeup - idiomatic async cancellation
             }
             debug!(
-                "Tube {}: All {} channels notified to shut down",
-                tube_id, channel_count
+                "Tube {}: All {} channels notified to shut down ({:?} elapsed, {:?} for grace+notify)",
+                tube_id,
+                channel_count,
+                start_time.elapsed(),
+                crate::config::channel_shutdown_grace_period()
             );
         }
 
@@ -1782,28 +1800,68 @@ impl Tube {
             guard.drain().collect()
         };
 
-        let mut closed_count = 0;
-        for (label, dc) in channels {
-            match tokio::time::timeout(crate::config::data_channel_close_timeout(), dc.close())
-                .await
-            {
-                Ok(Ok(_)) => {
-                    closed_count += 1;
-                    debug!("Data channel {} closed for tube {}", label, tube_id);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Error closing data channel {} for tube {}: {}",
-                        label, tube_id, e
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "Timeout closing data channel {} for tube {} after 3s",
-                        label, tube_id
-                    );
-                }
-            }
+        let channel_count = channels.len();
+        if channel_count > 0 {
+            info!(
+                "Tube {}: Closing {} data channels in parallel",
+                tube_id, channel_count
+            );
+
+            // Create futures for all channel closes
+            let close_futures: Vec<_> = channels
+                .into_iter()
+                .map(|(label, dc)| {
+                    let tube_id_clone = tube_id.clone();
+                    async move {
+                        let result = tokio::time::timeout(
+                            crate::config::data_channel_close_timeout(),
+                            dc.close(),
+                        )
+                        .await;
+
+                        match result {
+                            Ok(Ok(_)) => {
+                                debug!("Data channel {} closed for tube {}", label, tube_id_clone);
+                                Ok(label)
+                            }
+                            Ok(Err(e)) => {
+                                warn!(
+                                    "Error closing data channel {} for tube {}: {}",
+                                    label, tube_id_clone, e
+                                );
+                                Err((label, format!("close error: {}", e)))
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "Timeout closing data channel {} for tube {} after {:?}",
+                                    label,
+                                    tube_id_clone,
+                                    crate::config::data_channel_close_timeout()
+                                );
+                                Err((label, "timeout".to_string()))
+                            }
+                        }
+                    }
+                })
+                .collect();
+
+            // Wait for ALL closes to complete in parallel
+            let results = futures::future::join_all(close_futures).await;
+
+            // Count successes
+            let closed_count = results.iter().filter(|r| r.is_ok()).count();
+            let failed_count = results.len() - closed_count;
+
+            info!(
+                "Tube {}: Data channel close results: {} succeeded, {} failed/timeout ({:?} elapsed for parallel close)",
+                tube_id, closed_count, failed_count, start_time.elapsed()
+            );
+        } else {
+            debug!(
+                "Tube {}: No data channels to close ({:?} elapsed)",
+                tube_id,
+                start_time.elapsed()
+            );
         }
 
         // 4. Close peer connection (releases TURN allocation, stops refresh timers)
@@ -1814,30 +1872,45 @@ impl Tube {
             {
                 Ok(Ok(_)) => {
                     info!(
-                        "Tube {} closed successfully (data_channels: {}, TURN allocation released)",
-                        tube_id, closed_count
+                        "Tube {} closed successfully (peer connection closed, TURN allocation released, total time: {:?})",
+                        tube_id,
+                        start_time.elapsed()
                     );
                 }
                 Ok(Err(e)) => {
                     return Err(format!(
-                        "Failed to close peer connection for tube {}: {}",
-                        tube_id, e
+                        "Failed to close peer connection for tube {} after {:?}: {}",
+                        tube_id,
+                        start_time.elapsed(),
+                        e
                     ));
                 }
                 Err(_) => {
                     return Err(format!(
-                        "Timeout closing peer connection for tube {} after 5s",
-                        tube_id
+                        "Timeout closing peer connection for tube {} after {:?} (timeout: {:?})",
+                        tube_id,
+                        start_time.elapsed(),
+                        crate::config::peer_connection_close_timeout()
                     ));
                 }
             }
         } else {
-            debug!("Peer connection already closed for tube {}", tube_id);
+            debug!(
+                "Peer connection already closed for tube {} ({:?} elapsed)",
+                tube_id,
+                start_time.elapsed()
+            );
         }
 
         // Drain thread-local buffer pools to release memory
         let buffer_pool = BufferPool::default();
         buffer_pool.drain_thread_local();
+
+        info!(
+            "Tube {} close() completed successfully (total time: {:?})",
+            tube_id,
+            start_time.elapsed()
+        );
 
         Ok(())
     }

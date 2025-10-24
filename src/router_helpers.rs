@@ -7,6 +7,7 @@ use crate::unlikely;
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use log::{debug, error, info, warn};
+use once_cell::sync::Lazy;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use std::env;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // ROUTER CIRCUIT BREAKER STATE
@@ -33,6 +34,24 @@ static ROUTER_LAST_FAILURE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Timestamp of last router success (for monitoring)
 static ROUTER_LAST_SUCCESS: Mutex<Option<Instant>> = Mutex::new(None);
+
+// ============================================================================
+// HTTP CLIENT SINGLETON (Reuse connection pools, DNS cache, TLS sessions)
+// ============================================================================
+
+/// Singleton HTTP client for all router requests
+/// - Connection pooling across requests
+/// - DNS cache reuse
+/// - TLS session resumption
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30)) // Default, can be overridden per-request
+        .danger_accept_invalid_certs(!VERIFY_SSL)
+        .pool_max_idle_per_host(10) // Maintain connection pool
+        .pool_idle_timeout(Some(Duration::from_secs(90))) // Keep connections alive
+        .build()
+        .expect("Failed to create singleton HTTP client")
+});
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -117,14 +136,35 @@ mod challenge_response {
 
     impl ChallengeResponse {
         pub async fn fetch(ksm_config: &str) -> Result<(String, String), Box<dyn Error>> {
+            // Handle time anomalies gracefully (system time going backwards)
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_else(|e| {
+                    warn!("System time error (clock went backwards?): {} - using 0", e);
+                    Duration::from_secs(0)
+                })
                 .as_secs_f64();
 
             // Check if we can use the cached challenge
             {
-                let data = CHALLENGE_DATA.lock().unwrap();
+                // Recover from poisoned mutex (if previous thread panicked)
+                let data = CHALLENGE_DATA.lock().unwrap_or_else(|poisoned| {
+                    // CRITICAL: Mutex is poisoned - a thread panicked while holding the lock!
+                    // This indicates a serious bug. Log details and recover the data.
+                    error!(
+                        "CHALLENGE_DATA mutex POISONED! A thread panicked while holding this lock. \
+                          Check logs for panic stack trace above."
+                    );
+
+                    // Attempt to capture current thread backtrace (may not be the panic thread)
+                    #[cfg(debug_assertions)]
+                    {
+                        warn!("Current thread backtrace (may not be the panic source):");
+                        warn!("{:?}", std::backtrace::Backtrace::capture());
+                    }
+
+                    poisoned.into_inner()
+                });
                 let latest_challenge_seconds = now - data.challenge_seconds;
 
                 if latest_challenge_seconds < CHALLENGE_RESPONSE_TIMEOUT_SEC as f64
@@ -143,12 +183,13 @@ mod challenge_response {
             let router_http_host = http_router_url_from_ksm_config(ksm_config)?;
             let url = format!("{router_http_host}/api/device/get_challenge");
 
-            let client = reqwest::Client::builder()
+            // Use singleton HTTP client (reuses connections, DNS cache, TLS sessions)
+            let response = match HTTP_CLIENT
+                .get(&url)
                 .timeout(WEBSOCKET_CONNECTION_TIMEOUT)
-                .danger_accept_invalid_certs(!VERIFY_SSL)
-                .build()?;
-
-            let response = match client.get(&url).send().await {
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         let status = resp.status();
@@ -187,7 +228,14 @@ mod challenge_response {
 
             // Update the cache
             {
-                let mut data = CHALLENGE_DATA.lock().unwrap();
+                // Recover from poisoned mutex
+                let mut data = CHALLENGE_DATA.lock().unwrap_or_else(|poisoned| {
+                    error!(
+                        "CHALLENGE_DATA mutex POISONED during cache update! \
+                         A thread panicked while holding this lock. Recovering and continuing."
+                    );
+                    poisoned.into_inner()
+                });
                 data.challenge_seconds = now;
                 data.challenge = challenge.clone();
                 data.signature = signature.clone();
@@ -429,19 +477,16 @@ async fn router_request(
     let (challenge_str, signature) =
         challenge_response::ChallengeResponse::fetch(ksm_config).await?;
 
-    // Use config timeout (5s default) instead of hardcoded 30s
-    // This prevents actor from freezing for 30s on slow/dead router
-    let client = reqwest::Client::builder()
-        .timeout(crate::config::router_http_timeout())
-        .danger_accept_invalid_certs(!VERIFY_SSL)
-        .build()?;
+    // Use singleton HTTP client (reuses connections, DNS cache, TLS sessions)
+    // Per-request timeout override (5s for fast failure detection)
+    let request_timeout = crate::config::router_http_timeout();
 
-    // Create request builder
+    // Create request builder using singleton client
     let mut request_builder = match http_method {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "PUT" => client.put(&url),
-        "DELETE" => client.delete(&url),
+        "GET" => HTTP_CLIENT.get(&url),
+        "POST" => HTTP_CLIENT.post(&url),
+        "PUT" => HTTP_CLIENT.put(&url),
+        "DELETE" => HTTP_CLIENT.delete(&url),
         _ => {
             return Err(Box::new(KRouterError(format!(
                 "Unsupported HTTP method: {http_method}"
@@ -449,8 +494,9 @@ async fn router_request(
         }
     };
 
-    // Add headers
+    // Add headers and per-request timeout override
     request_builder = request_builder
+        .timeout(request_timeout)
         .header("Challenge", challenge_str)
         .header("Signature", signature)
         .header("Authorization", format!("KeeperDevice {client_id}"))

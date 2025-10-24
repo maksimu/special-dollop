@@ -642,7 +642,7 @@ pub async fn setup_outbound_task(
                                             // When browser is backgrounded (throttled to 1 FPS), response is delayed 10-16s → timeout
                                             // We intercept and respond immediately to prevent false "User is not responding" disconnects
 
-                                            // **CRITICAL FIX: Flush batch buffer BEFORE handling sync**
+                                            // Flush batch buffer BEFORE handling sync**
                                             // Bug (commit 196ba77): sync handler would continue without flushing batch,
                                             // causing keystroke echoes to wait ~1 second for next read/sync
                                             if let Some(ref mut batch_buffer) = guacd_batch_buffer {

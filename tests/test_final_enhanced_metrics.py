@@ -58,7 +58,9 @@ def test_enhanced_metrics_integration():
         print("     - webrtc_stats.connection_legs.{end_to_end_latency_ms, etc}")
 
         print("\n🎉 Enhanced metrics implementation is complete and ready!")
-        # Test passed - no return needed
+
+        # Explicit cleanup to prevent __del__ from clearing global registry
+        registry.cleanup_all()
 
     except ImportError as e:
         print(f"❌ Failed to import: {e}")
@@ -66,12 +68,6 @@ def test_enhanced_metrics_integration():
     except Exception as e:
         print(f"❌ Unexpected error: {e}")
         assert False, f"Unexpected error: {e}"
-    finally:
-        # Clean shutdown
-        try:
-            registry.shutdown_runtime()
-        except:
-            pass
 
 if __name__ == "__main__":
     success = test_enhanced_metrics_integration()

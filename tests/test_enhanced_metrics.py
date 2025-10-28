@@ -75,7 +75,9 @@ def test_enhanced_metrics():
             print(f"Total Bandwidth: {system.get('total_bandwidth_bps', 0):,} bps")
 
         print("\n✅ Enhanced metrics export working correctly!")
-        # Test passed - no return needed
+
+        # Explicit cleanup to prevent __del__ from clearing global registry
+        registry.cleanup_all()
 
     except ImportError as e:
         print(f"❌ Failed to import Rust module: {e}")

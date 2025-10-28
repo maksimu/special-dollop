@@ -2055,14 +2055,11 @@ impl PyTubeRegistry {
 // Implement Drop trait for PyTubeRegistry as a safety net
 impl Drop for PyTubeRegistry {
     fn drop(&mut self) {
+        // No logging here to avoid file descriptor race during Python test teardown
         if !self.explicit_cleanup_called.load(Ordering::SeqCst) {
-            warn!("PyTubeRegistry Drop triggered without explicit cleanup - forcing immediate cleanup");
-
             // LOCK-FREE: Direct access to registry DashMaps (no locks!)
             let tube_count = REGISTRY.tube_count();
             if tube_count > 0 {
-                debug!("Force cleanup: Clearing {} tubes immediately", tube_count);
-
                 // 1. Clean up metrics for all conversations before clearing tubes
                 let all_tube_ids = REGISTRY.all_tube_ids_sync();
                 for tube_id in &all_tube_ids {
@@ -2080,14 +2077,11 @@ impl Drop for PyTubeRegistry {
                 // 3. Drop all tube references (this will trigger their Drop)
                 // When Tubes drop, their signal_senders auto-close (RAII handles it!)
                 REGISTRY.tubes().clear();
-
-                debug!("Force cleanup: Registry cleaned up successfully");
             }
 
             // Runtime kept alive even in Drop (test isolation + service restart support)
             // Python process termination will clean up runtime automatically
             // For explicit shutdown, call registry.shutdown_runtime() before process exit
-            debug!("Force cleanup complete (runtime kept alive for reuse)");
         }
     }
 }

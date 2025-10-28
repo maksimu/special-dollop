@@ -43,10 +43,9 @@ TEST_CALLBACK_TOKEN = "TEST_MODE_CALLBACK_TOKEN"
 
 class TestCloseOperations(BaseWebRTCTest, unittest.TestCase):
     """Tests for close_connection and close_tube functionality"""
-    
+
     def setUp(self):
         super().setUp()
-        self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
         self.created_tubes = set()
         self.tube_states = {}
         self.tube_connection_events = {}

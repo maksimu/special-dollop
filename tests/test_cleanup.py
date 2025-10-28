@@ -9,8 +9,6 @@ import unittest
 import logging
 import time
 import threading
-import warnings
-import weakref
 
 import keeper_pam_webrtc_rs
 
@@ -32,11 +30,12 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
         super().tearDown()
         # Additional cleanup for any lingering resources
         try:
-            # Clean up any remaining tubes in the global registry
-            temp_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-            if temp_registry.active_tube_count() > 0:
-                logging.warning(f"tearDown: Found {temp_registry.active_tube_count()} leftover tubes, cleaning up")
-                temp_registry.cleanup_all()
+            # Use shared registry
+            if self.tube_registry.active_tube_count() > 0:
+                logging.warning(f"tearDown: Found {self.tube_registry.active_tube_count()} leftover tubes, cleaning up")
+                self.tube_registry.cleanup_all()
+                # Give cleanup time to complete
+                time.sleep(0.3)
         except Exception as e:
             logging.error(f"tearDown cleanup failed: {e}")
 
@@ -44,9 +43,9 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
     def test_explicit_cleanup_all(self):
         """Test explicit cleanup of all tubes"""
         logging.info("Testing explicit cleanup_all()")
-        
-        tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        
+
+        tube_registry = self.tube_registry
+
         try:
             # Verify registry starts clean
             self.assertEqual(tube_registry.active_tube_count(), 0, "Registry should start empty")
@@ -107,9 +106,9 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
     def test_selective_cleanup(self):
         """Test cleanup of specific tubes"""
         logging.info("Testing selective tube cleanup")
-        
-        tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        
+
+        tube_registry = self.tube_registry
+
         try:
             settings = {"conversationType": "tunnel"}
             
@@ -159,9 +158,9 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
     def test_cleanup_idempotent(self):
         """Test that cleanup methods are idempotent"""
         logging.info("Testing cleanup idempotency")
-        
-        tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        
+
+        tube_registry = self.tube_registry
+
         try:
             settings = {"conversationType": "tunnel"}
             
@@ -201,62 +200,14 @@ class TestTubeRegistryCleanup(BaseWebRTCTest, unittest.TestCase):
                 pass
             raise
 
-    def test_del_safety_net(self):
-        """Test that __del__ safety net works (and warns)"""
-        logging.info("Testing __del__ safety net")
-        
-        # Capture warnings
-        with warnings.catch_warnings(record=True) as warning_list:
-            warnings.simplefilter("always")
-            
-            # Create registry and tubes in a scope
-            def create_and_abandon_registry():
-                tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-                settings = {"conversationType": "tunnel"}
-                
-                tube_info = tube_registry.create_tube(
-                    conversation_id="del-test",
-                    settings=settings,
-                    trickle_ice=True,
-                    callback_token=TEST_CALLBACK_TOKEN,
-                    krelay_server="test.relay.server.com",
-                    client_version="ms16.5.0",
-                    ksm_config=TEST_KSM_CONFIG
-                )
-                
-                tube_id = tube_info['tube_id']
-                logging.info(f"Created tube {tube_id} without cleanup")
-                
-                # Don't call cleanup - let it go out of scope
-                return tube_id
-            
-            tube_id = create_and_abandon_registry()
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            # Give some time for cleanup to happen
-            time.sleep(0.5)
-            
-            # Check that cleanup happened (tube should be gone)
-            verification_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-            tube_still_exists = verification_registry.tube_found(tube_id)
-            
-            logging.info(f"After __del__, tube {tube_id} still exists: {tube_still_exists}")
-            
-            # Clean up any remaining tubes for safety
-            verification_registry.cleanup_all()
-            
-        logging.info("__del__ safety net test completed")
 
-    @with_runtime 
+    @with_runtime
     def test_cleanup_with_connections(self):
         """Test cleanup works properly with active connections"""
         logging.info("Testing cleanup with active connections")
-        
-        tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        
+
+        tube_registry = self.tube_registry
+
         try:
             settings = {"conversationType": "tunnel"}
             
@@ -323,8 +274,6 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
     
     def setUp(self):
         super().setUp()
-        # This shows the UPDATED pattern for your existing code
-        self.tube_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
         self.created_tubes = set()  # Track tubes we create
         self.tube_states = {}
         self.tube_connection_events = {}
@@ -511,40 +460,40 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
 
     @with_runtime
     def test_context_manager_pattern(self):
-        """Shows how to use context manager pattern"""
+        """Shows how to use context manager pattern with shared registry"""
         logging.info("Testing context manager pattern")
-        
+
         # This would be in a separate module/class
+        # IMPORTANT: Use the shared registry, not a new instance
         class TubeRegistryContext:
-            def __init__(self):
-                self.registry = keeper_pam_webrtc_rs.PyTubeRegistry()
+            def __init__(self, shared_registry):
+                self.registry = shared_registry  # Use shared registry
                 self.created_tubes = set()
-            
+
             def __enter__(self):
                 return self
-            
+
             def __exit__(self, exc_type, exc_val, exc_tb):
                 logging.info("Context manager cleanup")
                 if self.created_tubes:
                     tube_ids = list(self.created_tubes)
                     self.registry.cleanup_tubes(tube_ids)
-                elif self.registry.has_active_tubes():
-                    self.registry.cleanup_all()
-                
+                self.created_tubes.clear()
+
             def create_tube(self, **kwargs):
                 result = self.registry.create_tube(
                     krelay_server="test.relay.server.com",
-                    client_version="ms16.5.0", 
+                    client_version="ms16.5.0",
                     **kwargs
                 )
                 if 'tube_id' in result:
                     self.created_tubes.add(result['tube_id'])
                 return result
-        
-        # Usage with context manager
-        with TubeRegistryContext() as ctx:
+
+        # Usage with context manager - pass shared registry
+        with TubeRegistryContext(self.tube_registry) as ctx:
             settings = {"conversationType": "tunnel"}
-            
+
             tube_info = ctx.create_tube(
                 conversation_id="context-test",
                 settings=settings,
@@ -552,16 +501,18 @@ class TestCleanupIntegration(BaseWebRTCTest, unittest.TestCase):
                 callback_token=TEST_CALLBACK_TOKEN,
                 ksm_config=TEST_KSM_CONFIG
             )
-            
+
             tube_id = tube_info['tube_id']
             self.assertTrue(ctx.registry.tube_found(tube_id), "Tube should exist")
-            
+
             # Cleanup happens automatically when exiting context
-        
-        # Verify cleanup happened
-        verification_registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        self.assertFalse(verification_registry.tube_found(tube_id), "Tube should be cleaned up")
-        
+
+        # Give cleanup time to complete
+        time.sleep(0.3)
+
+        # Verify cleanup happened - use shared registry
+        self.assertFalse(self.tube_registry.tube_found(tube_id), "Tube should be cleaned up")
+
         logging.info("Context manager pattern test passed")
 
     def __del__(self):

@@ -55,7 +55,8 @@ def test_enhanced_ice_stats():
         print("   - Connection leg latency breakdown")
         print("   - Selected candidate pair details")
 
-        # Test passed - no return needed
+        # Explicit cleanup to prevent __del__ from clearing global registry
+        registry.cleanup_all()
 
     except ImportError as e:
         print(f"❌ Failed to import Rust module: {e}")

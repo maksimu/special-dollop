@@ -64,12 +64,11 @@ class TestThreadMonitoring(BaseWebRTCTest, unittest.TestCase):
         self.created_registries.clear()
 
     def create_tracked_registry(self):
-        """Create a registry and track it for cleanup"""
-        registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        # Configure higher resource limits for testing
-        self.configure_test_resource_limits(registry)
-        self.created_registries.append(registry)
-        return registry
+        """Return the shared registry (kept for compatibility with existing test code)"""
+        # NOTE: This method now returns the shared registry from BaseWebRTCTest
+        # instead of creating new instances, which was causing "Registry actor unavailable" errors
+        # and file descriptor corruption
+        return self.tube_registry
 
     def test_thread_creation_monitoring(self):
         """Monitor what threads are created when PyTubeRegistry is instantiated"""

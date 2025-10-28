@@ -602,8 +602,54 @@ impl Channel {
                             // but also good to try after receiving new data if not recently triggered.
                         }
                         Ok(None) => {
-                            info!("WebRTC data channel closed or sender dropped. (channel_id: {})", self.channel_id);
-                            break;
+                          info!("WebRTC data channel closed or sender dropped. (channel_id: {})", self.channel_id);
+
+                          // Process any pending connection closure signals before exiting
+                          let mut critical_conn_no: Option<u32> = None;
+                          while let Ok((closed_conn_no, closed_channel_id)) = local_conn_closed_rx.try_recv() {
+                              info!("Processing deferred connection closure signal (channel_id: {}, conn_no: {})", closed_channel_id, closed_conn_no);
+
+                              // Same critical closure check as the select arm
+                              if self.active_protocol == ActiveProtocol::Guacd {
+                                  let primary_opt = self.primary_guacd_conn_no.lock().await;
+                                  if let Some(primary_conn_no) = *primary_opt {
+                                      if primary_conn_no == closed_conn_no {
+                                          warn!("Critical Guacd data connection has closed (deferred processing). (channel_id: {}, conn_no: {})", self.channel_id, closed_conn_no);
+                                          critical_conn_no = Some(closed_conn_no);
+                                          break; // Stop processing, handle critical closure
+                                      }
+                                  }
+                              }
+                          }
+
+                          // If we found a critical closure, run cleanup before exiting
+                          if let Some(closed_conn_no) = critical_conn_no {
+                              self.should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                              // Explicitly close the failed data connection first
+                              info!("Closing failed data connection ({}) due to critical upstream closure. (channel_id: {})", closed_conn_no, self.channel_id);
+                              if let Err(e) = self.close_backend(closed_conn_no, CloseConnectionReason::UpstreamClosed).await {
+                                  warn!("Error closing failed data connection ({}) during critical shutdown. (channel_id: {}, error: {})", closed_conn_no, self.channel_id, e);
+                              }
+
+                              // Close control connection (conn_no 0) if needed
+                              if closed_conn_no != 0 {
+                                  info!("Shutting down control connection (0) due to critical upstream closure. (channel_id: {})", self.channel_id);
+                                  if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed).await {
+                                      debug!("Error explicitly closing control connection (0) during critical shutdown. (channel_id: {}, error: {})", self.channel_id, e);
+                                  }
+                              }
+
+                              // Clean up remaining connections
+                              self.log_final_stats().await;
+                              if let Err(e) = self.cleanup_all_connections().await {
+                                  warn!("Error during cleanup after critical closure (channel_id: {}, error: {})", self.channel_id, e);
+                              }
+
+                              return Err(ChannelError::CriticalUpstreamClosed(self.channel_id.clone()));
+                          }
+
+                          break;
                         }
                         Err(_) => { // Timeout on rx_from_dc.recv()
                             handle_ping_timeout(&mut self).await?;
@@ -629,6 +675,14 @@ impl Channel {
 
                         if is_critical_closure {
                             self.should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                            // Explicitly close the failed data connection first
+                            // The outbound task signaled it exited, but did NOT remove from DashMap
+                            info!("Closing failed data connection ({}) due to critical upstream closure. (channel_id: {})", closed_conn_no, self.channel_id);
+                            if let Err(e) = self.close_backend(closed_conn_no, CloseConnectionReason::UpstreamClosed).await {
+                                warn!("Error closing failed data connection ({}) during critical shutdown. (channel_id: {}, error: {})", closed_conn_no, self.channel_id, e);
+                            }
+
                             // Attempt to gracefully close the control connection (conn_no 0) as well, if not already closing.
                             // This sends a CloseConnection message to the client for the channel itself.
                             if closed_conn_no != 0 { // Avoid self-triggering if conn_no 0 was what closed to signal this.
@@ -637,14 +691,19 @@ impl Channel {
                                     debug!("Error explicitly closing control connection (0) during critical shutdown. (channel_id: {}, error: {})", self.channel_id, e);
                                 }
                             }
+
+                            // Clean up any remaining connections beyond the two we explicitly closed above
+                            self.log_final_stats().await;
+                            if let Err(e) = self.cleanup_all_connections().await {
+                                warn!("Error during cleanup after critical closure (channel_id: {}, error: {})", self.channel_id, e);
+                            }
+
                             // Instead of just breaking, return the specific error to indicate why the channel is stopping.
                             // The main loop will break due to should_exit, but this provides the reason to the caller of run().
                             // However, the run loop continues until should_exit is polled again.
                             // For immediate exit and propagation: directly return.
                             return Err(ChannelError::CriticalUpstreamClosed(self.channel_id.clone()));
                         }
-                        // Optional: Remove from self.conns and self.pending_messages if desired immediately.
-                        // However, cleanup_all_connections will handle it upon loop exit.
 
                     } else {
                         // Conn_closed_tx was dropped, meaning all senders are gone.
@@ -1220,7 +1279,9 @@ impl Drop for Channel {
             // Collect connection numbers from DashMap
             let conn_keys = Self::extract_connection_ids(&conns_clone);
             for conn_no in conn_keys {
-                if conn_no == 0 { continue; }
+                if conn_no == 0 {
+                    continue;
+                }
 
                 // Send close frame to remote peer
                 let mut close_buffer = buffer_pool_clone.acquire();
@@ -1228,47 +1289,39 @@ impl Drop for Channel {
                 close_buffer.extend_from_slice(&conn_no.to_be_bytes());
                 close_buffer.put_u8(CloseConnectionReason::Normal as u8);
 
-                let close_frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut close_buffer);
+                let close_frame = Frame::new_control_with_buffer(
+                    ControlMessage::CloseConnection,
+                    &mut close_buffer,
+                );
                 let encoded = close_frame.encode_with_pool(&buffer_pool_clone);
-                if let Err(e) = webrtc.send(encoded).await {
-                    if !e.contains("Channel is closing") {
-                        warn!("Error sending close frame in drop for connection (channel_id: {}, error: {})", channel_id, e);
-                    }
-                }
+                // Silently ignore send errors in Drop - no logging to avoid fd race
+                let _ = webrtc.send(encoded).await;
                 buffer_pool_clone.release(close_buffer);
 
                 // Send graceful shutdown message before aborting tasks
                 if let Some(conn_ref) = conns_clone.get(&conn_no) {
                     if active_protocol == ActiveProtocol::Guacd {
                         // For guacd: send disconnect instruction first (protocol-level)
-                        let disconnect_instruction = crate::channel::guacd_parser::GuacdInstruction::new(
-                            "disconnect".to_string(),
-                            vec![]
-                        );
-                        let disconnect_bytes = crate::channel::guacd_parser::GuacdParser::guacd_encode_instruction(
-                            &disconnect_instruction
-                        );
-                        let disconnect_message = crate::models::ConnectionMessage::Data(disconnect_bytes);
+                        let disconnect_instruction =
+                            crate::channel::guacd_parser::GuacdInstruction::new(
+                                "disconnect".to_string(),
+                                vec![],
+                            );
+                        let disconnect_bytes =
+                            crate::channel::guacd_parser::GuacdParser::guacd_encode_instruction(
+                                &disconnect_instruction,
+                            );
+                        let disconnect_message =
+                            crate::models::ConnectionMessage::Data(disconnect_bytes);
 
-                        if let Err(e) = conn_ref.data_tx.send(disconnect_message) {
-                            debug!("Failed to send disconnect to guacd in drop (channel_id: {}, error: {})", channel_id, e);
-                        } else {
-                            debug!("Sent disconnect instruction to guacd (channel_id: {}, conn_no: {})", channel_id, conn_no);
-                        }
+                        // Silently send - no logging to avoid fd race
+                        let _ = conn_ref.data_tx.send(disconnect_message);
 
                         // THEN send EOF for TCP-level shutdown (consistent with other protocols)
-                        if let Err(e) = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
-                            debug!("Failed to send EOF to guacd in drop (channel_id: {}, error: {})", channel_id, e);
-                        } else {
-                            debug!("Sent EOF after disconnect for guacd (channel_id: {}, conn_no: {})", channel_id, conn_no);
-                        }
+                        let _ = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof);
                     } else {
                         // For port forwarding/SOCKS5: send EOF for graceful TCP shutdown
-                        if let Err(e) = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof) {
-                            debug!("Failed to send EOF in drop (channel_id: {}, error: {})", channel_id, e);
-                        } else {
-                            debug!("Sent EOF for graceful shutdown (channel_id: {}, conn_no: {}, protocol: {:?})", channel_id, conn_no, active_protocol);
-                        }
+                        let _ = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof);
                     }
 
                     // Brief delay to allow shutdown message to be written before aborting tasks
@@ -1279,31 +1332,21 @@ impl Drop for Channel {
                 if let Some((_, mut conn)) = conns_clone.remove(&conn_no) {
                     // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
                     conn.graceful_shutdown(conn_no, &channel_id).await;
-                    debug!("Connection {} removed with graceful TCP shutdown (channel_id: {})", conn_no, channel_id);
+                    // No logging here - avoid fd race during Python teardown
                 }
             }
-            info!("Channel cleanup completed (channel_id: {})", channel_id);
+            // No final log - avoid fd race during Python teardown
         });
 
         // Clean up ALL UDP receiver tasks in Drop (client mode)
         let udp_receiver_tasks = self.udp_receiver_tasks.clone();
-        let channel_id_for_udp = self.channel_id.clone();
         runtime.spawn(async move {
             let mut tasks = udp_receiver_tasks.lock().await;
-            let task_count = tasks.len();
-            for (conn_no, task) in tasks.drain() {
+            for (_conn_no, task) in tasks.drain() {
                 task.abort();
-                debug!(
-                    "Channel({}): Aborted UDP receiver task in Drop (conn_no: {})",
-                    channel_id_for_udp, conn_no
-                );
+                // No logging here - avoid fd race during Python teardown
             }
-            if task_count > 0 {
-                info!(
-                    "Channel({}): Cleaned up {} UDP receiver tasks in Drop (RAII)",
-                    channel_id_for_udp, task_count
-                );
-            }
+            // No final log - avoid fd race during Python teardown
         });
     }
 }

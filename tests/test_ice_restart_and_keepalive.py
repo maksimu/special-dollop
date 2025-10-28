@@ -41,26 +41,18 @@ class TestICERestartAndKeepalive(BaseWebRTCTest, unittest.TestCase):
 
     def tearDown(self):
         super().tearDown()
-        # Emergency cleanup
-        for registry in self.created_registries:
-            try:
-                if registry.has_active_tubes():
-                    registry.cleanup_all()
-            except Exception as e:
-                logging.error(f"tearDown registry cleanup failed: {e}")
-        self.created_registries.clear()
-        
+        # Cleanup handled by BaseWebRTCTest.tearDown() for shared registry
+
         with self._lock:
             self.tube_states.clear()
             self.tube_connection_events.clear()
             self.peer_map.clear()
 
     def create_tracked_registry(self):
-        """Create a registry and track it for cleanup"""
-        registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-        self.configure_test_resource_limits(registry)
-        self.created_registries.append(registry)
-        return registry
+        """Return the shared registry (kept for compatibility with existing test code)"""
+        # NOTE: This method now returns the shared registry from BaseWebRTCTest
+        # instead of creating new instances, which was causing "Registry actor unavailable" errors
+        return self.tube_registry
 
     def _enhanced_signal_handler(self, signal_dict):
         """Enhanced signal handler that tracks keepalive and ICE restart events"""
@@ -115,9 +107,7 @@ class TestICERestartAndKeepalive(BaseWebRTCTest, unittest.TestCase):
                     peer_tube_id = self.peer_map.get(tube_id)
                     if peer_tube_id:
                         try:
-                            registry = self.created_registries[0] if self.created_registries else None
-                            if registry:
-                                registry.add_ice_candidate(peer_tube_id, data)
+                            self.tube_registry.add_ice_candidate(peer_tube_id, data)
                         except Exception as e:
                             logging.error(f"ICE relay failed: {e}")
                 
@@ -489,27 +479,24 @@ class TestICERestartAndKeepalive(BaseWebRTCTest, unittest.TestCase):
         """Wait for both tubes to establish a connection"""
         logging.debug(f"Waiting for connection: {tube_id1} <-> {tube_id2} (timeout: {timeout}s)")
         start_time = time.time()
-        
+
         while time.time() - start_time < timeout:
-            registry = self.created_registries[0] if self.created_registries else None
-            if not registry:
-                return False
-                
+            registry = self.tube_registry  # Use shared registry
+
             state1 = registry.get_connection_state(tube_id1)
             state2 = registry.get_connection_state(tube_id2)
-            
+
             if state1.lower() == "connected" and state2.lower() == "connected":
                 logging.debug(f"Connection established: {tube_id1}={state1}, {tube_id2}={state2}")
                 return True
-                
+
             time.sleep(0.1)
-        
+
         # Log final states on timeout
-        if registry:
-            state1 = registry.get_connection_state(tube_id1)
-            state2 = registry.get_connection_state(tube_id2)
-            logging.warning(f"Connection timeout: {tube_id1}={state1}, {tube_id2}={state2}")
-        
+        state1 = registry.get_connection_state(tube_id1)
+        state2 = registry.get_connection_state(tube_id2)
+        logging.warning(f"Connection timeout: {tube_id1}={state1}, {tube_id2}={state2}")
+
         return False
 
     def test_manual_ice_restart_api(self):

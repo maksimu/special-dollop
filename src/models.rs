@@ -164,6 +164,8 @@ pub(crate) struct Conn {
     pub(crate) backend_task: Option<JoinHandle<()>>,
     /// WebRTC outbound task handle - Option allows consuming via graceful_shutdown()
     pub(crate) to_webrtc: Option<JoinHandle<()>>,
+    /// Cancellation token for backend read task - allows immediate exit on WebRTC closure
+    pub(crate) cancel_read_task: tokio_util::sync::CancellationToken,
 }
 
 impl Conn {
@@ -175,6 +177,7 @@ impl Conn {
         channel_id: String,
     ) -> Self {
         let (data_tx, data_rx) = mpsc::unbounded_channel::<ConnectionMessage>();
+        let cancel_read_task = tokio_util::sync::CancellationToken::new();
 
         // Create backend task that handles the actual backend I/O
         let backend_task = tokio::spawn(backend_task_runner(
@@ -195,6 +198,7 @@ impl Conn {
             data_tx,
             backend_task: Some(backend_task), // Wrap in Option
             to_webrtc: Some(outbound_task),   // Wrap in Option
+            cancel_read_task,
         }
     }
 

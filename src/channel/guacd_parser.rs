@@ -56,6 +56,7 @@ pub struct PeekedInstruction<'a> {
 // Common opcode constants for fast comparison
 pub const ERROR_OPCODE: &str = "error";
 pub const SIZE_OPCODE: &str = "size";
+pub const DISCONNECT_OPCODE: &str = "disconnect";
 
 /// Special opcodes that need custom processing beyond normal batching
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,8 +65,11 @@ pub enum SpecialOpcode {
     // Error opcodes use CloseConnection action directly, kept for API consistency
     Error,
     Size,
+    #[allow(dead_code)]
+    // Disconnect opcode indicates guacd is closing the connection cleanly
+    // Maps to CloseConnection action directly, kept for API consistency
+    Disconnect,
     // Future opcodes can be added here:
-    // Disconnect,
     // Mouse,
     // Key,
     // Clipboard,
@@ -77,7 +81,7 @@ impl SpecialOpcode {
         match self {
             SpecialOpcode::Error => ERROR_OPCODE,
             SpecialOpcode::Size => SIZE_OPCODE,
-            // SpecialOpcode::Disconnect => "disconnect",
+            SpecialOpcode::Disconnect => DISCONNECT_OPCODE,
         }
     }
 }
@@ -690,10 +694,11 @@ impl GuacdParser {
         } else if opcode_str == "sync" {
             // Server sync keepalive - needs immediate response to prevent 15s timeout
             OpcodeAction::ServerSync
+        } else if opcode_str == DISCONNECT_OPCODE {
+            // Disconnect instruction from guacd - connection closing cleanly
+            OpcodeAction::CloseConnection
         } else {
-            // Add more checks as needed:
-            // } else if opcode_str == "disconnect" {
-            //     OpcodeAction::ProcessSpecial(SpecialOpcode::Disconnect)
+            // Add more checks as needed
             OpcodeAction::Normal
         };
 

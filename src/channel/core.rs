@@ -117,7 +117,7 @@ pub struct Channel {
     pub(crate) udp_conn_index:
         Arc<std::sync::Mutex<HashMap<u32, std::collections::HashSet<std::net::SocketAddr>>>>,
     // UDP receiver tasks for client mode (RAII: ensures proper cleanup)
-    pub(crate) udp_receiver_tasks: Arc<Mutex<HashMap<u32, tokio::task::JoinHandle<()>>>>,
+    pub(crate) udp_receiver_tasks: Arc<Mutex<HashMap<u32, JoinHandle<()>>>>,
     // Timestamp for the last channel-level ping sent (conn_no=0)
     pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
 
@@ -604,6 +604,11 @@ impl Channel {
                         Ok(None) => {
                           info!("WebRTC data channel closed or sender dropped. (channel_id: {})", self.channel_id);
 
+                          // CRITICAL: Brief delay to allow in-flight connection closure signals to arrive
+                          // When WebRTC closes during overload/failure, backend connections may be
+                          // closing simultaneously. Without this delay, their signals are lost.
+                          tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
                           // Process any pending connection closure signals before exiting
                           let mut critical_conn_no: Option<u32> = None;
                           while let Ok((closed_conn_no, closed_channel_id)) = local_conn_closed_rx.try_recv() {
@@ -814,19 +819,45 @@ impl Channel {
         self.internal_handle_connection_close(conn_no, reason)
             .await?;
 
-        self.send_control_message(ControlMessage::CloseConnection, &msg_data)
-            .await?;
+        // CRITICAL: Don't fail cleanup if we can't send the control message
+        // If WebRTC is already closed/closing, the send will fail, but we MUST
+        // still perform cleanup (cancel backend task, shutdown TCP, remove from map)
+        if let Err(e) = self
+            .send_control_message(ControlMessage::CloseConnection, &msg_data)
+            .await
+        {
+            warn!(
+                "Failed to send CloseConnection control message, continuing with cleanup anyway (channel_id: {}, conn_no: {}, error: {})",
+                self.channel_id, conn_no, e
+            );
+        }
 
         // For control connections or explicit cleanup, remove immediately
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
         if !should_delay_removal {
+            // Check if this is the primary guacd connection (before we cleared the reference)
+            let is_primary_guacd = if self.active_protocol == ActiveProtocol::Guacd {
+                let primary_opt = self.primary_guacd_conn_no.lock().await;
+                *primary_opt == Some(conn_no)
+            } else {
+                false
+            };
+
             // Send Guacd disconnect message with specific reason before removing connection
             if let Err(e) = self
-                .send_guacd_disconnect_message(conn_no, &reason.to_message())
+                .send_guacd_disconnect_message(conn_no, &reason.to_message(), is_primary_guacd)
                 .await
             {
                 warn!("Failed to send Guacd disconnect message during immediate close (channel_id: {}, error: {})", self.channel_id, e);
+            }
+
+            // CRITICAL: Brief delay to allow backend write task to process disconnect instruction
+            // The disconnect was queued via data_tx.send() above, but the backend task needs
+            // time to dequeue it and write to TCP before we close the channel
+            if self.active_protocol == ActiveProtocol::Guacd {
+                debug!("Waiting 100ms for backend write task to transmit disconnect instruction (channel_id: {}, conn_no: {})", self.channel_id, conn_no);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
 
             // CRITICAL: For Guacd sessions, wait for guacd to process disconnect and complete cleanup
@@ -842,6 +873,16 @@ impl Channel {
             }
 
             // Immediate removal using DashMap
+            if let Some(conn_ref) = self.conns.get(&conn_no) {
+                // CRITICAL: Cancel the read task FIRST to allow immediate exit
+                // This prevents the 15-second ICE timeout when guacd closes TCP without error opcode
+                conn_ref.cancel_read_task.cancel();
+                debug!(
+                    "Cancelled backend read task for immediate exit (channel_id: {}, conn_no: {})",
+                    self.channel_id, conn_no
+                );
+            }
+
             if let Some((_, mut conn)) = self.conns.remove(&conn_no) {
                 // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
                 conn.graceful_shutdown(conn_no, &self.channel_id).await;
@@ -853,6 +894,13 @@ impl Channel {
         } else {
             // Delayed removal - signal shutdown but keep in map briefly for pending messages
             if let Some(conn_ref) = self.conns.get(&conn_no) {
+                // CRITICAL: Cancel the read task immediately for faster exit
+                conn_ref.cancel_read_task.cancel();
+                debug!(
+                    "Cancelled backend read task for delayed removal (channel_id: {}, conn_no: {})",
+                    self.channel_id, conn_no
+                );
+
                 // Signal the connection to close its data channel
                 // (dropping the sender will cause the backend task to exit)
                 if !conn_ref.data_tx.is_closed() {
@@ -897,18 +945,19 @@ impl Channel {
     }
 
     /// Send Guacd disconnect message to both server and client before closing connection
-    async fn send_guacd_disconnect_message(&self, conn_no: u32, reason: &str) -> Result<()> {
+    async fn send_guacd_disconnect_message(
+        &self,
+        conn_no: u32,
+        reason: &str,
+        is_primary: bool,
+    ) -> Result<()> {
         // Only send disconnect for Guacd connections
         if self.active_protocol != ActiveProtocol::Guacd {
             return Ok(());
         }
 
-        // Check if this is the primary Guacd connection
-        let is_primary = {
-            let primary_opt = self.primary_guacd_conn_no.lock().await;
-            *primary_opt == Some(conn_no)
-        };
-
+        // Use the is_primary flag passed by caller (don't check primary_guacd_conn_no again,
+        // as it may have been cleared by internal_handle_connection_close)
         if !is_primary {
             debug!(
                 "Not primary Guacd connection, skipping disconnect message (channel_id: {})",
@@ -1040,46 +1089,60 @@ impl Channel {
         // the later primary check in send_guacd_disconnect_message!
         let is_primary_guacd = if self.active_protocol == ActiveProtocol::Guacd {
             let primary_opt = self.primary_guacd_conn_no.lock().await;
-            *primary_opt == Some(conn_no)
+            let primary_val = *primary_opt;
+            primary_val == Some(conn_no)
         } else {
             false
         };
 
-        self.internal_handle_connection_close(conn_no, reason)
-            .await?;
-
         // For control connections or explicit cleanup, remove immediately
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
 
-        if !should_delay_removal {
-            // Send Guacd disconnect message ONLY if this was the primary connection
-            // We use the saved is_primary_guacd flag since internal_handle_connection_close cleared it
-            if is_primary_guacd {
-                debug!(
-                    "Sending disconnect to primary Guacd connection (channel_id: {}, conn_no: {})",
-                    self.channel_id, conn_no
-                );
+        // CRITICAL FIX: Send disconnect BEFORE internal_handle_connection_close
+        // The WebRTC channel can close during internal_handle_connection_close, causing the
+        // channel run loop to exit before we get a chance to send the disconnect.
+        // By sending it first, we ensure it's queued in the channel before anything else happens.
+        if !should_delay_removal && is_primary_guacd {
+            debug!(
+                "Sending disconnect to primary Guacd connection BEFORE cleanup (channel_id: {}, conn_no: {})",
+                self.channel_id, conn_no
+            );
 
-                if let Err(e) = self
-                    .send_guacd_disconnect_message(conn_no, &reason.to_message())
-                    .await
-                {
-                    warn!(
-                        "Failed to send Guacd disconnect message (channel_id: {}, error: {})",
-                        self.channel_id, e
-                    );
-                }
-
-                // CRITICAL: Wait for guacd to process disconnect
-                debug!(
-                    "Waiting 500ms for guacd to process disconnect (channel_id: {}, conn_no: {})",
-                    self.channel_id, conn_no
+            if let Err(e) = self
+                .send_guacd_disconnect_message(conn_no, &reason.to_message(), is_primary_guacd)
+                .await
+            {
+                warn!(
+                    "Failed to send Guacd disconnect message (channel_id: {}, error: {})",
+                    self.channel_id, e
                 );
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
 
-            // ALWAYS remove connection from DashMap (don't skip based on primary status!)
-            // This is the critical fix - connection MUST be removed
+            // Brief delay to allow backend write task to transmit disconnect
+            debug!(
+                "Waiting 100ms for backend write task to transmit disconnect (channel_id: {}, conn_no: {})",
+                self.channel_id, conn_no
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        // Now safe to clean up internal state
+        self.internal_handle_connection_close(conn_no, reason)
+            .await?;
+
+        // For Guacd, wait for server to process disconnect
+        if !should_delay_removal && is_primary_guacd {
+            // Wait for guacd to process disconnect and complete cleanup
+            debug!(
+                "Waiting 500ms for guacd to process disconnect (channel_id: {}, conn_no: {})",
+                self.channel_id, conn_no
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        // ALWAYS remove connection from DashMap (don't skip based on primary status!)
+        // This is the critical fix - connection MUST be removed
+        if !should_delay_removal {
             if let Some((_, mut conn)) = self.conns.remove(&conn_no) {
                 // Gracefully shutdown to ensure TCP cleanup completes
                 conn.graceful_shutdown(conn_no, &self.channel_id).await;
@@ -1096,6 +1159,13 @@ impl Channel {
         } else {
             // Delayed removal - signal shutdown but keep in map briefly for pending messages
             if let Some(conn_ref) = self.conns.get(&conn_no) {
+                // CRITICAL: Cancel the read task immediately for faster exit
+                conn_ref.cancel_read_task.cancel();
+                debug!(
+                    "Cancelled backend read task for delayed removal (channel_id: {}, conn_no: {})",
+                    self.channel_id, conn_no
+                );
+
                 // Signal the connection to close its data channel
                 // (dropping the sender will cause the backend task to exit)
                 if !conn_ref.data_tx.is_closed() {
@@ -1303,14 +1373,9 @@ impl Drop for Channel {
                     if active_protocol == ActiveProtocol::Guacd {
                         // For guacd: send disconnect instruction first (protocol-level)
                         let disconnect_instruction =
-                            crate::channel::guacd_parser::GuacdInstruction::new(
-                                "disconnect".to_string(),
-                                vec![],
-                            );
+                            GuacdInstruction::new("disconnect".to_string(), vec![]);
                         let disconnect_bytes =
-                            crate::channel::guacd_parser::GuacdParser::guacd_encode_instruction(
-                                &disconnect_instruction,
-                            );
+                            GuacdParser::guacd_encode_instruction(&disconnect_instruction);
                         let disconnect_message =
                             crate::models::ConnectionMessage::Data(disconnect_bytes);
 

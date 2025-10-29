@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "Keeper PAM WebRTC for Python - A secure, stable, and high-performance Tube API for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations."
 license = "MIT"
@@ -44,6 +44,7 @@ smallvec = "1.15.1"
 socket2 = "0.6.1"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7"
 tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter", "json", "tracing-log"] }
 uuid = { version = "1.18.1", features = ["v4"] }

@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::timeout;
+use tokio::time::{timeout, Duration};
 
 use super::core::Channel;
 
@@ -33,6 +33,11 @@ fn should_log_connection(is_critical: bool) -> bool {
 
 /// Last backpressure log timestamp (rate limiting)
 static LAST_BACKPRESSURE_LOG: AtomicU64 = AtomicU64::new(0);
+
+/// Read timeout for cancellation check interval
+/// This allows the backend read task to check for cancellation every 500ms
+/// instead of waiting for TCP timeout (2-3 seconds)
+const READ_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 // Open a backend connection to a given address
 pub async fn open_backend(
@@ -264,6 +269,10 @@ pub async fn setup_outbound_task(
     // Clone data_tx for use in outbound task (to send sync auto-responses back to guacd)
     let data_tx_for_sync = data_tx.clone();
 
+    // Create cancellation token for immediate exit on WebRTC closure
+    let cancel_read_task = tokio_util::sync::CancellationToken::new();
+    let cancel_token_for_task = cancel_read_task.clone();
+
     // Create StreamHalf wrapper for backend_writer (needed for AsyncReadWrite trait)
     let stream_half = crate::models::StreamHalf {
         reader: None,
@@ -457,33 +466,82 @@ pub async fn setup_outbound_task(
             // **ZERO-COPY READ: Use buffer pool buffer directly**
             // For Guacd, read directly into main_read_buffer to append.
             // For others, use temp_read_buffer for a single pass.
+            // **CANCELLABLE READ**: Use tokio::select! to allow immediate exit on WebRTC closure
             let n_read = if active_protocol == ActiveProtocol::Guacd {
                 // Ensure main_read_buffer has enough capacity *before* the read_buf call
                 // This is slightly different from its previous position but more direct for this path.
                 if main_read_buffer.capacity() - main_read_buffer.len() < MAX_READ_SIZE {
                     main_read_buffer.reserve(MAX_READ_SIZE);
                 }
-                match reader.read_buf(&mut main_read_buffer).await {
-                    // Read then append to main_read_buffer
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!(
-                            "Endpoint {}: Read error on connection {} (Guacd path): {}",
-                            channel_id_for_task, conn_no, e
-                        );
-                        break;
+                tokio::select! {
+                    biased;  // Check cancellation first for faster exit
+
+                    _ = cancel_token_for_task.cancelled() => {
+                        if unlikely!(should_log_connection(true)) {
+                            debug!(
+                                "Backend read cancelled due to WebRTC closure (channel_id: {}, conn_no: {})",
+                                channel_id_for_task, conn_no
+                            );
+                        }
+                        break;  // Exit immediately
+                    }
+
+                    read_result = tokio::time::timeout(
+                        READ_CANCELLATION_CHECK_INTERVAL,
+                        reader.read_buf(&mut main_read_buffer)
+                    ) => {
+                        match read_result {
+                            Ok(Ok(n)) => n,
+                            Ok(Err(e)) => {
+                                error!(
+                                    "Endpoint {}: Read error on connection {} (Guacd path): {}",
+                                    channel_id_for_task, conn_no, e
+                                );
+                                break;
+                            }
+                            Err(_timeout) => {
+                                // Read timeout - loop continues and checks cancellation
+                                // This allows cancellation to be detected within 500ms
+                                // instead of waiting for TCP timeout (2-3 seconds)
+                                continue;
+                            }
+                        }
                     }
                 }
             } else {
-                match reader.read_buf(&mut temp_read_buffer).await {
-                    // read_buf clears and fills temp_read_buffer
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!(
-                            "Endpoint {}: Read error on connection {} (Non-Guacd path): {}",
-                            channel_id_for_task, conn_no, e
-                        );
-                        break;
+                tokio::select! {
+                    biased;  // Check cancellation first for faster exit
+
+                    _ = cancel_token_for_task.cancelled() => {
+                        if unlikely!(should_log_connection(true)) {
+                            debug!(
+                                "Backend read cancelled due to WebRTC closure (channel_id: {}, conn_no: {})",
+                                channel_id_for_task, conn_no
+                            );
+                        }
+                        break;  // Exit immediately
+                    }
+
+                    read_result = tokio::time::timeout(
+                        READ_CANCELLATION_CHECK_INTERVAL,
+                        reader.read_buf(&mut temp_read_buffer)
+                    ) => {
+                        match read_result {
+                            Ok(Ok(n)) => n,
+                            Ok(Err(e)) => {
+                                error!(
+                                    "Endpoint {}: Read error on connection {} (Non-Guacd path): {}",
+                                    channel_id_for_task, conn_no, e
+                                );
+                                break;
+                            }
+                            Err(_timeout) => {
+                                // Read timeout - loop continues and checks cancellation
+                                // This allows cancellation to be detected within 500ms
+                                // instead of waiting for TCP timeout (2-3 seconds)
+                                continue;
+                            }
+                        }
                     }
                 }
             };
@@ -552,36 +610,39 @@ pub async fn setup_outbound_task(
                                         }
                                     }
 
-                                    // Log opcode action for verbose debugging
-                                    if unlikely!(should_log_connection(false)) {
-                                        debug!("Opcode action dispatched by expandable system (channel_id: {}, conn_no: {}, action: {:?}, instruction_len: {})",
-                                           channel_id_for_task, conn_no, action, instruction_len);
-                                    }
-
                                     // Dispatch based on opcode action
                                     match action {
                                         OpcodeAction::CloseConnection => {
-                                            warn!("Error opcode detected - preparing to close connection (channel_id: {}, conn_no: {}, expected_opcode: {})", channel_id_for_task, conn_no, crate::channel::guacd_parser::ERROR_OPCODE);
-
-                                            // **COLD PATH**: Error opcode detected
+                                            // **COLD PATH**: Error or disconnect opcode detected
+                                            // Parse instruction to determine which opcode it is
                                             match GuacdParser::peek_instruction(current_slice) {
-                                                Ok(error_instr) => {
-                                                    error!("Guacd sent error opcode - closing connection (channel_id: {}, conn_no: {}, opcode: {}, expected_opcode: {}, args: {:?})", channel_id_for_task, conn_no, error_instr.opcode, crate::channel::guacd_parser::ERROR_OPCODE, error_instr.args);
+                                                Ok(instr) => {
+                                                    if instr.opcode == crate::channel::guacd_parser::DISCONNECT_OPCODE {
+                                                        // Guacd sent disconnect instruction - clean connection closure
+                                                        warn!("Guacd sent disconnect instruction - closing connection cleanly (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
+                                                    } else if instr.opcode == crate::channel::guacd_parser::ERROR_OPCODE {
+                                                        // Guacd sent error instruction - error condition
+                                                        error!("Guacd sent error opcode - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
+                                                    } else {
+                                                        // Unknown close opcode
+                                                        warn!("Guacd sent close instruction - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
+                                                    }
                                                 }
                                                 Err(_) => {
-                                                    error!("Guacd sent error opcode but failed to parse args - closing connection (channel_id: {}, conn_no: {}, expected_opcode: {})", channel_id_for_task, conn_no, crate::channel::guacd_parser::ERROR_OPCODE);
+                                                    // Failed to parse - assume error
+                                                    error!("Guacd sent close opcode but failed to parse - closing connection (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
                                                 }
                                             }
 
-                                            // Forward the error instruction to the other side before closing
-                                            // Extract the instruction data for forwarding
-                                            let error_instruction_slice =
+                                            // Forward the close instruction to the other side before closing
+                                            // (could be error or disconnect opcode)
+                                            let close_instruction_slice =
                                                 &current_slice[..instruction_len];
 
-                                            // Send the error instruction immediately
+                                            // Send the close instruction immediately
                                             let data_frame = Frame::new_data_with_pool(
                                                 conn_no,
-                                                error_instruction_slice,
+                                                close_instruction_slice,
                                                 &buffer_pool,
                                             );
                                             let encoded_data =
@@ -592,18 +653,20 @@ pub async fn setup_outbound_task(
                                                 conn_no,
                                                 &event_sender,
                                                 &channel_id_for_task,
-                                                "Guacd error instruction forward",
+                                                "Guacd close instruction forward",
                                             )
                                             .await
                                             .is_err()
                                             {
                                                 error!(
-                                                    "Channel({}): Conn {}: Failed to forward Guacd error instruction",
+                                                    "Channel({}): Conn {}: Failed to forward Guacd close instruction",
                                                     channel_id_for_task, conn_no
                                                 );
                                             }
 
-                                            // Now send CloseConnection with GuacdError reason
+                                            // Now send CloseConnection control frame
+                                            // Use GuacdError reason for both error and disconnect opcodes
+                                            // (disconnect is a clean closure initiated by guacd)
                                             let mut temp_buf_for_control = buffer_pool.acquire();
                                             temp_buf_for_control.clear();
                                             temp_buf_for_control
@@ -623,13 +686,13 @@ pub async fn setup_outbound_task(
                                                 conn_no,
                                                 &event_sender,
                                                 &channel_id_for_task,
-                                                "Guacd error close",
+                                                "Guacd close",
                                             )
                                             .await
                                             .is_err()
                                             {
                                                 error!(
-                                                    "Channel({}): Conn {}: Failed to send CloseConnection frame for Guacd error via event-driven system",
+                                                    "Channel({}): Conn {}: Failed to send CloseConnection frame for Guacd close via event-driven system",
                                                     channel_id_for_task, conn_no
                                                 );
                                             }
@@ -869,7 +932,11 @@ pub async fn setup_outbound_task(
                                                 SpecialOpcode::Error => {
                                                     // This should not happen as Error maps to CloseConnection
                                                     unreachable!("Error opcode should map to CloseConnection action");
-                                                } // Add more handlers as needed:
+                                                }
+                                                SpecialOpcode::Disconnect => {
+                                                    // This should not happen as Disconnect maps to CloseConnection
+                                                    unreachable!("Disconnect opcode should map to CloseConnection action");
+                                                } // Add more handlers as needed
                                             }
                                         }
                                         OpcodeAction::Normal => {
@@ -1136,6 +1203,7 @@ pub async fn setup_outbound_task(
         data_tx, // Channel for sending data to guacd (including sync responses)
         backend_task: Some(backend_task), // Task that writes client data to guacd
         to_webrtc: Some(outbound_handle), // Task that reads guacd data and sends to client
+        cancel_read_task, // Cancellation token for immediate exit on WebRTC closure
     };
 
     channel.conns.insert(conn_no, conn);

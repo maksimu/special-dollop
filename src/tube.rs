@@ -695,17 +695,19 @@ impl Tube {
                             };
                             if let Err(e) = sender.send(signal_msg) {
                                 error!("Failed to send channel_closed signal (from on_data_channel) to Python: {} (tube_id: {}, channel_label: {})", e, tube_id_for_log, label_clone_for_run);
-                            } else {
+                            } else if unlikely!(crate::logger::is_verbose_logging()) {
                                 debug!("Successfully sent channel_closed signal (from on_data_channel) to Python. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
                             }
-                        } else {
-                            warn!("No signal_sender on peer_connection for channel_closed signal (from on_data_channel). (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                        } else if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!("No signal_sender on peer_connection for channel_closed signal (from on_data_channel). (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
                         }
-                    } else {
-                        debug!("Peer_connection was None, cannot send channel_closed signal (from on_data_channel). (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                    } else if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("Peer_connection was None, cannot send channel_closed signal (from on_data_channel - tube_id: {}, channel_label: {}) - this is normal during shutdown", tube_id_for_log, label_clone_for_run);
                     }
 
-                    debug!("on_data_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("on_data_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                    }
                 });
 
                 debug!("on_data_channel: Successfully set up and spawned channel task. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
@@ -1245,17 +1247,19 @@ impl Tube {
                     };
                     if let Err(e) = sender.send(signal_msg) {
                         error!("Failed to send channel_closed signal to Python: {} (tube_id: {}, channel_name: {})", e, tube_id_for_spawn, name_clone);
-                    } else {
+                    } else if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!("Successfully sent channel_closed signal to Python. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
                     }
-                } else {
-                    warn!("No signal_sender found on peer_connection to send channel_closed signal. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
+                } else if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("No signal_sender found on peer_connection to send channel_closed signal. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
                 }
-            } else {
-                warn!("Peer_connection was None, cannot send channel_closed signal. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
+            } else if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("Peer_connection was None, cannot send channel_closed signal (tube_id: {}, channel_name: {}) - this is normal during shutdown", tube_id_for_spawn, name_clone);
             }
 
-            debug!("create_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("create_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
+            }
         });
         debug!("create_channel: Successfully set up and spawned channel task. Returning listening port. (tube_id: {}, channel_name: {}, actual_listening_port: {:?})", self.id, name, actual_listening_port);
         Ok(actual_listening_port)

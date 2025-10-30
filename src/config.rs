@@ -51,15 +51,6 @@ pub const ICE_KEEPALIVE_INTERVAL_MS: u64 = 200;
 /// **Rationale**: Internal polling frequency. Too frequent = CPU overhead, too slow = stale data.
 /// Internal timing, not network-dependent.
 pub const STATS_COLLECTION_INTERVAL_SECS: u64 = 5;
-
-/// TURN credential refresh threshold (50 minutes before 1-hour expiry).
-///
-/// **Value**: 3000 seconds (50 minutes)
-///
-/// **Rationale**: TURN credentials expire after 1 hour. 50min threshold provides
-/// 10-minute safety margin for refresh operation. Credential lifecycle, not network timing.
-pub const TURN_CREDENTIAL_REFRESH_THRESHOLD_SECS: u64 = 3000;
-
 /// Internal protocol message delivery delay.
 ///
 /// **Value**: 100 milliseconds

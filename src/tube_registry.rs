@@ -239,7 +239,7 @@ async fn close_tube_async(
     }
 
     // 3. Explicit close (closes data channels + peer connection properly)
-    if let Err(e) = tube.close().await {
+    if let Err(e) = tube.close(reason).await {
         warn!(
             "Error during explicit tube close: {} (tube_id: {}) - proceeding with removal",
             e, tube_id
@@ -537,15 +537,6 @@ impl RegistryActor {
             )
             .await?;
 
-        let turn_credentials_timestamp = if ice_servers
-            .iter()
-            .any(|s| s.urls.iter().any(|u| u.contains("turn:")))
-        {
-            Some(Instant::now())
-        } else {
-            None
-        };
-
         // PHASE 2: FAST INSERT (DashMap - microseconds!)
         self.tubes.insert(tube_id.clone(), Arc::clone(&tube_arc));
         self.conversations
@@ -580,7 +571,6 @@ impl RegistryActor {
                 &req.client_version,
                 req.settings.clone(),
                 signal_sender_for_webrtc,
-                turn_credentials_timestamp,
             )
             .await
             .map_err(|e| anyhow!("Failed to create peer connection: {}", e))?;

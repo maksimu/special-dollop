@@ -134,6 +134,7 @@ pub async fn setup_outbound_task(
     let conn_closed_tx_for_task = channel.conn_closed_tx.clone(); // Clone the sender for the task
     let buffer_pool = channel.buffer_pool.clone();
     let is_channel_server_mode = channel.server_mode;
+    let channel_close_reason_arc = channel.channel_close_reason.clone(); // For checking if Python already closed
 
     // TRACE: Ultra-verbose task lifecycle logging (only in verbose mode)
     if unlikely!(crate::logger::is_verbose_logging()) {
@@ -664,37 +665,59 @@ pub async fn setup_outbound_task(
                                                 );
                                             }
 
-                                            // Now send CloseConnection control frame
-                                            // Use GuacdError reason for both error and disconnect opcodes
-                                            // (disconnect is a clean closure initiated by guacd)
-                                            let mut temp_buf_for_control = buffer_pool.acquire();
-                                            temp_buf_for_control.clear();
-                                            temp_buf_for_control
-                                                .extend_from_slice(&conn_no.to_be_bytes());
-                                            temp_buf_for_control
-                                                .put_u8(CloseConnectionReason::GuacdError as u8);
+                                            // Check if Python already sent a CloseConnection with specific reason
+                                            // (e.g., AI_CLOSED). If so, don't send a second one that would overwrite it.
+                                            let python_already_closed = channel_close_reason_arc
+                                                .try_lock()
+                                                .ok()
+                                                .and_then(|guard| *guard)
+                                                .is_some();
 
-                                            let close_frame = Frame::new_control_with_buffer(
-                                                ControlMessage::CloseConnection,
-                                                &mut temp_buf_for_control,
-                                            );
-                                            buffer_pool.release(temp_buf_for_control);
-                                            let encoded_close_frame =
-                                                close_frame.encode_with_pool(&buffer_pool);
-                                            if send_with_event_backpressure(
-                                                encoded_close_frame,
-                                                conn_no,
-                                                &event_sender,
-                                                &channel_id_for_task,
-                                                "Guacd close",
-                                            )
-                                            .await
-                                            .is_err()
-                                            {
-                                                error!(
-                                                    "Channel({}): Conn {}: Failed to send CloseConnection frame for Guacd close via event-driven system",
-                                                    channel_id_for_task, conn_no
+                                            if python_already_closed {
+                                                // Python already sent CloseConnection with the correct reason
+                                                // (e.g., AI_CLOSED = 15). Don't send a second one with GuacdError.
+                                                // This prevents overwriting AI_CLOSED with GuacdError in Vault.
+                                                if unlikely!(should_log_connection(false)) {
+                                                    debug!(
+                                                        "Channel({}): Conn {}: Skipping redundant CloseConnection (Python already sent with specific reason)",
+                                                        channel_id_for_task, conn_no
+                                                    );
+                                                }
+                                            } else {
+                                                // Send CloseConnection control frame
+                                                // Use GuacdError reason for both error and disconnect opcodes
+                                                // (disconnect is a clean closure initiated by guacd)
+                                                let mut temp_buf_for_control =
+                                                    buffer_pool.acquire();
+                                                temp_buf_for_control.clear();
+                                                temp_buf_for_control
+                                                    .extend_from_slice(&conn_no.to_be_bytes());
+                                                temp_buf_for_control.put_u8(
+                                                    CloseConnectionReason::GuacdError as u8,
                                                 );
+
+                                                let close_frame = Frame::new_control_with_buffer(
+                                                    ControlMessage::CloseConnection,
+                                                    &mut temp_buf_for_control,
+                                                );
+                                                buffer_pool.release(temp_buf_for_control);
+                                                let encoded_close_frame =
+                                                    close_frame.encode_with_pool(&buffer_pool);
+                                                if send_with_event_backpressure(
+                                                    encoded_close_frame,
+                                                    conn_no,
+                                                    &event_sender,
+                                                    &channel_id_for_task,
+                                                    "Guacd close",
+                                                )
+                                                .await
+                                                .is_err()
+                                                {
+                                                    error!(
+                                                        "Channel({}): Conn {}: Failed to send CloseConnection frame for Guacd close via event-driven system",
+                                                        channel_id_for_task, conn_no
+                                                    );
+                                                }
                                             }
                                             close_conn_and_break = true;
                                             break;
@@ -804,10 +827,15 @@ pub async fn setup_outbound_task(
                                             .await
                                             .is_err()
                                             {
-                                                error!(
-                                                    "Channel({}): Conn {}: Failed to forward sync to client",
+                                                // WebRTC channel permanently closed - exit task to prevent zombie
+                                                // The EventDrivenSender only returns Err for permanent closure,
+                                                // temporary failures (buffer full) are queued and return Ok.
+                                                debug!(
+                                                    "Channel({}): Conn {}: WebRTC channel closed, exiting guacd outbound task",
                                                     channel_id_for_task, conn_no
                                                 );
+                                                close_conn_and_break = true;
+                                                break;
                                             }
 
                                             // Consume the instruction from buffer

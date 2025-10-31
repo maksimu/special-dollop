@@ -394,7 +394,6 @@ pub struct WebRTCPeerConnection {
     // TURN credential refresh infrastructure (on-demand, not background task)
     ksm_config: Option<String>, // For fetching fresh credentials
     client_version: String,     // For API calls
-    turn_credentials_created_at: Arc<Mutex<Option<Instant>>>, // Track credential age for on-demand refresh
 
     // ICE gathering timing for minimum duration enforcement
     ice_gathering_start_time: Arc<Mutex<Option<Instant>>>,
@@ -480,7 +479,6 @@ impl WebRTCPeerConnection {
         conversation_id: Option<String>,
         ksm_config: Option<String>, // For TURN credential refresh
         client_version: String,     // For API calls
-        turn_credentials_created_at: Option<Instant>, // Timestamp when TURN credentials were created
     ) -> Result<Self, String> {
         debug!("Creating isolated WebRTC connection for tube {}", tube_id);
 
@@ -621,7 +619,6 @@ impl WebRTCPeerConnection {
             // Initialize TURN credential tracking (on-demand refresh)
             ksm_config,
             client_version,
-            turn_credentials_created_at: Arc::new(Mutex::new(turn_credentials_created_at)),
 
             // Initialize ICE gathering timing
             ice_gathering_start_time: Arc::new(Mutex::new(None)),
@@ -1886,42 +1883,8 @@ impl WebRTCPeerConnection {
         Ok(())
     }
 
-    /// Check if TURN credentials are older than 50 minutes (need refresh before 1h expiry)
-    /// Returns true if credentials should be refreshed before ICE restart
-    fn should_refresh_turn_credentials(&self) -> bool {
-        // If no timestamp recorded, we don't know credential age - assume fresh
-        if let Ok(guard) = self.turn_credentials_created_at.lock() {
-            if let Some(created_at) = *guard {
-                // Check if credentials are >50 minutes old
-                // This provides a 10-minute safety margin before 1-hour expiry
-                let age = created_at.elapsed();
-                if age > Duration::from_secs(crate::config::TURN_CREDENTIAL_REFRESH_THRESHOLD_SECS)
-                {
-                    debug!(
-                        "TURN credentials are {}s old (>50min threshold), refresh needed (tube_id: {})",
-                        age.as_secs(),
-                        self.tube_id
-                    );
-                    return true;
-                }
-                debug!(
-                    "TURN credentials are {}s old (<50min threshold), still fresh (tube_id: {})",
-                    age.as_secs(),
-                    self.tube_id
-                );
-                false
-            } else {
-                // No timestamp - either no TURN configured or credentials not tracked yet
-                false
-            }
-        } else {
-            // Failed to acquire lock - assume fresh to be safe
-            false
-        }
-    }
-
     /// Fetch fresh TURN credentials and update peer connection configuration
-    /// This is called on-demand before ICE restart when credentials are >50min old
+    /// This is called before every ICE restart (industry-standard pattern used by Google Meet, Slack, etc.)
     async fn fetch_fresh_turn_credentials_for_restart(&self) -> Result<(), String> {
         // Check if we have the required configuration for refresh
         let ksm_config = match &self.ksm_config {
@@ -1996,11 +1959,6 @@ impl WebRTCPeerConnection {
             .set_configuration(config)
             .await
             .map_err(|e| format!("Failed to apply updated configuration: {}", e))?;
-
-        // Update credential timestamp
-        if let Ok(mut guard) = self.turn_credentials_created_at.lock() {
-            *guard = Some(Instant::now());
-        }
 
         info!(
             "Fresh TURN credentials applied and ready for ICE restart (tube_id: {})",
@@ -2667,20 +2625,18 @@ impl WebRTCPeerConnection {
         self.connection_quality_degraded
             .store(true, Ordering::Relaxed);
 
-        // Check if TURN credentials need refreshing before creating new ICE session
-        // This ensures fresh credentials are used for the new TURN allocations
-        if self.should_refresh_turn_credentials() {
-            info!(
-                "TURN credentials >50min old, fetching fresh credentials before ICE restart (tube_id: {})",
-                self.tube_id
+        // Always fetch fresh TURN credentials before ICE restart (industry-standard pattern)
+        // This ensures the new ICE session uses the freshest possible credentials
+        info!(
+            "Fetching fresh TURN credentials for ICE restart (tube_id: {})",
+            self.tube_id
+        );
+        if let Err(e) = self.fetch_fresh_turn_credentials_for_restart().await {
+            warn!(
+                "Failed to refresh TURN credentials before ICE restart: {} (tube_id: {}) - continuing with existing credentials",
+                e, self.tube_id
             );
-            if let Err(e) = self.fetch_fresh_turn_credentials_for_restart().await {
-                warn!(
-                    "Failed to refresh TURN credentials before ICE restart: {} (tube_id: {}) - continuing with existing credentials",
-                    e, self.tube_id
-                );
-                // Continue with existing credentials - not a fatal error
-            }
+            // Continue with existing credentials - not a fatal error
         }
 
         // Generate new offer with ICE restart

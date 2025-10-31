@@ -48,7 +48,6 @@ fn test_tube_creation() {
             "ms16.5.0",
             settings,
             signal_tx,
-            None, // turn_credentials_created_at (not tracked in tests)
         );
         let timeout_fut = tokio::time::timeout(Duration::from_secs(5), connection_fut);
         match timeout_fut.await {
@@ -142,7 +141,7 @@ fn test_tube_channel_creation() {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            tube.create_peer_connection(None, true, false, "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), "ms16.5.0", settings.clone(), signal_tx, None)
+            tube.create_peer_connection(None, true, false, "TEST_MODE_KSM_CONFIG_1".to_string(), "TEST_CALLBACK_TOKEN_1".to_string(), "ms16.5.0", settings.clone(), signal_tx)
         ).await.map_or_else(
             |_| println!("Timeout creating peer connection, continuing with test"),
             |res| res.expect("Failed to create peer connection")
@@ -214,7 +213,6 @@ async fn test_tube_create_with_pc() {
         "ms16.5.0",
         settings,
         signal_tx,
-        None, // turn_credentials_created_at (not tracked in tests)
     );
     assert!(result.await.is_ok());
 }
@@ -238,7 +236,6 @@ async fn test_tube_webrtc_connection() {
         "ms16.5.0",
         settings,
         signal_tx,
-        None, // turn_credentials_created_at (not tracked in tests)
     )
     .await
     .expect("Failed to create peer connection");
@@ -264,7 +261,6 @@ async fn test_tube_create_channel() {
         "ms16.5.0",
         settings.clone(),
         signal_tx,
-        None, // turn_credentials_created_at (not tracked in tests)
     )
     .await
     .expect("Tube failed to create peer connection");
@@ -671,7 +667,6 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             "ms16.5.0",
             settings.clone(),
             signal_tx1,
-            None,
         )
         .await?;
 
@@ -685,7 +680,6 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
             "ms16.5.0",
             settings,
             signal_tx2,
-            None,
         )
         .await?;
 
@@ -930,7 +924,6 @@ async fn test_turn_allocation_cleanup_on_close() {
             "ms16.5.0",
             settings,
             signal_tx,
-            None,
         ),
     )
     .await
@@ -956,7 +949,7 @@ async fn test_turn_allocation_cleanup_on_close() {
     }
 
     // CRITICAL: Call explicit close() (this releases TURN allocation)
-    match tube.close().await {
+    match tube.close(None).await {
         Ok(_) => println!("✓ Explicit close() completed successfully"),
         Err(e) => println!("⚠ Close error (non-fatal for test): {}", e),
     }
@@ -1010,7 +1003,6 @@ async fn test_drop_without_close_warns() {
             "ms16.5.0",
             settings,
             signal_tx,
-            None,
         ),
     )
     .await

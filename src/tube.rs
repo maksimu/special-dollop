@@ -29,6 +29,10 @@ pub struct ChannelMetadata {
     pub recordings_enabled: bool,
 }
 
+// Type alias to avoid type complexity warning
+type ChannelCloseReasonMap =
+    Arc<TokioRwLock<HashMap<String, Arc<TokioMutex<Option<CloseConnectionReason>>>>>>;
+
 // A single tube holding a WebRTC peer connection and channels
 // NOTE: Tube should NOT be Clone! It's always used inside Arc<Tube>.
 // Cloning Tube creates multiple instances that each call Drop, causing double-frees and premature cleanup.
@@ -44,6 +48,8 @@ pub struct Tube {
     pub(crate) control_channel: Arc<TokioRwLock<Option<WebRTCDataChannel>>>,
     // Map of channel names to their shutdown notifiers (idiomatic async cancellation)
     pub channel_shutdown_notifiers: Arc<TokioRwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    // Map of channel names to their close reason trackers (for preventing duplicate CloseConnection)
+    pub(crate) channel_close_reasons: ChannelCloseReasonMap,
     // Active channel metadata for tracking callbacks and config
     pub(crate) active_channels: Arc<TokioRwLock<HashMap<String, ChannelMetadata>>>,
     // Indicates if this tube was created in a server or client context by its registry
@@ -114,6 +120,7 @@ impl Tube {
             data_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             control_channel: Arc::new(TokioRwLock::new(None)),
             channel_shutdown_notifiers: Arc::new(TokioRwLock::new(HashMap::new())),
+            channel_close_reasons: Arc::new(TokioRwLock::new(HashMap::new())),
             active_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             is_server_mode_context,
             status: Arc::new(TokioRwLock::new(TubeStatus::Initializing)),
@@ -149,7 +156,6 @@ impl Tube {
         client_version: &str,
         protocol_settings: HashMap<String, serde_json::Value>,
         signal_sender: UnboundedSender<SignalMessage>,
-        turn_credentials_created_at: Option<std::time::Instant>, // Track when TURN credentials were fetched
     ) -> Result<()> {
         debug!(
             "[TUBE_DEBUG] Tube {}: create_peer_connection called. trickle_ice: {}, turn_only: {}",
@@ -179,7 +185,6 @@ impl Tube {
             self.original_conversation_id.clone(), // Pass original conversation_id for WebRTC signals
             Some(ksm_config.clone()),              // For TURN credential refresh
             client_version.to_string(),            // For API calls
-            turn_credentials_created_at,           // Timestamp when TURN credentials were fetched
         )
         .await
         .map_err(|e| anyhow!("{}", e))?;
@@ -587,6 +592,9 @@ impl Tube {
                 tube.channel_shutdown_notifiers.write().await.insert(rtc_data_channel_label.clone(), shutdown_notifier);
                 debug!("on_data_channel: Shutdown notifier stored for channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
 
+                // Store the close reason tracker for this channel (for preventing duplicate CloseConnection)
+                let channel_close_reason_arc = Arc::clone(&owned_channel.channel_close_reason);
+                tube.channel_close_reasons.write().await.insert(rtc_data_channel_label.clone(), channel_close_reason_arc);
 
                 if owned_channel.server_mode {
                     if let Some(listen_addr_str) = owned_channel.local_listen_addr.clone() {
@@ -1122,6 +1130,13 @@ impl Tube {
             self.id, name
         );
 
+        // Store the close reason tracker for this channel (for preventing duplicate CloseConnection)
+        let channel_close_reason_arc = Arc::clone(&owned_channel.channel_close_reason);
+        self.channel_close_reasons
+            .write()
+            .await
+            .insert(name.to_string(), channel_close_reason_arc);
+
         let mut actual_listening_port: Option<u16> = None;
 
         if owned_channel.server_mode {
@@ -1287,6 +1302,21 @@ impl Tube {
         reason: Option<CloseConnectionReason>,
     ) -> Result<()> {
         let reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
+
+        // CRITICAL: Set channel_close_reason BEFORE sending CloseConnection frame
+        // This prevents the Guacamole outbound task from sending a second CloseConnection
+        // that would overwrite this one (e.g., AI_CLOSED gets overwritten by GuacdError)
+        let close_reasons = self.channel_close_reasons.read().await;
+        if let Some(close_reason_arc) = close_reasons.get(name) {
+            let mut guard = close_reason_arc.lock().await;
+            *guard = Some(reason);
+            debug!(
+                "Tube {}: Set channel_close_reason to {:?} before sending CloseConnection (channel: {})",
+                self.id, reason, name
+            );
+        }
+        drop(close_reasons);
+
         // First, try to send a CloseConnection message with the specified reason
         // This ensures the remote side knows why it was closed
         let data_channels = self.data_channels.read().await;
@@ -1746,10 +1776,14 @@ impl Tube {
     ///
     /// CRITICAL: Prevents TURN "400 Bad Request" errors by ensuring allocations
     /// are properly deallocated before permission refresh timers fire.
-    pub async fn close(&self) -> Result<(), String> {
+    pub async fn close(&self, reason: Option<CloseConnectionReason>) -> Result<(), String> {
         let tube_id = self.id.clone();
+        let close_reason = reason.unwrap_or(CloseConnectionReason::AdminClosed);
         let start_time = Instant::now();
-        info!("Tube {} explicit close starting", tube_id);
+        info!(
+            "Tube {} explicit close starting (reason: {:?})",
+            tube_id, close_reason
+        );
 
         // 1. Stop keepalive task to prevent spurious activity during shutdown
         if let Ok(mut task_guard) = self.keepalive_task.try_lock() {
@@ -1798,7 +1832,67 @@ impl Tube {
             );
         }
 
-        // 3. Close all data channels (sends CloseConnection to downstream peers)
+        // 3. Send CloseConnection control messages to all channels BEFORE physically closing them
+        // This ensures Vault receives the close reason (e.g., AI_CLOSED) before channels disconnect
+        let channel_names: Vec<String> =
+            { self.data_channels.read().await.keys().cloned().collect() };
+
+        if !channel_names.is_empty() {
+            debug!(
+                "Tube {}: Sending CloseConnection messages to {} channels (reason: {:?})",
+                tube_id,
+                channel_names.len(),
+                close_reason
+            );
+
+            // Set channel_close_reason for each channel to prevent duplicate messages
+            let close_reasons_guard = self.channel_close_reasons.read().await;
+            for name in &channel_names {
+                if let Some(close_reason_arc) = close_reasons_guard.get(name) {
+                    let mut guard = close_reason_arc.lock().await;
+                    *guard = Some(close_reason);
+                }
+            }
+            drop(close_reasons_guard);
+
+            // Send CloseConnection control message on each data channel
+            let data_channels_guard = self.data_channels.read().await;
+            for name in &channel_names {
+                if let Some(channel) = data_channels_guard.get(name) {
+                    // Build CloseConnection control message
+                    let mut close_data = Vec::with_capacity(5);
+                    close_data.extend_from_slice(&0u32.to_be_bytes()); // conn_no 0 (control)
+                    close_data.push(close_reason as u8); // reason code
+
+                    let buffer_pool = BufferPool::default();
+                    let close_frame = Frame::new_control_with_pool(
+                        ControlMessage::CloseConnection,
+                        &close_data,
+                        &buffer_pool,
+                    );
+
+                    let encoded = close_frame.encode_with_pool(&buffer_pool);
+                    if let Err(e) = channel.send(encoded).await {
+                        warn!("Failed to send CloseConnection to channel {}: {}", name, e);
+                    } else {
+                        debug!(
+                            "Sent CloseConnection({:?}) to channel {}",
+                            close_reason, name
+                        );
+                    }
+                }
+            }
+            drop(data_channels_guard);
+
+            // Give messages time to be transmitted before closing channels (200ms for reliability)
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            debug!(
+                "Tube {}: CloseConnection messages sent, waited 200ms for transmission",
+                tube_id
+            );
+        }
+
+        // 4. Close all data channels (physically close the WebRTC channels)
         let channels: Vec<_> = {
             let mut guard = self.data_channels.write().await;
             guard.drain().collect()

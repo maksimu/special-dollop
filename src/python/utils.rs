@@ -33,7 +33,7 @@ where
 /// Helper function to convert any PyAny to serde_json::Value
 pub fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value> {
     if py_obj.is_instance_of::<PyDict>() {
-        let dict = py_obj.downcast::<PyDict>()?;
+        let dict = py_obj.cast::<PyDict>()?;
         let mut map = serde_json::Map::new();
         for (key, value) in dict.iter() {
             let key_str = key
@@ -43,7 +43,7 @@ pub fn py_any_to_json_value(py_obj: &Bound<PyAny>) -> PyResult<serde_json::Value
         }
         Ok(serde_json::Value::Object(map))
     } else if py_obj.is_instance_of::<PyList>() {
-        let list = py_obj.downcast::<PyList>()?;
+        let list = py_obj.cast::<PyList>()?;
         let mut vec = Vec::new();
         for item in list.iter() {
             vec.push(py_any_to_json_value(&item)?);

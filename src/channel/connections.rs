@@ -267,9 +267,6 @@ pub async fn setup_outbound_task(
     // Create channel for backend task (client→guacd direction)
     let (data_tx, data_rx) = mpsc::unbounded_channel::<crate::models::ConnectionMessage>();
 
-    // Clone data_tx for use in outbound task (to send sync auto-responses back to guacd)
-    let data_tx_for_sync = data_tx.clone();
-
     // Create cancellation token for immediate exit on WebRTC closure
     let cancel_read_task = tokio_util::sync::CancellationToken::new();
     let cancel_token_for_task = cancel_read_task.clone();
@@ -760,53 +757,6 @@ pub async fn setup_outbound_task(
                                                 }
                                             }
 
-                                            if let Ok(peeked_instr) =
-                                                GuacdParser::peek_instruction(current_slice)
-                                            {
-                                                if peeked_instr.opcode == "sync"
-                                                    && !peeked_instr.args.is_empty()
-                                                {
-                                                    let timestamp = peeked_instr.args[0];
-
-                                                    if unlikely!(should_log_connection(false)) {
-                                                        debug!(
-                                                            "KEEPALIVE: Detected guacd sync, auto-responding immediately (channel_id: {}, conn_no: {}, timestamp: {})",
-                                                            channel_id_for_task, conn_no, timestamp
-                                                        );
-                                                    }
-
-                                                    // Send sync response back to guacd IMMEDIATELY (write directly to backend)
-                                                    let sync_response =
-                                                        GuacdParser::guacd_encode_instruction(
-                                                            &GuacdInstruction::new(
-                                                                "sync".to_string(),
-                                                                vec![timestamp.to_string()],
-                                                            ),
-                                                        );
-
-                                                    if let Err(e) = data_tx_for_sync.send(
-                                                        crate::models::ConnectionMessage::Data(
-                                                            sync_response,
-                                                        ),
-                                                    ) {
-                                                        error!(
-                                                            "Failed to send sync auto-response to guacd: {} (channel_id: {}, conn_no: {})",
-                                                            e, channel_id_for_task, conn_no
-                                                        );
-                                                    } else if unlikely!(should_log_connection(
-                                                        false
-                                                    )) {
-                                                        debug!(
-                                                            "KEEPALIVE: Sent sync auto-response to guacd (channel_id: {}, timestamp: {}, prevents 15s timeout)",
-                                                            channel_id_for_task, timestamp
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            // Still forward the original sync to client (for frame timing/display sync)
-                                            // This is intentional - both our auto-response AND client's eventual response are fine
-                                            // Guacd will accept the first response (ours) and ignore duplicates
                                             let instruction_slice =
                                                 &current_slice[..instruction_len];
                                             let data_frame = Frame::new_data_with_pool(

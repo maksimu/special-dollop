@@ -1104,6 +1104,37 @@ impl WebRTCPeerConnection {
             // Mark connection as permanently failed
             self.is_closing.store(true, Ordering::Release);
 
+            // Close peer connection (may not trigger state transition if already Disconnected)
+            match self.peer_connection.close().await {
+                Ok(()) => {
+                    info!(
+                        "Peer connection closed after circuit breaker trip (tube_id: {})",
+                        tube_id
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to close peer connection after circuit breaker trip (tube_id: {}): {}",
+                        tube_id, e
+                    );
+                }
+            }
+
+            // Explicitly close tube via registry - don't rely on state transition alone
+            // This ensures cleanup even if peer connection state doesn't change
+            if let Err(e) = crate::tube_registry::REGISTRY
+                .close_tube(
+                    tube_id,
+                    Some(crate::tube_protocol::CloseConnectionReason::TunnelClosed),
+                )
+                .await
+            {
+                error!(
+                    "Failed to close tube after circuit breaker trip: {} (tube_id: {})",
+                    e, tube_id
+                );
+            }
+
             return Err(WebRTCError::IceRestartFailed {
                 tube_id: tube_id.clone(),
                 attempts: failure_count,
@@ -1142,22 +1173,35 @@ impl WebRTCPeerConnection {
                         );
 
                         // Close the peer connection to trigger cleanup cascade
-                        // This will change state to Closed, which triggers tube closure
+                        // NOTE: peer_connection.close() may not trigger state change if already Disconnected
                         match peer_connection.close().await {
                             Ok(()) => {
                                 info!(
                                     "Peer connection closed after ICE restart timeout (tube_id: {})",
                                     tube_id
                                 );
-                                // State change to Closed will trigger tube closure automatically via handler
                             }
                             Err(e) => {
                                 error!(
                                     "Failed to close peer connection after ICE restart timeout (tube_id: {}): {}",
                                     tube_id, e
                                 );
-                                // Connection is already failed/unusable anyway
                             }
+                        }
+
+                        // Explicitly close tube via registry - don't rely on state transition alone
+                        // This ensures cleanup even if peer connection state doesn't change from Disconnected to Closed
+                        if let Err(e) = crate::tube_registry::REGISTRY
+                            .close_tube(
+                                &tube_id,
+                                Some(crate::tube_protocol::CloseConnectionReason::Timeout),
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to close tube after ICE restart timeout: {} (tube_id: {})",
+                                e, tube_id
+                            );
                         }
                     }
                 });

@@ -135,7 +135,14 @@ async fn close_tube_async(
     let tube = tubes
         .get(&tube_id)
         .map(|entry| entry.value().clone())
-        .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
+        .ok_or_else(|| {
+            // Tube already removed - idempotent close is OK
+            debug!(
+                "Tube {} already removed from registry (idempotent close)",
+                tube_id
+            );
+            anyhow!("Tube not found: {}", tube_id)
+        })?;
 
     // CONCURRENT CLOSE PROTECTION: Check if already closing
     // Use compare_exchange to atomically check-and-set
@@ -150,10 +157,13 @@ async fn close_tube_async(
         .is_err(); // is_err() means it was already true
 
     if already_closing {
-        warn!(
-            "Tube {} is already being closed by another task - skipping duplicate close",
+        debug!(
+            "Tube {} is already being closed by another task - returning success (idempotent)",
             tube_id
         );
+        // Idempotent: Another task is closing it, that's fine.
+        // Don't wait - just return success immediately.
+        // The other task will complete the cleanup.
         return Ok(());
     }
 
@@ -163,7 +173,7 @@ async fn close_tube_async(
     {
         let mut status = tube.status.write().await;
         *status = TubeStatus::Closed;
-        debug!("  ✓ Status set to Closed (tube_id: {})", tube_id);
+        debug!("Status set to Closed (tube_id: {})", tube_id);
     }
 
     // 2. Send connection_close callbacks for channels (graceful shutdown)

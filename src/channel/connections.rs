@@ -715,6 +715,21 @@ pub async fn setup_outbound_task(
                                                         channel_id_for_task, conn_no
                                                     );
                                                 }
+
+                                                // Store the close reason so internal_handle_connection_close knows this was a GuacdError
+                                                // This allows the tube to be closed with the correct reason instead of generic UpstreamClosed
+                                                if let Ok(mut guard) =
+                                                    channel_close_reason_arc.try_lock()
+                                                {
+                                                    *guard =
+                                                        Some(CloseConnectionReason::GuacdError);
+                                                    if unlikely!(should_log_connection(false)) {
+                                                        debug!(
+                                                            "Stored GuacdError as close reason for channel (channel_id: {}, conn_no: {})",
+                                                            channel_id_for_task, conn_no
+                                                        );
+                                                    }
+                                                }
                                             }
                                             close_conn_and_break = true;
                                             break;
@@ -1146,7 +1161,7 @@ pub async fn setup_outbound_task(
         if unlikely!(should_log_connection(true)) {
             // Critical: connection closing
             debug!(
-                "Endpoint {}: Backend→WebRTC task for connection {} exited",
+                "Endpoint {}: Backend->WebRTC task for connection {} exited",
                 channel_id_for_task, conn_no
             );
         }

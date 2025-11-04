@@ -681,10 +681,17 @@ impl Channel {
                         if is_critical_closure {
                             self.should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
 
+                            // Read the actual close reason that was stored by the outbound task
+                            // This preserves GuacdError vs UpstreamClosed distinction
+                            let actual_close_reason = {
+                                let guard = self.channel_close_reason.lock().await;
+                                guard.unwrap_or(CloseConnectionReason::UpstreamClosed)
+                            };
+
                             // Explicitly close the failed data connection first
                             // The outbound task signaled it exited, but did NOT remove from DashMap
-                            info!("Closing failed data connection ({}) due to critical upstream closure. (channel_id: {})", closed_conn_no, self.channel_id);
-                            if let Err(e) = self.close_backend(closed_conn_no, CloseConnectionReason::UpstreamClosed).await {
+                            info!("Closing failed data connection ({}) due to critical upstream closure. (channel_id: {}, reason: {:?})", closed_conn_no, self.channel_id, actual_close_reason);
+                            if let Err(e) = self.close_backend(closed_conn_no, actual_close_reason).await {
                                 warn!("Error closing failed data connection ({}) during critical shutdown. (channel_id: {}, error: {})", closed_conn_no, self.channel_id, e);
                             }
 
@@ -692,7 +699,7 @@ impl Channel {
                             // This sends a CloseConnection message to the client for the channel itself.
                             if closed_conn_no != 0 { // Avoid self-triggering if conn_no 0 was what closed to signal this.
                                 info!("Shutting down control connection (0) due to critical upstream closure. (channel_id: {})", self.channel_id);
-                                if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed).await {
+                                if let Err(e) = self.close_backend(0, actual_close_reason).await {
                                     debug!("Error explicitly closing control connection (0) during critical shutdown. (channel_id: {}, error: {})", self.channel_id, e);
                                 }
                             }

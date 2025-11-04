@@ -716,6 +716,38 @@ impl Tube {
                     if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!("on_data_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
                     }
+
+                    // Debug: Log the actual close_reason to diagnose auto-close issues
+                    debug!(
+                        "on_data_channel: Channel exited with close_reason: {:?} (tube_id: {}, channel: {})",
+                        close_reason, tube_id_for_log, label_clone_for_run
+                    );
+
+                    // If channel closed due to GuacdError (the ONLY reason we auto-close tubes),
+                    // close the tube to prevent it sitting in Disconnected state forever.
+                    // Other error reasons (ProtocolError, ConfigurationError, etc.) are handled
+                    // by Python layer which explicitly calls close_tube() - we don't auto-close those.
+                    if let Some(CloseConnectionReason::GuacdError) = close_reason {
+                        // Check if tube is already being closed (don't trigger duplicate close)
+                        let is_closing = tube_arc.closing.load(std::sync::atomic::Ordering::Acquire);
+                        if !is_closing {
+                            info!(
+                                "Channel closed with GuacdError - closing tube (tube_id: {}, channel: {})",
+                                tube_id_for_log, label_clone_for_run
+                            );
+                            if let Err(e) = crate::tube_registry::REGISTRY.close_tube(&tube_id_for_log, Some(CloseConnectionReason::GuacdError)).await {
+                                error!(
+                                    "Failed to close tube after GuacdError: {} (tube_id: {}, channel: {})",
+                                    e, tube_id_for_log, label_clone_for_run
+                                );
+                            }
+                        } else {
+                            debug!(
+                                "Tube already closing - skipping auto-close for GuacdError (tube_id: {}, channel: {})",
+                                tube_id_for_log, label_clone_for_run
+                            );
+                        }
+                    }
                 });
 
                 debug!("on_data_channel: Successfully set up and spawned channel task. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);

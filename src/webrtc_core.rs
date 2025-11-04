@@ -2480,6 +2480,20 @@ impl WebRTCPeerConnection {
                     "Connection state check (tube_id: {}, connection_state: {:?})",
                     tube_id_clone, connection_state
                 );
+
+                // Self-terminate if connection is in terminal state
+                // This prevents zombie keepalive tasks if explicit close somehow fails
+                // Failed/Closed are terminal states - no point keeping alive a dead connection
+                if matches!(
+                    connection_state,
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+                ) {
+                    info!(
+                        "NAT timeout prevention stopping - connection {:?} is terminal (tube_id: {})",
+                        connection_state, tube_id_clone
+                    );
+                    break;
+                }
             }
 
             info!(

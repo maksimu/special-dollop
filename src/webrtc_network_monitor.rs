@@ -287,7 +287,7 @@ impl ConnectionMigrator {
         from_interface: String,
         to_interface: String,
     ) -> WebRTCResult<()> {
-        let migration_id = format!("{}:{}→{}", tube_id, from_interface, to_interface);
+        let migration_id = format!("{}:{}->{}", tube_id, from_interface, to_interface);
 
         info!("Starting connection migration: {}", migration_id);
 
@@ -360,7 +360,7 @@ impl ConnectionMigrator {
         // The caller (NetworkMonitor) should have already validated this before calling start_migration.
 
         debug!(
-            "Migration preparation completed: {} ({}→{})",
+            "Migration preparation completed: {} ({}->{})",
             migration_id, from_interface, to_interface
         );
         Ok(())
@@ -453,7 +453,7 @@ impl ConnectionMigrator {
         };
 
         debug!(
-            "Migration cleanup completed: {} ({}→{}, took {}ms)",
+            "Migration cleanup completed: {} ({}->{}, took {}ms)",
             migration_id, from_interface, to_interface, migration_time_ms
         );
 
@@ -899,7 +899,7 @@ impl NetworkMonitor {
         from_interface: &str,
         to_interface: &str,
     ) -> Option<MigrationState> {
-        let migration_id = format!("{}:{}→{}", tube_id, from_interface, to_interface);
+        let migration_id = format!("{}:{}->{}", tube_id, from_interface, to_interface);
         self.connection_migrator.get_migration_status(&migration_id)
     }
 

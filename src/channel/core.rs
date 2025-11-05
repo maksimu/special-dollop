@@ -688,33 +688,45 @@ impl Channel {
                                 guard.unwrap_or(CloseConnectionReason::UpstreamClosed)
                             };
 
-                            // Explicitly close the failed data connection first
-                            // The outbound task signaled it exited, but did NOT remove from DashMap
-                            info!("Closing failed data connection ({}) due to critical upstream closure. (channel_id: {}, reason: {:?})", closed_conn_no, self.channel_id, actual_close_reason);
-                            if let Err(e) = self.close_backend(closed_conn_no, actual_close_reason).await {
-                                warn!("Error closing failed data connection ({}) during critical shutdown. (channel_id: {}, error: {})", closed_conn_no, self.channel_id, e);
-                            }
+                            // Send disconnect to guacd backend so it doesn't wait 15s for user response
+                            // Don't send over WebRTC (that can hang if channel is closing)
+                            info!("Critical Guacd connection closed, sending disconnect to guacd (channel_id: {}, conn_no: {}, reason: {:?})", self.channel_id, closed_conn_no, actual_close_reason);
 
-                            // Attempt to gracefully close the control connection (conn_no 0) as well, if not already closing.
-                            // This sends a CloseConnection message to the client for the channel itself.
-                            if closed_conn_no != 0 { // Avoid self-triggering if conn_no 0 was what closed to signal this.
-                                info!("Shutting down control connection (0) due to critical upstream closure. (channel_id: {})", self.channel_id);
-                                if let Err(e) = self.close_backend(0, actual_close_reason).await {
-                                    debug!("Error explicitly closing control connection (0) during critical shutdown. (channel_id: {}, error: {})", self.channel_id, e);
+                            // Send disconnect instruction to guacd backend (NOT to client over WebRTC)
+                            if let Some(conn_ref) = self.conns.get(&closed_conn_no) {
+                                if !conn_ref.data_tx.is_closed() {
+                                    // Send disconnect to guacd so it doesn't wait for user response
+                                    let disconnect_instruction = GuacdInstruction::new("disconnect".to_string(), vec![]);
+                                    let disconnect_bytes = GuacdParser::guacd_encode_instruction(&disconnect_instruction);
+                                    let disconnect_message = crate::models::ConnectionMessage::Data(disconnect_bytes);
+
+                                    if let Err(e) = conn_ref.data_tx.send(disconnect_message) {
+                                        debug!("Failed to send disconnect to guacd backend: {}", e);
+                                    } else {
+                                        debug!("Sent disconnect instruction to guacd backend");
+                                    }
+
+                                    // Send EOF for TCP-level shutdown
+                                    let _ = conn_ref.data_tx.send(crate::models::ConnectionMessage::Eof);
                                 }
                             }
 
-                            // Clean up any remaining connections beyond the two we explicitly closed above
-                            self.log_final_stats().await;
-                            if let Err(e) = self.cleanup_all_connections().await {
-                                warn!("Error during cleanup after critical closure (channel_id: {}, error: {})", self.channel_id, e);
+                            // Brief delay to let guacd receive the disconnect before we close TCP
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                            // Now remove from DashMap
+                            if let Some((_, mut conn)) = self.conns.remove(&closed_conn_no) {
+                                conn.graceful_shutdown(closed_conn_no, &self.channel_id).await;
+                                debug!("Removed failed connection {} from registry", closed_conn_no);
                             }
 
-                            // Instead of just breaking, return the specific error to indicate why the channel is stopping.
-                            // The main loop will break due to should_exit, but this provides the reason to the caller of run().
-                            // However, the run loop continues until should_exit is polled again.
-                            // For immediate exit and propagation: directly return.
-                            return Err(ChannelError::CriticalUpstreamClosed(self.channel_id.clone()));
+                            // NOTE: Don't call cleanup_all_connections() here - we already closed everything above
+                            // Calling it again causes hangs when trying to send over already-closed WebRTC channels
+
+                            // Break out of the select! loop to exit cleanly
+                            // The normal cleanup path at lines 730-733 will run after the loop exits
+                            info!("Channel run loop exiting due to critical upstream closure (channel_id: {}, reason: {:?})", self.channel_id, actual_close_reason);
+                            break;
                         }
 
                     } else {
@@ -731,6 +743,26 @@ impl Channel {
         self.log_final_stats().await;
 
         self.cleanup_all_connections().await?;
+
+        // Check if we exited due to a critical error and return appropriate result
+        // The close reason was stored by the outbound task before signaling closure
+        let final_close_reason = {
+            let guard = self.channel_close_reason.lock().await;
+            *guard
+        };
+
+        if let Some(reason) = final_close_reason {
+            if reason.is_critical() {
+                info!(
+                    "Channel run loop completed with critical error (channel_id: {}, reason: {:?})",
+                    self.channel_id, reason
+                );
+                return Err(ChannelError::CriticalUpstreamClosed(
+                    self.channel_id.clone(),
+                ));
+            }
+        }
+
         Ok(())
     }
 

@@ -640,9 +640,12 @@ impl Tube {
 
                     // Clone the Arc so we can access it after run() consumes the channel
                     let close_reason_arc = owned_channel.channel_close_reason.clone();
+                    info!("on_data_channel: About to call channel.run() (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
                     let run_result = owned_channel.run().await;
+                    info!("on_data_channel: channel.run() completed with result: {:?} (tube_id: {}, channel_label: {})", run_result.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)), tube_id_for_log, label_clone_for_run);
                     // Get the close reason after run completes - use try_lock to avoid blocking
                     let close_reason = close_reason_arc.try_lock().ok().and_then(|guard| *guard);
+                    debug!("on_data_channel: Retrieved close_reason: {:?} (tube_id: {}, channel_label: {})", close_reason, tube_id_for_log, label_clone_for_run);
 
                     let outcome_details: String = match &run_result {
                         Ok(()) => {
@@ -717,36 +720,12 @@ impl Tube {
                         debug!("on_data_channel: channel.run() task finished and cleaned up. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
                     }
 
-                    // Debug: Log the actual close_reason to diagnose auto-close issues
-                    debug!(
-                        "on_data_channel: Channel exited with close_reason: {:?} (tube_id: {}, channel: {})",
-                        close_reason, tube_id_for_log, label_clone_for_run
-                    );
-
-                    // If channel closed due to GuacdError (the ONLY reason we auto-close tubes),
-                    // close the tube to prevent it sitting in Disconnected state forever.
-                    // Other error reasons (ProtocolError, ConfigurationError, etc.) are handled
-                    // by Python layer which explicitly calls close_tube() - we don't auto-close those.
-                    if let Some(CloseConnectionReason::GuacdError) = close_reason {
-                        // Check if tube is already being closed (don't trigger duplicate close)
-                        let is_closing = tube_arc.closing.load(std::sync::atomic::Ordering::Acquire);
-                        if !is_closing {
-                            info!(
-                                "Channel closed with GuacdError - closing tube (tube_id: {}, channel: {})",
-                                tube_id_for_log, label_clone_for_run
-                            );
-                            if let Err(e) = crate::tube_registry::REGISTRY.close_tube(&tube_id_for_log, Some(CloseConnectionReason::GuacdError)).await {
-                                error!(
-                                    "Failed to close tube after GuacdError: {} (tube_id: {}, channel: {})",
-                                    e, tube_id_for_log, label_clone_for_run
-                                );
-                            }
-                        } else {
-                            debug!(
-                                "Tube already closing - skipping auto-close for GuacdError (tube_id: {}, channel: {})",
-                                tube_id_for_log, label_clone_for_run
-                            );
-                        }
+                    // Debug: Log the actual close_reason to diagnose issues
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "on_data_channel: Channel exited with close_reason: {:?} (tube_id: {}, channel: {})",
+                            close_reason, tube_id_for_log, label_clone_for_run
+                        );
                     }
                 });
 

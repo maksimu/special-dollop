@@ -1,0 +1,29 @@
+[package]
+name = "guacr-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal emulation library for SSH and Telnet handlers"
+
+[dependencies]
+# Workspace dependencies
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# Terminal emulation
+vt100 = "0.15"
+
+# Image rendering
+image = "0.25"
+
+# Font rendering
+fontdue = "0.9"
+
+# Base64 encoding for Guacamole protocol
+base64.workspace = true
+
+# Serialization for asciicast
+serde.workspace = true
+serde_json.workspace = true

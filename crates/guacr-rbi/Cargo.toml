@@ -1,0 +1,31 @@
+[package]
+name = "guacr-rbi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Browser Isolation (RBI) handler for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-rdp = { path = "../guacr-rdp" }  # Reuse framebuffer
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+#anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# Browser engines (to be implemented)
+# headless_chrome = "1.0"  # Chrome - production ready
+# servo would go here if/when it becomes viable
+
+# Utilities
+#base64.workspace = true
+
+[features]
+default = []
+chrome = []  # Use headless Chrome (when implemented)
+# servo feature removed - servo crate doesn't exist on crates.io yet

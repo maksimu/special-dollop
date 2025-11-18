@@ -1,0 +1,29 @@
+[package]
+name = "guacr-database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Database protocol handlers (MySQL, PostgreSQL, SQL Server) for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# Database clients
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "postgres"], default-features = false }
+tiberius = { version = "0.12", features = ["sql-browser-tokio", "rustls"], default-features = false }
+
+# Image processing for spreadsheet view
+image = "0.25"
+
+# Utilities
+base64.workspace = true

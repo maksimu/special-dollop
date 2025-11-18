@@ -1,0 +1,19 @@
+[package]
+name = "guacr-handlers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol handler trait and registry for guacr remote desktop protocols"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+log.workspace = true
+
+# Additional dependencies
+parking_lot = "0.12"

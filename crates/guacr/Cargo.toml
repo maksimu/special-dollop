@@ -1,0 +1,31 @@
+[package]
+name = "guacr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Protocol handlers for remote desktop access (SSH, RDP, VNC, Telnet, Database protocols, RBI)"
+
+[dependencies]
+# Core handler traits and registry
+guacr-handlers = { path = "../guacr-handlers", version = "1.1.7" }
+
+# Protocol handlers
+guacr-ssh = { path = "../guacr-ssh", version = "1.1.7", optional = true }
+guacr-telnet = { path = "../guacr-telnet", version = "1.1.7", optional = true }
+guacr-rdp = { path = "../guacr-rdp", version = "1.1.7", optional = true }
+guacr-vnc = { path = "../guacr-vnc", version = "1.1.7", optional = true }
+guacr-sftp = { path = "../guacr-sftp", version = "1.1.7", optional = true }
+guacr-database = { path = "../guacr-database", version = "1.1.7", optional = true }
+guacr-rbi = { path = "../guacr-rbi", version = "1.1.7", optional = true }
+
+[features]
+default = ["ssh", "telnet"]
+ssh = ["guacr-ssh"]
+telnet = ["guacr-telnet"]
+rdp = ["guacr-rdp"]
+vnc = ["guacr-vnc"]
+sftp = ["guacr-sftp"]
+database = ["guacr-database"]
+rbi = ["guacr-rbi"]
+all = ["ssh", "telnet", "rdp", "vnc", "sftp", "database", "rbi"]

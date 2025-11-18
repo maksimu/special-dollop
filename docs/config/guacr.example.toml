@@ -1,0 +1,260 @@
+# Guacr Configuration File
+# Copy this to guacr.toml and customize for your environment
+
+[server]
+# Bind address for Guacamole protocol connections
+bind_address = "0.0.0.0:4822"
+
+# Enable WebSocket support
+websocket_enabled = true
+websocket_port = 4823
+
+# Maximum concurrent connections
+max_connections = 10000
+
+# Connection timeout (duration string: "30s", "5m", etc.)
+connection_timeout = "30s"
+
+# Number of worker threads (0 = number of CPU cores)
+worker_threads = 0
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: "json" or "pretty"
+format = "json"
+
+# Log output: "stdout", "stderr", or file path
+output = "stdout"
+
+# Enable colored output (only for pretty format)
+color = true
+
+[metrics]
+# Enable Prometheus metrics
+enabled = true
+
+# Prometheus HTTP endpoint port
+prometheus_port = 9090
+
+# OpenTelemetry exporter endpoint (optional)
+opentelemetry_endpoint = "http://localhost:4317"
+
+# Metrics export interval
+export_interval = "10s"
+
+[health]
+# Health check HTTP port
+port = 8080
+
+# Readiness probe checks database connections
+readiness_check_db = true
+
+[protocols.ssh]
+enabled = true
+max_connections = 5000
+default_port = 22
+keepalive_interval = "30s"
+
+# Terminal settings
+default_rows = 24
+default_cols = 80
+default_font = "monospace"
+default_font_size = 12
+
+[protocols.telnet]
+enabled = true
+max_connections = 1000
+default_port = 23
+
+[protocols.rdp]
+enabled = true
+max_connections = 2000
+default_port = 3389
+
+# Security mode: "any", "rdp", "nla", "tls"
+security_mode = "nla"
+
+# Desktop size
+default_width = 1920
+default_height = 1080
+
+# Enable audio
+enable_audio = true
+
+# Enable RemoteFX
+enable_remotefx = true
+
+[protocols.vnc]
+enabled = true
+max_connections = 1000
+default_port = 5900
+
+# Encoding preferences (in order)
+encodings = ["tight", "zrle", "hextile", "raw"]
+
+# Compression level (0-9)
+compression_level = 6
+
+[protocols.database]
+enabled = true
+
+# MySQL
+mysql = true
+mysql_max_connections = 500
+mysql_default_port = 3306
+
+# PostgreSQL
+postgresql = true
+postgresql_max_connections = 500
+postgresql_default_port = 5432
+
+# SQL Server
+sqlserver = true
+sqlserver_max_connections = 500
+sqlserver_default_port = 1433
+
+# SQL query timeout
+query_timeout = "30s"
+
+[protocols.rbi]
+# Remote Browser Isolation
+enabled = true
+max_browser_instances = 50
+
+# Path to Chromium/Chrome executable
+chromium_path = "/usr/bin/chromium"
+
+# Browser arguments
+chromium_args = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+
+# Frame capture rate (FPS)
+capture_fps = 30
+
+# Screen resolution
+default_width = 1920
+default_height = 1080
+
+[distribution]
+# Mode: "standalone" or "distributed"
+mode = "standalone"
+
+# gRPC endpoint for distributed mode
+grpc_enabled = false
+grpc_bind_address = "0.0.0.0:50051"
+
+# Service discovery
+service_discovery = "consul"
+consul_address = "http://localhost:8500"
+
+# Load balancing strategy: "round-robin", "least-connections", "random"
+load_balance_strategy = "least-connections"
+
+[security]
+# Enable TLS for client connections
+tls_enabled = false
+tls_cert = "/path/to/cert.pem"
+tls_key = "/path/to/key.pem"
+
+# Require client certificates (mTLS)
+require_client_cert = false
+client_ca = "/path/to/ca.pem"
+
+# Rate limiting
+rate_limit_enabled = true
+rate_limit_per_ip = 100  # connections per second
+
+# Maximum clipboard size (with units: KB, MB, GB)
+max_clipboard_size = "10MB"
+
+# Allowed clipboard directions: "both", "client-to-server", "server-to-client", "none"
+clipboard_direction = "both"
+
+[performance]
+# Enable io_uring (Linux only)
+enable_io_uring = true
+
+# Enable SIMD optimizations
+enable_simd = true
+
+# Enable GPU acceleration (requires hardware support)
+enable_gpu = false
+
+# Buffer pool size (number of buffers to pre-allocate)
+buffer_pool_size = 1024
+
+# Buffer size (per buffer)
+buffer_size = "8MB"
+
+# Frame rate limiting (0 = unlimited)
+max_fps = 60
+
+# Zero-copy optimizations
+enable_zero_copy = true
+
+[recording]
+# Enable session recording
+enabled = false
+
+# Storage backend: "local", "s3", "azure"
+storage = "local"
+
+# Local storage path
+local_path = "/var/lib/guacr/recordings"
+
+# S3 configuration (if storage = "s3")
+s3_bucket = "guacr-recordings"
+s3_region = "us-east-1"
+s3_endpoint = ""  # Optional for S3-compatible services
+
+# Azure configuration (if storage = "azure")
+azure_account = ""
+azure_container = "guacr-recordings"
+
+# Recording format: "guac" (native), "mp4" (requires GPU)
+format = "guac"
+
+# Retention period
+retention_days = 90
+
+[audit]
+# Enable audit logging
+enabled = true
+
+# Audit log output: "stdout", "file", "syslog"
+output = "stdout"
+
+# File path (if output = "file")
+file_path = "/var/log/guacr/audit.log"
+
+# Syslog facility (if output = "syslog")
+syslog_facility = "local0"
+
+# Log connection events
+log_connections = true
+
+# Log authentication events
+log_auth = true
+
+# Log input events (keyboard, mouse)
+log_input = false  # Can be verbose
+
+# Log clipboard events
+log_clipboard = true
+
+[experimental]
+# Enable experimental features (not production-ready)
+
+# WebRTC support
+enable_webrtc = false
+
+# H.264 video streaming
+enable_h264 = false
+
+# AI-powered anomaly detection
+enable_ai_detection = false

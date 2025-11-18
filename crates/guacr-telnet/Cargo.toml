@@ -1,0 +1,22 @@
+[package]
+name = "guacr-telnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telnet protocol handler for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# Utilities
+base64.workspace = true

@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/guacr",
+    "crates/guacr-handlers",
+    "crates/guacr-terminal",
+    "crates/guacr-ssh",
+    "crates/guacr-telnet",
+    "crates/guacr-rdp",
+    "crates/guacr-vnc",
+    "crates/guacr-database",
+    "crates/guacr-rbi",
+    "crates/guacr-sftp",
+]
+
+[workspace.package]
+version = "1.1.7"
+edition = "2021"
+license = "MIT"
+authors = ["Keeper Security Engineering <engineering@keeper.io>"]
+
+[workspace.dependencies]
+# Core async
+tokio = { version = "1.48.0", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7.17"
+async-trait = "0.1.89"
+
+# Data structures
+bytes = "1.11.0"
+dashmap = "6.1.0"
+smallvec = "1.15.1"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+# Error handling
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+
+# Logging
+log = "0.4.28"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter", "json", "tracing-log"] }
+
+# Utilities
+uuid = { version = "1.18.1", features = ["v4"] }
+base64 = "0.22.1"
+lazy_static = "1.5.0"
+once_cell = "1.21.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = false

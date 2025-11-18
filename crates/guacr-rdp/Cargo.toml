@@ -1,0 +1,27 @@
+[package]
+name = "guacr-rdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDP protocol handler for guacr remote desktop"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# RDP client - using ironrdp (pure Rust)
+ironrdp = "0.13.0"
+
+# Image processing
+image = "0.25.9"
+
+# Utilities
+base64.workspace = true

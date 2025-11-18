@@ -1,0 +1,25 @@
+[package]
+name = "guacr-vnc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VNC protocol handler for guacr remote desktop"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-rdp = { path = "../guacr-rdp" }  # Reuse framebuffer
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# VNC client
+# TODO: Add vnc client crate when available
+
+# Utilities
+base64.workspace = true

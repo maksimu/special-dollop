@@ -2,7 +2,7 @@ use async_trait::async_trait;
 #[allow(unused_imports)] // Engine trait needed for .decode() method
 use base64::Engine;
 use bytes::Bytes;
-use guacr_handlers::{HandlerError, HandlerStats, HealthStatus, ProtocolHandler};
+use guacr_handlers::{EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler};
 use guacr_terminal::{x11_keysym_to_bytes, DirtyTracker, TerminalEmulator, TerminalRenderer};
 use log::{debug, error, info, trace};
 use russh::client;
@@ -75,6 +75,10 @@ impl SshHandler {
 impl ProtocolHandler for SshHandler {
     fn name(&self) -> &str {
         "ssh"
+    }
+
+    fn as_event_based(&self) -> Option<&dyn EventBasedHandler> {
+        Some(self)
     }
 
     async fn connect(
@@ -321,6 +325,10 @@ impl ProtocolHandler for SshHandler {
         // Bidirectional forwarding
         loop {
             tokio::select! {
+                // Use biased selection to prioritize rendering over input
+                // This prevents the "one char behind" issue
+                biased;
+
                 // SSH channel messages -> Terminal -> Client
                 Some(msg) = channel.wait() => {
                     match msg {
@@ -401,7 +409,7 @@ impl ProtocolHandler for SshHandler {
                                             let pressed = pressed_val.starts_with('1');
 
                                             // Convert to terminal bytes
-                                            let bytes = x11_keysym_to_bytes(keysym, pressed);
+                                            let bytes = x11_keysym_to_bytes(keysym, pressed, None);
                                             if !bytes.is_empty() {
                                                 channel.data(&bytes[..]).await
                                                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
@@ -519,7 +527,6 @@ impl ProtocolHandler for SshHandler {
                                         scroll_lines,        // height: number of scrolled lines
                                         char_width,          // char_width: dynamic cell width
                                         char_height,         // char_height: dynamic cell height
-                                        0,                   // layer: default layer
                                     );
                                     for instr in clear_instrs {
                                         to_client.send(Bytes::from(instr)).await
@@ -569,7 +576,6 @@ impl ProtocolHandler for SshHandler {
                                         scroll_lines,  // height: number of scrolled lines
                                         char_width,    // char_width: dynamic cell width
                                         char_height,   // char_height: dynamic cell height
-                                        0,             // layer: default layer
                                     );
                                     for instr in clear_instrs {
                                         to_client.send(Bytes::from(instr)).await
@@ -743,7 +749,7 @@ mod tests {
     #[test]
     fn test_ssh_handler_new() {
         let handler = SshHandler::with_defaults();
-        assert_eq!(handler.name(), "ssh");
+        assert_eq!(ProtocolHandler::name(&handler), "ssh");
     }
 
     #[tokio::test]
@@ -764,5 +770,32 @@ mod tests {
         let (keysym, pressed) = result.unwrap();
         assert_eq!(keysym, 65293);
         assert!(pressed);
+    }
+}
+
+// Event-based handler implementation
+#[async_trait]
+impl EventBasedHandler for SshHandler {
+    fn name(&self) -> &str {
+        "ssh"
+    }
+
+    async fn connect_with_events(
+        &self,
+        params: HashMap<String, String>,
+        callback: Arc<dyn EventCallback>,
+        from_client: mpsc::Receiver<Bytes>,
+    ) -> Result<(), HandlerError> {
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(128);
+
+        let callback_clone = Arc::clone(&callback);
+        tokio::spawn(async move {
+            while let Some(msg) = to_client_rx.recv().await {
+                callback_clone.send_instruction(msg);
+            }
+        });
+
+        self.connect(params, to_client_tx, from_client).await?;
+        Ok(())
     }
 }

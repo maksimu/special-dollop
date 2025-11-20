@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::error::Result;
+use crate::events::EventBasedHandler;
 
 /// Health status of a protocol handler
 #[derive(Debug, Clone, PartialEq)]
@@ -127,5 +128,14 @@ pub trait ProtocolHandler: Send + Sync {
     /// Initialize handler with configuration (optional)
     async fn initialize(&self, _config: HashMap<String, String>) -> Result<()> {
         Ok(())
+    }
+
+    /// Get as event-based handler if supported
+    ///
+    /// Returns a reference to the EventBasedHandler trait if this handler
+    /// implements it, allowing zero-copy integration with keeper-pam-webrtc-rs.
+    /// Returns None if the handler only supports the channel-based interface.
+    fn as_event_based(&self) -> Option<&dyn EventBasedHandler> {
+        None
     }
 }

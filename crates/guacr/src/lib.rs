@@ -34,7 +34,15 @@
 
 // Re-export core handler traits and registry
 pub use guacr_handlers::{
-    handle_guacd_with_handlers, HandlerStats, HealthStatus, ProtocolHandler,
+    handle_guacd_with_handlers,
+    // Zero-copy event-based interface
+    EventBasedHandler,
+    EventCallback,
+    HandlerEvent,
+    HandlerStats,
+    HealthStatus,
+    InstructionSender,
+    ProtocolHandler,
     ProtocolHandlerRegistry,
 };
 

@@ -20,3 +20,15 @@ log.workspace = true
 
 # Utilities
 base64.workspace = true
+
+[features]
+default = []
+threat-detection = ["guacr-threat-detection", "uuid"]
+
+[dependencies.guacr-threat-detection]
+path = "../guacr-threat-detection"
+optional = true
+
+[dependencies.uuid]
+workspace = true
+optional = true

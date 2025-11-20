@@ -2,9 +2,12 @@
 //
 // Provides isolated browser sessions via headless Chrome/Chromium
 
+mod browser_client;
+mod chrome_session;
 mod handler;
 
-pub use handler::RbiHandler;
+pub use browser_client::BrowserClient;
+pub use handler::{RbiBackend, RbiConfig, RbiHandler};
 
 use thiserror::Error;
 

@@ -14,18 +14,33 @@ guacr-rdp = { path = "../guacr-rdp" }  # Reuse framebuffer
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures = "0.3"
 #anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
-# Browser engines (to be implemented)
-# headless_chrome = "1.0"  # Chrome - production ready
+# Browser engines
+# Option 1: chromiumoxide (recommended - async, well-maintained)
+chromiumoxide = { version = "0.7", optional = true }
+
+# Option 2: headless_chrome (synchronous alternative)
+# headless_chrome = "1.0", optional = true
+
+# Option 3: Servo (future - when v1.0 releases)
 # servo would go here if/when it becomes viable
 
+# Protocol parsing
+guacr-protocol = { path = "../guacr-protocol" }
+
+# JSON for CDP commands
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 # Utilities
-#base64.workspace = true
+base64.workspace = true
+reqwest = { version = "0.11", features = ["stream"], optional = true }
 
 [features]
 default = []
-chrome = []  # Use headless Chrome (when implemented)
+chrome = ["chromiumoxide", "reqwest"]  # Use chromiumoxide for Chrome CDP (API needs verification)
 # servo feature removed - servo crate doesn't exist on crates.io yet

@@ -5,8 +5,10 @@
 mod mariadb;
 mod mongodb;
 mod mysql;
+mod mysql_executor;
 mod oracle;
 mod postgresql;
+mod query_executor;
 mod redis;
 mod spreadsheet;
 mod sql_terminal;

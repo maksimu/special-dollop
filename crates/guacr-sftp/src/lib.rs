@@ -2,11 +2,13 @@
 //
 // Provides secure file transfer over SSH with graphical file browser
 
+mod channel_adapter;
 mod file_browser;
 mod handler;
 
+pub use channel_adapter::ChannelStreamAdapter;
 pub use file_browser::FileBrowser;
-pub use handler::SftpHandler;
+pub use handler::{SftpConfig, SftpHandler};
 
 use thiserror::Error;
 

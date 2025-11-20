@@ -21,5 +21,18 @@ log.workspace = true
 # VNC client
 # TODO: Add vnc client crate when available
 
+# Protocol parsing
+guacr-protocol = { path = "../guacr-protocol" }
+
 # Utilities
 base64.workspace = true
+
+# SFTP integration (optional)
+guacr-sftp = { path = "../guacr-sftp", optional = true }
+russh = { version = "0.46", optional = true }
+russh-sftp = { version = "2.1", optional = true }
+russh-keys = { version = "0.46", optional = true }
+
+[features]
+default = []
+sftp = ["guacr-sftp", "russh", "russh-sftp", "russh-keys"]

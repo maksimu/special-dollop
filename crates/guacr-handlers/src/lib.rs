@@ -5,16 +5,20 @@
 // managing and dispatching to handlers.
 
 mod error;
+mod events;
 mod handler;
 mod integration;
+mod multi_channel;
 mod registry;
 
 #[cfg(test)]
 mod mock;
 
 pub use error::{HandlerError, Result};
+pub use events::{EventBasedHandler, EventCallback, HandlerEvent, InstructionSender};
 pub use handler::{HandlerStats, HealthStatus, ProtocolHandler};
 pub use integration::handle_guacd_with_handlers;
+pub use multi_channel::{SimpleMultiChannelSender, WebRTCDataChannel};
 pub use registry::ProtocolHandlerRegistry;
 
 #[cfg(test)]

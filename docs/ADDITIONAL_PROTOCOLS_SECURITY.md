@@ -1,5 +1,7 @@
 # Additional Protocol Support & Security Analysis
 
+**Note**: This document is a reference/planning document. Current implementation status is in `docs/PROTOCOL_IMPLEMENTATION_STATUS.md`.
+
 ## Security-First Protocol Expansion
 
 Since security is the #1 priority, let's analyze additional protocols with security implications.

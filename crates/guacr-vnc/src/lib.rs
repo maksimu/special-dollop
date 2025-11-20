@@ -9,9 +9,18 @@
 // let handler = VncHandler::with_defaults();
 // ```
 
+// Supporting module (VNC protocol implementation)
+mod vnc_protocol;
+
+// Main handler (all logic in one file - SSH pattern)
 mod handler;
 
-pub use handler::VncHandler;
+#[cfg(feature = "sftp")]
+mod sftp_integration;
+
+// Public exports
+pub use handler::{VncConfig, VncHandler};
+pub use vnc_protocol::{VncPixelFormat, VncProtocol, VncRectangle};
 
 use thiserror::Error;
 
@@ -22,6 +31,9 @@ pub enum VncError {
 
     #[error("VNC authentication failed: {0}")]
     AuthenticationFailed(String),
+
+    #[error("VNC protocol error: {0}")]
+    ProtocolError(String),
 
     #[error("Handler error: {0}")]
     HandlerError(#[from] guacr_handlers::HandlerError),

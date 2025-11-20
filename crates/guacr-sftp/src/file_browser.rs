@@ -156,4 +156,111 @@ mod tests {
         assert_eq!(browser.selected_index, Some(0));
         assert!(browser.get_selected().is_some());
     }
+
+    #[test]
+    fn test_file_browser_multiple_entries() {
+        let entries = vec![
+            FileEntry {
+                name: "file1.txt".to_string(),
+                size: 1024,
+                is_directory: false,
+                permissions: "rw-r--r--".to_string(),
+                modified: "2024-01-01".to_string(),
+            },
+            FileEntry {
+                name: "dir1".to_string(),
+                size: 0,
+                is_directory: true,
+                permissions: "drwxr-xr-x".to_string(),
+                modified: "2024-01-02".to_string(),
+            },
+            FileEntry {
+                name: "file2.txt".to_string(),
+                size: 2048,
+                is_directory: false,
+                permissions: "rw-r--r--".to_string(),
+                modified: "2024-01-03".to_string(),
+            },
+        ];
+
+        let mut browser = FileBrowser::new("/".to_string(), entries);
+
+        // Click second entry (directory)
+        browser.handle_click(54); // y = 30 + 24 = 54 (second row)
+        assert_eq!(browser.selected_index, Some(1));
+        assert_eq!(browser.get_selected().unwrap().name, "dir1");
+        assert!(browser.get_selected().unwrap().is_directory);
+
+        // Click third entry
+        browser.handle_click(78); // y = 30 + 48 = 78 (third row)
+        assert_eq!(browser.selected_index, Some(2));
+        assert_eq!(browser.get_selected().unwrap().name, "file2.txt");
+    }
+
+    #[test]
+    fn test_file_browser_click_path_bar() {
+        let entries = vec![FileEntry {
+            name: "file1.txt".to_string(),
+            size: 1024,
+            is_directory: false,
+            permissions: "rw-r--r--".to_string(),
+            modified: "2024-01-01".to_string(),
+        }];
+
+        let mut browser = FileBrowser::new("/".to_string(), entries);
+        browser.handle_click(50); // Select first file
+        assert_eq!(browser.selected_index, Some(0));
+
+        // Click in path bar (y < 30) should not change selection
+        browser.handle_click(20);
+        assert_eq!(browser.selected_index, Some(0)); // Unchanged
+    }
+
+    #[test]
+    fn test_file_browser_click_out_of_bounds() {
+        let entries = vec![FileEntry {
+            name: "file1.txt".to_string(),
+            size: 1024,
+            is_directory: false,
+            permissions: "rw-r--r--".to_string(),
+            modified: "2024-01-01".to_string(),
+        }];
+
+        let mut browser = FileBrowser::new("/".to_string(), entries);
+
+        // Click beyond available entries
+        browser.handle_click(1000); // Way beyond
+        assert_eq!(browser.selected_index, None);
+    }
+
+    #[test]
+    fn test_file_entry_structure() {
+        let entry = FileEntry {
+            name: "test.txt".to_string(),
+            size: 12345,
+            is_directory: false,
+            permissions: "rw-r--r--".to_string(),
+            modified: "2024-01-01 12:00".to_string(),
+        };
+
+        assert_eq!(entry.name, "test.txt");
+        assert_eq!(entry.size, 12345);
+        assert!(!entry.is_directory);
+        assert_eq!(entry.permissions, "rw-r--r--");
+    }
+
+    #[test]
+    fn test_file_entry_directory() {
+        let entry = FileEntry {
+            name: "mydir".to_string(),
+            size: 0,
+            is_directory: true,
+            permissions: "drwxr-xr-x".to_string(),
+            modified: "2024-01-01".to_string(),
+        };
+
+        assert!(entry.is_directory);
+        assert_eq!(entry.size, 0);
+        assert!(entry.permissions.starts_with('d'));
+    }
 }

@@ -8,8 +8,7 @@ description = "SFTP file transfer protocol handler for guacr"
 [dependencies]
 # Local dependencies
 guacr-handlers = { path = "../guacr-handlers" }
-guacr-ssh = { path = "../guacr-ssh" }  # Reuse SSH connection
-guacr-rdp = { path = "../guacr-rdp" }  # Reuse framebuffer for file browser
+guacr-terminal = { path = "../guacr-terminal" }
 
 # Workspace dependencies
 tokio.workspace = true
@@ -20,8 +19,8 @@ thiserror.workspace = true
 log.workspace = true
 
 # SSH/SFTP
-russh = "0.45"
-russh-keys = "0.45"
+russh = "0.46"
+russh-keys = "0.46"
 russh-sftp = "2.1"
 
 # Image for file browser rendering
@@ -29,3 +28,5 @@ image = "0.25"
 
 # Utilities
 base64.workspace = true
+chrono = "0.4"
+futures = "0.3"

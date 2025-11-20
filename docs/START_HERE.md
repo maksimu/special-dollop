@@ -20,6 +20,14 @@ Rust-based WebRTC tunneling library with **native protocol handlers** for secure
 - Bidirectional clipboard (OSC 52 + bracketed paste)
 - Dirty region optimization with scroll detection
 - All input responsive (no lag)
+- ✅ Control character handling (Ctrl+C, etc.)
+- ✅ Scrollback buffer (~150 lines)
+- ✅ Mouse events for vim/tmux (X11 mouse sequences)
+- ✅ Host key verification (known_hosts)
+- ✅ Session recording (Asciicast + Guacamole .ses formats)
+- ✅ Recording transports (Files, S3, ZeroMQ, channels)
+- ✅ AI threat detection with BAML REST API
+- ✅ Automatic session termination on threats
 
 ### Architecture - JPEG + Font Rendering
 
@@ -115,29 +123,7 @@ Remote Servers
 
 ## TODO (Prioritized)
 
-### Phase 1: SSH Handler Polish
-- [x] ~~Private key authentication~~ (DONE: All formats supported)
-- [x] ~~Clipboard integration~~ (DONE: OSC 52 + bracketed paste)
-- [x] ~~Better logging~~ (DONE: Trace/debug for hot paths)
-- [ ] Send control + chars through like ctl+c  
-- [ ] Scrollback buffer (~150 lines)
-- [ ] Mouse events for vim/tmux (~80 lines)
-- [ ] Host key verification (~80 lines)
-
-### Phase 2: File Transfer & Advanced
-- [ ] SFTP file transfer integration (~500 lines)
-- [ ] Custom glyph protocol (7-25× bandwidth savings)
-- [ ] AI threat detection integration
-- [ ] Session termination on threat detection
-
-### Phase 3: Other Protocols
-- [ ] RDP: Complete ironrdp integration
-- [ ] VNC: Add VNC client calls
-- [ ] Databases: Wire up actual query execution
-- [ ] Telnet: Similar improvements to SSH
-- [ ] RBI: Remote Browser Isolation
-
-### Phase 4: New Protocol - Container Management (K8s/Docker)
+### Phase 1: Container Management Protocol (K8s/Docker)
 - [ ] Protocol handler for Kubernetes/Docker exec sessions
 - [ ] Container list view (spreadsheet-like, similar to database handlers)
 - [ ] Container logs streaming
@@ -145,6 +131,120 @@ Remote Servers
 - [ ] File copy to/from containers
 - [ ] Resource metrics display (CPU, memory)
 - [ ] Multi-container view support
+
+### Phase 2: Performance & Completeness
+
+#### Hardware Encoder Implementations (Medium Priority)
+
+**What**: Implement actual hardware encoders (NVENC, QuickSync, VideoToolbox, VAAPI) instead of just framework.
+
+**Why**: Critical for 4K video performance. Currently falls back to JPEG.
+
+**Effort**: 2-3 days per encoder (platform-specific)
+
+**Status**: Framework ready, needs actual implementations
+
+**Important Notes**: 
+- Hardware encoders require client-side video playback support
+- Guacamole protocol supports `video` instruction (H.264 streaming)
+- Vault client needs `VideoPlayer` implementation (currently returns empty array)
+- Current JPEG via `img` works fine, but H.264 would be 2-3x more bandwidth efficient
+
+**Build Configuration for Python Wheels**:
+
+When building Python wheels (keeper-pam-webrtc-rs), use:
+```toml
+guacr = { 
+    path = "../pam-guacr/crates/guacr", 
+    features = ["ssh", "telnet", "rdp", "vnc", "sftp"],
+    optional = true 
+}
+```
+
+**Do NOT enable hardware encoding features** (`nvenc`, `quicksync`, `videotoolbox`, `vaapi`) because:
+- ❌ They don't work in Docker build containers (no GPU access)
+- ❌ nvenc, quicksync, vaapi are placeholders that don't actually work yet
+- ❌ Build would require CUDA toolkit, Intel Media SDK, libva libraries installed
+- ✅ Software JPEG encoding works everywhere and is 5-10x faster than PNG
+
+**Hardware encoder code is kept in pam-guacr for future implementation**, but don't enable those features when building Python wheels.
+
+**Platform-specific builds** (future):
+- Linux wheel: Build in Docker without hardware features
+- macOS wheel: Could enable `videotoolbox` feature (only one that works)
+- Single wheel with all features: Not possible until placeholder encoders become real implementations
+
+#### RDPGFX Channel Integration (Medium Priority)
+
+**What**: Full RDPGFX channel support for hardware-accelerated graphics.
+
+**Why**: Better performance for 4K video streaming.
+
+**Effort**: 1-2 days
+
+**Status**: Framework ready
+
+#### VNC Encoding Types (Low Priority)
+
+**What**: Implement CopyRect, Hextile, ZRLE, Tight encodings.
+
+**Why**: Better bandwidth efficiency for VNC.
+
+**Effort**: 1 day per encoding type
+
+**Status**: CopyRect framework ready
+
+#### Database Query Execution (Low Priority)
+
+**What**: Wire up PostgreSQL, SQL Server, Oracle, MongoDB, Redis query execution (similar to MySQL).
+
+**Why**: Complete database handler support.
+
+**Effort**: 2-3 hours per database (reuse MySQL pattern)
+
+**Status**: MySQL complete, others pending
+
+### Phase 3: UI-Dependent Features
+
+#### Custom Glyph Protocol
+
+**What**: Custom glyph caching for 7-25× bandwidth savings
+
+**Why**: Significant bandwidth optimization for terminal protocols
+
+**Status**: Requires UI updates
+
+## Completed Phases
+
+### ✅ Phase 1: SSH Handler Polish - COMPLETE
+- ✅ Private key authentication (all formats supported)
+- ✅ Clipboard integration (OSC 52 + bracketed paste)
+- ✅ Better logging (trace/debug for hot paths)
+- ✅ Control character handling (Ctrl+C, etc.)
+- ✅ Scrollback buffer (~150 lines)
+- ✅ Mouse events for vim/tmux (X11 mouse sequences)
+- ✅ Host key verification (known_hosts)
+- ✅ Session recording (Asciicast + Guacamole .ses formats)
+- ✅ Recording transports (Files, S3, ZeroMQ, channels)
+
+### ✅ Phase 2: File Transfer & Advanced - COMPLETE
+- ✅ Telnet improvements (scrollback, mouse events, threat detection, dirty tracking)
+- ✅ SFTP file transfer integration
+  - ✅ Handler structure and security (chroot, path validation)
+  - ✅ File browser rendering
+  - ✅ Guacamole protocol integration (file upload/download)
+  - ✅ Mouse click handling for navigation
+  - ✅ Complete russh-sftp API integration
+- ✅ AI threat detection integration (BAML REST API)
+  - ✅ SSH/Telnet handler integration
+  - ✅ Configurable threat levels and auto-termination
+  - ✅ Tag-based rules (deny/allow regex patterns)
+
+### ✅ Phase 3: Other Protocols - COMPLETE
+- ✅ RDP: Complete ironrdp integration with hardware encoding framework
+- ✅ VNC: Full VNC protocol implementation
+- ✅ Databases: MySQL query execution wired up
+- ✅ RBI: chromiumoxide integration with file download support
 
 ## Key Files
 

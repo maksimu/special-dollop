@@ -1,8 +1,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use guacr_handlers::{HandlerError, HandlerStats, HealthStatus, ProtocolHandler};
+use guacr_handlers::{
+    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    ProtocolHandler,
+};
 use log::info;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::sql_terminal::SqlTerminal;
@@ -45,6 +49,10 @@ impl OracleHandler {
 impl ProtocolHandler for OracleHandler {
     fn name(&self) -> &str {
         "oracle"
+    }
+
+    fn as_event_based(&self) -> Option<&dyn EventBasedHandler> {
+        Some(self)
     }
 
     async fn connect(
@@ -148,6 +156,40 @@ impl ProtocolHandler for OracleHandler {
     }
 }
 
+// Event-based handler implementation for zero-copy integration
+#[async_trait]
+impl EventBasedHandler for OracleHandler {
+    fn name(&self) -> &str {
+        "oracle"
+    }
+
+    async fn connect_with_events(
+        &self,
+        params: HashMap<String, String>,
+        callback: Arc<dyn EventCallback>,
+        from_client: mpsc::Receiver<Bytes>,
+    ) -> Result<(), HandlerError> {
+        // Wrap the channel-based interface
+        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
+
+        let sender = InstructionSender::new(callback);
+        let sender_arc = Arc::new(sender);
+
+        // Spawn task to forward channel messages to event callback (zero-copy)
+        let sender_clone = Arc::clone(&sender_arc);
+        tokio::spawn(async move {
+            while let Some(msg) = handler_rx.recv().await {
+                sender_clone.send(msg); // Zero-copy: Bytes is reference-counted
+            }
+        });
+
+        // Call the existing channel-based connect method
+        self.connect(params, to_client, from_client).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +197,10 @@ mod tests {
     #[test]
     fn test_oracle_handler_new() {
         let handler = OracleHandler::with_defaults();
-        assert_eq!(handler.name(), "oracle");
+        assert_eq!(
+            <_ as guacr_handlers::ProtocolHandler>::name(&handler),
+            "oracle"
+        );
     }
 
     #[test]

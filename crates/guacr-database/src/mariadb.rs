@@ -11,12 +11,14 @@ pub type MariaDbHandler = MySqlHandler;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use guacr_handlers::ProtocolHandler;
 
     #[test]
     fn test_mariadb_is_mysql_compatible() {
         let handler = MariaDbHandler::with_defaults();
         // MariaDB uses same handler, but will be registered as "mariadb"
-        assert_eq!(handler.name(), "mysql");
+        assert_eq!(
+            <_ as guacr_handlers::ProtocolHandler>::name(&handler),
+            "mysql"
+        );
     }
 }

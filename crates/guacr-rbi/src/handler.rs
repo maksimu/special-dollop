@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use guacr_handlers::{HandlerError, HandlerStats, HealthStatus, ProtocolHandler};
-use guacr_rdp::FrameBuffer;
+use guacr_handlers::{
+    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    ProtocolHandler,
+};
 use log::info;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Remote Browser Isolation (RBI) handler
@@ -42,6 +45,17 @@ pub struct RbiConfig {
     pub resource_limits: ResourceLimits,
     pub capture_fps: u32,
     pub servo_allowlist: Vec<String>, // Domains known to work with Servo
+    pub download_config: DownloadConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadConfig {
+    pub enabled: bool,           // Enable downloads (default: false for security)
+    pub max_file_size_mb: usize, // Maximum file size (default: 10MB)
+    pub allowed_extensions: Vec<String>, // Allowed file extensions (e.g., ["pdf", "txt"])
+    pub blocked_extensions: Vec<String>, // Blocked file extensions (e.g., ["exe", "bat"])
+    pub require_approval: bool,  // Require user approval (future)
+    pub max_downloads_per_session: usize, // Rate limiting (default: 5)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +63,16 @@ pub enum PopupHandling {
     Block,                  // Block all popups (default, most secure)
     AllowList(Vec<String>), // Only allow specific domains (e.g., OAuth)
     NavigateMainWindow,     // Navigate main window to popup URL
+}
+
+impl PopupHandling {
+    /// Check if downloads should be enabled based on popup handling config
+    #[allow(dead_code)]
+    fn is_download_enabled(&self) -> bool {
+        // Downloads are controlled separately via DownloadConfig
+        // This is just a helper for Chrome flags
+        false // Default: block downloads
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +103,40 @@ impl Default for RbiConfig {
                 "wikipedia.org".to_string(),
                 "rust-lang.org".to_string(),
             ],
+            download_config: DownloadConfig::default(),
+        }
+    }
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Block by default (like KCM)
+            max_file_size_mb: 10,
+            allowed_extensions: vec![
+                "pdf".to_string(),
+                "txt".to_string(),
+                "csv".to_string(),
+                "json".to_string(),
+                "xml".to_string(),
+                "png".to_string(),
+                "jpg".to_string(),
+                "jpeg".to_string(),
+                "gif".to_string(),
+            ],
+            blocked_extensions: vec![
+                "exe".to_string(),
+                "bat".to_string(),
+                "sh".to_string(),
+                "dmg".to_string(),
+                "msi".to_string(),
+                "app".to_string(),
+                "deb".to_string(),
+                "rpm".to_string(),
+                "zip".to_string(), // Can contain executables
+            ],
+            require_approval: true,
+            max_downloads_per_session: 5,
         }
     }
 }
@@ -99,11 +157,15 @@ impl ProtocolHandler for RbiHandler {
         "http"
     }
 
+    fn as_event_based(&self) -> Option<&dyn EventBasedHandler> {
+        Some(self)
+    }
+
     async fn connect(
         &self,
         params: HashMap<String, String>,
-        _to_client: mpsc::Sender<Bytes>,
-        mut from_client: mpsc::Receiver<Bytes>,
+        to_client: mpsc::Sender<Bytes>,
+        from_client: mpsc::Receiver<Bytes>,
     ) -> guacr_handlers::Result<()> {
         info!("RBI handler starting");
 
@@ -221,11 +283,25 @@ impl ProtocolHandler for RbiHandler {
         //
         // Reference: docs/guacr/RBI_SERVO_AND_DATABASE_OPTIONS.md
 
-        let mut _framebuffer =
-            FrameBuffer::new(self.config.default_width, self.config.default_height);
+        // Get browser dimensions from params or use defaults
+        let width = params
+            .get("width")
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(self.config.default_width);
+        let height = params
+            .get("height")
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(self.config.default_height);
 
-        // Stub event loop - implement above plan
-        while from_client.recv().await.is_some() {}
+        // Use browser client wrapper
+        use crate::browser_client::BrowserClient;
+        let mut browser_client = BrowserClient::new(width, height, self.config.clone());
+
+        // Connect and handle session
+        browser_client
+            .connect(url, to_client, from_client)
+            .await
+            .map_err(HandlerError::ConnectionFailed)?;
 
         info!("RBI handler ended");
         Ok(())
@@ -240,6 +316,40 @@ impl ProtocolHandler for RbiHandler {
     }
 }
 
+// Event-based handler implementation for zero-copy integration
+#[async_trait]
+impl EventBasedHandler for RbiHandler {
+    fn name(&self) -> &str {
+        "http"
+    }
+
+    async fn connect_with_events(
+        &self,
+        params: HashMap<String, String>,
+        callback: Arc<dyn EventCallback>,
+        from_client: mpsc::Receiver<Bytes>,
+    ) -> Result<(), HandlerError> {
+        // Wrap the channel-based interface
+        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
+
+        let sender = InstructionSender::new(callback);
+        let sender_arc = Arc::new(sender);
+
+        // Spawn task to forward channel messages to event callback (zero-copy)
+        let sender_clone = Arc::clone(&sender_arc);
+        tokio::spawn(async move {
+            while let Some(msg) = handler_rx.recv().await {
+                sender_clone.send(msg); // Zero-copy: Bytes is reference-counted
+            }
+        });
+
+        // Call the existing channel-based connect method
+        self.connect(params, to_client, from_client).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +357,10 @@ mod tests {
     #[test]
     fn test_rbi_handler_new() {
         let handler = RbiHandler::with_defaults();
-        assert_eq!(handler.name(), "http");
+        assert_eq!(
+            <_ as guacr_handlers::ProtocolHandler>::name(&handler),
+            "http"
+        );
     }
 
     #[test]

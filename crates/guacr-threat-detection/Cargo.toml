@@ -1,0 +1,26 @@
+[package]
+name = "guacr-threat-detection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI threat detection using BAML REST API"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# HTTP client for BAML REST API
+reqwest = { version = "0.12", features = ["json"] }
+
+# Regex for tag matching
+regex = "1.11"
+
+# Utilities
+uuid.workspace = true

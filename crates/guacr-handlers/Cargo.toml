@@ -15,5 +15,8 @@ bytes.workspace = true
 dashmap.workspace = true
 log.workspace = true
 
+# Protocol support
+guacr-protocol = { path = "../guacr-protocol" }
+
 # Additional dependencies
 parking_lot = "0.12"

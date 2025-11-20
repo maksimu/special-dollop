@@ -27,3 +27,6 @@ image = "0.25"
 
 # Utilities
 base64.workspace = true
+
+# Guacamole protocol parsing
+guacr-protocol = { path = "../guacr-protocol" }

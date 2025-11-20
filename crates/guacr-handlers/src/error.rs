@@ -11,6 +11,9 @@ pub enum HandlerError {
     #[error("Missing parameter: {0}")]
     MissingParameter(String),
 
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("Protocol error: {0}")]
     ProtocolError(String),
 

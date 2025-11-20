@@ -17,11 +17,31 @@
 // params.insert("password".to_string(), "password123".to_string());
 // ```
 
+// Supporting modules (kept minimal - infrastructure only)
+mod channel_handler;
+mod clipboard;
 mod framebuffer;
+mod input_handler;
+mod simd;
+
+// Main handler (all logic in one file - SSH pattern)
 mod handler;
 
-pub use framebuffer::FrameBuffer;
-pub use handler::RdpHandler;
+#[cfg(feature = "sftp")]
+mod sftp_integration;
+
+// Public exports
+pub use channel_handler::{
+    CliprdrData, CliprdrFormat, DispResizeMessage, RdpChannelHandler, RdpgfxUpdate,
+};
+pub use clipboard::{RdpClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
+pub use framebuffer::{FrameBuffer, Rect};
+pub use handler::{RdpConfig, RdpHandler};
+pub use input_handler::{RdpInputHandler, RdpKeyEvent, RdpPointerEvent};
+pub use simd::convert_bgr_to_rgba_simd;
+
+// Re-export hardware encoder from shared terminal module
+pub use guacr_terminal::{HardwareEncoder, HardwareEncoderImpl};
 
 use thiserror::Error;
 

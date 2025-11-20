@@ -10,12 +10,12 @@ Guacr is a ground-up rewrite of Apache Guacamole's guacd daemon in Rust. It is a
 
 **Current Implementation Status:**
 - ✅ **SSH:** Production-ready with auth, clipboard, JPEG rendering (16ms debounce, 60fps)
-- 🚧 **Telnet:** Basic structure, needs polish
-- 🚧 **RDP:** Framework in place, needs ironrdp integration
-- 🚧 **VNC:** Framework in place, needs async-vnc integration
-- 🚧 **Database:** Spreadsheet UI implemented, needs query execution
-- 🚧 **SFTP:** Handler exists, needs file transfer implementation
-- 🚧 **RBI:** Design complete, implementation pending
+- ✅ **Telnet:** Complete with scrollback, mouse events, threat detection
+- ✅ **RDP:** Complete ironrdp integration with hardware encoding framework
+- ✅ **VNC:** Complete VNC protocol implementation (RFB 3.8)
+- ✅ **Database:** MySQL query execution wired up, spreadsheet UI complete
+- ✅ **SFTP:** Complete file transfer implementation with russh-sftp API
+- ✅ **RBI:** Complete chromiumoxide integration with file download support
 - 📋 **Container (K8s/Docker):** Design document created (see CONTAINER_MANAGEMENT_PROTOCOL.md)
 
 **Key Goals:**
@@ -263,17 +263,59 @@ Environment variables:
 
 ## Documentation Structure
 
-- `docs/context/` - Design documents for guacr (176KB, 5 files)
-  - **GUACR_ARCHITECTURE_PLAN.md** - Complete technical design (78KB)
-  - **GUACR_ZERO_COPY_OPTIMIZATION.md** - Performance techniques (33KB)
-  - **GUACR_PROTOCOL_HANDLERS_GUIDE.md** - Implementation patterns (30KB)
-  - **GUACR_QUICKSTART_GUIDE.md** - Getting started (22KB)
-  - **GUACR_EXECUTIVE_SUMMARY.md** - Business case (13KB)
+### Core Documentation (`docs/`)
 
-- `docs/reference/original-guacd/` - Analysis of C guacd (186KB, 10 files)
-  - Reference when implementing protocol handlers
-  - Shows how original system works
-  - Includes database plugins and RBI analysis
+**Essential Reference**:
+- `CLAUDE.md` - This file - guidance for Claude Code
+- `START_HERE.md` - Quick start guide and current implementation status
+- `CONTRIBUTING.md` - Contribution guidelines
+- `README.md` - Documentation index
+
+**Protocol Implementation**:
+- `RDP_VNC_IMPLEMENTATION.md` - Complete RDP/VNC guide with SFTP integration
+- `RBI_IMPLEMENTATION.md` - Remote Browser Isolation implementation
+- `SFTP_CHANNEL_ADAPTER.md` - SFTP file transfer implementation
+- `THREAT_DETECTION.md` - Security threat detection system
+
+**Technical Guides**:
+- `INTEGRATION_GUIDE.md` - System integration patterns
+- `TESTING_GUIDE.md` - Testing procedures
+- `PERFORMANCE_OPTIMIZATIONS.md` - Performance techniques
+- `ZERO_COPY_INTEGRATION.md` - Zero-copy optimization guide
+- `WEBRTC_INTEGRATION_CHANGES.md` - WebRTC integration details
+- `WEBRTC_MULTI_CHANNEL_OPTIMIZATION.md` - Multi-channel optimization
+- `RECORDING_TRANSPORTS.md` - Session recording system
+
+**Protocol Specifications**:
+- `BINARY_PROTOCOL_SPEC.md` - Binary protocol format
+- `GUACAMOLE_PROTOCOL_COVERAGE.md` - Guacamole protocol support
+- `CONTAINER_MANAGEMENT_PROTOCOL.md` - Kubernetes/Docker protocol design
+
+**Security**:
+- `ADDITIONAL_PROTOCOLS_SECURITY.md` - Security considerations
+- `KEEPER_PAM_WEBRTC_RS_INTEGRATION.md` - Keeper integration
+
+### Reference Documentation (`docs/docs/`)
+
+**Context** (`docs/docs/context/`):
+- `GUACR_ARCHITECTURE_PLAN.md` - Complete technical design
+- `GUACR_ZERO_COPY_OPTIMIZATION.md` - Performance techniques
+- `GUACR_PROTOCOL_HANDLERS_GUIDE.md` - Implementation patterns
+- `GUACR_QUICKSTART_GUIDE.md` - Getting started
+- `GUACR_EXECUTIVE_SUMMARY.md` - Business case
+- `GUACR_WEBRTC_INTEGRATION.md` - WebRTC integration
+
+**Original guacd Reference** (`docs/docs/reference/original-guacd/`):
+- Reference when implementing protocol handlers
+- Shows how original C implementation works
+- Includes database plugins and RBI analysis
+
+### Development Documentation (`docs/development/`)
+
+- `CUSTOM_GLYPH_PROTOCOL.md` - Custom glyph protocol design
+- `GUACD_FEATURE_COMPARISON.md` - Feature comparison with guacd
+- `PROTOCOL_CONVERSION.md` - Protocol conversion details
+- `RENDERING_METHODS.md` - Rendering techniques
 
 ## Development Phases
 
@@ -287,28 +329,31 @@ Environment variables:
 - ✅ Size cap to prevent WebRTC backpressure
 - ✅ Proper logging (trace for hot paths, info for events)
 
-**Phase 2 (IN PROGRESS):** SSH polish & other terminal protocols
-- [ ] Scrollback buffer support (~150 lines)
-- [ ] Mouse events for vim/tmux (~80 lines)
-- [ ] Host key verification (~80 lines)
-- [ ] Telnet protocol improvements
-- [ ] SFTP file transfer integration
+**Phase 2 (COMPLETE):** SSH polish & other terminal protocols
+- [x] Scrollback buffer support (~150 lines)
+- [x] Mouse events for vim/tmux (~80 lines)
+- [x] Host key verification (~80 lines)
+- [x] Telnet protocol improvements
+- [x] SFTP file transfer integration
+- [x] Threat detection with BAML integration
 
-**Phase 3 (PLANNED):** Container Management
+**Phase 3 (COMPLETE):** Graphical Protocols & RBI
+- [x] RDP support (ironrdp integration with hardware encoding framework)
+- [x] VNC support (complete RFB 3.8 protocol implementation)
+- [x] Remote Browser Isolation (RBI with chromiumoxide)
+- [x] Database query execution (MySQL wired up)
+
+**Phase 4 (PLANNED):** Container Management
 - [ ] Kubernetes/Docker protocol handler (see CONTAINER_MANAGEMENT_PROTOCOL.md)
 - [ ] Pod/container list view (spreadsheet-like)
 - [ ] Shell access (kubectl exec / docker exec)
 - [ ] Log streaming and metrics
 
-**Phase 4 (PLANNED):** Graphical Protocols
-- [ ] RDP support (ironrdp integration)
-- [ ] VNC support (async-vnc integration)
-- [ ] Remote Browser Isolation (RBI)
-
 **Phase 5 (FUTURE):** Advanced Features
 - [ ] Custom glyph protocol (7-25x bandwidth savings)
-- [ ] GPU acceleration for rendering
-- [ ] H.264 video encoding
+- [ ] Complete hardware encoder implementations (NVENC, QuickSync, etc.)
+- [ ] RDPGFX channel integration
+- [ ] Audio channel support
 - [ ] Multi-session support
 
 ## Key Files to Reference

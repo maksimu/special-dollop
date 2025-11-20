@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/guacr",
     "crates/guacr-handlers",
+    "crates/guacr-protocol",
     "crates/guacr-terminal",
     "crates/guacr-ssh",
     "crates/guacr-telnet",
@@ -11,6 +12,7 @@ members = [
     "crates/guacr-database",
     "crates/guacr-rbi",
     "crates/guacr-sftp",
+    "crates/guacr-threat-detection",
 ]
 
 [workspace.package]

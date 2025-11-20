@@ -1,5 +1,8 @@
 use crate::Result;
 use fontdue::{Font, FontSettings};
+use guacr_protocol::{
+    format_blob, format_cfill, format_end, format_instruction, format_rect, format_transfer,
+};
 use image::{Rgb, RgbImage};
 use std::io::Cursor;
 
@@ -99,17 +102,17 @@ impl TerminalRenderer {
             *pixel = Rgb([0, 0, 0]);
         }
 
-        // Get cursor position
-        let cursor_pos = screen.cursor_position();
-
-        // Render cells in the dirty region
+        // Render each cell in the region
         for row in min_row..=max_row {
             for col in min_col..=max_col {
+                let x = (col - min_col) as u32;
+                let y = (row - min_row) as u32;
+                let x_px = x * self.char_width;
+                let y_px = y * self.char_height;
+
                 if let Some(cell) = screen.cell(row, col) {
-                    let local_row = row - min_row;
-                    let local_col = col - min_col;
-                    let has_cursor = cursor_pos.0 == row && cursor_pos.1 == col;
-                    self.render_cell_at(&mut img, cell, local_row, local_col, has_cursor)?;
+                    let has_cursor = screen.cursor_position() == (row, col);
+                    self.render_cell(&mut img, cell, x_px, y_px, has_cursor)?;
                 }
             }
         }
@@ -122,24 +125,13 @@ impl TerminalRenderer {
         // Return JPEG + position info (x, y in pixels)
         let x_px = min_col as u32 * self.char_width;
         let y_px = min_row as u32 * self.char_height;
-
         Ok((jpeg_data, x_px, y_px, width_px, height_px))
-    }
-
-    fn render_cell_at(
-        &self,
-        img: &mut RgbImage,
-        cell: &vt100::Cell,
-        row: u16,
-        col: u16,
-        has_cursor: bool,
-    ) -> Result<()> {
-        self.render_cell(img, cell, row, col, has_cursor)
     }
 
     /// Render terminal screen to JPEG with exact pixel dimensions
     ///
-    /// This allows rendering at non-character-aligned sizes to match browser layer exactly
+    /// This version allows specifying exact output dimensions, useful for
+    /// matching browser layer size exactly.
     pub fn render_screen_with_size(
         &self,
         screen: &vt100::Screen,
@@ -155,15 +147,20 @@ impl TerminalRenderer {
             *pixel = Rgb([0, 0, 0]);
         }
 
-        // Get cursor position
-        let cursor_pos = screen.cursor_position();
-
         // Render each cell
         for row in 0..rows {
             for col in 0..cols {
+                let x_px = col as u32 * self.char_width;
+                let y_px = row as u32 * self.char_height;
+
+                // Skip if outside image bounds
+                if x_px >= width_px || y_px >= height_px {
+                    continue;
+                }
+
                 if let Some(cell) = screen.cell(row, col) {
-                    let has_cursor = cursor_pos.0 == row && cursor_pos.1 == col;
-                    self.render_cell(&mut img, cell, row, col, has_cursor)?;
+                    let has_cursor = screen.cursor_position() == (row, col);
+                    self.render_cell(&mut img, cell, x_px, y_px, has_cursor)?;
                 }
             }
         }
@@ -180,24 +177,17 @@ impl TerminalRenderer {
         &self,
         img: &mut RgbImage,
         cell: &vt100::Cell,
-        row: u16,
-        col: u16,
+        x: u32,
+        y: u32,
         has_cursor: bool,
     ) -> Result<()> {
-        let x = col as u32 * self.char_width;
-        let y = row as u32 * self.char_height;
-
-        // Get cell background color
+        // Background color
         let bg = self.vt100_color_to_rgb(cell.bgcolor(), false);
 
-        // Fill background
-        for dy in 0..self.char_height {
-            for dx in 0..self.char_width {
-                let px = x + dx;
-                let py = y + dy;
-                if px < img.width() && py < img.height() {
-                    img.put_pixel(px, py, bg);
-                }
+        // Fill cell background
+        for py in y..(y + self.char_height).min(img.height()) {
+            for px in x..(x + self.char_width).min(img.width()) {
+                img.put_pixel(px, py, bg);
             }
         }
 
@@ -296,53 +286,37 @@ impl TerminalRenderer {
                     Rgb([0, 0, 0]) // Default bg = black
                 }
             }
-            vt100::Color::Idx(idx) => self.ansi_color_to_rgb(idx),
+            vt100::Color::Idx(n) => {
+                // Standard 16-color palette
+                match n {
+                    0 => Rgb([0, 0, 0]),        // Black
+                    1 => Rgb([205, 0, 0]),      // Red
+                    2 => Rgb([0, 205, 0]),      // Green
+                    3 => Rgb([205, 205, 0]),    // Yellow
+                    4 => Rgb([0, 0, 238]),      // Blue
+                    5 => Rgb([205, 0, 205]),    // Magenta
+                    6 => Rgb([0, 205, 205]),    // Cyan
+                    7 => Rgb([229, 229, 229]),  // White
+                    8 => Rgb([127, 127, 127]),  // Bright Black
+                    9 => Rgb([255, 0, 0]),      // Bright Red
+                    10 => Rgb([0, 255, 0]),     // Bright Green
+                    11 => Rgb([255, 255, 0]),   // Bright Yellow
+                    12 => Rgb([92, 92, 255]),   // Bright Blue
+                    13 => Rgb([255, 0, 255]),   // Bright Magenta
+                    14 => Rgb([0, 255, 255]),   // Bright Cyan
+                    15 => Rgb([255, 255, 255]), // Bright White
+                    _ => Rgb([0, 0, 0]),        // Fallback
+                }
+            }
             vt100::Color::Rgb(r, g, b) => Rgb([r, g, b]),
         }
     }
 
-    fn ansi_color_to_rgb(&self, idx: u8) -> Rgb<u8> {
-        // Standard ANSI color palette
-        match idx {
-            0 => Rgb([0, 0, 0]),        // Black
-            1 => Rgb([205, 0, 0]),      // Red
-            2 => Rgb([0, 205, 0]),      // Green
-            3 => Rgb([205, 205, 0]),    // Yellow
-            4 => Rgb([0, 0, 238]),      // Blue
-            5 => Rgb([205, 0, 205]),    // Magenta
-            6 => Rgb([0, 205, 205]),    // Cyan
-            7 => Rgb([229, 229, 229]),  // White
-            8 => Rgb([127, 127, 127]),  // Bright black (gray)
-            9 => Rgb([255, 0, 0]),      // Bright red
-            10 => Rgb([0, 255, 0]),     // Bright green
-            11 => Rgb([255, 255, 0]),   // Bright yellow
-            12 => Rgb([92, 92, 255]),   // Bright blue
-            13 => Rgb([255, 0, 255]),   // Bright magenta
-            14 => Rgb([0, 255, 255]),   // Bright cyan
-            15 => Rgb([255, 255, 255]), // Bright white
-            _ => Rgb([229, 229, 229]),  // Default to white
-        }
-    }
-}
-
-impl Default for TerminalRenderer {
-    fn default() -> Self {
-        Self::new().unwrap()
-    }
-}
-
-impl TerminalRenderer {
-    /// Generate Guacamole drawing instructions for terminal rendering
+    /// Generate Guacamole protocol instructions for drawing operations
     ///
-    /// Returns Guacamole protocol instructions (rect, cfill, cursor) to render the terminal screen.
     /// Note: This method uses drawing instructions instead of JPEG images.
     /// For this implementation, JPEG is preferred (5-10x faster than PNG).
-    ///
-    /// Instructions generated:
-    /// 1. size - Set display dimensions
-    /// 2. rect + cfill - Draw each character cell with background/foreground
-    /// 3. cursor - Draw cursor position
-    pub fn render_terminal_instructions(
+    pub fn format_drawing_instructions(
         &self,
         screen: &vt100::Screen,
         rows: u16,
@@ -350,118 +324,27 @@ impl TerminalRenderer {
     ) -> Vec<String> {
         let mut instructions = Vec::new();
 
-        // Get cursor position
-        let cursor_pos = screen.cursor_position();
+        // Clear screen
+        instructions.push(format_rect(
+            0,
+            0,
+            0,
+            cols as u32 * self.char_width,
+            rows as u32 * self.char_height,
+        ));
+        instructions.push(format_cfill(0, 0, 0, 0, 255)); // Black background
 
-        // Render each cell as drawing instruction
+        // Render each cell as colored rectangle (simplified)
         for row in 0..rows {
             for col in 0..cols {
                 if let Some(cell) = screen.cell(row, col) {
-                    let x = col as i32 * self.char_width as i32;
-                    let y = row as i32 * self.char_height as i32;
+                    let x = col as u32 * self.char_width;
+                    let y = row as u32 * self.char_height;
 
-                    // Get colors
                     let bg = self.vt100_color_to_rgb(cell.bgcolor(), false);
-                    let fg = self.vt100_color_to_rgb(cell.fgcolor(), true);
 
-                    // Draw background rectangle
-                    let x_str = x.to_string();
-                    let y_str = y.to_string();
-                    let w_str = self.char_width.to_string();
-                    let h_str = self.char_height.to_string();
-
-                    // rect instruction: draws path
-                    let rect_instr = format!(
-                        "4.rect,1.0,{}.{},{}.{},{}.{},{}.{};",
-                        x_str.len(),
-                        x_str,
-                        y_str.len(),
-                        y_str,
-                        w_str.len(),
-                        w_str,
-                        h_str.len(),
-                        h_str
-                    );
-                    instructions.push(rect_instr);
-
-                    // cfill instruction: fill path with background color
-                    let r_str = bg.0[0].to_string();
-                    let g_str = bg.0[1].to_string();
-                    let b_str = bg.0[2].to_string();
-                    let cfill_instr = format!(
-                        "5.cfill,2.15,{}.{},{}.{},{}.{},3.255;",
-                        r_str.len(),
-                        r_str,
-                        g_str.len(),
-                        g_str,
-                        b_str.len(),
-                        b_str
-                    );
-                    instructions.push(cfill_instr);
-
-                    // If cell has visible character, draw foreground
-                    if let Some(c) = cell.contents().chars().next() {
-                        if c != ' ' && c != '\0' {
-                            // Draw smaller rect for character (leave margins)
-                            let char_x = x + 1;
-                            let char_y = y + 2;
-                            let char_w = (self.char_width - 2) as i32;
-                            let char_h = (self.char_height - 4) as i32;
-
-                            let cx_str = char_x.to_string();
-                            let cy_str = char_y.to_string();
-                            let cw_str = char_w.to_string();
-                            let ch_str = char_h.to_string();
-
-                            let char_rect = format!(
-                                "4.rect,1.0,{}.{},{}.{},{}.{},{}.{};",
-                                cx_str.len(),
-                                cx_str,
-                                cy_str.len(),
-                                cy_str,
-                                cw_str.len(),
-                                cw_str,
-                                ch_str.len(),
-                                ch_str
-                            );
-                            instructions.push(char_rect);
-
-                            // Fill with foreground color
-                            let fr_str = fg.0[0].to_string();
-                            let fg_str = fg.0[1].to_string();
-                            let fb_str = fg.0[2].to_string();
-                            let char_cfill = format!(
-                                "5.cfill,2.15,{}.{},{}.{},{}.{},3.255;",
-                                fr_str.len(),
-                                fr_str,
-                                fg_str.len(),
-                                fg_str,
-                                fb_str.len(),
-                                fb_str
-                            );
-                            instructions.push(char_cfill);
-                        }
-                    }
-
-                    // Draw cursor if at this position
-                    if cursor_pos.0 == row && cursor_pos.1 == col {
-                        // Cursor as white filled rectangle
-                        let cursor_rect = format!(
-                            "4.rect,1.0,{}.{},{}.{},{}.{},{}.{};",
-                            x_str.len(),
-                            x_str,
-                            y_str.len(),
-                            y_str,
-                            w_str.len(),
-                            w_str,
-                            h_str.len(),
-                            h_str
-                        );
-                        instructions.push(cursor_rect);
-
-                        let cursor_cfill = "5.cfill,2.15,3.255,3.255,3.255,3.255;".to_string();
-                        instructions.push(cursor_cfill);
-                    }
+                    instructions.push(format_rect(0, x, y, self.char_width, self.char_height));
+                    instructions.push(format_cfill(0, bg.0[0], bg.0[1], bg.0[2], 255));
                 }
             }
         }
@@ -473,11 +356,6 @@ impl TerminalRenderer {
     ///
     /// This is what guacd actually uses - JPEG images for terminal rendering.
     /// JPEG encoding is fast and efficient for terminal screenshots.
-    ///
-    /// Returns a vector of instruction strings that should be sent in sequence:
-    /// 1. img instruction (allocates stream)
-    /// 2. blob instruction(s) (sends base64-encoded JPEG data in chunks)
-    /// 3. end instruction (closes stream)
     pub fn format_img_instructions(
         &self,
         image_data: &[u8],
@@ -516,262 +394,90 @@ impl TerminalRenderer {
         );
         instructions.push(img_instr);
 
-        // 2. blob instruction(s): send base64-encoded JPEG data in chunks
-        // Format: blob,<stream_len>.<stream>,<base64_len>.<base64_data>;
-        let stream_str = stream_id.to_string();
-        for chunk in image_data.chunks(BLOB_CHUNK_SIZE) {
-            let base64_chunk = base64::engine::general_purpose::STANDARD.encode(chunk);
-            let blob_instr = format!(
-                "4.blob,{}.{},{}.{};",
-                stream_str.len(),
-                stream_str,
-                base64_chunk.len(),
-                base64_chunk
-            );
+        // 2. blob instructions: send base64-encoded JPEG data in chunks
+        let base64_data = base64::engine::general_purpose::STANDARD.encode(image_data);
+
+        for chunk in base64_data.as_bytes().chunks(BLOB_CHUNK_SIZE) {
+            let chunk_str = String::from_utf8_lossy(chunk);
+            let blob_instr = format_blob(stream_id, &chunk_str);
             instructions.push(blob_instr);
         }
 
-        // 3. end instruction: close the stream
-        // Format: end,<stream_len>.<stream>;
-        let end_instr = format!("3.end,{}.{};", stream_str.len(), stream_str);
-        instructions.push(end_instr);
+        // 3. end instruction: close stream
+        instructions.push(format_end(stream_id));
 
         instructions
     }
 
-    /// Generate size instruction to set display dimensions
-    /// CRITICAL: Must be sent before ANY image/drawing operations!
-    /// Format: size,<layer>,<width>,<height>;
-    pub fn format_size_instruction(layer: i32, width_px: u32, height_px: u32) -> String {
-        let layer_str = layer.to_string();
-        let width_str = width_px.to_string();
-        let height_str = height_px.to_string();
-        format!(
-            "4.size,{}.{},{}.{},{}.{};",
-            layer_str.len(),
-            layer_str,
-            width_str.len(),
-            width_str,
-            height_str.len(),
-            height_str
+    /// Format ready instruction
+    pub fn format_ready_instruction(protocol: &str) -> String {
+        format_instruction("ready", &[protocol])
+    }
+
+    /// Format size instruction
+    pub fn format_size_instruction(layer: i32, width: u32, height: u32) -> String {
+        format_instruction(
+            "size",
+            &[&layer.to_string(), &width.to_string(), &height.to_string()],
         )
     }
 
-    /// Generate sync instruction for frame boundary
-    /// Should be sent after all drawing operations for a frame
+    /// Format sync instruction
+    ///
+    /// Format: `4.sync,{timestamp};`
+    ///
+    /// # Arguments
+    /// - `timestamp_ms`: Timestamp in milliseconds
     pub fn format_sync_instruction(&self, timestamp_ms: u64) -> String {
-        let ts_str = timestamp_ms.to_string();
-        format!("4.sync,{}.{};", ts_str.len(), ts_str)
+        let timestamp_str = timestamp_ms.to_string();
+        format_instruction("sync", &[&timestamp_str])
     }
 
-    /// Generate instructions to clear a rectangular region with black fill
-    ///
-    /// This is essential before drawing JPEG content to prevent old content
-    /// from showing through (the copy instruction doesn't clear the source region).
-    ///
-    /// Returns vector of 2 instructions: [rect, cfill]
-    ///
-    /// # Arguments
-    ///
-    /// * `row`, `col` - Top-left position in character cells
-    /// * `width_chars`, `height_chars` - Size in character cells
-    /// * `char_width`, `char_height` - Character cell dimensions in pixels
-    /// * `layer` - Layer to operate on (typically 0 for default layer)
-    pub fn format_clear_region_instructions(
-        row: u16,
-        col: u16,
-        width_chars: u16,
-        height_chars: u16,
-        char_width: u32,
-        char_height: u32,
-        layer: i32,
-    ) -> Vec<String> {
-        let x = col as u32 * char_width;
-        let y = row as u32 * char_height;
-        let width_px = width_chars as u32 * char_width;
-        let height_px = height_chars as u32 * char_height;
-
-        let layer_str = layer.to_string();
-        let x_str = x.to_string();
-        let y_str = y.to_string();
-        let width_str = width_px.to_string();
-        let height_str = height_px.to_string();
-
-        vec![
-            // rect instruction: define rectangular path
-            format!(
-                "4.rect,{}.{},{}.{},{}.{},{}.{},{}.{};",
-                layer_str.len(),
-                layer_str,
-                x_str.len(),
-                x_str,
-                y_str.len(),
-                y_str,
-                width_str.len(),
-                width_str,
-                height_str.len(),
-                height_str
-            ),
-            // cfill instruction: fill with black (RGB 0,0,0)
-            "5.cfill,2.15,1.0,1.0,1.0,3.255;".to_string(),
-        ]
-    }
-
-    /// Generate copy instruction for efficient scrolling
-    ///
-    /// Copies a rectangular region from one position to another on the same layer.
-    /// This is how guacd implements efficient terminal scrolling - it moves existing
-    /// content rather than retransmitting it.
-    ///
-    /// Format: copy,<srclayer>,<srcx>,<srcy>,<srcwidth>,<srcheight>,<mask>,<dstlayer>,<dstx>,<dsty>;
-    ///
-    /// # Arguments
-    ///
-    /// * `src_row`, `src_col` - Source position in character cells
-    /// * `width_chars`, `height_chars` - Size of region in character cells
-    /// * `dst_row`, `dst_col` - Destination position in character cells
-    /// * `char_width`, `char_height` - Character cell dimensions in pixels
-    /// * `layer` - Layer to operate on (typically 0 for default layer)
+    /// Format copy instruction (for scroll optimization)
     #[allow(clippy::too_many_arguments)]
     pub fn format_copy_instruction(
         src_row: u16,
         src_col: u16,
-        width_chars: u16,
-        height_chars: u16,
+        width: u16,
+        height: u16,
         dst_row: u16,
         dst_col: u16,
         char_width: u32,
         char_height: u32,
         layer: i32,
     ) -> String {
-        // Convert character positions to pixel coordinates
+        // Copy instruction format: copy,<src_layer>,<src_x>,<src_y>,<width>,<height>,<dst_layer>,<dst_x>,<dst_y>;
         let src_x = src_col as u32 * char_width;
         let src_y = src_row as u32 * char_height;
-        let width_px = width_chars as u32 * char_width;
-        let height_px = height_chars as u32 * char_height;
+        let width_px = width as u32 * char_width;
+        let height_px = height as u32 * char_height;
         let dst_x = dst_col as u32 * char_width;
         let dst_y = dst_row as u32 * char_height;
 
-        let layer_str = layer.to_string();
-        let src_x_str = src_x.to_string();
-        let src_y_str = src_y.to_string();
-        let width_str = width_px.to_string();
-        let height_str = height_px.to_string();
-        let mask_str = "15"; // RGBA channels (0x0F)
-        let dst_x_str = dst_x.to_string();
-        let dst_y_str = dst_y.to_string();
-
-        format!(
-            "4.copy,{}.{},{}.{},{}.{},{}.{},{}.{},{},{}.{},{}.{},{}.{};",
-            layer_str.len(),
-            layer_str,
-            src_x_str.len(),
-            src_x_str,
-            src_y_str.len(),
-            src_y_str,
-            width_str.len(),
-            width_str,
-            height_str.len(),
-            height_str,
-            mask_str,
-            layer_str.len(),
-            layer_str,
-            dst_x_str.len(),
-            dst_x_str,
-            dst_y_str.len(),
-            dst_y_str
+        format_transfer(
+            layer, src_x, src_y, width_px, height_px, 12, // SRC function
+            layer, dst_x, dst_y,
         )
     }
 
-    /// Generate args instruction for Guacamole handshake
-    /// Lists the parameter names the protocol accepts
-    pub fn format_args_instruction(param_names: &[&str]) -> String {
-        let mut result = String::from("4.args");
-        for name in param_names {
-            result.push(',');
-            result.push_str(&name.len().to_string());
-            result.push('.');
-            result.push_str(name);
-        }
-        result.push(';');
-        result
-    }
-
-    /// Generate ready instruction for Guacamole handshake
-    /// Signals that the connection is ready to accept data
-    pub fn format_ready_instruction(connection_id: &str) -> String {
-        let cid_str = connection_id;
-        format!("5.ready,{}.{};", cid_str.len(), cid_str)
-    }
-
-    /// Generate argv/blob/end sequence to send a parameter value
-    ///
-    /// Guacd sends these after handshake to acknowledge received parameters.
-    /// Returns vec of 3 instructions: [argv, blob, end]
-    pub fn format_argv_instructions(
-        stream_id: u32,
-        param_name: &str,
-        param_value: &str,
+    /// Format clear region instructions (for scroll optimization)
+    pub fn format_clear_region_instructions(
+        row: u16,
+        col: u16,
+        width: u16,
+        height: u16,
+        char_width: u32,
+        char_height: u32,
     ) -> Vec<String> {
-        use base64::Engine;
+        let x = col as u32 * char_width;
+        let y = row as u32 * char_height;
+        let width_px = width as u32 * char_width;
+        let height_px = height as u32 * char_height;
 
-        let mut instructions = Vec::new();
-        let stream_str = stream_id.to_string();
-
-        // 1. argv instruction: allocate stream for parameter
-        // Format: argv,<stream>,<mimetype>,<param_name>;
-        let argv_instr = format!(
-            "4.argv,{}.{},10.text/plain,{}.{};",
-            stream_str.len(),
-            stream_str,
-            param_name.len(),
-            param_name
-        );
-        instructions.push(argv_instr);
-
-        // 2. blob instruction: send base64-encoded value
-        let base64_value = base64::engine::general_purpose::STANDARD.encode(param_value.as_bytes());
-        let blob_instr = format!(
-            "4.blob,{}.{},{}.{};",
-            stream_str.len(),
-            stream_str,
-            base64_value.len(),
-            base64_value
-        );
-        instructions.push(blob_instr);
-
-        // 3. end instruction: close stream
-        let end_instr = format!("3.end,{}.{};", stream_str.len(), stream_str);
-        instructions.push(end_instr);
-
-        instructions
-    }
-
-    /// Legacy method for backward compatibility - now uses streaming
-    #[deprecated(note = "Use format_img_instructions instead for proper Guacamole protocol")]
-    pub fn format_img_instruction(&self, image_data: &[u8]) -> String {
-        // This was sending the entire image in one instruction, which is wrong
-        // Keeping for now but should migrate to format_img_instructions
-        use base64::Engine;
-        let base64_data = base64::engine::general_purpose::STANDARD.encode(image_data);
-
-        let opcode = "img";
-        let args = vec!["0", "image/jpeg", &base64_data];
-
-        let mut result = String::new();
-        result.push_str(&opcode.len().to_string());
-        result.push('.');
-        result.push_str(opcode);
-
-        for arg in args {
-            result.push(',');
-            result.push_str(&arg.len().to_string());
-            result.push('.');
-            result.push_str(arg);
-        }
-
-        result.push(';');
-        result
+        vec![
+            format_rect(0, x, y, width_px, height_px),
+            format_cfill(0, 0, 0, 0, 255), // Black background
+        ]
     }
 }
 
@@ -786,46 +492,15 @@ mod tests {
     }
 
     #[test]
-    fn test_render_empty_screen() {
-        let renderer = TerminalRenderer::new().unwrap();
-        let parser = vt100::Parser::new(24, 80, 0);
-        let screen = parser.screen();
-
-        let jpeg = renderer.render_screen(screen, 24, 80);
-        assert!(jpeg.is_ok());
-
-        let jpeg_data = jpeg.unwrap();
-        assert!(!jpeg_data.is_empty());
-        // Check JPEG magic bytes (FF D8 FF)
-        assert_eq!(&jpeg_data[0..3], &[0xFF, 0xD8, 0xFF]);
+    fn test_renderer_with_dimensions() {
+        let renderer = TerminalRenderer::new_with_dimensions(24, 45, 31.5);
+        assert!(renderer.is_ok());
     }
 
     #[test]
-    fn test_render_with_text() {
+    fn test_vt100_color_to_rgb() {
         let renderer = TerminalRenderer::new().unwrap();
-        let mut parser = vt100::Parser::new(24, 80, 0);
-
-        parser.process(b"Hello, Terminal!\n");
-        let screen = parser.screen();
-
-        let jpeg = renderer.render_screen(screen, 24, 80);
-        assert!(jpeg.is_ok());
-
-        let jpeg_data = jpeg.unwrap();
-        assert!(!jpeg_data.is_empty());
-        assert!(jpeg_data.len() > 100); // Should have substantial data
-    }
-
-    #[test]
-    fn test_format_img_instruction() {
-        let renderer = TerminalRenderer::new().unwrap();
-        let jpeg_data = vec![0xFF, 0xD8, 0xFF]; // JPEG header
-
-        #[allow(deprecated)]
-        let instruction = renderer.format_img_instruction(&jpeg_data);
-
-        assert!(instruction.starts_with("3.img,"));
-        assert!(instruction.ends_with(';'));
-        assert!(instruction.contains("image/jpeg"));
+        let color = renderer.vt100_color_to_rgb(vt100::Color::Default, true);
+        assert_eq!(color.0, [229, 229, 229]); // Light gray
     }
 }

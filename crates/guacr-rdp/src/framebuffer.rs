@@ -77,6 +77,11 @@ impl FrameBuffer {
         &self.dirty_rects
     }
 
+    /// Get all pixels from framebuffer (for hardware encoding)
+    pub fn get_all_pixels(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+
     /// Optimize dirty rectangles by merging overlapping ones
     pub fn optimize_dirty_rects(&mut self) {
         if self.dirty_rects.len() < 2 {
@@ -99,6 +104,33 @@ impl FrameBuffer {
         merged.push(current);
 
         self.dirty_rects = merged;
+    }
+
+    /// Get pixels for a region (for hardware encoding)
+    pub fn get_region_pixels(&self, rect: Rect) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((rect.width * rect.height * 4) as usize);
+
+        for row in 0..rect.height {
+            for col in 0..rect.width {
+                let src_x = rect.x + col;
+                let src_y = rect.y + row;
+
+                if src_x < self.width && src_y < self.height {
+                    let src_offset = (src_y * self.width + src_x) as usize * 4;
+                    if src_offset + 4 <= self.data.len() {
+                        pixels.extend_from_slice(&self.data[src_offset..src_offset + 4]);
+                    } else {
+                        // Out of bounds - add transparent pixel
+                        pixels.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                } else {
+                    // Out of bounds - add transparent pixel
+                    pixels.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+
+        pixels
     }
 
     /// Encode a region to PNG

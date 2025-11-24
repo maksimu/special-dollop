@@ -941,11 +941,8 @@ async fn test_turn_allocation_cleanup_on_close() {
 
     // Verify peer connection exists before close
     {
-        let pc_guard = tube.peer_connection.lock().await;
-        assert!(
-            pc_guard.is_some(),
-            "Peer connection should exist before close"
-        );
+        let pc = tube.peer_connection.load();
+        assert!(pc.is_some(), "Peer connection should exist before close");
     }
 
     // CRITICAL: Call explicit close() (this releases TURN allocation)
@@ -956,9 +953,9 @@ async fn test_turn_allocation_cleanup_on_close() {
 
     // Verify peer connection was closed by explicit close()
     {
-        let pc_guard = tube.peer_connection.lock().await;
+        let pc = tube.peer_connection.load();
         assert!(
-            pc_guard.is_none(),
+            pc.is_none(),
             "Peer connection should be None after explicit close()"
         );
     }
@@ -1016,8 +1013,8 @@ async fn test_drop_without_close_warns() {
 
     // Verify peer connection exists
     {
-        let pc_guard = tube.peer_connection.lock().await;
-        assert!(pc_guard.is_some(), "Peer connection should exist");
+        let pc = tube.peer_connection.load();
+        assert!(pc.is_some(), "Peer connection should exist");
     }
 
     // CRITICAL: Drop WITHOUT calling close()

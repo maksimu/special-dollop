@@ -23,7 +23,6 @@ const WEBRTC_STATS_COLLECTION_INTERVAL_SECS: u64 = 5;
 
 /// Global metrics collector instance
 pub static METRICS_COLLECTOR: Lazy<Arc<MetricsCollector>> = Lazy::new(|| {
-    debug!("Initializing global metrics collector");
     let collector = Arc::new(MetricsCollector::new());
     collector.clone().start_background_tasks();
     collector
@@ -1034,7 +1033,7 @@ impl MetricsCollector {
                         .await
                     {
                         Ok(_) => {
-                            info!(
+                            debug!(
                                 "Successfully force-closed stale tube (tube_id: {})",
                                 tube_id_clone
                             );
@@ -1207,7 +1206,7 @@ impl MetricsCollector {
                             .await
                         {
                             Ok(_) => {
-                                info!(
+                                debug!(
                                     "Stale tube sweeper: Closed stale tube (tube_id: {})",
                                     tube_id
                                 );

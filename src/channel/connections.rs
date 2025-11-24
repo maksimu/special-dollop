@@ -589,11 +589,6 @@ pub async fn setup_outbound_task(
                             #[cfg(feature = "profiling")]
                             let parse_start = std::time::Instant::now();
 
-                            // **ULTRA-FAST PATH: Validate format and detect special opcodes**
-                            if unlikely!(should_log_connection(false)) {
-                                debug!("OUTBOUND: About to validate and detect special opcodes (channel_id: {}, conn_no: {}, slice_len: {}, first_bytes: {:?})",
-                                       channel_id_for_task, conn_no, current_slice.len(), &current_slice[..std::cmp::min(50, current_slice.len())]);
-                            }
                             match GuacdParser::validate_and_detect_special(current_slice) {
                                 Ok((instruction_len, action)) => {
                                     #[cfg(feature = "profiling")]

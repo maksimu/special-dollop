@@ -282,7 +282,9 @@ impl Channel {
                                             }
                                         })
                                         .collect();
-                                    debug!("Populated guacd_params map directly from JSON Value. (channel_id: {})", channel_id);
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!("Populated guacd_params map directly from JSON Value. (channel_id: {})", channel_id);
+                                    }
 
                                     // Override protocol name with correct guacd protocol name from ConversationType
                                     let guacd_protocol_name = parsed_conversation_type.to_string();
@@ -532,10 +534,6 @@ impl Channel {
         while !self.should_exit.load(std::sync::atomic::Ordering::Relaxed) {
             // Process any complete frames in the buffer
             while let Some(frame) = try_parse_frame(&mut buf) {
-                if unlikely!(crate::logger::is_verbose_logging()) {
-                    debug!("Received frame from WebRTC (channel_id: {}, connection_no: {}, payload_size: {})", self.channel_id, frame.connection_no, frame.payload.len());
-                }
-
                 if let Err(e) = handle_incoming_frame(&mut self, frame).await {
                     error!(
                         "Error handling frame (channel_id: {}, error: {})",
@@ -585,14 +583,6 @@ impl Channel {
                 maybe_chunk = self.rx_from_dc.recv() => {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
-                            if unlikely!(crate::logger::is_verbose_logging()) {
-                                debug!("Received data from WebRTC (channel_id: {}, bytes_received: {})", self.channel_id, chunk.len());
-
-                                if !chunk.is_empty() && unlikely!(crate::logger::is_verbose_logging()) {
-                                    debug!("First few bytes of received data (channel_id: {}, first_bytes: {:?})", self.channel_id, &chunk[..std::cmp::min(20, chunk.len())]);
-                                }
-                            }
-
                             buf.extend_from_slice(&chunk);
                             if unlikely!(crate::logger::is_verbose_logging()) {
                                 debug!("Buffer size after adding chunk (channel_id: {}, buffer_size: {})", self.channel_id, buf.len());

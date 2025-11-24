@@ -9,6 +9,7 @@ use crate::unlikely;
 use crate::webrtc_core::{create_data_channel, WebRTCPeerConnection};
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,8 +41,8 @@ type ChannelCloseReasonMap =
 pub struct Tube {
     // Unique ID for this tube
     pub(crate) id: String,
-    // WebRTC peer connection
-    pub(crate) peer_connection: Arc<TokioMutex<Option<Arc<WebRTCPeerConnection>>>>,
+    // WebRTC peer connection - lock-free atomic pointer to prevent deadlocks
+    pub(crate) peer_connection: ArcSwap<Option<Arc<WebRTCPeerConnection>>>,
     // Data channels mapped by label
     pub(crate) data_channels: Arc<TokioRwLock<HashMap<String, WebRTCDataChannel>>>,
     // Control channel (special default channel)
@@ -111,12 +112,9 @@ impl Tube {
             .as_ref()
             .map(|conv_id| crate::metrics::MetricsHandle::new(conv_id.clone(), id.clone()));
 
-        let has_signal = signal_sender.is_some();
-        let has_metrics = metrics_handle.is_some();
-
         let tube = Arc::new(Self {
             id: id.clone(),
-            peer_connection: Arc::new(TokioMutex::new(None)),
+            peer_connection: ArcSwap::from_pointee(None),
             data_channels: Arc::new(TokioRwLock::new(HashMap::new())),
             control_channel: Arc::new(TokioRwLock::new(None)),
             channel_shutdown_notifiers: Arc::new(TokioRwLock::new(HashMap::new())),
@@ -136,11 +134,6 @@ impl Tube {
             // Concurrent close protection:
             closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-
-        debug!(
-            "Tube created with RAII resources (tube_id: {}, has_signal: {}, has_metrics: {})",
-            id, has_signal, has_metrics
-        );
 
         Ok(tube)
     }
@@ -527,12 +520,16 @@ impl Tube {
                     error!("on_data_channel: Failed to add data channel to tube: {} (tube_id: {}, channel_label: {})", e, tube.id, rtc_data_channel_label);
                     return;
                 }
-                debug!("on_data_channel: Data channel added to tube's map. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Data channel added to tube's map. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                }
 
                 // If this is the control channel, store it specially
                 if rtc_data_channel_label == "control" {
                     *tube.control_channel.write().await = Some(data_channel.clone());
-                    debug!("on_data_channel: Set as control channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("on_data_channel: Set as control channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                    }
                 }
 
                 // Extract recordings_enabled before protocol_settings gets moved
@@ -545,9 +542,10 @@ impl Tube {
 
                 // Determine server_mode for the new channel based on the Tube's context
                 let current_server_mode = tube.is_server_mode_context;
-                debug!("on_data_channel: Determined server_mode for channel setup. (tube_id: {}, channel_label: {}, server_mode: {})", tube.id, rtc_data_channel_label, current_server_mode);
-
-                debug!("on_data_channel: About to call setup_channel_for_data_channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Determined server_mode for channel setup. (tube_id: {}, channel_label: {}, server_mode: {})", tube.id, rtc_data_channel_label, current_server_mode);
+                    debug!("on_data_channel: About to call setup_channel_for_data_channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                }
                 let channel_result = setup_channel_for_data_channel(
                     &data_channel,
                     &peer_connection_for_channel,
@@ -562,7 +560,9 @@ impl Tube {
 
                 let mut owned_channel = match channel_result {
                     Ok(ch_instance) => {
-                        debug!("on_data_channel: setup_channel_for_data_channel successful. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!("on_data_channel: setup_channel_for_data_channel successful. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                        }
                         ch_instance
                     }
                     Err(e) => {
@@ -582,15 +582,17 @@ impl Tube {
                     error!("Tube {}: Failed to register channel metadata '{}': {}", tube.id, rtc_data_channel_label, e);
                     return;
                 }
-                debug!("on_data_channel: Channel metadata registered with tube (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
                 if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Channel metadata registered with tube (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
                     debug!("on_data_channel: Channel details after setup. (tube_id: {}, channel_label: {}, active_protocol: {:?}, local_listen_addr: {:?})", tube.id, rtc_data_channel_label, owned_channel.active_protocol, owned_channel.local_listen_addr);
                 }
 
                 // Store the shutdown notifier for this newly created channel
                 let shutdown_notifier = Arc::clone(&owned_channel.shutdown_notify);
                 tube.channel_shutdown_notifiers.write().await.insert(rtc_data_channel_label.clone(), shutdown_notifier);
-                debug!("on_data_channel: Shutdown notifier stored for channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Shutdown notifier stored for channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                }
 
                 // Store the close reason tracker for this channel (for preventing duplicate CloseConnection)
                 let channel_close_reason_arc = Arc::clone(&owned_channel.channel_close_reason);
@@ -627,11 +629,14 @@ impl Tube {
                 let tube_id_for_log = tube.id.clone();
                 // Clone references for spawned task - avoid double Arc wrapping
                 let tube_arc = Arc::clone(&tube); // Clone the Arc, not the Tube
-                let peer_connection_for_signal = Arc::clone(&tube.peer_connection);
 
-                debug!("on_data_channel: Spawning channel.run() task. (tube_id: {}, channel_label: {})", tube.id, label_clone_for_run);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Spawning channel.run() task. (tube_id: {}, channel_label: {})", tube.id, label_clone_for_run);
+                }
                 runtime_for_run.spawn(async move {
-                    debug!("on_data_channel: channel.run() task started. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("on_data_channel: channel.run() task started. (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                    }
 
                     // Send connection_open callback when a channel starts running
                     if let Err(e) = tube_arc.send_connection_open_callback(&label_clone_for_run).await {
@@ -674,8 +679,8 @@ impl Tube {
                     tube_arc.remove_channel_shutdown_signal(&label_clone_for_run).await;
 
                     // Always send a signal when channel.run() finishes, regardless of reason.
-                    let pc_guard = peer_connection_for_signal.lock().await;
-                    if let Some(pc_instance_arc) = &*pc_guard {
+                    let pc = tube_arc.peer_connection.load();
+                    if let Some(pc_instance_arc) = pc.as_ref() {
                         if let Some(sender) = &pc_instance_arc.signal_sender {
                             let mut signal_json = serde_json::json!({
                                 "channel_id": label_clone_for_run, // The label of the channel from on_data_channel
@@ -729,13 +734,14 @@ impl Tube {
                     }
                 });
 
-                debug!("on_data_channel: Successfully set up and spawned channel task. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("on_data_channel: Successfully set up and spawned channel task. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                }
             })
         }));
 
-        // Now get the lock
-        let mut pc = self.peer_connection.lock().await;
-        *pc = Some(connection_arc);
+        // Store connection atomically (lock-free, instant, can't deadlock)
+        self.peer_connection.store(Arc::new(Some(connection_arc)));
 
         // Update status
         *self.status.write().await = TubeStatus::Connecting;
@@ -800,8 +806,8 @@ impl Tube {
     // Get reference to peer connection
     #[cfg(test)]
     pub(crate) async fn peer_connection(&self) -> Option<Arc<WebRTCPeerConnection>> {
-        let pc = self.peer_connection.lock().await;
-        pc.clone()
+        let pc = self.peer_connection.load();
+        (**pc).clone()
     }
 
     // Add a data channel
@@ -832,9 +838,9 @@ impl Tube {
         callback_token: String,
         client_version: &str,
     ) -> Result<WebRTCDataChannel> {
-        let pc_guard = self.peer_connection.lock().await;
+        let pc = self.peer_connection.load();
 
-        if let Some(pc) = &*pc_guard {
+        if let Some(pc) = pc.as_ref() {
             let rtc_data_channel = create_data_channel(&pc.peer_connection, label).await?;
             let data_channel = WebRTCDataChannel::new(rtc_data_channel);
 
@@ -847,11 +853,8 @@ impl Tube {
                 client_version,
             );
 
-            // Clone for release outside the lock
+            // Clone for release
             let data_channel_clone = data_channel.clone();
-
-            // Release lock before adding to avoid potential deadlock
-            drop(pc_guard);
 
             // Add to our mapping
             self.add_data_channel(data_channel.clone()).await?;
@@ -1030,20 +1033,18 @@ impl Tube {
         ksm_config: Option<String>,
         client_version: Option<String>,
     ) -> Result<Option<u16>> {
-        debug!(
-            "create_channel: Called. (tube_id: {}, channel_name: {})",
-            self.id, name
-        );
         if unlikely!(crate::logger::is_verbose_logging()) {
             debug!("create_channel: Initial parameters. (tube_id: {}, channel_name: {}, timeout_seconds: {:?}, protocol_settings: {:?})", self.id, name, timeout_seconds, protocol_settings);
         }
 
         // Register connection with metrics system
         crate::metrics::METRICS_COLLECTOR.register_connection(name.to_string(), self.id.clone());
-        debug!(
-            "Registered channel with metrics system (tube_id: {}, channel_name: {})",
-            self.id, name
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Registered channel with metrics system (tube_id: {}, channel_name: {})",
+                self.id, name
+            );
+        }
 
         let timeouts = timeout_seconds.map(|timeout| TunnelTimeouts {
             read: Duration::from_secs_f64(timeout),
@@ -1067,11 +1068,11 @@ impl Tube {
             }
         };
 
-        // Get peer connection for activity tracking
+        // Get peer connection for activity tracking (lock-free)
         let peer_connection = {
-            let pc_guard = self.peer_connection.lock().await;
-            if let Some(pc) = &*pc_guard {
-                pc.clone()
+            let pc = self.peer_connection.load();
+            if let Some(pc) = pc.as_ref() {
+                Arc::clone(pc)
             } else {
                 return Err(anyhow!(
                     "No peer connection available for activity tracking"
@@ -1193,15 +1194,17 @@ impl Tube {
         let name_clone = name.to_string();
         let runtime_clone = self.runtime.clone();
         let tube_id_for_spawn = self.id.clone(); // Clone self.id here to make it 'static
-        let peer_connection_for_spawn = Arc::clone(&self.peer_connection); // Clone peer_connection
-        debug!(
-            "create_channel: Spawning channel.run() task. (tube_id: {}, channel_name: {})",
-            self.id, name_clone
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "create_channel: Spawning channel.run() task. (tube_id: {}, channel_name: {})",
+                self.id, name_clone
+            );
+        }
         let tube_arc = Arc::clone(self); // Clone the Arc for the spawned task
         runtime_clone.spawn(async move {
-            // Use the cloned tube_id_for_spawn which is 'static
-            debug!("create_channel: channel.run() task started. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("create_channel: channel.run() task started. (tube_id: {}, channel_name: {})", tube_id_for_spawn, name_clone);
+            }
 
             // Only send connection_open callback for client mode channels
             if let Err(e) = tube_arc.send_connection_open_callback(&name_clone).await {
@@ -1241,8 +1244,8 @@ impl Tube {
             tube_arc.remove_channel_shutdown_signal(&name_clone).await;
 
             // Always send a signal when channel.run() finishes, regardless of reason.
-            let pc_guard = peer_connection_for_spawn.lock().await;
-            if let Some(pc_instance_arc) = &*pc_guard {
+            let pc = tube_arc.peer_connection.load();
+            if let Some(pc_instance_arc) = pc.as_ref() {
                 if let Some(sender) = &pc_instance_arc.signal_sender {
                     let mut signal_json = serde_json::json!({
                         "channel_id": name_clone, // This is the label of the channel that finished
@@ -1373,9 +1376,9 @@ impl Tube {
 
     // Common helper function for offer/answer creation with ICE gathering
     async fn create_session_description(&self, is_offer: bool) -> Result<String, String> {
-        let pc_guard = self.peer_connection.lock().await;
+        let pc = self.peer_connection.load();
 
-        if let Some(pc_arc) = &*pc_guard {
+        if let Some(pc_arc) = pc.as_ref() {
             // Call the unified (now pub(crate)) method in WebRTCPeerConnection
             let sdp = pc_arc.create_description_with_checks(is_offer).await?;
 
@@ -1422,9 +1425,9 @@ impl Tube {
             warn!("[SDP_DEBUG] SDP does NOT contain data channel (m=application) - on_data_channel will not fire (tube_id: {})", self.id);
         }
 
-        let pc_guard = self.peer_connection.lock().await;
+        let pc = self.peer_connection.load();
 
-        if let Some(pc) = &*pc_guard {
+        if let Some(pc) = pc.as_ref() {
             // Use the WebRTCPeerConnection wrapper method instead of bypassing to raw library
             // This ensures activity updates, candidate flushing, and ICE restart completion
             pc.set_remote_description(sdp, is_answer)
@@ -1437,9 +1440,9 @@ impl Tube {
 
     // Add an ICE candidate
     pub(crate) async fn add_ice_candidate(&self, candidate: String) -> Result<(), String> {
-        let pc_guard = self.peer_connection.lock().await;
+        let pc = self.peer_connection.load();
 
-        if let Some(pc) = &*pc_guard {
+        if let Some(pc) = pc.as_ref() {
             pc.add_ice_candidate(candidate).await
         } else {
             Err("No peer connection available".to_string())
@@ -1646,8 +1649,8 @@ impl Tube {
     pub async fn restart_ice(&self) -> Result<String, String> {
         use crate::webrtc_errors::WebRTCError;
 
-        let pc_guard = self.peer_connection.lock().await;
-        if let Some(ref pc) = *pc_guard {
+        let pc = self.peer_connection.load();
+        if let Some(ref pc) = **pc {
             pc.restart_ice().await.map_err(|e| match e {
                 WebRTCError::IceRestartFailed { reason, .. } => reason,
                 WebRTCError::CircuitBreakerOpen { .. } => {
@@ -1662,8 +1665,8 @@ impl Tube {
 
     // Get connection statistics
     pub async fn get_connection_stats(&self) -> Result<ConnectionStats, String> {
-        let pc_guard = self.peer_connection.lock().await;
-        if let Some(ref pc) = *pc_guard {
+        let pc = self.peer_connection.load();
+        if let Some(ref pc) = **pc {
             // Get WebRTC stats if available
             let reports = pc.peer_connection.get_stats().await;
             let mut stats = ConnectionStats::default();
@@ -1736,32 +1739,28 @@ impl Tube {
     /// Used for stale tube detection when data channel close events don't fire
     /// Returns true if no WebRTC activity for the given duration
     pub async fn is_inactive_for_duration(&self, duration: std::time::Duration) -> bool {
-        if let Ok(pc_guard) = self.peer_connection.try_lock() {
-            if let Some(pc) = &*pc_guard {
-                return pc.time_since_last_activity() > duration;
-            }
+        let pc = self.peer_connection.load();
+        if let Some(pc) = pc.as_ref() {
+            return pc.time_since_last_activity() > duration;
         }
         false // Can't check, assume active to be safe
     }
 
     /// Get current peer connection state (for stale tube detection)
-    /// Returns None if peer connection is not available or locked
+    /// Returns None if peer connection is not available
     pub async fn get_connection_state(&self) -> Option<RTCPeerConnectionState> {
-        if let Ok(pc_guard) = self.peer_connection.try_lock() {
-            pc_guard
-                .as_ref()
-                .map(|pc| pc.peer_connection.connection_state())
-        } else {
-            None // Can't get lock
-        }
+        let pc = self.peer_connection.load();
+        pc.as_ref()
+            .as_ref()
+            .map(|pc| pc.peer_connection.connection_state())
     }
 
     /// Get comprehensive circuit breaker statistics
     pub async fn get_circuit_breaker_stats(
         &self,
     ) -> Result<crate::webrtc_circuit_breaker::CircuitBreakerStats, String> {
-        let pc_guard = self.peer_connection.lock().await;
-        if let Some(ref pc) = *pc_guard {
+        let pc = self.peer_connection.load();
+        if let Some(ref pc) = **pc {
             Ok(pc.get_comprehensive_circuit_breaker_stats())
         } else {
             Err("Peer connection not available".to_string())
@@ -1770,8 +1769,8 @@ impl Tube {
 
     /// Check if circuit breaker is healthy (closed state)
     pub async fn is_circuit_breaker_healthy(&self) -> Result<bool, String> {
-        let pc_guard = self.peer_connection.lock().await;
-        if let Some(ref pc) = *pc_guard {
+        let pc = self.peer_connection.load();
+        if let Some(ref pc) = **pc {
             Ok(pc.is_circuit_breaker_healthy())
         } else {
             Err("Peer connection not available".to_string())
@@ -1974,8 +1973,10 @@ impl Tube {
         }
 
         // 4. Close peer connection (releases TURN allocation, stops refresh timers)
-        let mut pc_guard = self.peer_connection.lock().await;
-        if let Some(pc) = pc_guard.take() {
+        // Use swap() instead of lock().await to prevent deadlock
+        // This atomically takes ownership without ever blocking on a lock
+        let old_pc = self.peer_connection.swap(Arc::new(None));
+        if let Some(pc) = old_pc.as_ref() {
             match tokio::time::timeout(crate::config::peer_connection_close_timeout(), pc.close())
                 .await
             {
@@ -2078,9 +2079,8 @@ impl Drop for Tube {
         // Silently check - no logging to avoid fd race during test teardown
         let _ = self.data_channels.try_read();
 
-        // 6. SAFETY NET: Check if peer connection was closed
-        // Silently check - no logging to avoid fd race during test teardown
-        let _ = self.peer_connection.try_lock();
+        // 6. SAFETY NET: Check if peer connection was closed (no longer needed with ArcSwap)
+        // ArcSwap is lock-free and never blocks, so no spurious wakeup needed
 
         // Drop complete - no logging to avoid fd race during test teardown
     }

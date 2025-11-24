@@ -33,7 +33,7 @@ pub fn is_verbose_logging() -> bool {
 }
 
 /// Set verbose logging flag (callable from Python)
-#[cfg_attr(feature = "python", pyo3::pyfunction)]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn set_verbose_logging(enabled: bool) {
     VERBOSE_LOGGING.store(enabled, Ordering::Relaxed);
     log::debug!(
@@ -168,7 +168,9 @@ pub fn initialize_logger(
                     .filter_target("stun".to_owned(), log::LevelFilter::Error)
                     // RTP/RTCP libraries
                     .filter_target("rtp".to_owned(), log::LevelFilter::Error)
-                    .filter_target("rtcp".to_owned(), log::LevelFilter::Error);
+                    .filter_target("rtcp".to_owned(), log::LevelFilter::Error)
+                    // Turn off noisy websockets library logs
+                    .filter_target("websockets".to_owned(), log::LevelFilter::Off);
             }
 
             // Install the configured logger

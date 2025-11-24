@@ -1352,14 +1352,10 @@ impl WebRTCPeerConnection {
 
                         // Add max-message-size to answer SDP for non-trickle ICE only
                         if !is_offer && !sdp_str.contains("a=max-message-size") {
-                            debug!("Answer SDP missing max-message-size, attempting to add it (tube_id: {})", self.tube_id);
-
                             // Extract max-message-size from the offer (remote description)
                             let max_message_size = if let Some(remote_desc) =
                                 self.peer_connection.remote_description().await
                             {
-                                debug!("Remote description found, searching for max-message-size (tube_id: {})", self.tube_id);
-
                                 // Extract the max-message-size from the remote offer
                                 let offer_sdp = &remote_desc.sdp;
                                 if let Some(pos) = offer_sdp.find("a=max-message-size:") {
@@ -1371,18 +1367,14 @@ impl WebRTCPeerConnection {
                                         if let Ok(size) =
                                             offer_sdp[start..start + end].trim().parse::<u32>()
                                         {
-                                            debug!("Successfully extracted max-message-size from offer: {} (tube_id: {})", size, self.tube_id);
                                             size
                                         } else {
-                                            debug!("Failed to parse max-message-size value from offer (tube_id: {})", self.tube_id);
                                             DEFAULT_MAX_MESSAGE_SIZE // Default if parsing fails
                                         }
                                     } else {
-                                        debug!("No line ending found after max-message-size in offer (tube_id: {})", self.tube_id);
                                         DEFAULT_MAX_MESSAGE_SIZE // Default if no line ending
                                     }
                                 } else {
-                                    debug!("No max-message-size found in remote offer SDP (tube_id: {})", self.tube_id);
                                     DEFAULT_MAX_MESSAGE_SIZE // Default if isn't found in offer
                                 }
                             } else {
@@ -1397,25 +1389,30 @@ impl WebRTCPeerConnection {
                             let our_max = OUR_MAX_MESSAGE_SIZE;
                             let negotiated_size = max_message_size.min(our_max);
 
-                            debug!("Negotiating max-message-size: client_requested={} ({}KB), our_max={} ({}KB), negotiated={} ({}KB) (tube_id: {})",
-                                   max_message_size, max_message_size/1024, our_max, our_max/1024, negotiated_size, negotiated_size/1024, self.tube_id);
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("Negotiating max-message-size: client_requested={} ({}KB), our_max={} ({}KB), negotiated={} ({}KB) (tube_id: {})",
+                                    max_message_size, max_message_size/1024, our_max, our_max/1024, negotiated_size, negotiated_size/1024, self.tube_id);
+                            }
 
                             // Find the position to insert after sctp-port
                             if let Some(sctp_pos) = sdp_str.find("a=sctp-port:") {
                                 // Find the end of the sctp-port line
                                 if let Some(line_end) = sdp_str[sctp_pos..].find('\n') {
                                     let insert_pos = sctp_pos + line_end + 1;
-                                    debug!(
-                                        "Found sctp-port at position {} (tube_id: {})",
-                                        sctp_pos, self.tube_id
-                                    );
-                                    debug!("Inserting 'a=max-message-size:{}' at position {} (tube_id: {})", negotiated_size, insert_pos, self.tube_id);
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!(
+                                            "Found sctp-port at position {} (tube_id: {})",
+                                            sctp_pos, self.tube_id
+                                        );
+                                    }
                                     sdp_str.insert_str(
                                         insert_pos,
                                         &format!("a=max-message-size:{negotiated_size}\r\n"),
                                     );
-                                    info!("Successfully added max-message-size={} ({}KB) to answer SDP (client requested: {} ({}KB), our max: {} ({}KB)) (tube_id: {})",
-                                          negotiated_size, negotiated_size/1024, max_message_size, max_message_size/1024, our_max, our_max/1024, self.tube_id);
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!("Successfully added max-message-size={} ({}KB) to answer SDP (client requested: {} ({}KB), our max: {} ({}KB)) (tube_id: {})",
+                                            negotiated_size, negotiated_size/1024, max_message_size, max_message_size/1024, our_max, our_max/1024, self.tube_id);
+                                    }
                                 }
                             }
                         }
@@ -1433,14 +1430,12 @@ impl WebRTCPeerConnection {
         } else {
             // Trickle ICE: return the SDP immediately.
             // The calling Tube will set the local description if this is an offer/answer being created by self.
-            debug!(
-                "Trickle ICE: returning {} immediately (tube_id: {})",
-                sdp_type_str, self.tube_id
-            );
-            debug!(
-                "Initial {} SDP (tube_id: {}, sdp: {})",
-                sdp_type_str, self.tube_id, sdp_obj.sdp
-            );
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Initial {} SDP (tube_id: {}, sdp: {})",
+                    sdp_type_str, self.tube_id, sdp_obj.sdp
+                );
+            }
 
             // For trickle ICE, do not modify the SDP
             Ok(sdp_obj.sdp)
@@ -1473,15 +1468,20 @@ impl WebRTCPeerConnection {
             });
         }
 
-        debug!(
-            "set_remote_description called with {} (length: {} bytes) (tube_id: {})",
-            if is_answer { "answer" } else { "offer" },
-            sdp.len(),
-            self.tube_id
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "set_remote_description called with {} (length: {} bytes) (tube_id: {})",
+                if is_answer { "answer" } else { "offer" },
+                sdp.len(),
+                self.tube_id
+            );
+        }
 
         // Check if the offer contains max-message-size
-        if !is_answer && sdp.contains("a=max-message-size:") {
+        if unlikely!(crate::logger::is_verbose_logging())
+            && !is_answer
+            && sdp.contains("a=max-message-size:")
+        {
             debug!(
                 "Incoming offer contains max-message-size attribute (tube_id: {})",
                 self.tube_id
@@ -1498,8 +1498,6 @@ impl WebRTCPeerConnection {
 
         // Check the current signaling state before setting the remote description
         let current_state = self.peer_connection.signaling_state();
-        debug!("Current signaling state before set_remote_description");
-
         // Validate the signaling state transition
         Self::validate_signaling_state_transition(current_state, is_answer, false)?;
 
@@ -1519,10 +1517,12 @@ impl WebRTCPeerConnection {
             self.update_activity();
 
             // Flush buffered candidates now that remote description is set
-            debug!(
-                "Remote description set, flushing buffered incoming ICE candidates (tube_id: {})",
-                self.tube_id
-            );
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Remote description set, flushing buffered incoming ICE candidates (tube_id: {})",
+                    self.tube_id
+                );
+            }
             self.flush_buffered_incoming_ice_candidates().await;
 
             // If this is an answer to an ICE restart offer, mark restart as complete
@@ -1541,32 +1541,23 @@ impl WebRTCPeerConnection {
     pub async fn add_ice_candidate(&self, candidate_str: String) -> Result<(), String> {
         // Check if closing
         if self.is_closing.load(Ordering::Acquire) {
-            warn!(
-                "add_ice_candidate called but connection is closing (tube_id: {})",
-                self.tube_id
-            );
-            return Err("Connection is closing".to_string());
+            return Err("Ignoring ice_candidate, The connection is closing".to_string());
         }
 
-        debug!(
-            "add_ice_candidate called (tube_id: {}, candidate: {})",
-            self.tube_id, candidate_str
-        );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "add_ice_candidate called (tube_id: {}, candidate: {})",
+                self.tube_id, candidate_str
+            );
+        }
 
         // Check if we can add candidates immediately (remote description must be set)
         let local_desc = self.peer_connection.local_description().await;
         let remote_desc = self.peer_connection.remote_description().await;
         let can_add_immediately = remote_desc.is_some();
 
-        debug!("Checking if can add ICE candidate immediately (tube_id: {}, local_set: {}, remote_set: {}, can_add_immediately: {})", self.tube_id, local_desc.is_some(), remote_desc.is_some(), can_add_immediately);
-
         if can_add_immediately {
             // Connection is ready, add the candidate immediately
-            debug!(
-                "Remote description set, adding incoming ICE candidate immediately (tube_id: {})",
-                self.tube_id
-            );
-
             if !candidate_str.is_empty() {
                 // Track remote candidate receipt timing and count
                 {
@@ -1618,11 +1609,6 @@ impl WebRTCPeerConnection {
 
                 match self.peer_connection.add_ice_candidate(candidate_init).await {
                     Ok(()) => {
-                        debug!(
-                            "Successfully added ICE candidate immediately (tube_id: {})",
-                            self.tube_id
-                        );
-
                         // Enhanced debugging: Log candidate details and analyze pairs
                         self.log_candidate_details(&candidate_str, "INCOMING");
 
@@ -1643,11 +1629,6 @@ impl WebRTCPeerConnection {
 
                                 // Getting stats triggers internal ICE agent processing
                                 let _ = peer_conn_clone.get_stats().await;
-
-                                debug!(
-                                    "Triggered ICE connectivity check after adding trickle candidate (tube_id: {})",
-                                    tube_id_clone
-                                );
 
                                 // Analyze candidate pairs for debugging
                                 if let Err(e) = Self::analyze_candidate_pairs_static(
@@ -1681,10 +1662,12 @@ impl WebRTCPeerConnection {
                     .map(|start| start.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
 
-                info!(
-                    "Remote ICE gathering complete (tube_id: {}, total_remote_candidates: {}, duration: {:.1}s)",
-                    self.tube_id, final_remote_count, receive_duration
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Remote ICE gathering complete (tube_id: {}, total_remote_candidates: {}, duration: {:.1}s)",
+                        self.tube_id, final_remote_count, receive_duration
+                    );
+                }
 
                 // Final warning if very few candidates received
                 if final_remote_count > 0 && final_remote_count < 3 {
@@ -1745,7 +1728,7 @@ impl WebRTCPeerConnection {
                             tokio::time::sleep(crate::config::ice_disconnected_wait()).await;
                             network_integration.trigger_ice_restart(&tube_id, "connection disconnected");
                         } else {
-                            info!("Connection disconnected for tube {} - ICE restart not available (trickle_ice disabled)", tube_id);
+                            error!("Connection disconnected for tube {} - ICE restart is not available (trickle_ice disabled)", tube_id);
                         }
                     },
                     RTCPeerConnectionState::Failed => {
@@ -1753,7 +1736,7 @@ impl WebRTCPeerConnection {
                             warn!("Connection failed for tube {}, triggering immediate ICE restart (trickle_ice enabled)", tube_id);
                             network_integration.trigger_ice_restart(&tube_id, "connection failed");
                         } else {
-                            warn!("Connection failed for tube {} - ICE restart not available (trickle_ice disabled)", tube_id);
+                            warn!("Connection failed for tube {} - ICE restart is not available (trickle_ice disabled)", tube_id);
                         }
                     },
                     RTCPeerConnectionState::Connected => {
@@ -1773,7 +1756,7 @@ impl WebRTCPeerConnection {
                                     if let Err(e) = network_integration_clone.trigger_initial_scan().await {
                                         warn!("Failed to trigger initial network scan for tube {}: {}", tube_id_clone, e);
                                     } else {
-                                        info!("Initial network scan triggered successfully for tube {} (event-driven)", tube_id_clone);
+                                        debug!("Initial network scan triggered successfully for tube {} (event-driven)", tube_id_clone);
                                     }
                                 });
                             }
@@ -1824,19 +1807,10 @@ impl WebRTCPeerConnection {
         if let Some(ref conv_id) = self.conversation_id {
             crate::metrics::METRICS_COLLECTOR
                 .register_connection(conv_id.clone(), self.tube_id.clone());
-            debug!(
-                "Registered connection with metrics collector (conversation_id: {}, tube_id: {})",
-                conv_id, self.tube_id
-            );
         }
 
         // Start periodic stats collection
         self.start_stats_collection().await?;
-
-        // Network monitoring note:
-        // The NetworkMonitor tries to use pyo3_log::Logger from Rust async tasks
-        // but Python interpreter isn't initialized in pure Rust test contexts
-        debug!("Skipping network monitoring startup to avoid Python interpreter issues");
 
         // Register ICE restart callback for network changes
         // Note: This callback is ONLY called when trickle_ice=true (guarded in the state change handler above)
@@ -2915,13 +2889,17 @@ impl WebRTCPeerConnection {
                     match Self::test_udp_connectivity_static(&ip_clone, &port_clone).await {
                         Ok(_) => {
                             // Use println! to ensure log shows up immediately
-                            debug!("[PAIR_TEST] Candidate pair viable (tube_id: {}, result: Reachable)", tube_id_clone);
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("[PAIR_TEST] Candidate pair viable (tube_id: {}, result: Reachable)", tube_id_clone);
+                            }
                         }
                         Err(e) => {
-                            debug!(
-                                "[PAIR_TEST] Candidate pair not viable (tube_id: {}, result: {:?})",
-                                tube_id_clone, e
-                            );
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!(
+                                    "[PAIR_TEST] Candidate pair not viable (tube_id: {}, result: {:?})",
+                                    tube_id_clone, e
+                                );
+                            }
                         }
                     }
                 });
@@ -2997,10 +2975,12 @@ impl WebRTCPeerConnection {
                     total_pairs += 1;
 
                     // Log detailed pair info for debugging
-                    debug!(
-                        "[PAIR_DEBUG] Candidate pair (tube_id: {}, pair_id: {:?}, state: {:?})",
-                        tube_id, pair_stats.id, pair_stats.state
-                    );
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "Candidate pair (tube_id: {}, pair_id: {:?}, state: {:?})",
+                            tube_id, pair_stats.id, pair_stats.state
+                        );
+                    }
                 }
                 // Count data channels (your actual use case)
                 webrtc::stats::StatsReportType::DataChannel(_) => {

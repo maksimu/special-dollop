@@ -84,29 +84,6 @@ fn unlikely(condition: bool) -> bool {
 // **BOLD WARNING: HOT PATH - CALLED FOR EVERY INCOMING FRAME**
 // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
 pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Result<()> {
-    // HOT PATH: Only log frame reception in verbose mode (can be 1000s/sec)
-    if unlikely!(crate::logger::is_verbose_logging()) {
-        debug!(
-            "handle_incoming_frame received frame (channel_id: {}, conn_no: {}, payload_len: {})",
-            channel.channel_id,
-            frame.connection_no,
-            frame.payload.len()
-        );
-
-        if frame.payload.len() <= 100 {
-            debug!(
-                "Frame payload (channel_id: {}, payload: {:?})",
-                channel.channel_id, frame.payload
-            );
-        } else {
-            let first_bytes = &frame.payload[..std::cmp::min(50, frame.payload.len())];
-            debug!(
-                "Large frame first bytes (channel_id: {}, first_bytes: {:?})",
-                channel.channel_id, first_bytes
-            );
-        }
-    }
-
     // **BRANCH PREDICTION OPTIMIZATION**: Connection 1 is ULTRA HOT PATH (90%+ of data)
     if likely(frame.connection_no == 1) {
         // **ULTRA HOT PATH**: Connection 1 - main data traffic (most optimized)
@@ -197,31 +174,7 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
 // **COMPLETELY LOCK-FREE: Uses channel communication instead of mutex!**
 #[inline(always)] // Force inlining for maximum performance
 async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes) -> Result<()> {
-    let payload_len = payload.len(); // Store length before moving
-
-    // HOT PATH: Only log in verbose mode (suppress 1000s/sec spam with video workloads)
-    if unlikely!(crate::logger::is_verbose_logging()) {
-        debug!(
-            "Forwarding bytes via lock-free channel (channel_id: {}, conn_no: {}, payload_len: {})",
-            channel.channel_id, conn_no, payload_len
-        );
-
-        if payload_len > 0 && payload_len <= 100 {
-            debug!(
-                "Payload for backend (channel_id: {}, payload: {:?})",
-                channel.channel_id, payload
-            );
-        } else if payload_len > 100 {
-            let first_bytes = payload.slice(..std::cmp::min(50, payload_len));
-            debug!(
-                "Large payload first bytes (channel_id: {}, first_bytes: {:?})",
-                channel.channel_id, first_bytes
-            );
-        }
-    } // Close the is_verbose_logging() block
-
     // Skip inbound special instruction detection - user only wants outbound and handshake sizes
-
     // **COMPLETELY LOCK-FREE**: DashMap provides efficient concurrent access
     // **MEMORY OPTIMIZATION**: Smart prefetching for 2-connection pattern (always enabled)
     if likely(conn_no == 1) {

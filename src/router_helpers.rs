@@ -224,7 +224,9 @@ mod challenge_response {
             let challenge = response.text().await?;
             let signature = sign_client_id(ksm_config, &challenge)?;
 
-            debug!("Fetched new Keeper API challenge and generated response.");
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!("Fetched new Keeper API challenge and generated response.");
+            }
 
             // Update the cache
             {
@@ -269,8 +271,6 @@ mod challenge_response {
             }
         };
 
-        debug!("Decoding client_id and private key");
-
         let private_key_der_bytes = match url_safe_str_to_bytes(private_key_der_str) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -286,8 +286,6 @@ mod challenge_response {
                 return Err(e);
             }
         };
-
-        debug!("Adding challenge to the signature before connecting to the router");
 
         let challenge_bytes = match url_safe_str_to_bytes(challenge) {
             Ok(bytes) => bytes,

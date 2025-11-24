@@ -45,6 +45,8 @@ pub struct RegistryMetrics {
     pub avg_create_time: Duration,
     pub total_creates: u64,
     pub total_failures: u64,
+    pub stale_tubes_removed: u64,
+    pub close_timeouts: u64,
 }
 
 /// Request structure for tube creation
@@ -112,6 +114,9 @@ struct RegistryActor {
     total_creates: u64,
     total_failures: u64,
     create_times: Vec<Duration>,
+    /// Stale tube cleanup metrics (shared for cross-task updates)
+    stale_tubes_removed: Arc<AtomicUsize>,
+    close_timeouts: Arc<AtomicUsize>,
 }
 
 // ============================================================================
@@ -128,6 +133,8 @@ async fn close_tube_async(
     conversations: Arc<DashMap<String, String>>,
     tube_id: String,
     reason: Option<CloseConnectionReason>,
+    stale_counter: Arc<AtomicUsize>,
+    timeout_counter: Arc<AtomicUsize>,
 ) -> Result<()> {
     debug!("Spawned task closing tube: {}", tube_id);
 
@@ -157,6 +164,44 @@ async fn close_tube_async(
         .is_err(); // is_err() means it was already true
 
     if already_closing {
+        // STALE TUBE FIX: Check if tube is in terminal state and force-remove if stuck
+        // This prevents tubes from becoming stale when the original close operation hung
+        let state = tube.get_connection_state().await;
+        let is_terminal = matches!(
+            state,
+            Some(webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed)
+                | Some(
+                    webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed
+                )
+        );
+
+        // If in terminal state for 5+ minutes, force-remove even if already_closing
+        if is_terminal {
+            let inactive_5min = tube
+                .is_inactive_for_duration(std::time::Duration::from_secs(300))
+                .await;
+
+            if inactive_5min {
+                warn!(
+                    "Tube {} is already closing but stuck in terminal state ({:?}) for 5+ min - forcing removal",
+                    tube_id, state
+                );
+
+                // Force remove from registry - this is a stale tube
+                tubes.remove(&tube_id);
+                conversations.retain(|_, tid| tid != &tube_id);
+
+                // Track stale tube removal for monitoring
+                stale_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                info!(
+                    "Forced removal of stale tube {} (state: {:?})",
+                    tube_id, state
+                );
+                return Ok(());
+            }
+        }
+
         debug!(
             "Tube {} is already being closed by another task - returning success (idempotent)",
             tube_id
@@ -249,16 +294,31 @@ async fn close_tube_async(
     }
 
     // 3. Explicit close (closes data channels + peer connection properly)
-    if let Err(e) = tube.close(reason).await {
-        warn!(
-            "Error during explicit tube close: {} (tube_id: {}) - proceeding with removal",
-            e, tube_id
-        );
-    } else {
-        info!("Tube {} explicit close completed successfully", tube_id);
+    // Add timeout to prevent hanging forever - if close takes >30s, force-remove anyway
+    let close_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), tube.close(reason)).await;
+
+    match close_result {
+        Ok(Ok(_)) => {
+            info!("Tube {} explicit close completed successfully", tube_id);
+        }
+        Ok(Err(e)) => {
+            warn!(
+                "Error during explicit tube close: {} (tube_id: {}) - proceeding with removal",
+                e, tube_id
+            );
+        }
+        Err(_) => {
+            error!(
+                "Tube close timed out after 30s (tube_id: {}) - forcing removal to prevent stale tube",
+                tube_id
+            );
+            // Track timeout for monitoring
+            timeout_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
-    // 4. Remove from registry
+    // 4. Remove from registry (ALWAYS remove, even if close failed/timed out)
     tubes.remove(&tube_id);
     conversations.retain(|_, tid| tid != &tube_id);
 
@@ -283,6 +343,8 @@ impl RegistryActor {
             total_creates: 0,
             total_failures: 0,
             create_times: Vec::with_capacity(100),
+            stale_tubes_removed: Arc::new(AtomicUsize::new(0)),
+            close_timeouts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -372,12 +434,20 @@ impl RegistryActor {
                     let tubes = self.tubes.clone();
                     let conversations = self.conversations.clone();
                     let tube_id_clone = tube_id.clone();
+                    let stale_counter = self.stale_tubes_removed.clone();
+                    let timeout_counter = self.close_timeouts.clone();
 
                     // Spawn cleanup task - actor returns IMMEDIATELY
                     tokio::spawn(async move {
-                        let result =
-                            close_tube_async(tubes, conversations, tube_id_clone.clone(), reason)
-                                .await;
+                        let result = close_tube_async(
+                            tubes,
+                            conversations,
+                            tube_id_clone.clone(),
+                            reason,
+                            stale_counter,
+                            timeout_counter,
+                        )
+                        .await;
 
                         // Send result back
                         let _ = resp.send(result);
@@ -422,6 +492,9 @@ impl RegistryActor {
                         avg_create_time: avg_time,
                         total_creates: self.total_creates,
                         total_failures: self.total_failures,
+                        stale_tubes_removed: self.stale_tubes_removed.load(Ordering::Relaxed)
+                            as u64,
+                        close_timeouts: self.close_timeouts.load(Ordering::Relaxed) as u64,
                     };
                     let _ = resp.send(metrics);
                 }
@@ -436,8 +509,6 @@ impl RegistryActor {
                 }
             }
         }
-
-        info!("Registry actor event loop terminated gracefully");
     }
 
     /// Handle tube creation - all logic outside any locks
@@ -657,13 +728,6 @@ impl RegistryActor {
             result_map.insert("answer".to_string(), answer_base64);
         }
 
-        debug!(
-            "Tube created successfully via actor (tube_id: {}, conversation_id: {}, mode: {})",
-            tube_id,
-            conversation_id,
-            if is_server_mode { "server" } else { "client" }
-        );
-
         Ok(result_map)
     }
 
@@ -709,11 +773,6 @@ impl RegistryActor {
             warn!("No krelay_server provided (tube_id: {})", tube_id);
             return Ok(ice_servers);
         }
-
-        debug!(
-            "Using krelay_server for ICE configuration (tube_id: {}, relay: {})",
-            tube_id, krelay_server
-        );
 
         // Add STUN if not turn-only
         if !turn_only {
@@ -766,11 +825,6 @@ impl RegistryActor {
                             credential: existing_conn.password,
                         });
                     } else {
-                        // Fetch new credentials - NETWORK I/O but no locks held!
-                        debug!(
-                            "Fetching new TURN credentials from router (tube_id: {})",
-                            tube_id
-                        );
                         let turn_start = Instant::now();
 
                         match get_relay_access_creds(ksm_cfg, Some(3600), client_version).await {
@@ -781,12 +835,14 @@ impl RegistryActor {
 
                                 let ttl_seconds =
                                     creds.get("ttl").and_then(|v| v.as_u64()).unwrap_or(3600);
-                                info!(
-                                    "TURN credentials TTL: {}s ({:.1}h) (tube_id: {})",
-                                    ttl_seconds,
-                                    ttl_seconds as f64 / 3600.0,
-                                    tube_id
-                                );
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!(
+                                        "TURN credentials TTL: {}s ({:.1}h) (tube_id: {})",
+                                        ttl_seconds,
+                                        ttl_seconds as f64 / 3600.0,
+                                        tube_id
+                                    );
+                                }
 
                                 crate::metrics::METRICS_COLLECTOR.record_turn_allocation(
                                     tube_id,
@@ -1106,8 +1162,6 @@ impl RegistryHandle {
 
 // Global registry handle - initialized once
 pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
-    debug!("Initializing global tube registry with actor model");
-
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     // Get max concurrent from environment or default to 100
@@ -1128,7 +1182,6 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     std::thread::spawn(move || {
         let rt = crate::runtime::get_runtime();
         rt.spawn(async move {
-            debug!("Registry actor event loop starting");
             actor.run().await;
             // If actor exits, this is catastrophic
             error!("CRITICAL: Registry actor event loop terminated!");

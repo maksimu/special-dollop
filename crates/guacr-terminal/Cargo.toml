@@ -32,25 +32,8 @@ guacr-protocol = { path = "../guacr-protocol" }
 # Zero-copy buffer pooling
 crossbeam-queue = "0.3"
 
-# Hardware encoding support (optional, MIT/Apache-licensed)
-# Note: Only VideoToolbox actually works - others are placeholders for future implementation
-nvenc = { version = "0.1.0", optional = true }                    # NVIDIA NVENC - PLACEHOLDER (doesn't work yet)
-intel-mediasdk-sys = { version = "0.1.0", optional = true }        # Intel QuickSync - PLACEHOLDER (doesn't work yet)
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# macOS VideoToolbox - WORKS on macOS (the only one that actually works)
-objc2-video-toolbox = { version = "0.3.2", optional = true, default-features = false, features = ["VTCompressionSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
-objc2-core-media = { version = "0.3", optional = true }
-objc2-core-video = { version = "0.3", optional = true }
-objc2-core-foundation = { version = "0.3", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# Linux VAAPI - PLACEHOLDER (needs GPU access, doesn't work in standard Docker)
-libva-sys = { version = "0.1.2", optional = true }
+# Lock primitives (no poisoning)
+parking_lot = "0.12"
 
 [features]
 default = []
-nvenc = ["dep:nvenc"]              # PLACEHOLDER - doesn't work yet
-quicksync = ["intel-mediasdk-sys"] # PLACEHOLDER - doesn't work yet
-videotoolbox = ["dep:objc2-video-toolbox", "dep:objc2-core-media", "dep:objc2-core-video", "dep:objc2-core-foundation"]  # WORKS on macOS
-vaapi = ["libva-sys"]              # PLACEHOLDER - needs GPU, doesn't work in standard Docker

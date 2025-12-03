@@ -21,6 +21,7 @@ log.workspace = true
 # SSH client
 russh = "0.45"
 russh-keys = "0.45"
+rustls = { version = "0.23", features = ["ring"] }
 
 # Utilities
 base64.workspace = true

@@ -45,7 +45,7 @@ pub async fn establish_sftp_session(
             .await
             .map_err(|e| format!("Password auth failed: {}", e))?
     } else if let Some(key_data) = private_key {
-        let passphrase = private_key_passphrase.as_deref();
+        let passphrase = private_key_passphrase;
         let key = decode_secret_key(key_data, passphrase)
             .map_err(|e| format!("Key decode failed: {}", e))?;
         session
@@ -61,7 +61,7 @@ pub async fn establish_sftp_session(
     }
 
     // Open SFTP channel
-    let mut channel = session
+    let channel = session
         .channel_open_session()
         .await
         .map_err(|e| format!("Channel open failed: {}", e))?;

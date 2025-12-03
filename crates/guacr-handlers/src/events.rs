@@ -34,15 +34,23 @@ pub enum HandlerEvent {
 /// This allows keeper-pam-webrtc-rs to register callbacks for events
 /// instead of parsing all instructions. Only critical events (error,
 /// disconnect, threat) need to be handled by WebRTC layer.
+#[async_trait::async_trait]
 pub trait EventCallback: Send + Sync {
     /// Handle a protocol handler event
     fn on_event(&self, event: HandlerEvent);
 
-    /// Send instruction to client (zero-copy)
+    /// Send instruction to client (zero-copy with backpressure)
     ///
     /// This is the hot path - Bytes is reference-counted, so no copying happens.
     /// The WebRTC layer should send the Bytes directly to the client.
-    fn send_instruction(&self, instruction: Bytes);
+    ///
+    /// Async to allow proper backpressure - if WebRTC is backed up, this will await
+    /// rather than dropping frames (critical for RDP/VNC/database protocols).
+    ///
+    /// # Returns
+    /// * `Ok(())` - Instruction sent successfully
+    /// * `Err(HandlerError)` - Failed to send (channel closed, backpressure timeout, etc.)
+    async fn send_instruction(&self, instruction: Bytes) -> Result<(), crate::error::HandlerError>;
 }
 
 /// Protocol handler with event-based interface
@@ -87,11 +95,16 @@ impl InstructionSender {
         Self { callback }
     }
 
-    /// Send instruction (zero-copy)
+    /// Send instruction (zero-copy with backpressure)
     ///
     /// Bytes is reference-counted, so this is zero-copy.
-    pub fn send(&self, instruction: Bytes) {
-        self.callback.send_instruction(instruction);
+    /// Async to propagate backpressure from WebRTC layer.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Instruction sent successfully
+    /// * `Err(HandlerError)` - Failed to send (channel closed, backpressure timeout, etc.)
+    pub async fn send(&self, instruction: Bytes) -> Result<(), crate::error::HandlerError> {
+        self.callback.send_instruction(instruction).await
     }
 
     /// Send error event
@@ -123,6 +136,77 @@ impl InstructionSender {
     }
 }
 
+/// Helper function to adapt a channel-based handler to event-based interface
+///
+/// This eliminates boilerplate code in protocol implementations by providing
+/// a common adapter pattern. All protocols that implement both ProtocolHandler
+/// and EventBasedHandler can use this helper.
+///
+/// # Arguments
+/// * `connect_fn` - The channel-based connect function to wrap
+/// * `params` - Connection parameters
+/// * `callback` - Event callback for sending instructions
+/// * `from_client` - Channel receiver for client messages
+/// * `channel_capacity` - Capacity for the internal forwarding channel (typically 128 or 4096)
+///
+/// # Example
+/// ```no_run
+/// # use guacr_handlers::{connect_with_event_adapter, EventCallback, HandlerEvent, Result};
+/// # use std::collections::HashMap;
+/// # use std::sync::Arc;
+/// # use tokio::sync::mpsc;
+/// # use bytes::Bytes;
+/// # async fn example(
+/// #     params: HashMap<String, String>,
+/// #     callback: Arc<dyn EventCallback>,
+/// #     from_client: mpsc::Receiver<Bytes>,
+/// # ) -> Result<()> {
+/// connect_with_event_adapter(
+///     |p, tx, rx| async move {
+///         // Your channel-based connect implementation
+///         Ok(())
+///     },
+///     params,
+///     callback,
+///     from_client,
+///     128,  // channel capacity
+/// ).await
+/// # }
+/// ```
+pub async fn connect_with_event_adapter<F, Fut>(
+    connect_fn: F,
+    params: std::collections::HashMap<String, String>,
+    callback: Arc<dyn EventCallback>,
+    from_client: tokio::sync::mpsc::Receiver<Bytes>,
+    channel_capacity: usize,
+) -> Result<(), crate::error::HandlerError>
+where
+    F: FnOnce(
+        std::collections::HashMap<String, String>,
+        tokio::sync::mpsc::Sender<Bytes>,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::error::HandlerError>>,
+{
+    // Create channel for handler → callback forwarding
+    let (to_client, mut handler_rx) = tokio::sync::mpsc::channel::<Bytes>(channel_capacity);
+
+    // Spawn forwarding task with proper backpressure
+    tokio::spawn(async move {
+        while let Some(msg) = handler_rx.recv().await {
+            // Await send to propagate backpressure (prevents dropping frames)
+            // If send fails (e.g., channel closed), log error and stop forwarding
+            if let Err(e) = callback.send_instruction(msg).await {
+                log::error!("Failed to forward instruction to client: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Call the channel-based connect function
+    connect_fn(params, to_client, from_client).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,18 +217,23 @@ mod tests {
         instructions: Arc<Mutex<Vec<Bytes>>>,
     }
 
+    #[async_trait::async_trait]
     impl EventCallback for TestCallback {
         fn on_event(&self, event: HandlerEvent) {
             self.events.lock().unwrap().push(event);
         }
 
-        fn send_instruction(&self, instruction: Bytes) {
+        async fn send_instruction(
+            &self,
+            instruction: Bytes,
+        ) -> Result<(), crate::error::HandlerError> {
             self.instructions.lock().unwrap().push(instruction);
+            Ok(())
         }
     }
 
-    #[test]
-    fn test_event_callback() {
+    #[tokio::test]
+    async fn test_event_callback() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let instructions = Arc::new(Mutex::new(Vec::new()));
 
@@ -156,7 +245,7 @@ mod tests {
         let sender = InstructionSender::new(callback.clone());
 
         // Send instruction
-        sender.send(Bytes::from("test"));
+        sender.send(Bytes::from("test")).await.unwrap();
         assert_eq!(instructions.lock().unwrap().len(), 1);
 
         // Send error

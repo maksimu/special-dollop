@@ -1,16 +1,30 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    // Connection utilities
+    connect_tcp_with_timeout,
+    is_mouse_event_allowed_readonly,
+    EventBasedHandler,
+    EventCallback,
+    HandlerError,
+    // Security
+    HandlerSecuritySettings,
+    HandlerStats,
+    HealthStatus,
+    KeepAliveManager,
+    MultiFormatRecorder,
     ProtocolHandler,
+    // Recording
+    RecordingConfig,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
 use guacr_protocol::{BinaryEncoder, GuacamoleParser};
-use guacr_rdp::FrameBuffer;
-use log::{debug, error, info, warn};
+use guacr_terminal::FrameBuffer;
+use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::vnc_protocol::VncProtocol;
@@ -82,7 +96,15 @@ impl ProtocolHandler for VncHandler {
             .map_err(HandlerError::InvalidParameter)?;
 
         // Create VNC client
-        let mut client = VncClient::new(settings.width, settings.height, to_client);
+        let mut client = VncClient::new(
+            settings.width,
+            settings.height,
+            settings.read_only,
+            settings.security.clone(),
+            settings.recording_config.clone(),
+            to_client,
+            &params,
+        );
 
         // Connect and run session
         client
@@ -125,21 +147,15 @@ impl EventBasedHandler for VncHandler {
         callback: Arc<dyn EventCallback>,
         from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
-
-        let sender = InstructionSender::new(callback);
-        let sender_arc = Arc::new(sender);
-
-        let sender_clone = Arc::clone(&sender_arc);
-        tokio::spawn(async move {
-            while let Some(msg) = handler_rx.recv().await {
-                sender_clone.send(msg);
-            }
-        });
-
-        self.connect(params, to_client, from_client).await?;
-
-        Ok(())
+        // Use common event adapter helper (eliminates boilerplate)
+        guacr_handlers::connect_with_event_adapter(
+            |params, to_client, from_client| self.connect(params, to_client, from_client),
+            params,
+            callback,
+            from_client,
+            4096, // channel capacity
+        )
+        .await
     }
 }
 
@@ -155,6 +171,12 @@ pub struct VncSettings {
     pub password: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// Read-only mode - blocks keyboard/mouse input
+    pub read_only: bool,
+    /// Security settings
+    pub security: HandlerSecuritySettings,
+    /// Recording configuration
+    pub recording_config: RecordingConfig,
     #[cfg(feature = "sftp")]
     pub enable_sftp: bool,
     #[cfg(feature = "sftp")]
@@ -188,15 +210,31 @@ impl VncSettings {
 
         let password = params.get("password").cloned();
 
-        let width = params
-            .get("width")
-            .and_then(|w| w.parse().ok())
-            .unwrap_or(defaults.default_width);
+        // IMPORTANT: Always use DEFAULT size during initialization (like guacd does)
+        // The client will send a resize instruction with actual browser dimensions after handshake
+        // This prevents "half screen" display issues
+        info!("VNC: Using default handshake size - will resize after client connects");
+        let width = defaults.default_width;
+        let height = defaults.default_height;
 
-        let height = params
-            .get("height")
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(defaults.default_height);
+        // Parse security settings
+        let security = HandlerSecuritySettings::from_params(params);
+        let read_only = security.read_only;
+        info!(
+            "VNC: Security settings - read_only={}, disable_copy={}, disable_paste={}",
+            security.read_only, security.disable_copy, security.disable_paste
+        );
+
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(params);
+        if recording_config.is_enabled() {
+            info!(
+                "VNC: Recording enabled - ses={}, asciicast={}, typescript={}",
+                recording_config.is_ses_enabled(),
+                recording_config.is_asciicast_enabled(),
+                recording_config.is_typescript_enabled()
+            );
+        }
 
         #[cfg(feature = "sftp")]
         let (
@@ -257,7 +295,10 @@ impl VncSettings {
             }
         };
 
-        info!("VNC Settings: {}:{}, {}x{}", hostname, port, width, height);
+        info!(
+            "VNC Settings: {}:{}, {}x{}, read_only={}",
+            hostname, port, width, height, read_only
+        );
 
         Ok(Self {
             hostname,
@@ -265,6 +306,9 @@ impl VncSettings {
             password,
             width,
             height,
+            read_only,
+            security,
+            recording_config,
             #[cfg(feature = "sftp")]
             enable_sftp,
             #[cfg(feature = "sftp")]
@@ -294,19 +338,63 @@ struct VncClient {
     stream_id: u32,
     width: u32,
     height: u32,
+    /// Read-only mode - blocks keyboard/mouse input
+    read_only: bool,
+    /// Security settings (includes connection timeout)
+    security: HandlerSecuritySettings,
+    /// Recording configuration
+    #[allow(dead_code)] // TODO: Use for .ses recording
+    recording_config: RecordingConfig,
+    /// Active recorder
+    #[allow(dead_code)] // TODO: Use for .ses recording
+    recorder: Option<MultiFormatRecorder>,
     #[cfg(feature = "sftp")]
     sftp_session: Option<russh_sftp::client::SftpSession>,
     to_client: mpsc::Sender<Bytes>,
 }
 
 impl VncClient {
-    fn new(width: u32, height: u32, to_client: mpsc::Sender<Bytes>) -> Self {
+    fn new(
+        width: u32,
+        height: u32,
+        read_only: bool,
+        security: HandlerSecuritySettings,
+        recording_config: RecordingConfig,
+        to_client: mpsc::Sender<Bytes>,
+        params: &HashMap<String, String>,
+    ) -> Self {
+        // Initialize recording if enabled
+        let recorder = if recording_config.is_enabled() {
+            match MultiFormatRecorder::new(
+                &recording_config,
+                params,
+                "vnc",
+                width as u16,
+                height as u16,
+            ) {
+                Ok(rec) => {
+                    info!("VNC: Session recording initialized");
+                    Some(rec)
+                }
+                Err(e) => {
+                    warn!("VNC: Failed to initialize recording: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             framebuffer: FrameBuffer::new(width, height),
             binary_encoder: BinaryEncoder::new(),
             stream_id: 1,
             width,
             height,
+            read_only,
+            security,
+            recording_config,
+            recorder,
             #[cfg(feature = "sftp")]
             sftp_session: None,
             to_client,
@@ -322,11 +410,16 @@ impl VncClient {
         #[cfg(feature = "sftp")] settings: Option<&VncSettings>,
         #[cfg(not(feature = "sftp"))] _settings: Option<&VncSettings>,
     ) -> Result<(), String> {
-        info!("VNC: Connecting to {}:{}", hostname, port);
+        info!(
+            "VNC: Connecting to {}:{} (timeout: {}s)",
+            hostname, port, self.security.connection_timeout_secs
+        );
 
-        let mut stream = TcpStream::connect((hostname, port))
-            .await
-            .map_err(|e| format!("TCP connection failed: {}", e))?;
+        // Connect with timeout (matches guacd behavior)
+        let mut stream =
+            connect_tcp_with_timeout((hostname, port), self.security.connection_timeout_secs)
+                .await
+                .map_err(|e| format!("{}", e))?;
 
         info!("VNC: TCP connection established");
 
@@ -397,8 +490,25 @@ impl VncClient {
 
         let mut read_buf = vec![0u8; 65536];
 
+        // Keep-alive manager (matches guacd's guac_socket_require_keep_alive behavior)
+        let mut keepalive = KeepAliveManager::new(DEFAULT_KEEPALIVE_INTERVAL_SECS);
+        let mut keepalive_interval =
+            tokio::time::interval(Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                // Keep-alive ping to detect dead connections
+                _ = keepalive_interval.tick() => {
+                    if let Some(sync_instr) = keepalive.check() {
+                        trace!("VNC: Sending keep-alive sync");
+                        if self.to_client.send(sync_instr).await.is_err() {
+                            info!("VNC: Client channel closed, ending session");
+                            break;
+                        }
+                    }
+                }
+
                 result = stream.read(&mut read_buf) => {
                     match result {
                         Ok(0) => {
@@ -474,6 +584,12 @@ impl VncClient {
 
         match instr.opcode {
             "key" => {
+                // Security: Check read-only mode
+                if self.read_only {
+                    trace!("VNC: Keyboard input blocked (read-only mode)");
+                    return Ok(());
+                }
+
                 if instr.args.len() >= 2 {
                     if let (Ok(keysym), Ok(pressed)) =
                         (instr.args[0].parse::<u32>(), instr.args[1].parse::<u8>())
@@ -489,6 +605,12 @@ impl VncClient {
                         instr.args[1].parse::<i32>(),
                         instr.args[2].parse::<i32>(),
                     ) {
+                        // Security: Check read-only mode for mouse clicks
+                        if self.read_only && !is_mouse_event_allowed_readonly(mask as u32) {
+                            trace!("VNC: Mouse click blocked (read-only mode)");
+                            return Ok(());
+                        }
+
                         let x = x.max(0).min(self.width as i32 - 1) as u16;
                         let y = y.max(0).min(self.height as i32 - 1) as u16;
 

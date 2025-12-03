@@ -4,7 +4,8 @@
 use bytes::Bytes;
 use guacr_protocol::GuacamoleParser;
 use log::{info, warn};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Minimum clipboard buffer size (256KB)
 /// Matches GUAC_COMMON_CLIPBOARD_MIN_LENGTH from kcm patches
@@ -102,7 +103,8 @@ impl RdpClipboard {
         }
 
         // Store clipboard data
-        let mut buffer = self.buffer.lock().unwrap();
+        // Using parking_lot::Mutex which doesn't poison on panic
+        let mut buffer = self.buffer.lock();
         buffer[..data.len()].copy_from_slice(data.as_bytes());
         self.length = data.len();
         self.mimetype = mimetype.to_string();
@@ -130,7 +132,8 @@ impl RdpClipboard {
         }
 
         // Store clipboard data
-        let mut buffer = self.buffer.lock().unwrap();
+        // Using parking_lot::Mutex which doesn't poison on panic
+        let mut buffer = self.buffer.lock();
         buffer[..data.len()].copy_from_slice(data);
         self.length = data.len();
 
@@ -164,7 +167,7 @@ impl RdpClipboard {
 
     /// Get current clipboard data
     pub fn get_data(&self) -> Vec<u8> {
-        let buffer = self.buffer.lock().unwrap();
+        let buffer = self.buffer.lock();
         buffer[..self.length].to_vec()
     }
 

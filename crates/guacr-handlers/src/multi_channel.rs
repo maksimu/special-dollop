@@ -5,7 +5,8 @@
 
 use bytes::Bytes;
 use log::warn;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Simple multi-channel sender for WebRTC data channels
 ///
@@ -39,8 +40,8 @@ impl SimpleMultiChannelSender {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use guacr_handlers::multi_channel::{SimpleMultiChannelSender, WebRTCDataChannel};
-    /// use guacr_protocol::MAX_SAFE_PAYLOAD_SIZE;
+    /// use guacr_handlers::{SimpleMultiChannelSender, WebRTCDataChannel};
+    /// use bytes::Bytes;
     /// use std::sync::Arc;
     ///
     /// struct MyChannel;
@@ -103,8 +104,9 @@ impl SimpleMultiChannelSender {
         }
 
         // Round-robin to channel
+        // Using parking_lot::Mutex which doesn't poison on panic
         let channel_idx = {
-            let mut idx = self.current_channel.lock().unwrap();
+            let mut idx = self.current_channel.lock();
             let current = *idx;
             *idx = (*idx + 1) % self.channels.len();
             current

@@ -1,24 +1,47 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    // Connection utilities (timeout, keep-alive)
+    connect_tcp_with_timeout,
+    is_keyboard_event_allowed_readonly,
+    is_mouse_event_allowed_readonly,
+    parse_blob_instruction,
+    parse_end_instruction,
+    parse_pipe_instruction,
+    pipe_blob_bytes,
+    EventBasedHandler,
+    EventCallback,
+    HandlerError,
+    // Security
+    HandlerSecuritySettings,
+    HandlerStats,
+    HealthStatus,
+    KeepAliveManager,
+    MultiFormatRecorder,
+    // Pipe streams (for native terminal display)
+    PipeStreamManager,
     ProtocolHandler,
+    // Recording
+    RecordingConfig,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS,
+    PIPE_NAME_STDIN,
+    PIPE_STREAM_STDOUT,
 };
 use guacr_terminal::{
-    mouse_event_to_x11_sequence, x11_keysym_to_bytes, DirtyTracker, ModifierState,
-    TerminalEmulator, TerminalRenderer,
+    format_clipboard_instructions, handle_mouse_selection, mouse_event_to_x11_sequence,
+    parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes,
+    DirtyTracker, ModifierState, MouseSelection, TerminalEmulator, TerminalRenderer,
 };
+#[cfg(feature = "threat-detection")]
+use log::error;
 use log::{debug, info, trace, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 #[cfg(feature = "threat-detection")]
 use guacr_threat_detection::{ThreatDetector, ThreatDetectorConfig};
-#[cfg(feature = "threat-detection")]
-use uuid;
 
 /// Telnet protocol handler
 ///
@@ -87,6 +110,24 @@ impl ProtocolHandler for TelnetHandler {
     ) -> guacr_handlers::Result<()> {
         info!("Telnet handler starting connection");
 
+        // Parse security settings
+        let security = HandlerSecuritySettings::from_params(&params);
+        info!(
+            "Telnet: Security settings - read_only={}, disable_copy={}, disable_paste={}",
+            security.read_only, security.disable_copy, security.disable_paste
+        );
+
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(&params);
+        if recording_config.is_enabled() {
+            info!(
+                "Telnet: Recording enabled - ses={}, asciicast={}, typescript={}",
+                recording_config.is_ses_enabled(),
+                recording_config.is_asciicast_enabled(),
+                recording_config.is_typescript_enabled()
+            );
+        }
+
         // Extract connection parameters
         let hostname = params
             .get("hostname")
@@ -97,50 +138,33 @@ impl ProtocolHandler for TelnetHandler {
             .and_then(|p| p.parse().ok())
             .unwrap_or(self.config.default_port);
 
-        // Parse size parameter from browser (format: "width,height,dpi" or just dimensions)
-        // Telnet uses fixed 19x38 cell dimensions for now (TODO: make dynamic like SSH)
+        // IMPORTANT: Always use DEFAULT size during initialization (like guacd does)
+        // The client will send a resize instruction with actual browser dimensions after handshake
+        // This matches guacd behavior and prevents "half screen" display issues
+        //
+        // Telnet uses fixed 19x38 cell dimensions (high DPI style)
+        // Default: 1024x768 @ 96 DPI equivalent → ~53x20 chars
         const CHAR_W: u32 = 19;
         const CHAR_H: u32 = 38;
 
-        let (rows, cols, width_px, height_px) = if let Some(size_str) = params.get("size") {
-            // Size comes as comma-separated values
-            let parts: Vec<&str> = size_str.split(',').collect();
-            if parts.len() >= 2 {
-                if let (Ok(w_px), Ok(h_px)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                    let calc_cols = (w_px / CHAR_W).max(1) as u16;
-                    let calc_rows = (h_px / CHAR_H).max(1) as u16;
-                    let aligned_width = calc_cols as u32 * CHAR_W;
-                    let aligned_height = calc_rows as u32 * CHAR_H;
-                    info!(
-                        "Telnet: Browser requested {}x{} px → {}x{} chars → aligned to {}x{} px",
-                        w_px, h_px, calc_cols, calc_rows, aligned_width, aligned_height
-                    );
-                    (calc_rows, calc_cols, aligned_width, aligned_height)
-                } else {
-                    info!("Telnet: Failed to parse size parameter, using defaults");
-                    let w = self.config.default_cols as u32 * CHAR_W;
-                    let h = self.config.default_rows as u32 * CHAR_H;
-                    (self.config.default_rows, self.config.default_cols, w, h)
-                }
-            } else {
-                info!("Telnet: Size parameter missing dimensions, using defaults");
-                let w = self.config.default_cols as u32 * CHAR_W;
-                let h = self.config.default_rows as u32 * CHAR_H;
-                (self.config.default_rows, self.config.default_cols, w, h)
-            }
-        } else {
-            info!("Telnet: No size parameter provided, using defaults");
-            let w = self.config.default_cols as u32 * CHAR_W;
-            let h = self.config.default_rows as u32 * CHAR_H;
-            (self.config.default_rows, self.config.default_cols, w, h)
-        };
+        info!(
+            "Telnet: Using default handshake size (1024x768) - will resize after client connects"
+        );
+        let rows = self.config.default_rows;
+        let cols = self.config.default_cols;
+        let width_px = cols as u32 * CHAR_W;
+        let height_px = rows as u32 * CHAR_H;
+        let (rows, cols, width_px, height_px) = (rows, cols, width_px, height_px);
 
-        info!("Connecting to {}:{}", hostname, port);
+        info!(
+            "Connecting to {}:{} (timeout: {}s)",
+            hostname, port, security.connection_timeout_secs
+        );
 
-        // Connect via TCP
-        let stream = TcpStream::connect((hostname.as_str(), port))
-            .await
-            .map_err(|e| HandlerError::ConnectionFailed(e.to_string()))?;
+        // Connect via TCP with timeout (matches guacd behavior)
+        let stream =
+            connect_tcp_with_timeout((hostname.as_str(), port), security.connection_timeout_secs)
+                .await?;
 
         info!("Telnet connection established");
 
@@ -154,8 +178,42 @@ impl ProtocolHandler for TelnetHandler {
         // Dirty region tracker for optimization
         let mut dirty_tracker = DirtyTracker::new(rows, cols);
 
+        // Initialize recording if enabled
+        let mut recorder: Option<MultiFormatRecorder> = if recording_config.is_enabled() {
+            match MultiFormatRecorder::new(&recording_config, &params, "telnet", cols, rows) {
+                Ok(rec) => {
+                    info!("Telnet: Session recording initialized");
+                    Some(rec)
+                }
+                Err(e) => {
+                    warn!("Telnet: Failed to initialize recording: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Use fixed stream ID for main display (reusing stream replaces content, not stacking)
         let stream_id: u32 = 1;
+
+        // Initialize pipe stream manager for native terminal display support
+        let mut pipe_manager = PipeStreamManager::new();
+
+        // Check if pipe streams are enabled (connection parameter)
+        let enable_pipe = params
+            .get("enable-pipe")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        if enable_pipe {
+            info!("Telnet: Pipe streams enabled - opening STDOUT pipe for native terminal display");
+            let pipe_instr = pipe_manager.enable_stdout();
+            to_client
+                .send(Bytes::from(pipe_instr))
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
 
         // Initialize threat detection if enabled
         #[cfg(feature = "threat-detection")]
@@ -213,13 +271,13 @@ impl ProtocolHandler for TelnetHandler {
         #[cfg(not(feature = "threat-detection"))]
         let _threat_detector: Option<()> = None;
         #[cfg(feature = "threat-detection")]
-        let _session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
         #[cfg(not(feature = "threat-detection"))]
         let _session_id = String::new();
         #[cfg(feature = "threat-detection")]
-        let _hostname_for_threat = hostname.clone();
+        let hostname_for_threat = hostname.clone();
         #[cfg(feature = "threat-detection")]
-        let _username_for_threat = params.get("username").cloned().unwrap_or_default();
+        let username_for_threat = params.get("username").cloned().unwrap_or_default();
 
         // Send ready instruction
         info!("Telnet: Sending ready instruction");
@@ -245,13 +303,31 @@ impl ProtocolHandler for TelnetHandler {
         // Bidirectional forwarding
         let mut buf = vec![0u8; 4096];
         let mut modifier_state = ModifierState::new();
+        let mut mouse_selection = MouseSelection::new();
 
         // Debounce timer for batching screen updates (16ms = 60fps)
         let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
         debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Keep-alive manager (matches guacd's guac_socket_require_keep_alive behavior)
+        let mut keepalive = KeepAliveManager::new(DEFAULT_KEEPALIVE_INTERVAL_SECS);
+        let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(
+            DEFAULT_KEEPALIVE_INTERVAL_SECS,
+        ));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                // Keep-alive ping to detect dead connections
+                _ = keepalive_interval.tick() => {
+                    if let Some(sync_instr) = keepalive.check() {
+                        trace!("Telnet: Sending keep-alive sync");
+                        if to_client.send(sync_instr).await.is_err() {
+                            info!("Telnet: Client channel closed, ending session");
+                            break;
+                        }
+                    }
+                }
                 // Telnet output -> Terminal -> Client
                 result = read_half.read(&mut buf) => {
                     match result {
@@ -260,6 +336,14 @@ impl ProtocolHandler for TelnetHandler {
                             break;
                         }
                         Ok(n) => {
+                            // If STDOUT pipe is enabled, send raw data to client
+                            // This enables native terminal display (with ANSI escape codes)
+                            if pipe_manager.is_stdout_enabled() {
+                                let blob = pipe_blob_bytes(PIPE_STREAM_STDOUT, &buf[..n]);
+                                to_client.send(blob).await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            }
+
                             // Threat detection: Analyze live terminal output from server
                             #[cfg(feature = "threat-detection")]
                             if let Some(ref detector) = threat_detector {
@@ -279,7 +363,12 @@ impl ProtocolHandler for TelnetHandler {
                                 }
                             }
 
-                            // Process terminal output
+                            // Record output if recording is enabled
+                            if let Some(ref mut rec) = recorder {
+                                let _ = rec.record_output(&buf[..n]);
+                            }
+
+                            // Process terminal output (for image rendering)
                             terminal.process(&buf[..n])
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
@@ -297,87 +386,169 @@ impl ProtocolHandler for TelnetHandler {
                     // Parse Guacamole instruction
                     let msg_str = String::from_utf8_lossy(&msg);
 
-                    if msg_str.contains(".key,") {
-                        // Parse and send key
-                        if let Some(args_part) = msg_str.split_once(".key,") {
-                            if let Some((first_arg, rest)) = args_part.1.split_once(',') {
-                                if let Some((_, keysym_str)) = first_arg.split_once('.') {
-                                    if let Ok(keysym) = keysym_str.parse::<u32>() {
-                                        if let Some((_, pressed_val)) = rest.split_once('.') {
-                                            let pressed = pressed_val.starts_with('1');
+                    if let Some(key_event) = parse_key_instruction(&msg_str) {
+                        // Update modifier state if this is a modifier key
+                        if modifier_state.update_modifier(key_event.keysym, key_event.pressed) {
+                            // Don't send anything for modifier keys alone
+                            continue;
+                        }
 
-                                            // Update modifier state if this is a modifier key
-                                            if modifier_state.update_modifier(keysym, pressed) {
-                                                // Don't send anything for modifier keys alone
-                                                continue;
+                        // Security: Check read-only mode
+                        if security.read_only
+                            && !is_keyboard_event_allowed_readonly(key_event.keysym, modifier_state.control)
+                        {
+                            trace!("Telnet: Keyboard input blocked (read-only mode)");
+                            continue;
+                        }
+
+                        // Convert to terminal bytes with current modifier state
+                        let bytes = x11_keysym_to_bytes(key_event.keysym, key_event.pressed, Some(&modifier_state));
+                        if !bytes.is_empty() {
+                            // Threat detection: Analyze live keyboard input before sending to server
+                            #[cfg(feature = "threat-detection")]
+                            if let Some(ref detector) = threat_detector {
+                                if let Ok(keystroke_sequence) = String::from_utf8(bytes.clone()) {
+                                    match detector.analyze_keystroke_sequence(&session_id, &keystroke_sequence, &username_for_threat, &hostname_for_threat, "telnet").await {
+                                        Ok(threat) => {
+                                            if threat.should_terminate() {
+                                                error!("Telnet: TERMINATING SESSION due to threat in keyboard input: {}", threat.description);
+                                                let error_msg = format!("error,0.Session terminated: {};", threat.description);
+                                                to_client.send(Bytes::from(error_msg)).await
+                                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                                break;
                                             }
-
-                                            // Convert to terminal bytes with current modifier state
-                                            let bytes = x11_keysym_to_bytes(keysym, pressed, Some(&modifier_state));
-                                            if !bytes.is_empty() {
-                                                // Threat detection: Analyze live keyboard input before sending to server
-                                                #[cfg(feature = "threat-detection")]
-                                                if let Some(ref detector) = threat_detector {
-                                                    if let Ok(keystroke_sequence) = String::from_utf8(bytes.clone()) {
-                                                        match detector.analyze_keystroke_sequence(&session_id, &keystroke_sequence, &username_for_threat, &hostname_for_threat, "telnet").await {
-                                                            Ok(threat) => {
-                                                                if threat.should_terminate() {
-                                                                    error!("Telnet: TERMINATING SESSION due to threat in keyboard input: {}", threat.description);
-                                                                    let error_msg = format!("error,0.Session terminated: {};", threat.description);
-                                                                    to_client.send(Bytes::from(error_msg)).await
-                                                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                                                                    break;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                debug!("Telnet: Threat detection error (non-fatal): {}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                write_half.write_all(&bytes).await
-                                                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("Telnet: Threat detection error (non-fatal): {}", e);
                                         }
                                     }
                                 }
+                            }
+
+                            // Record input if enabled
+                            if let Some(ref mut rec) = recorder {
+                                if recording_config.recording_include_keys {
+                                    let _ = rec.record_input(&bytes);
+                                }
+                            }
+
+                            write_half.write_all(&bytes).await
+                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        }
+                    } else if msg_str.contains(".clipboard,") {
+                        // Clipboard instruction received - the actual data comes in a blob message
+                        debug!("Telnet: Clipboard stream opened - data incoming");
+                    } else if let Some(clipboard_text) = parse_clipboard_blob(&msg_str) {
+                        // Security: Check if paste is allowed
+                        if !security.is_paste_allowed() {
+                            debug!("Telnet: Paste blocked (disabled or read-only mode)");
+                            continue;
+                        }
+
+                        // Check clipboard buffer size limit
+                        let max_size = security.clipboard_buffer_size;
+                        let paste_text = if clipboard_text.len() > max_size {
+                            warn!("Telnet: Clipboard truncated from {} to {} bytes", clipboard_text.len(), max_size);
+                            &clipboard_text[..max_size]
+                        } else {
+                            &clipboard_text
+                        };
+
+                        // Handle clipboard paste - send to terminal using bracketed paste
+                        debug!("Telnet: Pasting {} chars from clipboard", paste_text.len());
+
+                        let mut paste_data = Vec::new();
+                        paste_data.extend_from_slice(b"\x1b[200~"); // Start bracketed paste
+                        paste_data.extend_from_slice(paste_text.as_bytes());
+                        paste_data.extend_from_slice(b"\x1b[201~"); // End bracketed paste
+
+                        write_half.write_all(&paste_data[..]).await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                    } else if let Some(mouse_event) = parse_mouse_instruction(&msg_str) {
+                        // Security: Check read-only mode for mouse clicks
+                        if security.read_only && !is_mouse_event_allowed_readonly(mouse_event.button_mask) {
+                            trace!("Telnet: Mouse click blocked (read-only mode)");
+                            continue;
+                        }
+
+                        // Handle mouse events intelligently:
+                        // 1. Left-click drag = text selection (copy to clipboard)
+                        // 2. Clicks/drags with buttons pressed = X11 sequences (for vim/tmux)
+                        // 3. Hover with no buttons = ignored (prevents garbage)
+
+                        // Try text selection first (left button drag)
+                        if let Some(selected_text) = handle_mouse_selection(
+                            mouse_event,
+                            &mut mouse_selection,
+                            &terminal,
+                            CHAR_W,
+                            CHAR_H,
+                            cols,
+                            rows,
+                        ) {
+                            // Security: Check if copy is allowed
+                            if !security.is_copy_allowed() {
+                                debug!("Telnet: Selection copy blocked (copy disabled)");
+                                continue;
+                            }
+
+                            debug!("Telnet: Selection complete, copying {} chars", selected_text.len());
+
+                            // Send to client as clipboard
+                            let clipboard_stream_id = 10;
+                            let clipboard_instructions = format_clipboard_instructions(&selected_text, clipboard_stream_id);
+
+                            for instr in clipboard_instructions {
+                                to_client.send(Bytes::from(instr)).await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            }
+                        } else if mouse_event.button_mask != 0 {
+                            // A button is pressed (but not a selection) - send to vim/tmux
+                            let mouse_seq = mouse_event_to_x11_sequence(
+                                mouse_event.x_px,
+                                mouse_event.y_px,
+                                mouse_event.button_mask as u8,
+                                CHAR_W,
+                                CHAR_H
+                            );
+
+                            if !mouse_seq.is_empty() {
+                                trace!("Telnet: Mouse X11 sequence (button={}) at ({}, {})",
+                                    mouse_event.button_mask, mouse_event.x_px, mouse_event.y_px);
+                                write_half.write_all(&mouse_seq).await
+                                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                             }
                         }
-                    } else if msg_str.contains(".mouse,") {
-                        // Handle mouse events for vim/tmux support (ported from SSH)
-                        // Format: "mouse,<layer>,<x>,<y>,<button_mask>;"
-                        if let Some(mouse_part) = msg_str.strip_prefix("mouse,") {
-                            let parts: Vec<&str> = mouse_part.split(',').collect();
-                            if parts.len() >= 4 {
-                                if let (Some(x_part), Some(y_part), Some(button_part)) =
-                                    (parts.get(1), parts.get(2), parts.get(3)) {
-
-                                    if let (Some((_, x_str)), Some((_, y_str))) =
-                                        (x_part.split_once('.'), y_part.split_once('.')) {
-
-                                        let button_str = button_part.split(';').next().unwrap_or(button_part);
-                                        if let Some((_, button_mask_str)) = button_str.split_once('.') {
-
-                                            if let (Ok(x_px), Ok(y_px), Ok(button_mask)) =
-                                                (x_str.parse::<u32>(), y_str.parse::<u32>(), button_mask_str.parse::<u8>()) {
-
-                                                // Convert to X11 mouse escape sequence
-                                                let mouse_seq = mouse_event_to_x11_sequence(
-                                                    x_px, y_px, button_mask, CHAR_W, CHAR_H
-                                                );
-
-                                                if !mouse_seq.is_empty() {
-                                                    trace!("Telnet: Mouse event at ({}, {}) px → ({}, {}) chars, button={}",
-                                                        x_px, y_px, x_px / CHAR_W, y_px / CHAR_H, button_mask);
-                                                    write_half.write_all(&mouse_seq).await
-                                                        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                        // Else: no buttons pressed, just hovering - ignore to prevent garbage
+                    } else if let Some(pipe_instr) = parse_pipe_instruction(&msg_str) {
+                        // Handle incoming pipe stream (e.g., STDIN from client)
+                        if pipe_instr.name == PIPE_NAME_STDIN {
+                            debug!("Telnet: STDIN pipe opened by client (stream {})", pipe_instr.stream_id);
+                            pipe_manager.register_incoming(
+                                pipe_instr.stream_id,
+                                &pipe_instr.name,
+                                &pipe_instr.mimetype,
+                            );
+                        } else {
+                            debug!("Telnet: Unknown pipe '{}' opened by client", pipe_instr.name);
+                        }
+                    } else if let Some(blob_instr) = parse_blob_instruction(&msg_str) {
+                        // Handle blob data on STDIN pipe
+                        if pipe_manager.is_stdin_stream(blob_instr.stream_id) {
+                            // Security: Check if input is allowed
+                            if security.read_only {
+                                debug!("Telnet: STDIN pipe data blocked (read-only mode)");
+                            } else {
+                                debug!("Telnet: Received {} bytes on STDIN pipe", blob_instr.data.len());
+                                write_half.write_all(&blob_instr.data).await
+                                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                             }
+                        }
+                    } else if let Some(end_stream_id) = parse_end_instruction(&msg_str) {
+                        // Handle end of pipe stream
+                        if pipe_manager.is_stdin_stream(end_stream_id) {
+                            debug!("Telnet: STDIN pipe closed by client");
+                            pipe_manager.close(PIPE_NAME_STDIN);
                         }
                     }
                 }
@@ -501,6 +672,21 @@ impl ProtocolHandler for TelnetHandler {
             }
         }
 
+        // Close any open pipe streams
+        let end_instructions = pipe_manager.close_all();
+        for instr in end_instructions {
+            let _ = to_client.send(Bytes::from(instr)).await;
+        }
+
+        // Finalize recording
+        if let Some(rec) = recorder {
+            if let Err(e) = rec.finalize() {
+                warn!("Telnet: Failed to finalize recording: {}", e);
+            } else {
+                info!("Telnet: Session recording finalized");
+            }
+        }
+
         info!("Telnet handler connection ended");
         Ok(())
     }
@@ -527,24 +713,14 @@ impl EventBasedHandler for TelnetHandler {
         callback: Arc<dyn EventCallback>,
         from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        // Wrap the channel-based interface
-        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
-
-        let sender = InstructionSender::new(callback);
-        let sender_arc = Arc::new(sender);
-
-        // Spawn task to forward channel messages to event callback (zero-copy)
-        let sender_clone = Arc::clone(&sender_arc);
-        tokio::spawn(async move {
-            while let Some(msg) = handler_rx.recv().await {
-                sender_clone.send(msg); // Zero-copy: Bytes is reference-counted
-            }
-        });
-
-        // Call the existing channel-based connect method
-        self.connect(params, to_client, from_client).await?;
-
-        Ok(())
+        guacr_handlers::connect_with_event_adapter(
+            |params, to_client, from_client| self.connect(params, to_client, from_client),
+            params,
+            callback,
+            from_client,
+            4096, // channel capacity
+        )
+        .await
     }
 }
 

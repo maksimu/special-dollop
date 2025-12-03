@@ -18,7 +18,13 @@ thiserror.workspace = true
 log.workspace = true
 
 # RDP client - using ironrdp (pure Rust)
-ironrdp = "0.13.0"
+ironrdp = { version = "0.13.0", features = ["connector", "session", "graphics", "input", "cliprdr"] }
+ironrdp-async = "0.7.0"
+ironrdp-tokio = "0.7.0"
+ironrdp-pdu = "0.6.0"
+tokio-rustls = "0.26"
+rustls = "0.23"
+x509-cert = "0.2"
 
 # Image processing
 image = "0.25.9"
@@ -40,10 +46,10 @@ russh-keys = { version = "0.46", optional = true }
 
 [features]
 default = []
-# Hardware encoding features are inherited from guacr-terminal
-nvenc = ["guacr-terminal/nvenc"]
-quicksync = ["guacr-terminal/quicksync"]
-videotoolbox = ["guacr-terminal/videotoolbox"]
-vaapi = ["guacr-terminal/vaapi"]
+# Hardware encoding features temporarily disabled
+# nvenc = ["guacr-terminal/nvenc"]
+# quicksync = ["guacr-terminal/quicksync"]
+# videotoolbox = ["guacr-terminal/videotoolbox"]
+# vaapi = ["guacr-terminal/vaapi"]
 # SFTP integration feature
 sftp = ["guacr-sftp", "russh", "russh-sftp", "russh-keys"]

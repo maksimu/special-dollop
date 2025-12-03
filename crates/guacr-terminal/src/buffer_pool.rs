@@ -26,6 +26,8 @@ impl BufferPool {
     /// # Example
     ///
     /// ```rust
+    /// use guacr_terminal::BufferPool;
+    ///
     /// // Pool for 4K RGBA frames (3840 * 2160 * 4 = 33MB per buffer)
     /// let pool = BufferPool::new(8, 33_177_600);
     /// ```

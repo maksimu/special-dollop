@@ -33,7 +33,7 @@ impl GuacamoleParser {
     /// # Example
     ///
     /// ```
-    /// use guacr_protocol::parser::GuacamoleParser;
+    /// use guacr_protocol::GuacamoleParser;
     /// use bytes::Bytes;
     ///
     /// let data = Bytes::from("3.key,5.65507,1.1;");

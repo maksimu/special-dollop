@@ -1,0 +1,158 @@
+# Docker Compose for Full Integration Tests
+#
+# This provides test servers for all terminal/graphical protocols:
+# - SSH (port 2222)
+# - Telnet (port 2323)
+# - RDP/xrdp (port 3389)
+# - VNC (port 5900)
+#
+# Usage:
+#   docker-compose -f docker-compose.test.yml up -d
+#   ./scripts/run-all-tests.sh
+#   docker-compose -f docker-compose.test.yml down
+#
+# Individual services:
+#   docker-compose -f docker-compose.test.yml up -d ssh telnet
+#
+
+services:
+  # ============================================================================
+  # SSH Server (OpenSSH)
+  # ============================================================================
+  ssh:
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: guacr-test-ssh
+    hostname: test-ssh
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - PASSWORD_ACCESS=true
+      - USER_PASSWORD=test_password
+      - USER_NAME=test_user
+      - SUDO_ACCESS=true
+    ports:
+      - "2222:2222"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2222 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # ============================================================================
+  # Telnet Server
+  # ============================================================================
+  telnet:
+    image: alpine:latest
+    container_name: guacr-test-telnet
+    hostname: test-telnet
+    command: |
+      sh -c "
+        apk add --no-cache busybox-extras shadow &&
+        adduser -D test_user &&
+        echo 'test_user:test_password' | chpasswd &&
+        echo 'root:test_password' | chpasswd &&
+        busybox telnetd -F -l /bin/sh -p 23
+      "
+    ports:
+      - "2323:23"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 23 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # ============================================================================
+  # RDP Server (xrdp on Ubuntu)
+  # ============================================================================
+  rdp:
+    image: danielguerra/ubuntu-xrdp:latest
+    container_name: guacr-test-rdp
+    hostname: test-rdp
+    environment:
+      - TZ=UTC
+    ports:
+      - "3389:3389"
+    # Create test user on startup
+    entrypoint: |
+      bash -c "
+        useradd -m -s /bin/bash test_user 2>/dev/null || true
+        echo 'test_user:test_password' | chpasswd
+        echo 'root:test_password' | chpasswd
+        /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 3389 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - guacr-test-network
+    # xrdp needs more resources
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ============================================================================
+  # VNC Server (TigerVNC on Alpine)
+  # ============================================================================
+  vnc:
+    image: consol/alpine-xfce-vnc:latest
+    container_name: guacr-test-vnc
+    hostname: test-vnc
+    environment:
+      - VNC_PW=test_password
+      - VNC_RESOLUTION=1024x768
+      - VNC_COL_DEPTH=24
+    ports:
+      - "5900:5901"
+      - "6900:6901"  # noVNC web interface
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 5901 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - guacr-test-network
+
+  # ============================================================================
+  # Alternative: Lighter VNC (x11vnc)
+  # ============================================================================
+  vnc-light:
+    image: alpine:latest
+    container_name: guacr-test-vnc-light
+    hostname: test-vnc-light
+    command: |
+      sh -c "
+        apk add --no-cache x11vnc xvfb xterm fluxbox &&
+        Xvfb :0 -screen 0 1024x768x24 &
+        sleep 2 &&
+        fluxbox &
+        x11vnc -display :0 -forever -rfbport 5900 -passwd test_password -shared
+      "
+    ports:
+      - "5901:5900"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 5900 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - guacr-test-network
+
+networks:
+  guacr-test-network:
+    driver: bridge

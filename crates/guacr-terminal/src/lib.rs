@@ -21,29 +21,37 @@
 // ```
 
 mod buffer_pool;
+mod clipboard;
+mod database_renderer;
 mod dirty_tracker;
 mod emulator;
-mod hardware_encoder;
-mod hardware_encoding_helper;
+mod framebuffer;
+mod guacamole_input;
+mod input_handler;
 mod keysym;
 mod recorder;
 mod renderer;
-
-// Hardware encoder platform-specific implementations
-#[cfg(feature = "videotoolbox")]
-mod hardware_encoder_videotoolbox;
+mod simd;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
+pub use clipboard::{RdpClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
+pub use database_renderer::{DatabaseTerminal, QueryResult, SpreadsheetRenderer};
 pub use dirty_tracker::{DirtyRect, DirtyTracker};
 pub use emulator::{Rect, ScrollbackLine, TerminalEmulator};
-pub use hardware_encoder::{HardwareEncoder, HardwareEncoderImpl};
-pub use hardware_encoding_helper::try_hardware_encode_then_fallback;
+pub use framebuffer::{FrameBuffer, FrameRect};
+pub use guacamole_input::{
+    extract_selection_text, format_clipboard_instructions, handle_mouse_selection,
+    parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction, KeyEvent, MouseEvent,
+    MouseSelection,
+};
+pub use input_handler::{RdpInputHandler, RdpKeyEvent, RdpPointerEvent};
 pub use keysym::{mouse_event_to_x11_sequence, x11_keysym_to_bytes, ModifierState};
 pub use recorder::{
     create_recording_transports, AsciicastHeader, AsciicastRecorder, AsyncDualFormatRecorder,
     ChannelRecordingTransport, DualFormatRecorder, EventType, FileRecordingTransport,
     GuacamoleSessionRecorder, MultiTransportRecorder, RecordingTransport,
 };
+pub use simd::convert_bgr_to_rgba_simd;
 
 // S3 recording transport available when s3 feature is enabled
 // #[cfg(feature = "s3")]

@@ -289,9 +289,9 @@ mod tests {
 /// - direction: '0' = server->client, '1' = client->server
 /// - instruction_bytes: Raw Guacamole protocol instruction (e.g., "3.key,3.104,1.1;")
 ///
-/// # Example
+/// # File Format Example
 ///
-/// ```
+/// ```text
 /// 0.0.4.size,1.0,4.1920,4.1080;
 /// 150.1.3.key,3.104,1.1;
 /// 200.0.3.img,1.0,10.image/png,1.0,1.0,1000.<base64_data>;
@@ -420,7 +420,9 @@ impl RecordingTransport for FileRecordingTransport {
 /// ```no_run
 /// use tokio::sync::mpsc;
 /// use guacr_terminal::{ChannelRecordingTransport, RecordingTransport};
+/// use bytes::Bytes;
 ///
+/// # async fn example() {
 /// // Create channel for recording data
 /// let (recording_tx, mut recording_rx) = mpsc::channel::<Bytes>(1024);
 ///
@@ -438,6 +440,7 @@ impl RecordingTransport for FileRecordingTransport {
 ///         // zmq_socket.send(&data, 0).unwrap();
 ///     }
 /// });
+/// # }
 /// ```
 pub struct ChannelRecordingTransport {
     sender: mpsc::Sender<Bytes>,
@@ -883,12 +886,14 @@ impl RecordingTransport for S3RecordingTransport {
 /// use bytes::Bytes;
 /// use std::collections::HashMap;
 ///
+/// # async fn example() {
 /// let mut params = HashMap::new();
 /// params.insert("recording_s3_bucket".to_string(), "my-recordings".to_string());
 /// params.insert("recording_s3_region".to_string(), "us-west-2".to_string());
 ///
 /// let (asciicast_transports, guacamole_transports) =
 ///     create_recording_transports(&params, "session-123").await.unwrap();
+/// # }
 /// ```
 pub async fn create_recording_transports(
     params: &std::collections::HashMap<String, String>,

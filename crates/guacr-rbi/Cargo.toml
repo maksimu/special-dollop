@@ -8,31 +8,29 @@ description = "Remote Browser Isolation (RBI) handler for guacr"
 [dependencies]
 # Local dependencies
 guacr-handlers = { path = "../guacr-handlers" }
-guacr-rdp = { path = "../guacr-rdp" }  # Reuse framebuffer
+guacr-terminal = { path = "../guacr-terminal" }
 
 # Workspace dependencies
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures = "0.3"
-#anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
 # Browser engines
-# Option 1: chromiumoxide (recommended - async, well-maintained)
+# CEF - Chromium Embedded Framework (same as KCM uses)
+# The 'cef' crate from Tauri provides safe Rust bindings to CEF
+# Requires CEF binaries - use export-cef-dir to download them
+cef = { version = "142", optional = true, default-features = false }
+
+# Chrome CDP fallback (no audio support, but works out of the box)
 chromiumoxide = { version = "0.7", optional = true }
-
-# Option 2: headless_chrome (synchronous alternative)
-# headless_chrome = "1.0", optional = true
-
-# Option 3: Servo (future - when v1.0 releases)
-# servo would go here if/when it becomes viable
 
 # Protocol parsing
 guacr-protocol = { path = "../guacr-protocol" }
 
-# JSON for CDP commands
+# JSON for configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -40,7 +38,33 @@ serde_json = "1.0"
 base64.workspace = true
 reqwest = { version = "0.11", features = ["stream"], optional = true }
 
+# Cryptography for secure TOTP implementation
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+
+# Image encoding for CEF raw pixels -> PNG
+png = { version = "0.17", optional = true }
+
+# Parking lot for efficient synchronization in CEF callbacks
+parking_lot = { version = "0.12", optional = true }
+
+# Secure temp directory creation for session isolation
+tempfile = "3"
+
+# Unix system calls for profile locking and DBus isolation
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
-default = []
-chrome = ["chromiumoxide", "reqwest"]  # Use chromiumoxide for Chrome CDP (API needs verification)
-# servo feature removed - servo crate doesn't exist on crates.io yet
+default = []  # No default - user must choose backend
+
+# CEF backend - full Chromium Embedded Framework with audio support
+# Build with: cargo build --features cef
+# Requires CEF binaries in CEF_PATH environment variable
+cef = ["dep:cef", "dep:png", "dep:parking_lot"]
+
+# Chrome CDP backend - uses installed Chrome via DevTools Protocol (no audio)
+# Build with: cargo build --features chrome
+# Requires Chrome/Chromium installed on the system at runtime
+chrome = ["chromiumoxide", "reqwest"]

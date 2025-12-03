@@ -4,7 +4,7 @@
 #[cfg(feature = "sftp")]
 use guacr_sftp::ChannelStreamAdapter;
 #[cfg(feature = "sftp")]
-use log::{info, warn};
+use log::info;
 #[cfg(feature = "sftp")]
 use russh::client;
 #[cfg(feature = "sftp")]
@@ -47,7 +47,7 @@ pub async fn establish_sftp_session(
             .await
             .map_err(|e| format!("Password auth failed: {}", e))?
     } else if let Some(key_data) = private_key {
-        let passphrase = private_key_passphrase.as_deref();
+        let passphrase = private_key_passphrase;
         let key = decode_secret_key(key_data, passphrase)
             .map_err(|e| format!("Key decode failed: {}", e))?;
         session
@@ -63,7 +63,7 @@ pub async fn establish_sftp_session(
     }
 
     // Open SFTP channel
-    let mut channel = session
+    let channel = session
         .channel_open_session()
         .await
         .map_err(|e| format!("Channel open failed: {}", e))?;
@@ -92,6 +92,7 @@ pub async fn establish_sftp_session(
 /// - Upload: file,<stream>,<mimetype>,<filename>,<base64-data>
 /// - Download: file,<stream>,<mimetype>,<filename>
 #[cfg(feature = "sftp")]
+#[allow(dead_code)]
 pub async fn handle_sftp_file_request(
     sftp: &mut SftpSession,
     args: &[String],

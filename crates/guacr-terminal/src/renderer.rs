@@ -196,8 +196,42 @@ impl TerminalRenderer {
             if c != ' ' && c != '\0' {
                 let fg = self.vt100_color_to_rgb(cell.fgcolor(), true);
 
+                // Check for Unicode block drawing characters (U+2580-U+259F)
+                // These are often missing from fonts, so render them manually
+                if let Some(block_region) = Self::get_block_character_region(c) {
+                    // Render block character as a filled rectangle
+                    let (x_start, y_start, x_end, y_end) = block_region;
+                    let x0 = x + (self.char_width as f32 * x_start) as u32;
+                    let y0 = y + (self.char_height as f32 * y_start) as u32;
+                    let x1 = x + (self.char_width as f32 * x_end) as u32;
+                    let y1 = y + (self.char_height as f32 * y_end) as u32;
+
+                    for py in y0..y1.min(img.height()) {
+                        for px in x0..x1.min(img.width()) {
+                            img.put_pixel(px, py, fg);
+                        }
+                    }
+                    return Ok(());
+                }
+
                 // Rasterize glyph at dynamic font size
                 let (metrics, bitmap) = self.font.rasterize(c, self.font_size);
+
+                // If font doesn't have this glyph, try to render as a simple rectangle
+                // (catches other missing characters beyond block elements)
+                if bitmap.is_empty() && metrics.width == 0 {
+                    // Draw a small centered rectangle as a fallback "missing glyph" indicator
+                    // This is better than showing nothing
+                    let margin_x = self.char_width / 4;
+                    let margin_y = self.char_height / 4;
+                    for py in (y + margin_y)..(y + self.char_height - margin_y).min(img.height()) {
+                        for px in (x + margin_x)..(x + self.char_width - margin_x).min(img.width())
+                        {
+                            img.put_pixel(px, py, fg);
+                        }
+                    }
+                    return Ok(());
+                }
 
                 // CRITICAL: Use consistent baseline alignment, not centering
                 // This ensures all characters appear at the same size/position
@@ -275,6 +309,48 @@ impl TerminalRenderer {
         }
 
         Ok(())
+    }
+
+    /// Returns the fill region (x_start, y_start, x_end, y_end) as fractions of cell size
+    /// for Unicode block drawing characters (U+2580-U+259F).
+    /// Returns None if the character is not a block element.
+    fn get_block_character_region(c: char) -> Option<(f32, f32, f32, f32)> {
+        match c {
+            // Block Elements (U+2580-U+259F)
+            '\u{2580}' => Some((0.0, 0.0, 1.0, 0.5)), // ▀ Upper half block
+            '\u{2581}' => Some((0.0, 0.875, 1.0, 1.0)), // ▁ Lower one eighth block
+            '\u{2582}' => Some((0.0, 0.75, 1.0, 1.0)), // ▂ Lower one quarter block
+            '\u{2583}' => Some((0.0, 0.625, 1.0, 1.0)), // ▃ Lower three eighths block
+            '\u{2584}' => Some((0.0, 0.5, 1.0, 1.0)), // ▄ Lower half block
+            '\u{2585}' => Some((0.0, 0.375, 1.0, 1.0)), // ▅ Lower five eighths block
+            '\u{2586}' => Some((0.0, 0.25, 1.0, 1.0)), // ▆ Lower three quarters block
+            '\u{2587}' => Some((0.0, 0.125, 1.0, 1.0)), // ▇ Lower seven eighths block
+            '\u{2588}' => Some((0.0, 0.0, 1.0, 1.0)), // █ Full block
+            '\u{2589}' => Some((0.0, 0.0, 0.875, 1.0)), // ▉ Left seven eighths block
+            '\u{258A}' => Some((0.0, 0.0, 0.75, 1.0)), // ▊ Left three quarters block
+            '\u{258B}' => Some((0.0, 0.0, 0.625, 1.0)), // ▋ Left five eighths block
+            '\u{258C}' => Some((0.0, 0.0, 0.5, 1.0)), // ▌ Left half block
+            '\u{258D}' => Some((0.0, 0.0, 0.375, 1.0)), // ▍ Left three eighths block
+            '\u{258E}' => Some((0.0, 0.0, 0.25, 1.0)), // ▎ Left one quarter block
+            '\u{258F}' => Some((0.0, 0.0, 0.125, 1.0)), // ▏ Left one eighth block
+            '\u{2590}' => Some((0.5, 0.0, 1.0, 1.0)), // ▐ Right half block
+            '\u{2591}' => Some((0.0, 0.0, 1.0, 1.0)), // ░ Light shade (render as full for now)
+            '\u{2592}' => Some((0.0, 0.0, 1.0, 1.0)), // ▒ Medium shade (render as full for now)
+            '\u{2593}' => Some((0.0, 0.0, 1.0, 1.0)), // ▓ Dark shade (render as full for now)
+            '\u{2594}' => Some((0.0, 0.0, 1.0, 0.125)), // ▔ Upper one eighth block
+            '\u{2595}' => Some((0.875, 0.0, 1.0, 1.0)), // ▕ Right one eighth block
+            '\u{2596}' => Some((0.0, 0.5, 0.5, 1.0)), // ▖ Quadrant lower left
+            '\u{2597}' => Some((0.5, 0.5, 1.0, 1.0)), // ▗ Quadrant lower right
+            '\u{2598}' => Some((0.0, 0.0, 0.5, 0.5)), // ▘ Quadrant upper left
+            '\u{2599}' => Some((0.0, 0.0, 1.0, 1.0)), // ▙ Quadrant upper left and lower left and lower right (complex)
+            '\u{259A}' => Some((0.0, 0.0, 1.0, 1.0)), // ▚ Quadrant upper left and lower right (complex)
+            '\u{259B}' => Some((0.0, 0.0, 1.0, 1.0)), // ▛ Quadrant upper left and upper right and lower left (complex)
+            '\u{259C}' => Some((0.0, 0.0, 1.0, 1.0)), // ▜ Quadrant upper left and upper right and lower right (complex)
+            '\u{259D}' => Some((0.5, 0.0, 1.0, 0.5)), // ▝ Quadrant upper right
+            '\u{259E}' => Some((0.0, 0.0, 1.0, 1.0)), // ▞ Quadrant upper right and lower left (complex)
+            '\u{259F}' => Some((0.0, 0.0, 1.0, 1.0)), // ▟ Quadrant upper right and lower left and lower right (complex)
+            _ => None,
+        }
     }
 
     fn vt100_color_to_rgb(&self, color: vt100::Color, is_foreground: bool) -> Rgb<u8> {

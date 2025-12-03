@@ -1,8 +1,8 @@
 // RDP channel handling (CLIPRDR, AUDIO, RDPGFX, DISP)
 // Manages RDP virtual channels for clipboard, audio, graphics acceleration, and display updates
 
-use crate::clipboard::RdpClipboard;
 use bytes::Bytes;
+use guacr_terminal::RdpClipboard;
 // GuacamoleParser not needed here - clipboard handler uses it internally
 use log::{debug, info, warn};
 

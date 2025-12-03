@@ -161,7 +161,7 @@ Current test coverage:
 - bytes - Zero-copy byte buffers
 - dashmap - Lock-free concurrent HashMap
 - thiserror - Error handling
-- tracing - Structured logging
+- log - Logging facade
 
 ## Next Steps for Implementers
 

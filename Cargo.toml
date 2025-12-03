@@ -24,13 +24,11 @@ authors = ["Keeper Security Engineering <engineering@keeper.io>"]
 [workspace.dependencies]
 # Core async
 tokio = { version = "1.48.0", features = ["full", "rt-multi-thread"] }
-tokio-util = "0.7.17"
 async-trait = "0.1.89"
 
 # Data structures
 bytes = "1.11.0"
 dashmap = "6.1.0"
-smallvec = "1.15.1"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -42,14 +40,21 @@ thiserror = "2.0.17"
 
 # Logging
 log = "0.4.28"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter", "json", "tracing-log"] }
 
 # Utilities
 uuid = { version = "1.18.1", features = ["v4"] }
 base64 = "0.22.1"
-lazy_static = "1.5.0"
-once_cell = "1.21.3"
+
+# Patch for ironrdp - use miroberts fork with Update PDU workaround
+# PR #1043 (static dispatch) is now merged to master
+# Our branch adds Update PDU handling on top of master
+# See: https://github.com/miroberts/IronRDP/tree/feature/handle-update-pdu
+[patch.crates-io]
+ironrdp = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-async = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-tokio = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-pdu = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-session = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 
 [profile.release]
 opt-level = 3

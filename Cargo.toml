@@ -37,8 +37,12 @@ lazy_static = "1.5.0"
 log = "0.4.29"
 once_cell = "1.21.3"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
+<<<<<<< HEAD
 parking_lot = "0.12"
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py37"], optional = true }
+=======
+pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py37"], optional = true }
+>>>>>>> 074e8e4 (upgraded to pyo3 v0.27.2)
 pyo3-log = { version = "0.13.2", optional = true }
 reqwest = { version = "0.12.24", features = ["json", "rustls-tls"], default-features = false }
 rustls = { version = "0.23.35", features = ["ring"], default-features = false }

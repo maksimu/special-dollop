@@ -6,10 +6,11 @@ use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyStrin
 use std::collections::HashMap;
 
 /// Helper function to safely execute async code from Python bindings
-pub fn safe_python_async_execute<F, R>(py: Python<'_>, future: F) -> R
+/// Returns PyResult<T> to properly propagate errors to Python
+pub fn safe_python_async_execute<F, T>(py: Python<'_>, future: F) -> PyResult<T>
 where
-    F: std::future::Future<Output = R> + Send + 'static,
-    R: Send + 'static,
+    F: std::future::Future<Output = PyResult<T>> + Send + 'static,
+    T: Send + 'static,
 {
     Python::detach(py, || {
         // Check if we're already in a runtime context
@@ -21,7 +22,15 @@ where
                 let _ = tx.send(result);
             });
             // Block on the std channel receiver (safe in runtime context)
-            rx.recv().expect("Task failed to complete")
+            rx.recv().unwrap_or_else(|e| {
+                warn!(
+                    "Async task failed to complete: channel closed unexpectedly: {}",
+                    e
+                );
+                Err(PyRuntimeError::new_err(
+                    "Async task failed: task panicked or was cancelled",
+                ))
+            })
         } else {
             // We're not in a runtime, safe to use block_on
             let runtime = get_runtime();

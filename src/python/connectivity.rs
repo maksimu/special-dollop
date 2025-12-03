@@ -718,14 +718,12 @@ async fn generate_recommendations(
     let mut advanced_diagnostics = serde_json::Map::new();
 
     // DNS troubleshooting
-    if !results
+    let dns_success = results
         .get("dns_resolution")
-        .unwrap()
-        .get("success")
-        .unwrap()
-        .as_bool()
-        .unwrap()
-    {
+        .and_then(|v| v.get("success"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !dns_success {
         recommendations
             .push("CRITICAL: DNS resolution failed - this blocks all connectivity".to_string());
         recommendations.push("Verify DNS servers are configured and accessible".to_string());

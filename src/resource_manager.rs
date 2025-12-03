@@ -1,7 +1,8 @@
 use log::{debug, error, info, warn};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -128,19 +129,19 @@ impl ResourceManager {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                let mut stats = self.stats.lock().unwrap();
+                let mut stats = self.stats.lock();
                 stats.resource_exhaustion_errors += 1;
                 stats.last_exhaustion = Some(Instant::now());
 
                 ResourceError::Exhausted {
                     resource: "sockets".to_string(),
-                    limit: self.limits.read().unwrap().max_concurrent_sockets,
+                    limit: self.limits.read().max_concurrent_sockets,
                 }
             })?;
 
         let count = self.current_sockets.fetch_add(1, Ordering::SeqCst) + 1;
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = self.stats.lock();
             stats.sockets_allocated += 1;
         }
 
@@ -158,19 +159,19 @@ impl ResourceManager {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                let mut stats = self.stats.lock().unwrap();
+                let mut stats = self.stats.lock();
                 stats.resource_exhaustion_errors += 1;
                 stats.last_exhaustion = Some(Instant::now());
 
                 ResourceError::Exhausted {
                     resource: "ice_agents".to_string(),
-                    limit: self.limits.read().unwrap().max_concurrent_ice_agents,
+                    limit: self.limits.read().max_concurrent_ice_agents,
                 }
             })?;
 
         let count = self.current_ice_agents.fetch_add(1, Ordering::SeqCst) + 1;
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = self.stats.lock();
             stats.ice_agents_created += 1;
         }
 
@@ -183,7 +184,7 @@ impl ResourceManager {
     }
 
     pub fn get_turn_connection(&self, server: &str) -> Option<TurnConnectionInfo> {
-        let mut connections = self.turn_connections.lock().unwrap();
+        let mut connections = self.turn_connections.lock();
 
         if let Some(server_connections) = connections.get_mut(server) {
             server_connections.retain(|conn| conn.ref_count.load(Ordering::SeqCst) > 0);
@@ -196,7 +197,7 @@ impl ResourceManager {
             // This ensures RBI sessions don't compete for bandwidth through shared TURN ports
             {
                 conn.ref_count.fetch_add(1, Ordering::SeqCst);
-                let mut stats = self.stats.lock().unwrap();
+                let mut stats = self.stats.lock();
                 stats.turn_connections_reused += 1;
                 return Some(conn.clone());
             }
@@ -211,10 +212,10 @@ impl ResourceManager {
         username: String,
         password: String,
     ) -> Arc<AtomicUsize> {
-        let mut connections = self.turn_connections.lock().unwrap();
+        let mut connections = self.turn_connections.lock();
         let server_connections = connections.entry(server.clone()).or_default();
 
-        let limits = self.limits.read().unwrap();
+        let limits = self.limits.read();
         if server_connections.len() >= limits.max_turn_connections_per_server {
             server_connections.remove(0);
         }
@@ -230,14 +231,14 @@ impl ResourceManager {
 
         server_connections.push(conn_info);
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock();
         stats.turn_connections_pooled += 1;
 
         ref_count
     }
 
     pub fn cleanup_stale_connections(&self) {
-        let mut connections = self.turn_connections.lock().unwrap();
+        let mut connections = self.turn_connections.lock();
         let stale_threshold = Duration::from_secs(300); // 5 minutes
         let now = Instant::now();
 
@@ -253,11 +254,11 @@ impl ResourceManager {
     }
 
     pub fn get_resource_status(&self) -> ResourceStats {
-        self.stats.lock().unwrap().clone()
+        self.stats.lock().clone()
     }
 
     pub fn update_limits(&self, new_limits: ResourceLimits) {
-        let mut limits = self.limits.write().unwrap();
+        let mut limits = self.limits.write();
         *limits = new_limits;
         info!(
             "Updated resource limits: max_sockets={}, max_ice_agents={}",
@@ -270,7 +271,7 @@ impl ResourceManager {
     }
 
     pub fn get_limits(&self) -> ResourceLimits {
-        self.limits.read().unwrap().clone()
+        self.limits.read().clone()
     }
 
     /// Retry ICE gathering with exponential backoff for resource failures
@@ -360,7 +361,7 @@ impl ResourceManager {
         mut config: webrtc::peer_connection::configuration::RTCConfiguration,
         tube_id: &str,
     ) -> webrtc::peer_connection::configuration::RTCConfiguration {
-        let limits = self.limits.read().unwrap();
+        let limits = self.limits.read();
 
         // Apply ICE candidate pool size limit
         if let Some(pool_size) = limits.ice_candidate_pool_size {
@@ -486,10 +487,8 @@ impl SocketGuard {
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let count = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
-        {
-            let mut stats = self.stats.lock().unwrap();
-            stats.sockets_released += 1;
-        }
+        // parking_lot never poisons - always succeeds
+        self.stats.lock().sockets_released += 1;
         debug!("Released socket permit, remaining: {}", count);
     }
 }
@@ -517,10 +516,8 @@ impl IceAgentGuard {
 impl Drop for IceAgentGuard {
     fn drop(&mut self) {
         let count = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
-        {
-            let mut stats = self.stats.lock().unwrap();
-            stats.ice_agents_destroyed += 1;
-        }
+        // parking_lot never poisons - always succeeds
+        self.stats.lock().ice_agents_destroyed += 1;
         info!("Released ICE agent permit, remaining: {}", count);
     }
 }

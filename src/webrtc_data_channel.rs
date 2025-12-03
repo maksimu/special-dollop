@@ -3,11 +3,13 @@ use bytes::Bytes;
 #[cfg(test)]
 use futures::future::BoxFuture;
 use log::{debug, warn};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use webrtc::data_channel::RTCDataChannel;
+
+// Lock-free queue for pending frames - uses crossbeam's SegQueue
+use crossbeam_queue::SegQueue;
 
 /// Standard buffer threshold for optimal WebRTC performance.
 /// This value (8KB) is optimized for mixed interactive + bulk workloads:
@@ -19,25 +21,32 @@ use webrtc::data_channel::RTCDataChannel;
 /// - Marginal CPU increase (~1-2% per connection) for dramatic latency improvement
 pub const STANDARD_BUFFER_THRESHOLD: u64 = 8 * 1024; // 8KB - balanced for latency + throughput
 
-// Type alias for complex callback type
-type BufferedAmountLowCallback = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>;
+// Type alias for complex callback type - callbacks still need Mutex (can't be atomic)
+type BufferedAmountLowCallback =
+    Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>;
+
+#[cfg(test)]
+type TestSendHook = Arc<
+    std::sync::Mutex<Option<Box<dyn Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static>>>,
+>;
 
 // Async-first wrapper for data channel functionality
 pub struct WebRTCDataChannel {
     pub data_channel: Arc<RTCDataChannel>,
     pub(crate) is_closing: Arc<AtomicBool>,
-    pub(crate) buffered_amount_low_threshold: Arc<Mutex<u64>>,
+    /// Buffered amount threshold - lock-free with AtomicU64
+    pub(crate) buffered_amount_low_threshold: Arc<AtomicU64>,
+    /// Callback for buffered amount low - still needs Mutex (callback is not Copy)
     pub(crate) on_buffered_amount_low_callback: BufferedAmountLowCallback,
     pub(crate) threshold_monitor: Arc<AtomicBool>,
 
     #[cfg(test)]
-    pub(crate) test_send_hook:
-        Arc<Mutex<Option<Box<dyn Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static>>>>,
+    pub(crate) test_send_hook: TestSendHook,
 }
 
 impl Clone for WebRTCDataChannel {
     fn clone(&self) -> Self {
-        WebRTCDataChannel {
+        Self {
             data_channel: Arc::clone(&self.data_channel),
             is_closing: Arc::clone(&self.is_closing),
             buffered_amount_low_threshold: Arc::clone(&self.buffered_amount_low_threshold),
@@ -55,19 +64,20 @@ impl WebRTCDataChannel {
         Self {
             data_channel,
             is_closing: Arc::new(AtomicBool::new(false)),
-            buffered_amount_low_threshold: Arc::new(Mutex::new(0)),
-            on_buffered_amount_low_callback: Arc::new(Mutex::new(None)),
+            buffered_amount_low_threshold: Arc::new(AtomicU64::new(0)),
+            on_buffered_amount_low_callback: Arc::new(std::sync::Mutex::new(None)),
             threshold_monitor: Arc::new(AtomicBool::new(false)),
 
             #[cfg(test)]
-            test_send_hook: Arc::new(Mutex::new(None)),
+            test_send_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    /// Set the buffered amount low threshold
+    /// Set the buffered amount low threshold (lock-free)
     pub fn set_buffered_amount_low_threshold(&self, threshold: u64) {
-        let mut guard = self.buffered_amount_low_threshold.lock().unwrap();
-        *guard = threshold;
+        // Lock-free store
+        self.buffered_amount_low_threshold
+            .store(threshold, Ordering::Release);
 
         // Log the threshold change
         debug!("Set buffered amount low threshold to {} bytes", threshold);
@@ -95,16 +105,21 @@ impl WebRTCDataChannel {
                         let threshold_value = threshold_clone;
 
                         Box::pin(async move {
-                            debug!(
-                                "Native bufferedAmountLow event triggered (buffer below {})",
-                                threshold_value
-                            );
+                            // Buffer drain event logging - verbose only (can be frequent)
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                log::debug!(
+                                    "Native bufferedAmountLow event triggered (buffer below {})",
+                                    threshold_value
+                                );
+                            }
 
-                            // Get and call our callback
-                            let callback_guard =
-                                callback_dc.on_buffered_amount_low_callback.lock().unwrap();
-                            if let Some(ref callback) = *callback_guard {
-                                callback();
+                            // Get and call our callback (callback mutex is infrequent, not hot path)
+                            if let Ok(callback_guard) =
+                                callback_dc.on_buffered_amount_low_callback.lock()
+                            {
+                                if let Some(ref callback) = *callback_guard {
+                                    callback();
+                                }
                             }
                         })
                     }))
@@ -118,11 +133,13 @@ impl WebRTCDataChannel {
         // Check is_some() before moving the callback
         let has_callback = callback.is_some();
 
-        // Now move it into the mutex
-        let mut guard = self.on_buffered_amount_low_callback.lock().unwrap();
-        *guard = callback;
-
-        debug!("Set buffered amount low callback: {}", has_callback);
+        // Callback registration is infrequent - mutex is acceptable here
+        if let Ok(mut guard) = self.on_buffered_amount_low_callback.lock() {
+            *guard = callback;
+            debug!("Set buffered amount low callback: {}", has_callback);
+        } else {
+            warn!("Failed to set buffered amount low callback - mutex poisoned");
+        }
     }
 
     // Add a test method to set the sending hook for testing
@@ -131,8 +148,9 @@ impl WebRTCDataChannel {
     where
         F: Fn(Bytes) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
-        let mut guard = self.test_send_hook.lock().unwrap();
-        *guard = Some(Box::new(hook));
+        if let Ok(mut guard) = self.test_send_hook.lock() {
+            *guard = Some(Box::new(hook));
+        }
     }
 
     pub async fn send(&self, data: Bytes) -> Result<(), String> {
@@ -144,16 +162,17 @@ impl WebRTCDataChannel {
         // For testing: call the test hook if set
         #[cfg(test)]
         {
-            let hook_guard = self.test_send_hook.lock().unwrap();
-            if let Some(ref hook) = *hook_guard {
-                // Clone the data for the hook
-                let data_clone = data.clone();
+            if let Ok(hook_guard) = self.test_send_hook.lock() {
+                if let Some(ref hook) = *hook_guard {
+                    // Clone the data for the hook
+                    let data_clone = data.clone();
 
-                // Call the hook with a clone of the data
-                let hook_future = hook(data_clone);
+                    // Call the hook with a clone of the data
+                    let hook_future = hook(data_clone);
 
-                // Spawn the hook execution to avoid blocking
-                tokio::spawn(hook_future);
+                    // Spawn the hook execution to avoid blocking
+                    tokio::spawn(hook_future);
+                }
             }
         }
 
@@ -188,7 +207,7 @@ impl WebRTCDataChannel {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         // Wrap sender in Arc<Mutex<Option<>>> so we can safely consume it from either callback
-        let sender = Arc::new(Mutex::new(Some(tx)));
+        let sender = Arc::new(std::sync::Mutex::new(Some(tx)));
 
         // Create shared flags for state
         let is_open = Arc::new(AtomicBool::new(false));
@@ -208,8 +227,10 @@ impl WebRTCDataChannel {
                 is_open.store(true, Ordering::Release);
 
                 // Send the notification, consuming the sender
-                if let Some(tx) = sender_clone.lock().unwrap().take() {
-                    let _ = tx.send(true);
+                if let Ok(mut guard) = sender_clone.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(true);
+                    }
                 }
 
                 Box::pin(async {})
@@ -223,8 +244,10 @@ impl WebRTCDataChannel {
             // If opened and then closed during this wait, send it false
             if is_open_for_close.load(Ordering::Acquire) {
                 // Send false to indicate a closed state, consuming the sender
-                if let Some(tx) = sender_for_close.lock().unwrap().take() {
-                    let _ = tx.send(false);
+                if let Ok(mut guard) = sender_for_close.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(false);
+                    }
                 }
             }
 
@@ -290,9 +313,11 @@ impl WebRTCDataChannel {
 
 /// Event-driven sender that uses WebRTC native bufferedAmountLow events
 /// Eliminates polling and provides natural backpressure
+/// Uses lock-free SegQueue for zero-contention frame queueing
 pub struct EventDrivenSender {
     data_channel: Arc<WebRTCDataChannel>,
-    pending_frames: Arc<Mutex<VecDeque<Bytes>>>,
+    /// Lock-free queue for pending frames - SegQueue provides MPSC without locks
+    pending_frames: Arc<SegQueue<Bytes>>,
     can_send: Arc<AtomicBool>,
     threshold: u64,               // Backpressure threshold for monitoring
     queue_size: Arc<AtomicUsize>, // Lock-free queue depth counter
@@ -303,7 +328,7 @@ impl EventDrivenSender {
     pub fn new(data_channel: Arc<WebRTCDataChannel>, threshold: u64) -> Self {
         let sender = Self {
             data_channel: data_channel.clone(),
-            pending_frames: Arc::new(Mutex::new(VecDeque::new())),
+            pending_frames: Arc::new(SegQueue::new()),
             can_send: Arc::new(AtomicBool::new(true)),
             threshold,
             queue_size: Arc::new(AtomicUsize::new(0)),
@@ -322,13 +347,36 @@ impl EventDrivenSender {
             can_send_clone.store(true, Ordering::Release);
 
             // Drain pending frames when space becomes available (batched)
-            let to_send = {
-                let mut pending = pending_clone.lock().unwrap();
-                let batch_size = std::cmp::min(pending.len(), 2000); // Max 2000 frames per batch
-                let drained = pending.drain(..batch_size).collect::<Vec<_>>();
-                queue_size_clone.store(pending.len(), Ordering::Release); // Update atomic counter
-                drained
-            };
+            // Lock-free: pop from SegQueue without any locks
+            let mut to_send = Vec::with_capacity(2000);
+            while to_send.len() < 2000 {
+                match pending_clone.pop() {
+                    Some(frame) => to_send.push(frame),
+                    None => break,
+                }
+            }
+
+            // Update atomic counter after draining
+            let old_size = queue_size_clone.fetch_sub(to_send.len(), Ordering::AcqRel);
+
+            // Sanity check: counter should never underflow (indicates a bug in increment/decrement logic)
+            // In development: panic to catch the bug immediately
+            // In production: log error and reset counter to prevent permanent corruption
+            debug_assert!(
+                old_size >= to_send.len(),
+                "Queue size counter underflowed! old_size={}, to_send.len()={} - this indicates a race condition in queue management",
+                old_size,
+                to_send.len()
+            );
+
+            if old_size < to_send.len() {
+                log::error!(
+                    "CRITICAL: Queue size counter underflowed! old_size={}, to_send.len()={} - resetting counter to 0. This indicates a bug in queue increment/decrement logic.",
+                    old_size,
+                    to_send.len()
+                );
+                queue_size_clone.store(0, Ordering::Release);
+            }
 
             if !to_send.is_empty() {
                 let dc = dc_clone.clone();
@@ -352,7 +400,7 @@ impl EventDrivenSender {
         sender
     }
 
-    /// Send with zero-polling natural backpressure
+    /// Send with zero-polling natural backpressure (lock-free!)
     /// Returns immediately - either sends or queues for later
     pub async fn send_with_natural_backpressure(&self, frame: Bytes) -> Result<(), String> {
         let frame_len = frame.len(); // Capture for logging
@@ -372,10 +420,13 @@ impl EventDrivenSender {
                         || error_str.contains("closed")
                     {
                         // Permanent failure - WebRTC is dead, don't queue
-                        debug!(
-                            "WebRTC permanently closed, failing send to trigger cleanup (frame_size: {} bytes, error: {})",
-                            frame_len, e
-                        );
+                        // Only log once per channel to avoid spam during shutdown
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            log::debug!(
+                                "WebRTC permanently closed, failing send (frame_size: {} bytes)",
+                                frame_len
+                            );
+                        }
                         return Err(error_str);
                     }
 
@@ -393,47 +444,48 @@ impl EventDrivenSender {
             }
         }
 
-        // Slow path: queue for later when buffer drains
-        {
-            let mut pending = self.pending_frames.lock().unwrap();
-            let queue_size = pending.len();
+        // Slow path: queue for later when buffer drains (lock-free!)
+        // CRITICAL: Check size BEFORE incrementing to avoid race condition where
+        // counter is incremented but frame is never queued (window of incorrect state)
+        let current_queue_size = self.queue_size.load(Ordering::Acquire);
 
-            // Log warnings at various thresholds
-            if queue_size > 7500 {
-                // 75% of max capacity
-                warn!(
-                    "EventDrivenSender queue critically high: {}/10000 frames ({:.1}% full) - approaching data loss",
-                    queue_size,
-                    (queue_size as f64 / 10000.0) * 100.0
-                );
-            } else if queue_size > 5000 && queue_size.is_multiple_of(500) {
-                // Log every 500 frames after 50%
-                if unlikely!(crate::logger::is_verbose_logging()) {
-                    debug!(
-                        "EventDrivenSender queue growing: {}/10000 frames ({:.1}% full)",
-                        queue_size,
-                        (queue_size as f64 / 10000.0) * 100.0
-                    );
-                }
-            }
-
-            pending.push_back(frame);
-
-            // Prevent unbounded growth - increased from 1000 to 10000 frames
-            if pending.len() > 10000 {
-                // Drop oldest frames if queue grows too large
-                let dropped_frame = pending.pop_front();
-                log::error!(
-                    "CRITICAL: EventDrivenSender queue overflow! Dropping frame (queue_size: {}, threshold: {}, dropped_bytes: {})",
-                    pending.len(),
-                    self.threshold,
-                    dropped_frame.as_ref().map(|f| f.len()).unwrap_or(0)
-                );
-            }
-
-            // Update atomic counter after modifications
-            self.queue_size.store(pending.len(), Ordering::Release);
+        // Prevent unbounded growth - increased from 1000 to 10000 frames
+        // Check BEFORE incrementing counter to maintain accurate queue depth
+        if current_queue_size >= 10000 {
+            log::error!(
+                "CRITICAL: EventDrivenSender queue overflow! Dropping frame (queue_size: {}, threshold: {}, dropped_bytes: {})",
+                current_queue_size,
+                self.threshold,
+                frame_len
+            );
+            return Ok(()); // Still return Ok - frame was "handled" (dropped)
         }
+
+        // Log warnings at various thresholds (before incrementing)
+        if current_queue_size > 7500 {
+            // 75% of max capacity
+            warn!(
+                "EventDrivenSender queue critically high: {}/10000 frames ({:.1}% full) - approaching data loss",
+                current_queue_size,
+                (current_queue_size as f64 / 10000.0) * 100.0
+            );
+        } else if current_queue_size > 5000 && current_queue_size.is_multiple_of(500) {
+            // Log every 500 frames after 50%
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "EventDrivenSender queue growing: {}/10000 frames ({:.1}% full)",
+                    current_queue_size,
+                    (current_queue_size as f64 / 10000.0) * 100.0
+                );
+            }
+        }
+
+        // Push to queue FIRST (SegQueue::push is infallible - always succeeds)
+        self.pending_frames.push(frame);
+
+        // Then increment counter (atomic operation)
+        // This ensures counter never exceeds actual queue size
+        self.queue_size.fetch_add(1, Ordering::Release);
 
         Ok(()) // Queued successfully - no blocking!
     }

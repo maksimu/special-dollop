@@ -1,9 +1,10 @@
 // Buffer pool implementation for efficient buffer reuse
 
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Standard high-performance buffer pool configuration
 /// Used consistently across the system to avoid thread-local conflicts
@@ -94,9 +95,9 @@ impl BufferPool {
 
     /// Acquire from fallback shared pool or create new
     fn acquire_from_fallback(&self) -> BytesMut {
-        // Try to get from shared pool
+        // Try to get from shared pool (poison-resistant)
         {
-            let mut inner = self.fallback.lock().unwrap();
+            let mut inner = self.fallback.lock();
             if let Some(buf) = inner.buffers.pop_front() {
                 return buf;
             }
@@ -130,10 +131,10 @@ impl BufferPool {
             false
         });
 
-        // If thread-local pool is full, try shared pool
+        // If thread-local pool is full, try shared pool (poison-resistant)
         if !stored_locally {
             if let Some(buffer) = buf {
-                let mut inner = self.fallback.lock().unwrap();
+                let mut inner = self.fallback.lock();
                 if inner.buffers.len() < inner.config.max_pooled {
                     inner.buffers.push_back(buffer);
                 }

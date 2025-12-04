@@ -1,30 +1,31 @@
-use crate::Result;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::io::Cursor;
 
+type Result<T> = std::result::Result<T, crate::TerminalError>;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rect {
+pub struct FrameRect {
     pub x: u32,
     pub y: u32,
     pub width: u32,
     pub height: u32,
 }
 
-impl Rect {
-    pub fn intersects(&self, other: &Rect) -> bool {
+impl FrameRect {
+    pub fn intersects(&self, other: &FrameRect) -> bool {
         !(self.x + self.width <= other.x
             || other.x + other.width <= self.x
             || self.y + self.height <= other.y
             || other.y + other.height <= self.y)
     }
 
-    pub fn union(&self, other: &Rect) -> Rect {
+    pub fn union(&self, other: &FrameRect) -> FrameRect {
         let x = self.x.min(other.x);
         let y = self.y.min(other.y);
         let x2 = (self.x + self.width).max(other.x + other.width);
         let y2 = (self.y + self.height).max(other.y + other.height);
 
-        Rect {
+        FrameRect {
             x,
             y,
             width: x2 - x,
@@ -38,7 +39,7 @@ pub struct FrameBuffer {
     width: u32,
     height: u32,
     data: Vec<u8>, // RGBA pixels
-    dirty_rects: Vec<Rect>,
+    dirty_rects: Vec<FrameRect>,
 }
 
 impl FrameBuffer {
@@ -64,7 +65,7 @@ impl FrameBuffer {
             }
         }
 
-        self.dirty_rects.push(Rect {
+        self.dirty_rects.push(FrameRect {
             x,
             y,
             width,
@@ -73,7 +74,7 @@ impl FrameBuffer {
     }
 
     /// Get dirty rectangles
-    pub fn dirty_rects(&self) -> &[Rect] {
+    pub fn dirty_rects(&self) -> &[FrameRect] {
         &self.dirty_rects
     }
 
@@ -107,7 +108,7 @@ impl FrameBuffer {
     }
 
     /// Get pixels for a region (for hardware encoding)
-    pub fn get_region_pixels(&self, rect: Rect) -> Vec<u8> {
+    pub fn get_region_pixels(&self, rect: FrameRect) -> Vec<u8> {
         let mut pixels = Vec::with_capacity((rect.width * rect.height * 4) as usize);
 
         for row in 0..rect.height {
@@ -134,7 +135,7 @@ impl FrameBuffer {
     }
 
     /// Encode a region to PNG
-    pub fn encode_region(&self, rect: Rect) -> Result<Vec<u8>> {
+    pub fn encode_region(&self, rect: FrameRect) -> Result<Vec<u8>> {
         let mut img: RgbaImage = ImageBuffer::new(rect.width, rect.height);
 
         for row in 0..rect.height {
@@ -200,19 +201,19 @@ mod tests {
 
     #[test]
     fn test_rect_intersects() {
-        let rect1 = Rect {
+        let rect1 = FrameRect {
             x: 10,
             y: 10,
             width: 20,
             height: 20,
         };
-        let rect2 = Rect {
+        let rect2 = FrameRect {
             x: 20,
             y: 20,
             width: 20,
             height: 20,
         };
-        let rect3 = Rect {
+        let rect3 = FrameRect {
             x: 50,
             y: 50,
             width: 10,
@@ -225,13 +226,13 @@ mod tests {
 
     #[test]
     fn test_rect_union() {
-        let rect1 = Rect {
+        let rect1 = FrameRect {
             x: 10,
             y: 10,
             width: 20,
             height: 20,
         };
-        let rect2 = Rect {
+        let rect2 = FrameRect {
             x: 20,
             y: 20,
             width: 20,

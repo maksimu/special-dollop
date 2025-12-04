@@ -1320,12 +1320,14 @@ impl ZeroCopyMetrics {
 }
 
 // Expose via Prometheus
-lazy_static! {
-    static ref ZERO_COPY_BYTES: IntCounter = register_int_counter!(
+use std::sync::LazyLock;
+
+static ZERO_COPY_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "guacr_zero_copy_bytes_total",
         "Total bytes transferred via zero-copy"
-    ).unwrap();
-}
+    ).unwrap()
+});
 ```
 
 ### Profiling Tools

@@ -40,7 +40,8 @@ Each protocol is a separate crate implementing the `ProtocolHandler` trait:
   - JPEG rendering with 16ms debounce (60fps)
   - Bidirectional clipboard (OSC 52 + bracketed paste)
   - Dirty region optimization with scroll detection
-  - 1024x768 size cap to prevent WebRTC backpressure
+  - Default handshake size (1024x768 @ 96 DPI, then resizes to browser)
+  - Proper backpressure with async EventCallback (4096 channel capacity)
 - **guacr-telnet**: Telnet with custom implementation
 - **guacr-rdp**: RDP using ironrdp crate (pure Rust)
 - **guacr-vnc**: VNC using async-vnc crate
@@ -319,29 +320,7 @@ Environment variables:
 
 ## Development Phases
 
-**Current Status:** Phase 1 Complete (SSH production-ready), Phase 2 in progress
-
-**Phase 1 (COMPLETE):** SSH handler production-ready
-- ✅ Password & SSH key authentication (all formats)
-- ✅ JPEG rendering with 60fps smoothness (16ms debounce)
-- ✅ Bidirectional clipboard (OSC 52 + bracketed paste)
-- ✅ Dirty region optimization with scroll detection
-- ✅ Size cap to prevent WebRTC backpressure
-- ✅ Proper logging (trace for hot paths, info for events)
-
-**Phase 2 (COMPLETE):** SSH polish & other terminal protocols
-- [x] Scrollback buffer support (~150 lines)
-- [x] Mouse events for vim/tmux (~80 lines)
-- [x] Host key verification (~80 lines)
-- [x] Telnet protocol improvements
-- [x] SFTP file transfer integration
-- [x] Threat detection with BAML integration
-
-**Phase 3 (COMPLETE):** Graphical Protocols & RBI
-- [x] RDP support (ironrdp integration with hardware encoding framework)
-- [x] VNC support (complete RFB 3.8 protocol implementation)
-- [x] Remote Browser Isolation (RBI with chromiumoxide)
-- [x] Database query execution (MySQL wired up)
+**Current Status:** Phase 4 in progress
 
 **Phase 4 (PLANNED):** Container Management
 - [ ] Kubernetes/Docker protocol handler (see CONTAINER_MANAGEMENT_PROTOCOL.md)

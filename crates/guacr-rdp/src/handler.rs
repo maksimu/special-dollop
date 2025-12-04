@@ -1,25 +1,57 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    // Connection utilities
+    connect_tcp_with_timeout,
+    is_mouse_event_allowed_readonly,
+    EventBasedHandler,
+    EventCallback,
+    HandlerError,
+    // Security
+    HandlerSecuritySettings,
+    HandlerStats,
+    HealthStatus,
+    InstructionSender,
+    KeepAliveManager,
+    MultiFormatRecorder,
     ProtocolHandler,
+    // Recording
+    RecordingConfig,
+    RecordingDirection,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
-use guacr_protocol::{BinaryEncoder, GuacamoleParser};
-use guacr_terminal::{BufferPool, HardwareEncoder, HardwareEncoderImpl};
-use log::{debug, error, info, warn};
+use guacr_protocol::GuacamoleParser;
+use guacr_terminal::BufferPool;
+use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+// IronRDP imports
+use ironrdp::connector::{self, ClientConnector, ConnectionResult, Credentials, DesktopSize};
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp::session::image::DecodedImage;
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+use ironrdp_pdu::input::mouse::PointerFlags;
+use ironrdp_pdu::input::MousePdu;
+use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use tokio_rustls::TlsConnector;
+
+type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+
 // Re-export supporting modules
 use crate::channel_handler::RdpChannelHandler;
-use crate::clipboard::{
-    RdpClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE,
+
+// Import shared types from guacr-terminal
+use guacr_terminal::{
+    FrameBuffer, RdpClipboard, RdpInputHandler, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE,
+    CLIPBOARD_MIN_SIZE,
 };
-use crate::framebuffer::FrameBuffer;
-use crate::input_handler::RdpInputHandler;
 
 /// RDP protocol handler
 ///
@@ -105,7 +137,11 @@ impl ProtocolHandler for RdpHandler {
             settings.clipboard_buffer_size,
             settings.disable_copy,
             settings.disable_paste,
+            settings.read_only,
+            settings.security.connection_timeout_secs,
+            settings.recording_config.clone(),
             to_client,
+            &params,
         );
 
         // Connect and run session
@@ -160,7 +196,10 @@ impl EventBasedHandler for RdpHandler {
         let sender_clone = Arc::clone(&sender_arc);
         tokio::spawn(async move {
             while let Some(msg) = handler_rx.recv().await {
-                sender_clone.send(msg);
+                if let Err(e) = sender_clone.send(msg).await {
+                    log::error!("RDP: Failed to send instruction: {}", e);
+                    break;
+                }
             }
         });
 
@@ -187,6 +226,10 @@ pub struct RdpSettings {
     pub clipboard_buffer_size: usize,
     pub disable_copy: bool,
     pub disable_paste: bool,
+    /// Read-only mode - blocks keyboard/mouse input
+    pub read_only: bool,
+    /// Security settings (includes connection timeout)
+    pub security: HandlerSecuritySettings,
     pub domain: Option<String>,
     #[allow(dead_code)] // TODO: Used for connection brokers
     pub load_balance_info: Option<String>,
@@ -194,6 +237,8 @@ pub struct RdpSettings {
     pub ignore_cert: bool,
     #[allow(dead_code)] // TODO: Used for cert validation
     pub cert_fingerprint: Option<String>,
+    /// Recording configuration
+    pub recording_config: RecordingConfig,
     #[cfg(feature = "sftp")]
     pub enable_sftp: bool,
     #[cfg(feature = "sftp")]
@@ -268,6 +313,17 @@ impl RdpSettings {
             .map(|s| s == "true")
             .unwrap_or(defaults.disable_paste);
 
+        let read_only = params
+            .get("read-only")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false);
+
+        // Parse security settings (includes connection timeout)
+        let security = HandlerSecuritySettings::from_params(params);
+
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(params);
+
         let domain = params.get("domain").cloned();
         let load_balance_info = params.get("load-balance-info").cloned();
         let ignore_cert = params
@@ -336,9 +392,25 @@ impl RdpSettings {
         };
 
         info!(
-            "RDP Settings: {}@{}:{}, {}x{}, security: {}, clipboard: {} bytes",
-            username, hostname, port, width, height, security_mode, clipboard_buffer_size
+            "RDP Settings: {}@{}:{}, {}x{}, security: {}, clipboard: {} bytes, read_only: {}",
+            username,
+            hostname,
+            port,
+            width,
+            height,
+            security_mode,
+            clipboard_buffer_size,
+            read_only
         );
+
+        if recording_config.is_enabled() {
+            info!(
+                "RDP: Recording enabled - ses={}, asciicast={}, typescript={}",
+                recording_config.is_ses_enabled(),
+                recording_config.is_asciicast_enabled(),
+                recording_config.is_typescript_enabled()
+            );
+        }
 
         Ok(Self {
             hostname,
@@ -351,10 +423,13 @@ impl RdpSettings {
             clipboard_buffer_size,
             disable_copy,
             disable_paste,
+            read_only,
+            security,
             domain,
             load_balance_info,
             ignore_cert,
             cert_fingerprint,
+            recording_config,
             #[cfg(feature = "sftp")]
             enable_sftp,
             #[cfg(feature = "sftp")]
@@ -382,18 +457,24 @@ struct IronRdpSession {
     framebuffer: FrameBuffer,
     #[allow(dead_code)] // TODO: Used for buffer pooling optimization
     buffer_pool: Arc<BufferPool>,
-    binary_encoder: BinaryEncoder,
     #[allow(dead_code)] // TODO: Used for clipboard integration
     clipboard: RdpClipboard,
     input_handler: RdpInputHandler,
     channel_handler: RdpChannelHandler,
-    hardware_encoder: Option<HardwareEncoderImpl>,
-    video_stream_id: Option<u32>,
     stream_id: u32,
     #[allow(dead_code)] // TODO: Used for clipboard policy
     disable_copy: bool,
     #[allow(dead_code)] // TODO: Used for clipboard policy
     disable_paste: bool,
+    /// Read-only mode - blocks keyboard/mouse input
+    read_only: bool,
+    /// Connection timeout in seconds
+    connection_timeout_secs: u64,
+    /// Recording configuration
+    #[allow(dead_code)] // Config stored for reference, recorder does the work
+    recording_config: RecordingConfig,
+    /// Active recorder for .guac format session recording
+    recorder: Option<MultiFormatRecorder>,
     to_client: mpsc::Sender<Bytes>,
     width: u32,
     height: u32,
@@ -404,26 +485,38 @@ struct IronRdpSession {
 }
 
 impl IronRdpSession {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         width: u32,
         height: u32,
         clipboard_buffer_size: usize,
         disable_copy: bool,
         disable_paste: bool,
+        read_only: bool,
+        connection_timeout_secs: u64,
+        recording_config: RecordingConfig,
         to_client: mpsc::Sender<Bytes>,
+        params: &HashMap<String, String>,
     ) -> Self {
         let frame_size = (width * height * 4) as usize;
         let buffer_pool = Arc::new(BufferPool::new(8, frame_size));
 
-        let use_hardware_encoding = width >= 3840 || height >= 2160;
-        let hardware_encoder = if use_hardware_encoding {
-            match HardwareEncoderImpl::new(width, height, 20) {
-                Ok(encoder) => {
-                    info!("RDP: Hardware encoder initialized: {}", encoder.name());
-                    Some(encoder)
+        // Initialize recording if enabled
+        let recorder = if recording_config.is_enabled() {
+            // RDP doesn't have cols/rows like terminal, use width/height
+            match MultiFormatRecorder::new(
+                &recording_config,
+                params,
+                "rdp",
+                width as u16,
+                height as u16,
+            ) {
+                Ok(rec) => {
+                    info!("RDP: Session recording initialized");
+                    Some(rec)
                 }
                 Err(e) => {
-                    warn!("RDP: Hardware encoder unavailable: {}, using JPEG", e);
+                    warn!("RDP: Failed to initialize recording: {}", e);
                     None
                 }
             }
@@ -434,7 +527,6 @@ impl IronRdpSession {
         Self {
             framebuffer: FrameBuffer::new(width, height),
             buffer_pool,
-            binary_encoder: BinaryEncoder::new(),
             clipboard: RdpClipboard::new(clipboard_buffer_size),
             input_handler: RdpInputHandler::new(),
             channel_handler: RdpChannelHandler::new(
@@ -442,15 +534,17 @@ impl IronRdpSession {
                 disable_copy,
                 disable_paste,
             ),
-            hardware_encoder,
-            video_stream_id: None,
             stream_id: 1,
             disable_copy,
             disable_paste,
+            read_only,
+            connection_timeout_secs,
+            recording_config,
+            recorder,
             to_client,
             width,
             height,
-            use_hardware_encoding,
+            use_hardware_encoding: false, // Hardware encoding disabled for now
             #[cfg(feature = "sftp")]
             sftp_session: None,
         }
@@ -461,35 +555,59 @@ impl IronRdpSession {
         mut self,
         hostname: &str,
         port: u16,
-        _username: &str,
-        _password: &str,
-        _domain: Option<&str>,
+        username: &str,
+        password: &str,
+        domain: Option<&str>,
         _security_mode: &str,
         from_client: mpsc::Receiver<Bytes>,
         #[cfg(feature = "sftp")] settings: Option<&RdpSettings>,
         #[cfg(not(feature = "sftp"))] _settings: Option<&RdpSettings>,
     ) -> Result<(), String> {
-        info!("RDP: Connecting to {}:{}", hostname, port);
+        info!(
+            "RDP: Connecting to {}:{} (timeout: {}s)",
+            hostname, port, self.connection_timeout_secs
+        );
 
-        let stream = TcpStream::connect((hostname, port))
+        // Build IronRDP connector config
+        let config = self.build_ironrdp_config(username, password, domain);
+
+        // Establish TCP connection with timeout (matches guacd behavior)
+        let stream = connect_tcp_with_timeout((hostname, port), self.connection_timeout_secs)
             .await
-            .map_err(|e| format!("TCP connection failed: {}", e))?;
+            .map_err(|e| format!("{}", e))?;
 
         info!("RDP: TCP connection established");
 
+        // Perform RDP handshake and authentication
+        let (connection_result, framed) = self
+            .perform_rdp_handshake(stream, config, hostname.to_string())
+            .await
+            .map_err(|e| format!("RDP handshake failed: {}", e))?;
+
+        info!(
+            "RDP: Connection established - {}x{}",
+            connection_result.desktop_size.width, connection_result.desktop_size.height
+        );
+
+        // Update session dimensions if they differ from requested
+        self.width = u32::from(connection_result.desktop_size.width);
+        self.height = u32::from(connection_result.desktop_size.height);
+        self.framebuffer = FrameBuffer::new(self.width, self.height);
+
+        // Send ready and size instructions to client (and record them)
         let ready_instr = format!("5.ready,{}.{};", 8, "rdp-ready");
-        self.to_client
-            .send(Bytes::from(ready_instr))
-            .await
-            .map_err(|e| format!("Failed to send ready: {}", e))?;
+        self.send_and_record(&ready_instr).await?;
 
-        let size_instr = self.binary_encoder.encode_size(0, self.width, self.height);
-        self.to_client
-            .send(size_instr)
-            .await
-            .map_err(|e| format!("Failed to send size: {}", e))?;
+        let size_instr = format!(
+            "4.size,1.0,{}.{},{}.{};",
+            self.width.to_string().len(),
+            self.width,
+            self.height.to_string().len(),
+            self.height
+        );
+        self.send_and_record(&size_instr).await?;
 
-        info!("RDP: Session ready, starting event loop");
+        info!("RDP: Session ready, starting active session");
 
         #[cfg(feature = "sftp")]
         if let Some(settings) = settings {
@@ -520,288 +638,435 @@ impl IronRdpSession {
             }
         }
 
-        self.run_event_loop(stream, from_client).await?;
+        // Run the active RDP session
+        self.run_active_session(connection_result, framed, from_client)
+            .await?;
 
         Ok(())
     }
 
-    async fn run_event_loop<S>(
-        &mut self,
-        mut stream: S,
+    fn build_ironrdp_config(
+        &self,
+        username: &str,
+        password: &str,
+        domain: Option<&str>,
+    ) -> connector::Config {
+        connector::Config {
+            credentials: Credentials::UsernamePassword {
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+            domain: domain.map(|s| s.to_string()),
+            enable_tls: true,
+            enable_credssp: true,
+            keyboard_type: KeyboardType::IbmEnhanced,
+            keyboard_subtype: 0,
+            keyboard_layout: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            dig_product_id: String::new(),
+            desktop_size: DesktopSize {
+                width: self.width as u16,
+                height: self.height as u16,
+            },
+            bitmap: None,
+            client_build: 0,
+            client_name: "guacr-rdp".to_owned(),
+            client_dir: "C:\\\\Windows\\\\System32\\\\mstscax.dll".to_owned(),
+            #[cfg(target_os = "macos")]
+            platform: MajorPlatformType::MACINTOSH,
+            #[cfg(target_os = "linux")]
+            platform: MajorPlatformType::UNIX,
+            #[cfg(target_os = "windows")]
+            platform: MajorPlatformType::WINDOWS,
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            platform: MajorPlatformType::UNIX,
+            enable_server_pointer: true,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            pointer_software_rendering: true,
+            performance_flags: PerformanceFlags::default(),
+            desktop_scale_factor: 0,
+            hardware_id: None,
+            license_cache: None,
+            timezone_info: TimezoneInfo::default(),
+        }
+    }
+
+    async fn perform_rdp_handshake(
+        &self,
+        stream: TcpStream,
+        config: connector::Config,
+        server_name: String,
+    ) -> Result<
+        (
+            ConnectionResult,
+            ironrdp_tokio::Framed<ironrdp_tokio::MovableTokioStream<TokioTlsStream>>,
+        ),
+        String,
+    > {
+        use ironrdp_tokio::{connect_begin, connect_finalize, mark_as_upgraded, Framed};
+
+        let client_addr = stream
+            .local_addr()
+            .map_err(|e| format!("Failed to get local address: {}", e))?;
+
+        let mut framed = Framed::<ironrdp_tokio::MovableTokioStream<_>>::new(stream);
+        let mut connector = ClientConnector::new(config, client_addr);
+
+        // Begin RDP connection (X.224, MCS)
+        let should_upgrade = connect_begin(&mut framed, &mut connector)
+            .await
+            .map_err(|e| format!("RDP connection begin failed: {}", e))?;
+
+        info!("RDP: Initial handshake complete, performing TLS upgrade");
+
+        // TLS upgrade
+        let initial_stream = framed.into_inner_no_leftover();
+        let (upgraded_stream, server_public_key) = self
+            .tls_upgrade(initial_stream, &server_name)
+            .await
+            .map_err(|e| format!("TLS upgrade failed: {}", e))?;
+
+        let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+        let mut upgraded_framed =
+            Framed::<ironrdp_tokio::MovableTokioStream<_>>::new(upgraded_stream);
+
+        // Finalize connection (authentication, capability negotiation)
+        // PR #1043 changed parameter order and made network_client required
+        let mut dummy_network_client = DummyNetworkClient;
+        let connection_result = connect_finalize(
+            upgraded,
+            connector,
+            &mut upgraded_framed,
+            &mut dummy_network_client,
+            server_name.into(),
+            server_public_key,
+            None, // kerberos_config
+        )
+        .await
+        .map_err(|e| format!("RDP connection finalize failed: {}", e))?;
+
+        Ok((connection_result, upgraded_framed))
+    }
+
+    async fn tls_upgrade(
+        &self,
+        stream: TcpStream,
+        server_name: &str,
+    ) -> Result<(TokioTlsStream, Vec<u8>), String> {
+        use tokio_rustls::rustls;
+
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(
+                DangerousNoCertificateVerification,
+            ))
+            .with_no_client_auth();
+
+        // Disable TLS resumption (not supported by CredSSP)
+        config.resumption = rustls::client::Resumption::disabled();
+
+        let connector = TlsConnector::from(std::sync::Arc::new(config));
+        let server_name_owned = rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|e| format!("Invalid server name: {}", e))?;
+
+        let mut tls_stream = connector
+            .connect(server_name_owned, stream)
+            .await
+            .map_err(|e| format!("TLS connection failed: {}", e))?;
+
+        // Flush to ensure handshake completes
+        tls_stream
+            .flush()
+            .await
+            .map_err(|e| format!("TLS flush failed: {}", e))?;
+
+        // Extract server public key
+        let (_, session) = tls_stream.get_ref();
+        let cert = session
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .ok_or_else(|| "No peer certificate found".to_string())?;
+
+        let server_public_key = extract_tls_server_public_key(cert.as_ref())
+            .map_err(|e| format!("Failed to extract server public key: {}", e))?;
+
+        Ok((tls_stream, server_public_key))
+    }
+
+    async fn run_active_session(
+        mut self,
+        connection_result: ConnectionResult,
+        mut framed: ironrdp_tokio::Framed<ironrdp_tokio::MovableTokioStream<TokioTlsStream>>,
         mut from_client: mpsc::Receiver<Bytes>,
-    ) -> Result<(), String>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        let mut read_buf = vec![0u8; 4096];
+    ) -> Result<(), String> {
+        use ironrdp_tokio::FramedWrite;
+
+        let mut active_stage = ActiveStage::new(connection_result);
+        let mut image = DecodedImage::new(
+            ironrdp::graphics::image_processing::PixelFormat::RgbA32,
+            self.width as u16,
+            self.height as u16,
+        );
+
+        // Keep-alive manager (matches guacd's guac_socket_require_keep_alive behavior)
+        let mut keepalive = KeepAliveManager::new(DEFAULT_KEEPALIVE_INTERVAL_SECS);
+        let mut keepalive_interval =
+            tokio::time::interval(Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        info!("RDP: Active session started");
 
         loop {
             tokio::select! {
-                result = stream.read(&mut read_buf) => {
-                    match result {
-                        Ok(0) => {
-                            info!("RDP: Connection closed by server");
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = self.process_rdp_pdu(&read_buf[..n]).await {
-                                error!("RDP: Error processing PDU: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("RDP: Read error: {}", e);
-                            break;
+                // Keep-alive ping to detect dead connections
+                _ = keepalive_interval.tick() => {
+                    if let Some(sync_instr) = keepalive.check() {
+                        trace!("RDP: Sending keep-alive sync");
+                        if self.to_client.send(sync_instr).await.is_err() {
+                            info!("RDP: Client channel closed, ending session");
+                            return Ok(());
                         }
                     }
                 }
 
+                // Handle incoming RDP frames
+                result = framed.read_pdu() => {
+                    match result {
+                        Ok((action, payload)) => {
+                            debug!("RDP: Received frame - action: {:?}, {} bytes", action, payload.len());
+
+                            let outputs = active_stage
+                                .process(&mut image, action, &payload)
+                                .map_err(|e| format!("Failed to process RDP frame: {}", e))?;
+
+                            for output in outputs {
+                                match output {
+                                    ActiveStageOutput::ResponseFrame(frame) => {
+                                        framed
+                                            .write_all(&frame)
+                                            .await
+                                            .map_err(|e| format!("Failed to write response: {}", e))?;
+                                    }
+                                    ActiveStageOutput::GraphicsUpdate(_rect) => {
+                                        // Send graphics update to client
+                                        self.send_graphics_update(&image).await?;
+                                    }
+                                    ActiveStageOutput::Terminate(reason) => {
+                                        info!("RDP: Session terminated: {:?}", reason);
+                                        return Ok(());
+                                    }
+                                    _ => {
+                                        debug!("RDP: Unhandled output: {:?}", output);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("RDP: Read error: {}", e);
+                            return Err(format!("RDP read error: {}", e));
+                        }
+                    }
+                }
+
+                // Handle client input
                 Some(msg) = from_client.recv() => {
-                    if let Err(e) = self.handle_client_input(&mut stream, &msg).await {
+                    if let Err(e) = self.handle_client_input_ironrdp(&mut framed, &msg, &mut active_stage, &mut image).await {
                         warn!("RDP: Error handling client input: {}", e);
                     }
                 }
 
                 else => {
-                    debug!("RDP: Event loop ended");
+                    info!("RDP: Event loop ended");
                     break;
                 }
             }
         }
 
-        Ok(())
-    }
-
-    async fn process_rdp_pdu(&mut self, data: &[u8]) -> Result<(), String> {
-        debug!("RDP: Processing {} bytes of RDP data", data.len());
-
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let first_byte = data[0];
-        let is_fast_path = (first_byte & 0x80) != 0;
-
-        if is_fast_path {
-            return self.process_fast_path_bitmap(data).await;
-        }
-
-        if data.len() >= 4 && data[0] == 0x03 && data[1] == 0x00 {
-            let tpkt_length = u16::from_be_bytes([data[2], data[3]]) as usize;
-            if data.len() >= tpkt_length {
-                return self.process_tpkt_channel(&data[4..tpkt_length]).await;
+        // Finalize recording
+        if let Some(recorder) = self.recorder.take() {
+            if let Err(e) = recorder.finalize() {
+                warn!("RDP: Failed to finalize recording: {}", e);
+            } else {
+                info!("RDP: Session recording finalized");
             }
         }
 
-        if data.len() > 100 {
-            debug!("RDP: Using heuristic bitmap detection (temporary)");
-            let test_pixels = vec![255u8; 100 * 100 * 3];
-            self.handle_graphics_update(0, 0, 100, 100, &test_pixels)
-                .await?;
-        }
-
         Ok(())
     }
 
-    async fn process_fast_path_bitmap(&mut self, data: &[u8]) -> Result<(), String> {
-        if data.len() < 5 {
-            return Err("Fast-Path bitmap data too short".to_string());
-        }
+    async fn send_graphics_update(&mut self, image: &DecodedImage) -> Result<(), String> {
+        // Convert DecodedImage to our framebuffer format and send to client
+        let image_data = image.data();
 
-        let update_code = data[1];
-        if update_code != 0 {
-            debug!("RDP: Fast-Path update code: {} (not bitmap)", update_code);
-            return Ok(());
-        }
+        // Update our framebuffer with the new image data
+        self.framebuffer
+            .update_region(0, 0, self.width, self.height, image_data);
 
-        let rect_count = u16::from_le_bytes([data[3], data[4]]) as usize;
-        debug!(
-            "RDP: Fast-Path bitmap update with {} rectangles",
-            rect_count
-        );
-
-        let mut offset = 5;
-        for _i in 0..rect_count {
-            if offset + 18 > data.len() {
-                break;
-            }
-
-            let x = u16::from_le_bytes([data[offset], data[offset + 1]]) as u32;
-            let y = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as u32;
-            let width = u16::from_le_bytes([data[offset + 8], data[offset + 9]]) as u32;
-            let height = u16::from_le_bytes([data[offset + 10], data[offset + 11]]) as u32;
-            let bpp = u16::from_le_bytes([data[offset + 12], data[offset + 13]]);
-
-            offset += 18;
-
-            let bytes_per_pixel = (bpp / 8) as usize;
-            let bitmap_size = (width * height) as usize * bytes_per_pixel;
-
-            if offset + bitmap_size > data.len() {
-                warn!("RDP: Bitmap data incomplete, skipping rectangle");
-                break;
-            }
-
-            let bitmap_data = &data[offset..offset + bitmap_size];
-
-            self.handle_graphics_update(x, y, width, height, bitmap_data)
-                .await?;
-
-            offset += bitmap_size;
-        }
-
-        Ok(())
+        // Encode and send the update
+        self.handle_graphics_update(0, 0, self.width, self.height, image_data)
+            .await
     }
 
-    async fn process_tpkt_channel(&mut self, data: &[u8]) -> Result<(), String> {
-        debug!("RDP: TPKT channel data received, {} bytes", data.len());
-        Ok(())
-    }
+    async fn handle_client_input_ironrdp(
+        &mut self,
+        framed: &mut ironrdp_tokio::Framed<ironrdp_tokio::MovableTokioStream<TokioTlsStream>>,
+        msg: &Bytes,
+        active_stage: &mut ActiveStage,
+        image: &mut DecodedImage,
+    ) -> Result<(), String> {
+        use ironrdp_tokio::FramedWrite;
 
-    async fn handle_client_input<S>(&mut self, stream: &mut S, msg: &Bytes) -> Result<(), String>
-    where
-        S: AsyncWrite + Unpin,
-    {
         let instr = GuacamoleParser::parse_instruction(msg)
             .map_err(|e| format!("Failed to parse instruction: {}", e))?;
 
+        // Record client input (if recording is enabled and includes keys/mouse)
+        self.record_client_input(msg);
+
         match instr.opcode {
             "key" => {
-                self.handle_keyboard_input(stream, &instr.args).await?;
+                if instr.args.len() >= 2 {
+                    let keysym: u32 = instr.args[0].parse().map_err(|_| "Invalid keysym")?;
+                    let pressed = instr.args[1] == "1";
+
+                    // Security: Check read-only mode
+                    // In graphical mode, allow Ctrl+C/Ctrl+Insert for copy
+                    if self.read_only {
+                        // TODO: Track modifier state for Ctrl detection
+                        // For now, block all keyboard input in read-only mode
+                        trace!("RDP: Keyboard input blocked (read-only mode)");
+                        return Ok(());
+                    }
+
+                    let key_event = self.input_handler.handle_keyboard(keysym, pressed)?;
+
+                    // Convert to IronRDP FastPathInputEvent
+                    let flags = if pressed {
+                        KeyboardFlags::empty()
+                    } else {
+                        KeyboardFlags::RELEASE
+                    };
+
+                    let event = FastPathInputEvent::KeyboardEvent(flags, key_event.scancode);
+                    let outputs = active_stage
+                        .process_fastpath_input(image, &[event])
+                        .map_err(|e| format!("Failed to process keyboard input: {}", e))?;
+
+                    // Send response frames to RDP server
+                    for output in outputs {
+                        if let ActiveStageOutput::ResponseFrame(frame) = output {
+                            framed
+                                .write_all(&frame)
+                                .await
+                                .map_err(|e| format!("Failed to write keyboard response: {}", e))?;
+                        }
+                    }
+
+                    debug!(
+                        "RDP: Keyboard event sent - scancode: 0x{:02x}, pressed: {}",
+                        key_event.scancode, pressed
+                    );
+                }
             }
             "mouse" => {
-                self.handle_mouse_input(stream, &instr.args).await?;
+                if instr.args.len() >= 3 {
+                    let mask: u8 = instr.args[0].parse().map_err(|_| "Invalid mouse mask")?;
+                    let x: i32 = instr.args[1].parse().map_err(|_| "Invalid x")?;
+                    let y: i32 = instr.args[2].parse().map_err(|_| "Invalid y")?;
+
+                    // Security: Check read-only mode for mouse clicks
+                    if self.read_only && !is_mouse_event_allowed_readonly(mask as u32) {
+                        trace!("RDP: Mouse click blocked (read-only mode)");
+                        return Ok(());
+                    }
+
+                    let pointer_event = self.input_handler.handle_mouse(mask, x, y)?;
+
+                    // Convert Guacamole mouse mask to RDP PointerFlags
+                    // Guacamole mask: bit 0=left, bit 1=middle, bit 2=right, bit 3=scroll up, bit 4=scroll down
+                    let mut flags = PointerFlags::MOVE;
+                    let mut wheel_units: i16 = 0;
+
+                    if pointer_event.left_button {
+                        flags |= PointerFlags::LEFT_BUTTON | PointerFlags::DOWN;
+                    }
+                    if pointer_event.middle_button {
+                        flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL | PointerFlags::DOWN;
+                    }
+                    if pointer_event.right_button {
+                        flags |= PointerFlags::RIGHT_BUTTON | PointerFlags::DOWN;
+                    }
+                    if pointer_event.scroll_up {
+                        flags |= PointerFlags::VERTICAL_WHEEL;
+                        wheel_units = 120; // Standard wheel delta
+                    }
+                    if pointer_event.scroll_down {
+                        flags |= PointerFlags::VERTICAL_WHEEL | PointerFlags::WHEEL_NEGATIVE;
+                        wheel_units = -120;
+                    }
+
+                    let mouse_pdu = MousePdu {
+                        flags,
+                        number_of_wheel_rotation_units: wheel_units,
+                        x_position: pointer_event.x as u16,
+                        y_position: pointer_event.y as u16,
+                    };
+
+                    let event = FastPathInputEvent::MouseEvent(mouse_pdu);
+                    let outputs = active_stage
+                        .process_fastpath_input(image, &[event])
+                        .map_err(|e| format!("Failed to process mouse input: {}", e))?;
+
+                    // Send response frames and handle graphics updates
+                    for output in outputs {
+                        match output {
+                            ActiveStageOutput::ResponseFrame(frame) => {
+                                framed.write_all(&frame).await.map_err(|e| {
+                                    format!("Failed to write mouse response: {}", e)
+                                })?;
+                            }
+                            ActiveStageOutput::GraphicsUpdate(_rect) => {
+                                // Pointer moved, send graphics update
+                                self.send_graphics_update(image).await?;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    debug!(
+                        "RDP: Mouse event sent - x: {}, y: {}, flags: {:?}",
+                        pointer_event.x, pointer_event.y, flags
+                    );
+                }
             }
             "clipboard" => {
-                self.handle_clipboard_input(stream, msg).await?;
+                match self.channel_handler.handle_client_clipboard(msg) {
+                    Ok(Some(cliprdr_data)) => {
+                        info!(
+                            "RDP: Clipboard data ready: {} bytes",
+                            cliprdr_data.data.len()
+                        );
+                        // TODO: Send clipboard via CLIPRDR channel when implemented
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!("RDP: Clipboard error: {}", e),
+                }
             }
             "size" => {
-                self.handle_resize(stream, &instr.args).await?;
-            }
-            #[cfg(feature = "sftp")]
-            "file" => {
-                if let Some(ref mut sftp) = self.sftp_session {
-                    if let Err(e) = crate::sftp_integration::handle_sftp_file_request(
-                        sftp,
-                        &instr.args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                        &self.to_client,
-                    )
-                    .await
-                    {
-                        warn!("RDP: SFTP file operation failed: {}", e);
-                    }
-                } else {
-                    warn!("RDP: File transfer requested but SFTP not enabled");
+                if instr.args.len() >= 2 {
+                    let width: u32 = instr.args[0].parse().map_err(|_| "Invalid width")?;
+                    let height: u32 = instr.args[1].parse().map_err(|_| "Invalid height")?;
+                    info!("RDP: Resize requested: {}x{}", width, height);
+                    // TODO: Send display control resize via DISP channel
+                    let _disp_msg = self.channel_handler.prepare_disp_resize(width, height);
                 }
             }
             _ => {
                 debug!("RDP: Unhandled instruction: {}", instr.opcode);
             }
         }
-
-        Ok(())
-    }
-
-    async fn handle_keyboard_input<S>(
-        &mut self,
-        _stream: &mut S,
-        args: &[&str],
-    ) -> Result<(), String>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        if args.len() < 2 {
-            return Err("Invalid key instruction".to_string());
-        }
-
-        let keysym: u32 = args[0].parse().map_err(|_| "Invalid keysym".to_string())?;
-        let pressed = args[1] == "1";
-
-        let key_event = self.input_handler.handle_keyboard(keysym, pressed)?;
-
-        debug!(
-            "RDP: Sending keyboard event - scancode: 0x{:02x}, pressed: {}",
-            key_event.scancode, key_event.pressed
-        );
-
-        Ok(())
-    }
-
-    async fn handle_mouse_input<S>(&mut self, _stream: &mut S, args: &[&str]) -> Result<(), String>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        if args.len() < 3 {
-            return Err("Invalid mouse instruction".to_string());
-        }
-
-        let mask: u8 = args[0]
-            .parse()
-            .map_err(|_| "Invalid mouse mask".to_string())?;
-        let x: i32 = args[1]
-            .parse()
-            .map_err(|_| "Invalid x coordinate".to_string())?;
-        let y: i32 = args[2]
-            .parse()
-            .map_err(|_| "Invalid y coordinate".to_string())?;
-
-        let pointer_event = self.input_handler.handle_mouse(mask, x, y)?;
-
-        debug!(
-            "RDP: Sending mouse event - x: {}, y: {}, buttons: L={} M={} R={}",
-            pointer_event.x,
-            pointer_event.y,
-            pointer_event.left_button,
-            pointer_event.middle_button,
-            pointer_event.right_button
-        );
-
-        Ok(())
-    }
-
-    async fn handle_clipboard_input<S>(
-        &mut self,
-        _stream: &mut S,
-        msg: &Bytes,
-    ) -> Result<(), String>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        match self.channel_handler.handle_client_clipboard(msg) {
-            Ok(Some(cliprdr_data)) => {
-                info!(
-                    "RDP: Clipboard data ready for server: format={:?}, {} bytes",
-                    cliprdr_data.format,
-                    cliprdr_data.data.len()
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("RDP: Clipboard error: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_resize<S>(&mut self, _stream: &mut S, args: &[&str]) -> Result<(), String>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        if args.len() < 2 {
-            return Err("Invalid size instruction".to_string());
-        }
-
-        let width: u32 = args[0].parse().map_err(|_| "Invalid width".to_string())?;
-        let height: u32 = args[1].parse().map_err(|_| "Invalid height".to_string())?;
-
-        info!("RDP: Resize requested: {}x{}", width, height);
-
-        let _disp_msg = self.channel_handler.prepare_disp_resize(width, height);
-
-        self.width = width;
-        self.height = height;
-        self.framebuffer = FrameBuffer::new(width, height);
 
         Ok(())
     }
@@ -815,7 +1080,7 @@ impl IronRdpSession {
         pixels: &[u8],
     ) -> Result<(), String> {
         let mut rgba_vec = vec![0u8; (width * height * 4) as usize];
-        crate::simd::convert_bgr_to_rgba_simd(pixels, &mut rgba_vec, width, height);
+        guacr_terminal::convert_bgr_to_rgba_simd(pixels, &mut rgba_vec, width, height);
 
         self.framebuffer
             .update_region(x, y, width, height, &rgba_vec);
@@ -826,78 +1091,199 @@ impl IronRdpSession {
             return Ok(());
         }
 
-        if let Some(ref mut encoder) = self.hardware_encoder {
-            let full_pixels = self.framebuffer.get_all_pixels();
-
-            if let Ok(h264_data) = encoder.encode_frame(&full_pixels, self.width, self.height) {
-                let video_stream_id = if let Some(id) = self.video_stream_id {
-                    id
-                } else {
-                    let id = self.stream_id;
-                    self.stream_id += 1;
-                    self.video_stream_id = Some(id);
-
-                    let video_msg = self.binary_encoder.encode_video(id, 0, "video/h264");
-                    self.to_client
-                        .send(video_msg)
-                        .await
-                        .map_err(|e| format!("Failed to send video instruction: {}", e))?;
-
-                    id
-                };
-
-                let blob_msg = self.binary_encoder.encode_blob(video_stream_id, h264_data);
-                self.to_client
-                    .send(blob_msg)
-                    .await
-                    .map_err(|e| format!("Failed to send video blob: {}", e))?;
-
-                self.framebuffer.clear_dirty();
-                return Ok(());
-            } else {
-                debug!("RDP: Hardware encoding failed, falling back to JPEG");
-            }
-        }
-
+        // Use PNG encoding for all graphics updates
         for rect in &dirty_rects {
             let png_data = self
                 .framebuffer
                 .encode_region(*rect)
                 .map_err(|e| format!("Encoding failed: {}", e))?;
 
-            let png_bytes = Bytes::from(png_data);
+            // Encode PNG as base64 for text protocol
+            let png_base64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
-            let msg = self.binary_encoder.encode_image(
-                self.stream_id,
-                0,
-                rect.x as i32,
-                rect.y as i32,
-                rect.width as u16,
-                rect.height as u16,
-                0,
-                png_bytes,
+            // Format img instruction: img,<stream>,<mask>,<layer>,<mimetype>,<x>,<y>;
+            // Then send blob instruction: blob,<stream>,<base64_data>;
+            let stream_str = self.stream_id.to_string();
+            let x_str = rect.x.to_string();
+            let y_str = rect.y.to_string();
+            let mimetype = "image/png";
+
+            let img_instr = format!(
+                "3.img,{}.{},1.7,1.0,{}.{},{}.{},{}.{};",
+                stream_str.len(),
+                stream_str,
+                mimetype.len(),
+                mimetype,
+                x_str.len(),
+                x_str,
+                y_str.len(),
+                y_str
             );
 
-            self.to_client
-                .send(msg)
-                .await
-                .map_err(|e| format!("Failed to send image: {}", e))?;
+            let blob_instr = format!(
+                "4.blob,{}.{},{}.{};",
+                stream_str.len(),
+                stream_str,
+                png_base64.len(),
+                png_base64
+            );
+
+            // Send and record instructions
+            self.send_and_record(&img_instr).await?;
+            self.send_and_record(&blob_instr).await?;
         }
 
         self.framebuffer.clear_dirty();
 
-        let sync_msg = self.binary_encoder.encode_sync(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-        );
-        self.to_client
-            .send(sync_msg)
-            .await
-            .map_err(|e| format!("Failed to send sync: {}", e))?;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let ts_str = timestamp_ms.to_string();
+        let sync_instr = format!("4.sync,{}.{};", ts_str.len(), ts_str);
+
+        self.send_and_record(&sync_instr).await?;
 
         Ok(())
+    }
+
+    /// Send instruction to client and record it (if recording is enabled)
+    async fn send_and_record(&mut self, instruction: &str) -> Result<(), String> {
+        let bytes = Bytes::from(instruction.to_string());
+
+        // Record before sending (server-to-client direction)
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) = recorder.record_instruction(RecordingDirection::ServerToClient, &bytes)
+            {
+                warn!("RDP: Failed to record instruction: {}", e);
+            }
+        }
+
+        self.to_client
+            .send(bytes)
+            .await
+            .map_err(|e| format!("Failed to send: {}", e))
+    }
+
+    /// Record client input instruction (if recording is enabled)
+    fn record_client_input(&mut self, instruction: &Bytes) {
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) =
+                recorder.record_instruction(RecordingDirection::ClientToServer, instruction)
+            {
+                warn!("RDP: Failed to record client input: {}", e);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// TLS Helper Functions
+// ============================================================================
+
+/// Dangerous certificate verifier that accepts all certificates
+/// (Required for RDP servers with self-signed certificates)
+#[derive(Debug)]
+struct DangerousNoCertificateVerification;
+
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier
+    for DangerousNoCertificateVerification
+{
+    fn verify_server_cert(
+        &self,
+        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        vec![
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            tokio_rustls::rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA256,
+            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA384,
+            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA512,
+            tokio_rustls::rustls::SignatureScheme::ED25519,
+            tokio_rustls::rustls::SignatureScheme::ED448,
+        ]
+    }
+}
+
+/// Extract the server's public key from a TLS certificate
+fn extract_tls_server_public_key(cert_der: &[u8]) -> Result<Vec<u8>, String> {
+    use x509_cert::der::Decode;
+
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| format!("Failed to parse certificate: {}", e))?;
+
+    debug!(
+        "RDP: Server certificate subject: {}",
+        cert.tbs_certificate.subject
+    );
+
+    let server_public_key = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| "Subject public key BIT STRING is not aligned".to_string())?
+        .to_owned();
+
+    Ok(server_public_key)
+}
+
+/// Dummy network client for CredSSP
+///
+/// We don't actually use network client functionality (it's for fetching auth tokens
+/// from external services like KDC proxy), but the API requires one.
+///
+/// See: https://github.com/Devolutions/IronRDP/pull/1043
+struct DummyNetworkClient;
+
+impl ironrdp_async::NetworkClient for DummyNetworkClient {
+    async fn send(
+        &mut self,
+        _request: &ironrdp::connector::sspi::generator::NetworkRequest,
+    ) -> ironrdp::connector::ConnectorResult<Vec<u8>> {
+        Err(ironrdp::connector::general_err!(
+            "Network client not implemented"
+        ))
     }
 }
 

@@ -1,30 +1,47 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
-    ProtocolHandler,
+    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
 };
-use log::info;
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tiberius::{AuthMethod, Client, Config, Row};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::sql_terminal::SqlTerminal;
+use crate::csv_export::{generate_csv_filename, CsvExporter};
+use crate::csv_import::CsvImporter;
+use crate::query_executor::{execute_with_timing, QueryExecutor};
+use crate::security::{check_query_allowed, DatabaseSecuritySettings};
+
+use std::sync::atomic::AtomicI32;
+
+/// Global stream index counter for unique stream IDs
+static STREAM_INDEX: AtomicI32 = AtomicI32::new(2000);
 
 /// SQL Server protocol handler
+///
+/// Provides interactive SQL terminal access to Microsoft SQL Server databases.
 pub struct SqlServerHandler {
-    #[allow(dead_code)]
     config: SqlServerConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct SqlServerConfig {
     pub default_port: u16,
+    pub connection_timeout_secs: u64,
+    pub trust_server_certificate: bool,
 }
 
 impl Default for SqlServerConfig {
     fn default() -> Self {
-        Self { default_port: 1433 }
+        Self {
+            default_port: 1433,
+            connection_timeout_secs: guacr_handlers::DEFAULT_CONNECTION_TIMEOUT_SECS,
+            trust_server_certificate: true, // For development; should be false in production
+        }
     }
 }
 
@@ -51,25 +68,322 @@ impl ProtocolHandler for SqlServerHandler {
     async fn connect(
         &self,
         params: HashMap<String, String>,
-        _to_client: mpsc::Sender<Bytes>,
+        to_client: mpsc::Sender<Bytes>,
         mut from_client: mpsc::Receiver<Bytes>,
     ) -> guacr_handlers::Result<()> {
         info!("SQL Server handler starting");
 
-        let _hostname = params
+        // Parse security settings
+        let security = DatabaseSecuritySettings::from_params(&params);
+        if security.base.read_only {
+            info!("SQL Server: Read-only mode enabled");
+        }
+
+        // Parse connection parameters
+        let hostname = params
             .get("hostname")
             .ok_or_else(|| HandlerError::MissingParameter("hostname".to_string()))?;
+        let port: u16 = params
+            .get("port")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(self.config.default_port);
+        let username = params
+            .get("username")
+            .ok_or_else(|| HandlerError::MissingParameter("username".to_string()))?;
+        let password = params
+            .get("password")
+            .ok_or_else(|| HandlerError::MissingParameter("password".to_string()))?;
+        let database = params.get("database").map(|s| s.as_str());
 
-        // TODO: Full SQL Server implementation with tiberius
-        let mut terminal = SqlTerminal::new(24, 80, "1> ")
+        info!(
+            "SQL Server: Connecting to {}@{}:{}",
+            username, hostname, port
+        );
+
+        // Create query executor with SQL Server prompt
+        let prompt = if security.base.read_only {
+            "1 [RO]> "
+        } else {
+            "1> "
+        };
+        let mut executor = QueryExecutor::new(prompt, "sqlserver")
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-        terminal
-            .write_line("Connected to SQL Server.")
+        // Send initial screen
+        executor
+            .terminal
+            .write_line("Connecting to SQL Server...")
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        let (_, instructions) = executor
+            .render_screen()
+            .await
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        for instr in instructions {
+            to_client
+                .send(instr)
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
 
-        while from_client.recv().await.is_some() {}
+        // Build tiberius config
+        let mut config = Config::new();
+        config.host(hostname);
+        config.port(port);
+        config.authentication(AuthMethod::sql_server(username, password));
 
+        if let Some(db) = database {
+            config.database(db);
+        }
+
+        if self.config.trust_server_certificate {
+            config.trust_cert();
+        }
+
+        debug!("SQL Server: Connecting with config");
+
+        // Connect to SQL Server
+        let tcp = match TcpStream::connect(config.get_addr()).await {
+            Ok(tcp) => {
+                tcp.set_nodelay(true).ok();
+                tcp
+            }
+            Err(e) => {
+                let error_msg = format!("TCP connection failed: {}", e);
+                warn!("SQL Server: {}", error_msg);
+
+                executor
+                    .terminal
+                    .write_error(&error_msg)
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_prompt()
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+
+                while from_client.recv().await.is_some() {}
+                return Err(HandlerError::ConnectionFailed(error_msg));
+            }
+        };
+
+        let mut client = match Client::connect(config, tcp.compat_write()).await {
+            Ok(client) => {
+                info!("SQL Server: Connected successfully");
+
+                executor
+                    .terminal
+                    .write_line("")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line(&format!("Connected to SQL Server at {}:{}", hostname, port))
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                if let Some(db) = database {
+                    executor
+                        .terminal
+                        .write_line(&format!("Database: {}", db))
+                        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                }
+                executor
+                    .terminal
+                    .write_line("Type 'help' for available commands.")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_prompt()
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                client
+            }
+            Err(e) => {
+                let error_msg = format!("SQL Server connection failed: {}", e);
+                warn!("SQL Server: {}", error_msg);
+
+                executor
+                    .terminal
+                    .write_line("")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_error(&error_msg)
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("Troubleshooting:")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("  1. Check hostname and port")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("  2. Verify SQL Server is running")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("  3. Check SQL authentication is enabled")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_line("  4. Verify credentials")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                executor
+                    .terminal
+                    .write_prompt()
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+
+                while from_client.recv().await.is_some() {}
+                return Err(HandlerError::ConnectionFailed(error_msg));
+            }
+        };
+
+        // Send updated screen
+        let (_, instructions) = executor
+            .render_screen()
+            .await
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        for instr in instructions {
+            to_client
+                .send(instr)
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
+
+        // Event loop
+        while let Some(msg) = from_client.recv().await {
+            match executor.process_input(&msg).await {
+                Ok((needs_render, instructions, pending_query)) => {
+                    if let Some(query) = pending_query {
+                        info!("SQL Server: Executing query: {}", query);
+
+                        // Handle built-in commands
+                        if handle_builtin_command(&query, &mut executor, &to_client, &security)
+                            .await?
+                        {
+                            continue;
+                        }
+
+                        // Check for export command: \e <query>
+                        if query.to_lowercase().starts_with("\\e ") {
+                            let export_query = query[3..].trim();
+                            handle_csv_export(
+                                export_query,
+                                &mut client,
+                                &mut executor,
+                                &to_client,
+                                &security,
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        // Check for import command: \i <table>
+                        if query.to_lowercase().starts_with("\\i ") {
+                            let table_name = query[3..].trim();
+                            handle_csv_import(
+                                table_name,
+                                &mut client,
+                                &mut executor,
+                                &to_client,
+                                &security,
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        // Check read-only mode
+                        if let Err(msg) = check_query_allowed(&query, &security) {
+                            executor
+                                .write_error(&msg)
+                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                            let (_, result_instructions) = executor
+                                .render_screen()
+                                .await
+                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                            for instr in result_instructions {
+                                to_client
+                                    .send(instr)
+                                    .await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            }
+                            continue;
+                        }
+
+                        // Execute query
+                        match execute_with_timing(|| execute_sqlserver_query(&mut client, &query))
+                            .await
+                        {
+                            Ok(exec_result) => {
+                                let result = exec_result.into_query_result();
+                                executor
+                                    .write_result(&result)
+                                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                            }
+                            Err(e) => {
+                                executor
+                                    .write_error(&e)
+                                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                            }
+                        }
+
+                        let (_, result_instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in result_instructions {
+                            to_client
+                                .send(instr)
+                                .await
+                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                        }
+                        continue;
+                    }
+
+                    if needs_render {
+                        for instr in instructions {
+                            to_client
+                                .send(instr)
+                                .await
+                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("SQL Server: Input processing error: {}", e);
+                }
+            }
+        }
+
+        info!("SQL Server handler ended");
         Ok(())
     }
 
@@ -82,7 +396,437 @@ impl ProtocolHandler for SqlServerHandler {
     }
 }
 
-// Event-based handler implementation for zero-copy integration
+/// Execute SQL Server query and return results
+async fn execute_sqlserver_query(
+    client: &mut Client<Compat<TcpStream>>,
+    query: &str,
+) -> Result<guacr_terminal::QueryResult, String> {
+    let stream = client
+        .query(query, &[])
+        .await
+        .map_err(|e| format!("Query error: {}", e))?;
+
+    // Get all results
+    let rows: Vec<Row> = stream
+        .into_results()
+        .await
+        .map_err(|e| format!("Result error: {}", e))?
+        .into_iter()
+        .flat_map(|result_set| result_set.into_iter())
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(guacr_terminal::QueryResult {
+            columns: vec![],
+            rows: vec![],
+            affected_rows: Some(0),
+            execution_time_ms: None,
+        });
+    }
+
+    // Get column names from first row
+    let columns: Vec<String> = rows[0]
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+
+    let mut result_rows: Vec<Vec<String>> = Vec::new();
+
+    for row in &rows {
+        let mut row_data = Vec::new();
+        for i in 0..row.len() {
+            // Try to get as string for each column
+            let value: Option<&str> = row.try_get(i).ok().flatten();
+            row_data.push(value.unwrap_or("NULL").to_string());
+        }
+        result_rows.push(row_data);
+    }
+
+    Ok(guacr_terminal::QueryResult {
+        columns,
+        rows: result_rows,
+        affected_rows: None,
+        execution_time_ms: None,
+    })
+}
+
+/// Handle built-in commands
+async fn handle_builtin_command(
+    query: &str,
+    executor: &mut QueryExecutor,
+    to_client: &mpsc::Sender<Bytes>,
+    security: &DatabaseSecuritySettings,
+) -> guacr_handlers::Result<bool> {
+    let query_lower = query.to_lowercase();
+
+    match query_lower.as_str() {
+        "help" | "\\h" | "\\?" | ":help" => {
+            executor
+                .terminal
+                .write_line("")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("Available commands:")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("  help         Show this help")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("  quit         Disconnect")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            if !security.disable_csv_export {
+                executor
+                    .terminal
+                    .write_line("  \\e <query>   Export query results as CSV")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            }
+            if !security.disable_csv_import && !security.base.read_only {
+                executor
+                    .terminal
+                    .write_line("  \\i <table>   Import CSV data into table")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            }
+            executor
+                .terminal
+                .write_line("")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("Common SQL commands:")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("  SELECT name FROM sys.databases")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("  SELECT * FROM sys.tables")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("  sp_help 'table_name'")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_line("")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            executor
+                .terminal
+                .write_prompt()
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+            let (_, instructions) = executor
+                .render_screen()
+                .await
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            for instr in instructions {
+                to_client
+                    .send(instr)
+                    .await
+                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            }
+            return Ok(true);
+        }
+        "quit" | "exit" | ":quit" | "go quit" => {
+            executor
+                .terminal
+                .write_line("Bye")
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            let (_, instructions) = executor
+                .render_screen()
+                .await
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            for instr in instructions {
+                to_client
+                    .send(instr)
+                    .await
+                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            }
+            return Err(HandlerError::Disconnected(
+                "User requested disconnect".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+/// Handle CSV export for a query
+async fn handle_csv_export(
+    query: &str,
+    client: &mut Client<Compat<TcpStream>>,
+    executor: &mut QueryExecutor,
+    to_client: &mpsc::Sender<Bytes>,
+    security: &DatabaseSecuritySettings,
+) -> guacr_handlers::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    // Check if export is allowed
+    if security.disable_csv_export {
+        executor
+            .terminal
+            .write_error("CSV export is disabled by your administrator.")
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        executor
+            .terminal
+            .write_prompt()
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        let (_, instructions) = executor
+            .render_screen()
+            .await
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        for instr in instructions {
+            to_client
+                .send(instr)
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    executor
+        .terminal
+        .write_line("Executing query for export...")
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    let (_, instructions) = executor
+        .render_screen()
+        .await
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    for instr in instructions {
+        to_client
+            .send(instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+    }
+
+    // Execute the query
+    match execute_sqlserver_query(client, query).await {
+        Ok(result) => {
+            if result.rows.is_empty() {
+                executor
+                    .terminal
+                    .write_line("Query returned no results to export.")
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            } else {
+                // Generate filename and create exporter
+                let filename = generate_csv_filename(query, "sqlserver");
+                let stream_idx = STREAM_INDEX.fetch_add(1, Ordering::SeqCst);
+                let mut exporter = CsvExporter::new(stream_idx);
+
+                executor
+                    .terminal
+                    .write_line(&format!(
+                        "Beginning CSV download ({} rows). Press Ctrl+C to cancel.",
+                        result.rows.len()
+                    ))
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                // Send file instruction to start download
+                let file_instr = exporter.start_download(&filename);
+                to_client
+                    .send(file_instr)
+                    .await
+                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                // Export the data
+                match exporter.export_query_result(&result, to_client).await {
+                    Ok(()) => {
+                        executor
+                            .terminal
+                            .write_line("Download complete.")
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                    }
+                    Err(e) => {
+                        executor
+                            .terminal
+                            .write_error(&format!("Export failed: {}", e))
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            executor
+                .terminal
+                .write_error(&format!("Query failed: {}", e))
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        }
+    }
+
+    executor
+        .terminal
+        .write_prompt()
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    let (_, instructions) = executor
+        .render_screen()
+        .await
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    for instr in instructions {
+        to_client
+            .send(instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Handle CSV import for a table
+async fn handle_csv_import(
+    table_name: &str,
+    client: &mut Client<Compat<TcpStream>>,
+    executor: &mut QueryExecutor,
+    to_client: &mpsc::Sender<Bytes>,
+    security: &DatabaseSecuritySettings,
+) -> guacr_handlers::Result<()> {
+    // Check if import is allowed
+    if security.disable_csv_import {
+        executor
+            .terminal
+            .write_error("CSV import is disabled by your administrator.")
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        executor
+            .terminal
+            .write_prompt()
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        let (_, instructions) = executor
+            .render_screen()
+            .await
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        for instr in instructions {
+            to_client
+                .send(instr)
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    // Check read-only mode
+    if security.base.read_only {
+        executor
+            .terminal
+            .write_error("Import blocked: read-only mode is enabled.")
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        executor
+            .terminal
+            .write_prompt()
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        let (_, instructions) = executor
+            .render_screen()
+            .await
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        for instr in instructions {
+            to_client
+                .send(instr)
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    if table_name.is_empty() {
+        executor
+            .terminal
+            .write_error("Usage: \\i <table_name>")
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        executor
+            .terminal
+            .write_prompt()
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        let (_, instructions) = executor
+            .render_screen()
+            .await
+            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        for instr in instructions {
+            to_client
+                .send(instr)
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    executor
+        .terminal
+        .write_line(&format!("Import into table: {}", table_name))
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    executor
+        .terminal
+        .write_line("Demo: Importing sample data...")
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+    // Demo data
+    let sample_csv = "id,name,value\n1,Test,100\n2,Demo,200";
+    let mut importer = CsvImporter::new(1);
+
+    importer
+        .receive_blob(sample_csv.as_bytes())
+        .map_err(HandlerError::ProtocolError)?;
+
+    let csv_data = importer
+        .finish_receive()
+        .map_err(HandlerError::ProtocolError)?;
+
+    executor
+        .terminal
+        .write_line(&format!(
+            "Parsed {} columns, {} rows",
+            csv_data.headers.len(),
+            csv_data.row_count()
+        ))
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+    // Generate and execute INSERT statements
+    let inserts = importer
+        .generate_sqlserver_inserts(table_name)
+        .map_err(HandlerError::ProtocolError)?;
+
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    for insert in &inserts {
+        match client.execute(insert, &[]).await {
+            Ok(_) => success_count += 1,
+            Err(e) => {
+                error_count += 1;
+                warn!("Import error: {}", e);
+            }
+        }
+    }
+
+    executor
+        .terminal
+        .write_success(&format!(
+            "Import complete: {} rows inserted, {} errors",
+            success_count, error_count
+        ))
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+    executor
+        .terminal
+        .write_prompt()
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    let (_, instructions) = executor
+        .render_screen()
+        .await
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+    for instr in instructions {
+        to_client
+            .send(instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+// Event-based handler implementation
 #[async_trait]
 impl EventBasedHandler for SqlServerHandler {
     fn name(&self) -> &str {
@@ -95,24 +839,14 @@ impl EventBasedHandler for SqlServerHandler {
         callback: Arc<dyn EventCallback>,
         from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        // Wrap the channel-based interface
-        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
-
-        let sender = InstructionSender::new(callback);
-        let sender_arc = Arc::new(sender);
-
-        // Spawn task to forward channel messages to event callback (zero-copy)
-        let sender_clone = Arc::clone(&sender_arc);
-        tokio::spawn(async move {
-            while let Some(msg) = handler_rx.recv().await {
-                sender_clone.send(msg); // Zero-copy: Bytes is reference-counted
-            }
-        });
-
-        // Call the existing channel-based connect method
-        self.connect(params, to_client, from_client).await?;
-
-        Ok(())
+        guacr_handlers::connect_with_event_adapter(
+            |params, to_client, from_client| self.connect(params, to_client, from_client),
+            params,
+            callback,
+            from_client,
+            4096,
+        )
+        .await
     }
 }
 
@@ -124,8 +858,14 @@ mod tests {
     fn test_sqlserver_handler_new() {
         let handler = SqlServerHandler::with_defaults();
         assert_eq!(
-            <_ as guacr_handlers::ProtocolHandler>::name(&handler),
+            <SqlServerHandler as ProtocolHandler>::name(&handler),
             "sqlserver"
         );
+    }
+
+    #[test]
+    fn test_sqlserver_config() {
+        let config = SqlServerConfig::default();
+        assert_eq!(config.default_port, 1433);
     }
 }

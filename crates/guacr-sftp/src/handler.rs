@@ -2,8 +2,14 @@ use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    EventBasedHandler,
+    EventCallback,
+    HandlerError,
+    HandlerStats,
+    HealthStatus,
     ProtocolHandler,
+    // Security
+    SftpSecuritySettings,
 };
 use guacr_terminal::TerminalRenderer;
 use log::{debug, info, warn};
@@ -105,6 +111,16 @@ impl ProtocolHandler for SftpHandler {
         mut from_client: mpsc::Receiver<Bytes>,
     ) -> guacr_handlers::Result<()> {
         info!("SFTP handler starting");
+
+        // Parse security settings from params
+        let security = SftpSecuritySettings::from_params(&params);
+        info!(
+            "SFTP: Security - read_only={}, download={}, upload={}, root={:?}",
+            security.base.read_only,
+            security.is_download_allowed(),
+            security.is_upload_allowed(),
+            security.root_directory
+        );
 
         let hostname = params
             .get("hostname")
@@ -428,7 +444,7 @@ impl ProtocolHandler for SftpHandler {
                                                         warn!("SFTP: Failed to read directory {}: {}", validated_path.display(), e);
                                                     }
                                                 }
-                                            } else if self.config.allow_downloads {
+                                            } else if self.config.allow_downloads && security.is_download_allowed() {
                                                 // Download file
                                                 let file_path = current_path.join(&entry.name);
                                                 let validated_path = self.validate_path(&file_path, &home)?;
@@ -480,7 +496,7 @@ impl ProtocolHandler for SftpHandler {
                         }
                     }
                     // Handle file upload
-                    else if msg_str.contains(".file,") && self.config.allow_uploads {
+                    else if msg_str.contains(".file,") && self.config.allow_uploads && security.is_upload_allowed() {
                         // Parse file instruction: file,<stream>,<mimetype>,<filename>,<data>;
                         if let Some(file_part) = msg_str.split_once(".file,") {
                             let parts: Vec<&str> = file_part.1.split(',').collect();
@@ -624,24 +640,14 @@ impl EventBasedHandler for SftpHandler {
         callback: Arc<dyn EventCallback>,
         from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        // Wrap the channel-based interface
-        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
-
-        let sender = InstructionSender::new(callback);
-        let sender_arc = Arc::new(sender);
-
-        // Spawn task to forward channel messages to event callback (zero-copy)
-        let sender_clone = Arc::clone(&sender_arc);
-        tokio::spawn(async move {
-            while let Some(msg) = handler_rx.recv().await {
-                sender_clone.send(msg); // Zero-copy: Bytes is reference-counted
-            }
-        });
-
-        // Call the existing channel-based connect method
-        self.connect(params, to_client, from_client).await?;
-
-        Ok(())
+        guacr_handlers::connect_with_event_adapter(
+            |params, to_client, from_client| self.connect(params, to_client, from_client),
+            params,
+            callback,
+            from_client,
+            4096, // channel capacity
+        )
+        .await
     }
 }
 

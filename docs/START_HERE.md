@@ -16,7 +16,7 @@ Rust-based WebRTC tunneling library with **native protocol handlers** for secure
 - Password & SSH key authentication (all formats: OpenSSH, PEM, PKCS#8)
 - JPEG rendering (5-10x faster than PNG)
 - 16ms debounce (60fps smoothness)
-- 1024x768 size cap (prevents WebRTC backpressure)
+- Default handshake size (1024x768 @ 96 DPI, then resizes to browser)
 - Bidirectional clipboard (OSC 52 + bracketed paste)
 - Dirty region optimization with scroll detection
 - All input responsive (no lag)
@@ -34,7 +34,7 @@ Rust-based WebRTC tunneling library with **native protocol handlers** for secure
 **Approach:** JPEG encoding with fontdue (5-10x faster than PNG)
 - ✅ Dirty region tracking (like guacd)
 - ✅ Scroll optimization (copy + render only new lines)
-- ✅ Size cap (1024x768 to prevent backpressure)
+- ✅ Default handshake size (1024x768 @ 96 DPI, matches guacd behavior)
 - ✅ 16ms debounce (60fps updates)
 - ✅ Font rendering (Noto Sans Mono)
 - ✅ JPEG quality 95 (fast with minimal loss)
@@ -55,11 +55,13 @@ Rust-based WebRTC tunneling library with **native protocol handlers** for secure
 ### Recently Fixed
 
 1. **Performance lag fixed** - Changed PNG to JPEG (5-10x faster)
-2. **Size cap added** - 1024x768 max to prevent WebRTC backpressure (~60KB → ~25KB images)
-3. **Debounce optimized** - Reduced from 100ms to 16ms for 60fps smoothness
-4. **SSH key auth** - All formats supported (OpenSSH, PEM, PKCS#8) with passphrases
-5. **Clipboard integration** - Bidirectional copy/paste with OSC 52 + bracketed paste
-6. **Logging cleanup** - Trace/debug for hot paths, info/error for user events
+2. **Handshake sizing fixed** - Use default 1024x768 @ 96 DPI during handshake (matches guacd), then resize to browser dimensions
+3. **Backpressure fix** - Made EventCallback async with proper await to prevent frame dropping
+4. **Channel capacity increased** - 4096 capacity for all protocols to handle burst traffic
+5. **Debounce optimized** - Reduced from 100ms to 16ms for 60fps smoothness
+6. **SSH key auth** - All formats supported (OpenSSH, PEM, PKCS#8) with passphrases
+7. **Clipboard integration** - Bidirectional copy/paste with OSC 52 + bracketed paste
+8. **Logging cleanup** - Trace/debug for hot paths, info/error for user events
 
 ## Quick Commands
 

@@ -64,12 +64,21 @@ pub fn x11_keysym_to_bytes(
     if let Some(mods) = modifiers {
         if mods.control {
             // Control + character combinations
+            // X11 keysyms: uppercase A-Z = 0x0041-0x005A, lowercase a-z = 0x0061-0x007A
+            // Browser sends LOWERCASE keysyms when typing Ctrl+C (keysym 99 = 'c')
             match keysym {
-                // Control + A-Z: convert to 0x01-0x1A
+                // Control + A-Z (uppercase): convert to 0x01-0x1A
                 0x0041..=0x005A => {
                     // A-Z: subtract 0x40 to get control character
                     // Ctrl+A (0x41) -> 0x01, Ctrl+C (0x43) -> 0x03, etc.
                     return vec![(keysym - 0x40) as u8];
+                }
+                // Control + a-z (lowercase): convert to 0x01-0x1A
+                // This is the common case - browsers send lowercase when Ctrl is held
+                0x0061..=0x007A => {
+                    // a-z: subtract 0x60 to get control character
+                    // Ctrl+a (0x61) -> 0x01, Ctrl+c (0x63) -> 0x03, etc.
+                    return vec![(keysym - 0x60) as u8];
                 }
                 // Control + [ (0x5B) -> ESC (0x1B)
                 0x005B => return vec![0x1B],
@@ -146,7 +155,7 @@ pub fn x11_keysym_to_bytes(
 /// Convert mouse event to X11 mouse escape sequence for terminal mouse support
 ///
 /// Terminal applications (vim, tmux) use X11 mouse escape sequences:
-/// ESC [ M <button> <x> <y>
+/// `ESC [ M <button> <x> <y>`
 ///
 /// Where:
 /// - button: encodes button (0-2) + action (32 for drag, 35 for release)
@@ -284,17 +293,30 @@ mod tests {
         let mut mods = ModifierState::new();
         mods.control = true;
 
-        // Ctrl+C (C is 0x43, should become 0x03)
+        // Ctrl+C (uppercase C is 0x43, should become 0x03)
         assert_eq!(x11_keysym_to_bytes(0x0043, true, Some(&mods)), vec![0x03]);
 
-        // Ctrl+A (A is 0x41, should become 0x01)
+        // Ctrl+c (lowercase c is 0x63, should also become 0x03)
+        // This is what browsers actually send!
+        assert_eq!(x11_keysym_to_bytes(0x0063, true, Some(&mods)), vec![0x03]);
+
+        // Ctrl+A (uppercase A is 0x41, should become 0x01)
         assert_eq!(x11_keysym_to_bytes(0x0041, true, Some(&mods)), vec![0x01]);
 
-        // Ctrl+Z (Z is 0x5A, should become 0x1A)
+        // Ctrl+a (lowercase a is 0x61, should also become 0x01)
+        assert_eq!(x11_keysym_to_bytes(0x0061, true, Some(&mods)), vec![0x01]);
+
+        // Ctrl+Z (uppercase Z is 0x5A, should become 0x1A)
         assert_eq!(x11_keysym_to_bytes(0x005A, true, Some(&mods)), vec![0x1A]);
+
+        // Ctrl+z (lowercase z is 0x7A, should also become 0x1A)
+        assert_eq!(x11_keysym_to_bytes(0x007A, true, Some(&mods)), vec![0x1A]);
 
         // Ctrl+[ should become ESC (0x1B)
         assert_eq!(x11_keysym_to_bytes(0x005B, true, Some(&mods)), vec![0x1B]);
+
+        // Ctrl+d (lowercase d is 0x64, should become 0x04 - EOF)
+        assert_eq!(x11_keysym_to_bytes(0x0064, true, Some(&mods)), vec![0x04]);
     }
 
     #[test]

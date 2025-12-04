@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_format_arc() {
-        let instr = format_arc(0, 50, 50, 25, 25, 0.0, 3.14159);
+        let instr = format_arc(0, 50, 50, 25, 25, 0.0, std::f64::consts::PI);
         assert!(instr.starts_with("3.arc,"));
         assert!(instr.contains("50"));
     }

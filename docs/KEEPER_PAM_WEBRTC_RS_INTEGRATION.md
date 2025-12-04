@@ -68,8 +68,10 @@ impl ProtocolHandler for SshHandler {
 Handlers that want zero-copy support need to implement both:
 
 ```rust
-use guacr_handlers::{ProtocolHandler, EventBasedHandler, EventCallback, InstructionSender};
+use guacr_handlers::{ProtocolHandler, EventBasedHandler, EventCallback};
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use bytes::Bytes;
 
 impl ProtocolHandler for SshHandler {
     // ... channel-based interface ...
@@ -79,18 +81,23 @@ impl EventBasedHandler for SshHandler {
     fn name(&self) -> &str {
         "ssh"
     }
-    
+
     async fn connect_with_events(
         &self,
         params: HashMap<String, String>,
         callback: Arc<dyn EventCallback>,
+        from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        let sender = InstructionSender::new(callback);
-        
-        // Use sender instead of channel
-        // sender.send(instruction);  // Zero-copy
-        
-        Ok(())
+        // Use helper function to wrap channel-based interface
+        // All protocols use 4096 capacity for burst traffic
+        guacr_handlers::connect_with_event_adapter(
+            |params, to_client, from_client| self.connect(params, to_client, from_client),
+            params,
+            callback,
+            from_client,
+            4096, // channel capacity
+        )
+        .await
     }
 }
 ```

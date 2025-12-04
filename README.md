@@ -57,6 +57,101 @@ params.insert("username".to_string(), "user".to_string());
 handler.connect(params, to_client, from_client).await?;
 ```
 
+## Native Terminal Display (Pipe Streams)
+
+Terminal protocols (SSH, Telnet) support native terminal display via Guacamole pipe streams. 
+This allows CLI clients to receive raw terminal output (including ANSI escape codes) instead of 
+rendered images, enabling display in native terminal applications.
+
+Enable with the `enable-pipe=true` connection parameter:
+
+```rust
+params.insert("enable-pipe".to_string(), "true".to_string());
+```
+
+When enabled:
+- Server opens a `STDOUT` pipe stream and sends raw terminal data as `blob` instructions
+- Client can open a `STDIN` pipe stream to send input directly to the terminal
+- ANSI escape codes (colors, cursor movement, etc.) are preserved
+- Image rendering still occurs if `PIPE_INTERPRET_OUTPUT` flag is set (default)
+
+## Testing
+
+### Quick Tests (No Docker Required)
+
+Run unit tests only:
+
+```bash
+./scripts/run-all-tests.sh --quick
+```
+
+### Full Integration Tests
+
+The test suite includes Docker-based integration tests for all protocols:
+
+```bash
+# Run all tests (starts Docker containers automatically)
+./scripts/run-all-tests.sh
+
+# Run specific protocols only
+./scripts/run-all-tests.sh --protocol ssh,vnc
+
+# Include database tests
+./scripts/run-all-tests.sh --protocol ssh,database
+
+# Clean up containers after tests
+./scripts/run-all-tests.sh --clean
+
+# Show help
+./scripts/run-all-tests.sh --help
+```
+
+### Docker Test Services
+
+| Service | Port | Credentials | Description |
+|---------|------|-------------|-------------|
+| SSH | 2222 | test_user / test_password | OpenSSH server |
+| Telnet | 2323 | root / test_password | Alpine telnetd |
+| RDP | 3389 | test_user / test_password | Ubuntu xrdp |
+| VNC | 5901 | (password) test_password | Alpine x11vnc |
+| MySQL | 13306 | testuser / testpassword | MySQL 8.0 |
+| PostgreSQL | 15432 | testuser / testpassword | PostgreSQL 16 |
+| MongoDB | 17017 | testuser / testpassword | MongoDB 7.0 |
+| Redis | 16379 | (password) testpassword | Redis 7.2 |
+
+### Manual Docker Setup
+
+```bash
+# Start all test services
+docker-compose -f docker-compose.test.yml up -d
+
+# Start specific services
+docker-compose -f docker-compose.test.yml up -d ssh telnet
+
+# Start database services
+cd crates/guacr-database
+docker-compose -f docker-compose.test.yml up -d
+
+# Stop all services
+docker-compose -f docker-compose.test.yml down
+```
+
+### Running Individual Test Suites
+
+```bash
+# Pipe stream tests (no Docker needed)
+cargo test -p guacr-handlers --test pipe_integration_test
+
+# SSH handler tests (requires SSH Docker container)
+cargo test -p guacr-ssh --test integration_test -- --include-ignored
+
+# Database tests (requires database Docker containers)
+cargo test -p guacr-database --test integration_test
+
+# All unit tests
+cargo test --workspace
+```
+
 ## License
 
 MIT

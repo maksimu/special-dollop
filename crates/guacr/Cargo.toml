@@ -10,6 +10,9 @@ description = "Protocol handlers for remote desktop access (SSH, RDP, VNC, Telne
 # Core handler traits and registry
 guacr-handlers = { path = "../guacr-handlers", version = "1.1.7" }
 
+# Re-export async_trait for EventCallback implementations
+async-trait.workspace = true
+
 # Protocol handlers
 guacr-ssh = { path = "../guacr-ssh", version = "1.1.7", optional = true }
 guacr-telnet = { path = "../guacr-telnet", version = "1.1.7", optional = true }
@@ -28,4 +31,15 @@ vnc = ["guacr-vnc"]
 sftp = ["guacr-sftp"]
 database = ["guacr-database"]
 rbi = ["guacr-rbi"]
+
+# RBI backend options (require "rbi" feature)
+# Chrome/CDP - uses installed Chrome via DevTools Protocol (no audio)
+rbi-chrome = ["rbi", "guacr-rbi/chrome"]
+# CEF - Chromium Embedded Framework with audio support (requires CEF binaries)
+rbi-cef = ["rbi", "guacr-rbi/cef"]
+
 all = ["ssh", "telnet", "rdp", "vnc", "sftp", "database", "rbi"]
+# All handlers with Chrome/CDP for RBI (easy setup, no audio)
+all-chrome = ["all", "rbi-chrome"]
+# All handlers with CEF for RBI (requires CEF binaries, has audio)
+all-cef = ["all", "rbi-cef"]

@@ -201,7 +201,7 @@ mod tests {
     fn test_read_buffer_structure() {
         // Create a minimal adapter structure for testing buffer logic
         // Note: We can't easily create a real Channel, so we test the buffer logic separately
-        let read_buffer = vec![1, 2, 3, 4, 5];
+        let read_buffer = [1, 2, 3, 4, 5];
         assert_eq!(read_buffer.len(), 5);
 
         // Test buffer drain logic conceptually

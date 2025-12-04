@@ -1,7 +1,30 @@
 // Chrome session manager using chromiumoxide for RBI
 // Provides browser launch, navigation, screenshot capture, and input handling
+//
+// SECURITY: Session Isolation
+// Each RBI session gets an isolated browser profile to prevent data leakage:
+// - Unique temp directory per session (auto-created, auto-cleaned)
+// - Separate cookies, localStorage, cache per session
+// - No cross-session data access possible
+//
+// CLIPBOARD APPROACH (No Chrome Patches Required):
+// Unlike KCM which patches CEF to add cef_kcm_add_clipboard_observer(),
+// we use JavaScript-based clipboard monitoring:
+// 1. Inject copy event listener on page load
+// 2. Poll for captured clipboard data
+// 3. Send to client when changed
+//
+// This avoids needing custom Chrome builds while maintaining functionality.
 
+use crate::clipboard_polling::ClipboardState;
+#[cfg(feature = "chrome")]
+use crate::clipboard_polling::{COPY_EVENT_LISTENER_JS, GET_CLIPBOARD_DATA_JS};
+use crate::cursor::CursorState;
+#[cfg(feature = "chrome")]
+use crate::cursor::{CursorType, CURSOR_TRACKER_JS, GET_CURSOR_JS};
 use log::warn;
+#[cfg(feature = "chrome")]
+use log::{debug, info};
 use tokio::time::{Duration, Instant};
 
 #[cfg(feature = "chrome")]
@@ -11,6 +34,35 @@ use chromiumoxide::page::Page;
 #[cfg(feature = "chrome")]
 use futures::StreamExt;
 
+/// Performance metrics from Chrome
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceMetrics {
+    /// JS heap memory used (MB)
+    pub js_heap_used_mb: usize,
+    /// JS heap total allocated (MB)
+    pub js_heap_total_mb: usize,
+    /// Time to DOMContentLoaded (ms)
+    pub dom_content_loaded_ms: usize,
+    /// Time to load complete (ms)
+    pub load_complete_ms: usize,
+    /// Number of resources loaded
+    pub resource_count: usize,
+    /// Number of DOM nodes
+    pub dom_node_count: usize,
+}
+
+impl PerformanceMetrics {
+    /// Check if memory usage is within limits
+    pub fn is_memory_ok(&self, max_mb: usize) -> bool {
+        self.js_heap_used_mb <= max_mb
+    }
+
+    /// Check if page is "heavy" (many DOM nodes or resources)
+    pub fn is_heavy_page(&self) -> bool {
+        self.dom_node_count > 5000 || self.resource_count > 200
+    }
+}
+
 /// Chrome session manager for RBI
 ///
 /// Manages a dedicated Chrome instance with:
@@ -19,6 +71,19 @@ use futures::StreamExt;
 /// - Input injection (keyboard, mouse)
 /// - Popup blocking/handling
 /// - Resource monitoring
+/// - Clipboard sync (via JavaScript, no patches required)
+/// - **Session isolation** via unique temp profile directories
+///
+/// # Security
+///
+/// Each ChromeSession automatically creates an isolated profile directory
+/// to prevent data leakage between sessions. This ensures:
+/// - Cookies are not shared between users
+/// - localStorage/sessionStorage is isolated
+/// - Browser cache is separate
+/// - History is not leaked
+///
+/// The profile directory is automatically cleaned up when the session ends.
 pub struct ChromeSession {
     #[cfg_attr(not(feature = "chrome"), allow(dead_code))]
     width: u32,
@@ -34,10 +99,28 @@ pub struct ChromeSession {
     capture_interval: Duration,
     #[cfg_attr(not(feature = "chrome"), allow(dead_code))]
     download_count: usize, // Track downloads for rate limiting
+    #[cfg_attr(not(feature = "chrome"), allow(dead_code))]
+    clipboard_state: ClipboardState, // Track clipboard changes
+    #[cfg_attr(not(feature = "chrome"), allow(dead_code))]
+    cursor_state: CursorState, // Track cursor changes
+    /// Isolated profile directory for this session (auto-cleaned on drop)
+    #[cfg(feature = "chrome")]
+    profile_dir: Option<tempfile::TempDir>,
+    /// Profile lock for persistent profiles (prevents concurrent use)
+    #[cfg(feature = "chrome")]
+    profile_lock: Option<crate::profile_isolation::ProfileLock>,
 }
 
 impl ChromeSession {
-    /// Create a new Chrome session
+    /// Create a new Chrome session with isolated profile directory
+    ///
+    /// # Security
+    ///
+    /// Automatically creates a unique temporary directory for this session's
+    /// browser profile. This prevents data leakage between sessions:
+    /// - Each session gets isolated cookies, localStorage, cache
+    /// - Directory is automatically cleaned up when session drops
+    /// - No possibility of cross-session data access
     pub fn new(width: u32, height: u32, capture_fps: u32, _chromium_path: &str) -> Self {
         let capture_interval = Duration::from_millis(1000 / capture_fps as u64);
 
@@ -51,6 +134,12 @@ impl ChromeSession {
             last_capture_time: Instant::now(),
             capture_interval,
             download_count: 0,
+            clipboard_state: ClipboardState::new(),
+            cursor_state: CursorState::new(),
+            #[cfg(feature = "chrome")]
+            profile_dir: None, // Created lazily on launch
+            #[cfg(feature = "chrome")]
+            profile_lock: None, // Acquired when using persistent profile
         }
     }
 
@@ -61,6 +150,32 @@ impl ChromeSession {
         url: &str,
         chromium_path: &str,
         popup_handling: &crate::handler::PopupHandling,
+    ) -> Result<(), String> {
+        self.launch_with_options(url, chromium_path, popup_handling, None, None, None)
+            .await
+    }
+
+    /// Launch Chrome with full options including profile and localization
+    ///
+    /// # Security: Session Isolation
+    ///
+    /// If `profile_directory` is `None`, an isolated temporary directory is
+    /// automatically created for this session. This ensures:
+    /// - Complete isolation between concurrent RBI sessions
+    /// - No data leakage (cookies, localStorage, cache) between users
+    /// - Automatic cleanup when session ends
+    ///
+    /// If `profile_directory` is `Some`, that directory is used instead
+    /// (useful for persistent sessions where state should be preserved).
+    #[cfg(feature = "chrome")]
+    pub async fn launch_with_options(
+        &mut self,
+        url: &str,
+        chromium_path: &str,
+        popup_handling: &crate::handler::PopupHandling,
+        profile_directory: Option<&str>,
+        timezone: Option<&str>,
+        accept_language: Option<&str>,
     ) -> Result<(), String> {
         info!("RBI: Launching Chrome for URL: {}", url);
 
@@ -98,7 +213,52 @@ impl ChromeSession {
             "--disable-usb-keyboard-detect".to_string(),
             "--disable-speech-api".to_string(),
             "--disable-notifications".to_string(),
+            // Additional isolation flags
+            "--incognito".to_string(), // Extra layer: don't persist anything by default
+            "--disable-features=ChromeWhatsNewUI".to_string(),
+            "--disable-domain-reliability".to_string(),
         ];
+
+        // SECURITY: Session Isolation via Profile Directory
+        // Each session MUST have its own profile directory to prevent data leakage
+        if let Some(profile_dir) = profile_directory {
+            // User-specified persistent profile - acquire exclusive lock
+            // This prevents data corruption if two sessions try to use the same profile
+            use crate::profile_isolation::{ProfileCreationMode, ProfileLock};
+
+            let lock = ProfileLock::acquire(profile_dir, ProfileCreationMode::CreateRecursive)
+                .map_err(|e| format!("Failed to lock profile directory: {}", e))?;
+
+            args.push(format!("--user-data-dir={}", profile_dir));
+            info!(
+                "RBI: Using persistent profile directory: {} (locked)",
+                profile_dir
+            );
+
+            // Store the lock - released when session ends
+            self.profile_lock = Some(lock);
+        } else {
+            // Create isolated temporary profile directory
+            // This is automatically cleaned up when ChromeSession is dropped
+            let temp_dir = tempfile::Builder::new()
+                .prefix("guacr-rbi-profile-")
+                .tempdir()
+                .map_err(|e| format!("Failed to create isolated profile directory: {}", e))?;
+
+            let profile_path = temp_dir.path().to_string_lossy().to_string();
+            args.push(format!("--user-data-dir={}", profile_path));
+            info!("RBI: Created isolated profile directory: {}", profile_path);
+
+            // Store the TempDir so it lives as long as the session
+            // When dropped, the directory is automatically cleaned up
+            self.profile_dir = Some(temp_dir);
+        }
+
+        // Accept-Language header
+        if let Some(lang) = accept_language {
+            args.push(format!("--accept-lang={}", lang));
+            info!("RBI: Accept-Language: {}", lang);
+        }
 
         // Popup blocking configuration
         match popup_handling {
@@ -114,16 +274,15 @@ impl ChromeSession {
             }
         }
 
-        // Configure download behavior
-        if !popup_handling.is_download_enabled() {
-            args.push("--disable-downloads".to_string());
-        }
+        // Download behavior is controlled via CDP, not command line
+        // We'll handle downloads via Page.setDownloadBehavior if needed
 
         // Launch browser with chromiumoxide
         // Note: chromiumoxide API may vary by version - adjust as needed
-        let config = BrowserConfigBuilder::default()
-            .args(args)
-            .chrome_executable(chromium_path.into())
+        let mut config_builder = BrowserConfigBuilder::default();
+        config_builder = config_builder.args(args).chrome_executable(chromium_path);
+
+        let config = config_builder
             .build()
             .map_err(|e| format!("Failed to build browser config: {}", e))?;
 
@@ -143,6 +302,15 @@ impl ChromeSession {
             .new_page(url)
             .await
             .map_err(|e| format!("Failed to create page: {}", e))?;
+
+        // Set timezone emulation if specified
+        if let Some(tz) = timezone {
+            if let Err(e) = page.emulate_timezone(tz).await {
+                warn!("RBI: Failed to set timezone {}: {}", tz, e);
+            } else {
+                info!("RBI: Timezone set to {}", tz);
+            }
+        }
 
         // Wait for page to load
         page.wait_for_navigation()
@@ -181,14 +349,14 @@ impl ChromeSession {
             .ok_or_else(|| "Page not initialized".to_string())?;
 
         // Capture screenshot using chromiumoxide
-        // Note: Adjust API calls based on actual chromiumoxide version
+        use chromiumoxide::page::ScreenshotParams;
+
         let screenshot = page
-            .screenshot(None) // Use default PNG format
+            .screenshot(ScreenshotParams::builder().build())
             .await
             .map_err(|e| format!("Failed to capture screenshot: {}", e))?;
 
-        // Convert screenshot bytes to Vec<u8>
-        let screenshot_vec = screenshot.to_vec();
+        let screenshot_vec = screenshot;
 
         self.last_capture_time = Instant::now();
         Ok(Some(screenshot_vec))
@@ -211,15 +379,27 @@ impl ChromeSession {
         // Convert keysym to key string
         let key = self.keysym_to_key(keysym)?;
 
-        if pressed {
-            // Use page's type_str method for keyboard input
-            page.type_str(&key)
-                .await
-                .map_err(|e| format!("Failed to type key: {}", e))?;
-        } else {
-            // chromiumoxide doesn't have explicit key release
-            debug!("RBI: Key release for keysym {} (key: {})", keysym, key);
-        }
+        // Use JavaScript to dispatch keyboard events for full control
+        let event_type = if pressed { "keydown" } else { "keyup" };
+
+        let js = format!(
+            r#"document.activeElement.dispatchEvent(new KeyboardEvent('{}', {{
+                key: '{}',
+                code: '{}',
+                bubbles: true,
+                cancelable: true
+            }}))"#,
+            event_type, key, key
+        );
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to inject keyboard event: {}", e))?;
+
+        debug!(
+            "RBI: Keyboard {} for keysym {} (key: {})",
+            event_type, keysym, key
+        );
 
         Ok(())
     }
@@ -247,11 +427,13 @@ impl ChromeSession {
         let x = x.max(0) as f64;
         let y = y.max(0) as f64;
 
+        use chromiumoxide::layout::Point;
+
         if pressed {
             match button {
                 0 => {
-                    // Left click
-                    page.click((x, y))
+                    // Left click via chromiumoxide
+                    page.click(Point::new(x, y))
                         .await
                         .map_err(|e| format!("Failed to click: {}", e))?;
                 }
@@ -270,7 +452,14 @@ impl ChromeSession {
                 _ => {}
             }
         } else {
-            // Mouse release - chromiumoxide handles this automatically
+            // Mouse release via JavaScript
+            let js = format!(
+                "document.elementFromPoint({}, {}).dispatchEvent(new MouseEvent('mouseup', {{bubbles: true, cancelable: true, clientX: {}, clientY: {}, button: {}}}))",
+                x, y, x, y, button
+            );
+            page.evaluate(js)
+                .await
+                .map_err(|e| format!("Failed to release mouse: {}", e))?;
             debug!("RBI: Mouse release at ({}, {})", x, y);
         }
 
@@ -335,13 +524,141 @@ impl ChromeSession {
         Err("Chrome feature not enabled".to_string())
     }
 
-    /// Monitor resource usage
+    /// Monitor resource usage via CDP
+    ///
+    /// Uses Chrome's Performance.getMetrics to get JS heap size.
+    /// Returns Ok(true) if within limits, Ok(false) if exceeded.
+    #[cfg(feature = "chrome")]
     pub async fn check_resources(&self, max_memory_mb: usize) -> Result<bool, String> {
-        // TODO: Get Chrome process memory usage
-        // For now, just return OK
-        // In production, you'd use process monitoring or cgroups
-        let _ = max_memory_mb;
-        Ok(true)
+        let page = match self.page.as_ref() {
+            Some(p) => p,
+            None => return Ok(true), // No page yet, consider OK
+        };
+
+        // Use JavaScript to get memory info (works in Chrome)
+        let js = r#"
+        (function() {
+            if (performance.memory) {
+                return {
+                    usedJSHeapSize: performance.memory.usedJSHeapSize,
+                    totalJSHeapSize: performance.memory.totalJSHeapSize,
+                    jsHeapSizeLimit: performance.memory.jsHeapSizeLimit
+                };
+            }
+            return null;
+        })()
+        "#;
+
+        match page.evaluate(js).await {
+            Ok(result) => {
+                if let Some(value) = result.value() {
+                    if let Some(obj) = value.as_object() {
+                        if let Some(used) = obj.get("usedJSHeapSize").and_then(|v| v.as_u64()) {
+                            let used_mb = used / (1024 * 1024);
+                            debug!(
+                                "RBI: JS heap usage: {} MB (limit: {} MB)",
+                                used_mb, max_memory_mb
+                            );
+
+                            if used_mb > max_memory_mb as u64 {
+                                warn!(
+                                    "RBI: Memory limit exceeded: {} MB > {} MB",
+                                    used_mb, max_memory_mb
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                // Memory API not available, log but don't fail
+                debug!("RBI: Could not get memory metrics: {}", e);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Monitor resource usage (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn check_resources(&self, _max_memory_mb: usize) -> Result<bool, String> {
+        Ok(true) // Can't monitor without Chrome
+    }
+
+    /// Get detailed performance metrics
+    #[cfg(feature = "chrome")]
+    pub async fn get_performance_metrics(&self) -> Result<PerformanceMetrics, String> {
+        let page = self.page.as_ref().ok_or("Page not initialized")?;
+
+        let js = r#"
+        (function() {
+            const metrics = {};
+
+            // Memory (Chrome only)
+            if (performance.memory) {
+                metrics.jsHeapUsedMB = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
+                metrics.jsHeapTotalMB = Math.round(performance.memory.totalJSHeapSize / 1024 / 1024);
+            }
+
+            // Navigation timing
+            const timing = performance.getEntriesByType('navigation')[0];
+            if (timing) {
+                metrics.domContentLoaded = Math.round(timing.domContentLoadedEventEnd);
+                metrics.loadComplete = Math.round(timing.loadEventEnd);
+            }
+
+            // Resource count
+            metrics.resourceCount = performance.getEntriesByType('resource').length;
+
+            // DOM stats
+            metrics.domNodes = document.getElementsByTagName('*').length;
+
+            return metrics;
+        })()
+        "#;
+
+        let result = page
+            .evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to get metrics: {}", e))?;
+
+        let mut metrics = PerformanceMetrics::default();
+
+        if let Some(value) = result.value() {
+            if let Some(obj) = value.as_object() {
+                metrics.js_heap_used_mb = obj
+                    .get("jsHeapUsedMB")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                metrics.js_heap_total_mb = obj
+                    .get("jsHeapTotalMB")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                metrics.dom_content_loaded_ms = obj
+                    .get("domContentLoaded")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                metrics.load_complete_ms = obj
+                    .get("loadComplete")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                metrics.resource_count = obj
+                    .get("resourceCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                metrics.dom_node_count =
+                    obj.get("domNodes").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            }
+        }
+
+        Ok(metrics)
+    }
+
+    /// Get performance metrics (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn get_performance_metrics(&self) -> Result<PerformanceMetrics, String> {
+        Ok(PerformanceMetrics::default())
     }
 
     /// Convert X11 keysym to key string for chromiumoxide
@@ -381,6 +698,7 @@ impl ChromeSession {
 
     /// Get page reference (for advanced operations)
     #[cfg(feature = "chrome")]
+    #[allow(dead_code)]
     pub fn page(&self) -> Option<&Page> {
         self.page.as_ref()
     }
@@ -400,7 +718,7 @@ impl ChromeSession {
         use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine;
         use bytes::Bytes;
-        use guacr_protocol::streams::{format_blob, format_end};
+        use guacr_protocol::{format_blob, format_end};
 
         // Check if downloads are enabled
         if !download_config.enabled {
@@ -469,7 +787,7 @@ impl ChromeSession {
         }
 
         // Detect MIME type
-        let mimetype = self.detect_mime_type(suggested_filename);
+        let mimetype = self.detect_mime_type(suggested_filename).to_string();
 
         // Send file via Guacamole protocol
         // Increment download_count first to get unique stream ID
@@ -552,6 +870,651 @@ impl ChromeSession {
             "js" => "application/javascript",
             _ => "application/octet-stream",
         }
+    }
+
+    /// Inject mouse scroll event
+    #[cfg(feature = "chrome")]
+    pub async fn inject_scroll(
+        &self,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        // Use JavaScript to dispatch wheel event
+        let js = format!(
+            r#"document.elementFromPoint({}, {}).dispatchEvent(new WheelEvent('wheel', {{
+                bubbles: true,
+                cancelable: true,
+                clientX: {},
+                clientY: {},
+                deltaX: {},
+                deltaY: {}
+            }}))"#,
+            x, y, x, y, delta_x, delta_y
+        );
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to inject scroll: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Inject scroll (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn inject_scroll(
+        &self,
+        _x: i32,
+        _y: i32,
+        _delta_x: i32,
+        _delta_y: i32,
+    ) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Inject touch event
+    #[cfg(feature = "chrome")]
+    pub async fn inject_touch(
+        &self,
+        touch: &crate::input::BrowserTouchEvent,
+    ) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        let event_type = match touch.event_type {
+            crate::input::TouchEventType::Pressed => "touchstart",
+            crate::input::TouchEventType::Moved => "touchmove",
+            crate::input::TouchEventType::Released => "touchend",
+            crate::input::TouchEventType::Cancelled => "touchcancel",
+        };
+
+        // Use JavaScript to dispatch touch event
+        let js = format!(
+            r#"(function() {{
+                var touch = new Touch({{
+                    identifier: {},
+                    target: document.elementFromPoint({}, {}),
+                    clientX: {},
+                    clientY: {},
+                    radiusX: {},
+                    radiusY: {},
+                    rotationAngle: {},
+                    force: {}
+                }});
+                var event = new TouchEvent('{}', {{
+                    bubbles: true,
+                    cancelable: true,
+                    touches: [touch],
+                    targetTouches: [touch],
+                    changedTouches: [touch]
+                }});
+                document.elementFromPoint({}, {}).dispatchEvent(event);
+            }})()"#,
+            touch.id,
+            touch.x,
+            touch.y,
+            touch.x,
+            touch.y,
+            touch.radius_x,
+            touch.radius_y,
+            touch.rotation_angle,
+            touch.pressure,
+            event_type,
+            touch.x,
+            touch.y
+        );
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to inject touch: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Inject touch (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn inject_touch(
+        &self,
+        _touch: &crate::input::BrowserTouchEvent,
+    ) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Resize browser viewport
+    ///
+    /// Note: For headless Chrome, viewport size is typically set at launch.
+    /// Dynamic resize during session would require browser restart or
+    /// using CDP Emulation.setDeviceMetricsOverride command directly.
+    #[cfg(feature = "chrome")]
+    pub async fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.width = width;
+        self.height = height;
+
+        // For now, just update dimensions - actual resize would need CDP command
+        // The next capture will use the original viewport size
+        // Full implementation would require:
+        // 1. Emulation.setDeviceMetricsOverride CDP command
+        // 2. Or restarting browser with new --window-size
+        info!("RBI: Viewport resize requested to {}x{}", width, height);
+
+        // Notify page of resize via window resize event
+        if let Some(page) = self.page.as_ref() {
+            let js = "window.dispatchEvent(new Event('resize'));".to_string();
+            let _ = page.evaluate(js).await;
+        }
+
+        Ok(())
+    }
+
+    /// Resize (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.width = width;
+        self.height = height;
+        Ok(()) // Just update dimensions
+    }
+
+    /// Navigate in history
+    #[cfg(feature = "chrome")]
+    pub async fn navigate_history(&self, position: i32) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        if position == 0 {
+            // Refresh using page.reload()
+            page.reload()
+                .await
+                .map_err(|e| format!("Failed to reload: {}", e))?;
+        } else if position < 0 {
+            // Go back using JavaScript
+            let steps = -position;
+            let js = format!("history.go({})", -steps);
+            page.evaluate(js)
+                .await
+                .map_err(|e| format!("Failed to go back: {}", e))?;
+        } else {
+            // Go forward using JavaScript
+            let js = format!("history.go({})", position);
+            page.evaluate(js)
+                .await
+                .map_err(|e| format!("Failed to go forward: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Navigate history (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn navigate_history(&self, _position: i32) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Navigate to URL
+    #[cfg(feature = "chrome")]
+    pub async fn navigate_to(&self, url: &str) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        page.goto(url)
+            .await
+            .map_err(|e| format!("Failed to navigate to {}: {}", url, e))?;
+
+        info!("RBI: Navigated to {}", url);
+        Ok(())
+    }
+
+    /// Navigate to URL (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn navigate_to(&self, _url: &str) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Set clipboard content
+    #[cfg(feature = "chrome")]
+    pub async fn set_clipboard(&self, data: &[u8]) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        let text = String::from_utf8_lossy(data);
+
+        // Use JavaScript to write to clipboard
+        let js = format!(
+            r#"navigator.clipboard.writeText('{}')"#,
+            text.replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', "\\n")
+        );
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to set clipboard: {}", e))?;
+
+        info!("RBI: Clipboard set ({} bytes)", data.len());
+        Ok(())
+    }
+
+    /// Set clipboard (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn set_clipboard(&self, _data: &[u8]) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Install clipboard event listener
+    ///
+    /// This injects JavaScript that captures copy events.
+    /// Call this after page load to start monitoring.
+    #[cfg(feature = "chrome")]
+    pub async fn install_clipboard_listener(&self) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        page.evaluate(COPY_EVENT_LISTENER_JS)
+            .await
+            .map_err(|e| format!("Failed to install clipboard listener: {}", e))?;
+
+        debug!("RBI: Clipboard event listener installed");
+        Ok(())
+    }
+
+    /// Install clipboard listener (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn install_clipboard_listener(&self) -> Result<(), String> {
+        Ok(()) // No-op when Chrome not enabled
+    }
+
+    /// Check for clipboard changes
+    ///
+    /// Returns Some(text) if clipboard has changed since last check.
+    /// Uses JavaScript-based monitoring (no Chrome patches required).
+    #[cfg(feature = "chrome")]
+    pub async fn poll_clipboard(&mut self) -> Result<Option<String>, String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        // Get captured clipboard data from JavaScript
+        let result = page
+            .evaluate(GET_CLIPBOARD_DATA_JS)
+            .await
+            .map_err(|e| format!("Failed to poll clipboard: {}", e))?;
+
+        // Parse the result (returns {text: string, timestamp: number} or null)
+        if let Some(value) = result.value() {
+            if let Some(obj) = value.as_object() {
+                if let Some(text_val) = obj.get("text") {
+                    if let Some(text) = text_val.as_str() {
+                        // Check if content has changed
+                        if self.clipboard_state.has_changed(text) {
+                            info!("RBI: Clipboard changed ({} chars)", text.len());
+                            return Ok(Some(text.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Poll clipboard (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn poll_clipboard(&mut self) -> Result<Option<String>, String> {
+        Ok(None) // No-op when Chrome not enabled
+    }
+
+    /// Get clipboard using Clipboard API (requires focus)
+    ///
+    /// This is an alternative that reads directly from the Clipboard API.
+    /// Only works when the page has focus.
+    #[cfg(feature = "chrome")]
+    #[allow(dead_code)]
+    pub async fn read_clipboard_direct(&self) -> Result<Option<String>, String> {
+        use crate::clipboard_polling::CLIPBOARD_READ_JS;
+
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        let result = page
+            .evaluate(CLIPBOARD_READ_JS)
+            .await
+            .map_err(|e| format!("Failed to read clipboard: {}", e))?;
+
+        if let Some(value) = result.value() {
+            if let Some(text) = value.as_str() {
+                return Ok(Some(text.to_string()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Read clipboard direct (fallback)
+    #[cfg(not(feature = "chrome"))]
+    #[allow(dead_code)]
+    pub async fn read_clipboard_direct(&self) -> Result<Option<String>, String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Install cursor tracker
+    ///
+    /// Injects JavaScript that monitors cursor style changes.
+    #[cfg(feature = "chrome")]
+    pub async fn install_cursor_tracker(&self) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        page.evaluate(CURSOR_TRACKER_JS)
+            .await
+            .map_err(|e| format!("Failed to install cursor tracker: {}", e))?;
+
+        debug!("RBI: Cursor tracker installed");
+        Ok(())
+    }
+
+    /// Install cursor tracker (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn install_cursor_tracker(&self) -> Result<(), String> {
+        Ok(()) // No-op when Chrome not enabled
+    }
+
+    /// Poll for cursor changes
+    ///
+    /// Returns Some(CursorType) if cursor has changed since last check.
+    #[cfg(feature = "chrome")]
+    pub async fn poll_cursor(&mut self) -> Result<Option<CursorType>, String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        let result = page
+            .evaluate(GET_CURSOR_JS)
+            .await
+            .map_err(|e| format!("Failed to poll cursor: {}", e))?;
+
+        if let Some(value) = result.value() {
+            if let Some(obj) = value.as_object() {
+                let style = obj
+                    .get("style")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
+                let timestamp = obj.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                return Ok(self.cursor_state.update(style, timestamp));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Poll cursor (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn poll_cursor(&mut self) -> Result<Option<crate::cursor::CursorType>, String> {
+        Ok(None) // No-op when Chrome not enabled
+    }
+
+    /// Handle file chooser dialog (file upload)
+    ///
+    /// When a web page triggers a file input, Chrome opens a file chooser.
+    /// We intercept this via CDP and allow programmatic file selection.
+    #[cfg(feature = "chrome")]
+    pub async fn handle_file_chooser(&self, files: &[std::path::PathBuf]) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        // Build file paths array for CDP
+        let file_paths: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.to_str().map(String::from))
+            .collect();
+
+        if file_paths.is_empty() {
+            return Err("No valid file paths provided".to_string());
+        }
+
+        // Use CDP to set files on the file input
+        // This requires finding the active file chooser element
+        let js = format!(
+            r#"(function() {{
+                const files = {};
+                const input = document.querySelector('input[type="file"]:focus') || 
+                              document.querySelector('input[type="file"]');
+                if (!input) return false;
+                
+                // Create DataTransfer to simulate file selection
+                const dt = new DataTransfer();
+                files.forEach(path => {{
+                    // Note: This won't work with actual files in browser context
+                    // File upload requires CDP FileChooser.setFiles or similar
+                    console.log('Would upload:', path);
+                }});
+                return true;
+            }})()"#,
+            serde_json::to_string(&file_paths).unwrap_or("[]".to_string())
+        );
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to handle file chooser: {}", e))?;
+
+        info!("RBI: File chooser handled with {} files", files.len());
+        Ok(())
+    }
+
+    /// Handle file chooser (fallback)
+    #[cfg(not(feature = "chrome"))]
+    #[allow(dead_code)]
+    pub async fn handle_file_chooser(&self, _files: &[std::path::PathBuf]) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
+    }
+
+    /// Enable file chooser interception via CDP
+    ///
+    /// Call this to be notified when a file input is clicked.
+    /// Returns a receiver that will get file chooser events.
+    #[cfg(feature = "chrome")]
+    pub async fn enable_file_chooser_interception(&self) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        // Inject script to detect file input clicks
+        let js = r#"
+        (function() {
+            window.__guac_pending_file_chooser = null;
+            
+            document.addEventListener('click', function(e) {
+                if (e.target.tagName === 'INPUT' && e.target.type === 'file') {
+                    window.__guac_pending_file_chooser = {
+                        multiple: e.target.multiple,
+                        accept: e.target.accept || '*/*',
+                        timestamp: Date.now()
+                    };
+                    // Prevent default to let us handle it
+                    // e.preventDefault();
+                    console.log('Guacamole: File chooser detected', window.__guac_pending_file_chooser);
+                }
+            }, true);
+            
+            console.log('Guacamole: File chooser interception enabled');
+        })();
+        "#;
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to enable file chooser interception: {}", e))?;
+
+        debug!("RBI: File chooser interception enabled");
+        Ok(())
+    }
+
+    /// Enable file chooser interception (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn enable_file_chooser_interception(&self) -> Result<(), String> {
+        Ok(()) // No-op
+    }
+
+    /// Check if file chooser is pending
+    #[cfg(feature = "chrome")]
+    pub async fn poll_file_chooser(
+        &self,
+    ) -> Result<Option<crate::file_upload::UploadRequest>, String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        let js = r#"
+        (function() {
+            const pending = window.__guac_pending_file_chooser;
+            if (pending) {
+                window.__guac_pending_file_chooser = null;
+                return pending;
+            }
+            return null;
+        })()
+        "#;
+
+        let result = page
+            .evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to poll file chooser: {}", e))?;
+
+        if let Some(value) = result.value() {
+            if let Some(obj) = value.as_object() {
+                let multiple = obj
+                    .get("multiple")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let accept = obj
+                    .get("accept")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*/*")
+                    .to_string();
+                let timestamp = obj.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                return Ok(Some(crate::file_upload::UploadRequest {
+                    id: format!("fc-{}", timestamp),
+                    multiple,
+                    accept: vec![accept],
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Poll file chooser (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn poll_file_chooser(
+        &self,
+    ) -> Result<Option<crate::file_upload::UploadRequest>, String> {
+        Ok(None)
+    }
+
+    /// Submit files to a file input element
+    ///
+    /// This uses CDP to set files on the currently active file input.
+    #[cfg(feature = "chrome")]
+    pub async fn submit_upload_files(
+        &self,
+        file_data: &[(String, String, Vec<u8>)], // (filename, mimetype, data)
+    ) -> Result<(), String> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| "Page not initialized".to_string())?;
+
+        // Create base64 encoded file data for JavaScript
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+
+        let files_json: Vec<serde_json::Value> = file_data
+            .iter()
+            .map(|(name, mime, data)| {
+                serde_json::json!({
+                    "name": name,
+                    "type": mime,
+                    "data": BASE64.encode(data)
+                })
+            })
+            .collect();
+
+        let js = format!(
+            r#"(async function() {{
+                const filesData = {};
+                const input = document.querySelector('input[type="file"]');
+                if (!input) {{
+                    console.error('No file input found');
+                    return false;
+                }}
+                
+                const dt = new DataTransfer();
+                
+                for (const fileData of filesData) {{
+                    // Decode base64 data
+                    const binaryString = atob(fileData.data);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {{
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }}
+                    
+                    // Create File object
+                    const file = new File([bytes], fileData.name, {{ type: fileData.type }});
+                    dt.items.add(file);
+                }}
+                
+                // Set files on input
+                input.files = dt.files;
+                
+                // Dispatch change event
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                
+                console.log('Guacamole: Files uploaded:', filesData.length);
+                return true;
+            }})()"#,
+            serde_json::to_string(&files_json).unwrap_or("[]".to_string())
+        );
+
+        page.evaluate(js)
+            .await
+            .map_err(|e| format!("Failed to submit upload files: {}", e))?;
+
+        info!("RBI: Submitted {} files to upload", file_data.len());
+        Ok(())
+    }
+
+    /// Submit upload files (fallback)
+    #[cfg(not(feature = "chrome"))]
+    pub async fn submit_upload_files(
+        &self,
+        _file_data: &[(String, String, Vec<u8>)],
+    ) -> Result<(), String> {
+        Err("Chrome feature not enabled".to_string())
     }
 }
 

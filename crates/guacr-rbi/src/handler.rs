@@ -1,8 +1,16 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, InstructionSender,
+    EventBasedHandler,
+    EventCallback,
+    HandlerError,
+    HandlerStats,
+    HealthStatus,
     ProtocolHandler,
+    // Security
+    RbiSecuritySettings,
+    // Recording
+    RecordingConfig,
 };
 use log::info;
 use std::collections::HashMap;
@@ -46,6 +54,27 @@ pub struct RbiConfig {
     pub capture_fps: u32,
     pub servo_allowlist: Vec<String>, // Domains known to work with Servo
     pub download_config: DownloadConfig,
+    pub upload_config: crate::file_upload::UploadConfig,
+    // Security settings
+    pub allowed_url_patterns: Vec<String>, // URL whitelist patterns
+    pub allowed_resource_patterns: Vec<String>, // Resource URL whitelist
+    pub disable_copy: bool,                // Block copy from browser
+    pub disable_paste: bool,               // Block paste to browser
+    pub clipboard_buffer_size: usize,      // Clipboard buffer size (256KB-50MB)
+    // Navigation settings
+    pub allow_url_manipulation: bool, // Allow user to change URL
+    pub ignore_ssl_errors: bool,      // Ignore SSL cert errors for initial URL
+    // Localization settings
+    pub timezone: Option<String>, // Timezone (e.g., "America/New_York")
+    pub accept_language: Option<String>, // Accept-Language header (e.g., "en-US,en;q=0.9")
+    // Audio settings
+    pub audio_config: crate::audio::AudioConfig,
+    // Autofill settings
+    pub autofill_rules: Vec<crate::autofill::AutofillRule>,
+    pub autofill_credentials: Option<crate::autofill::AutofillCredentials>,
+    // Profile settings
+    pub profile_storage_directory: Option<String>, // Persist browser profile
+    pub create_profile_directory: bool,            // Create directory if missing
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +133,27 @@ impl Default for RbiConfig {
                 "rust-lang.org".to_string(),
             ],
             download_config: DownloadConfig::default(),
+            upload_config: crate::file_upload::UploadConfig::default(),
+            // Security settings - open by default (can be restricted per-connection)
+            allowed_url_patterns: Vec::new(), // Empty = allow all
+            allowed_resource_patterns: Vec::new(),
+            disable_copy: false,
+            disable_paste: false,
+            clipboard_buffer_size: 256 * 1024, // 256KB default
+            // Navigation settings
+            allow_url_manipulation: true,
+            ignore_ssl_errors: false,
+            // Localization settings
+            timezone: None,        // Use browser default
+            accept_language: None, // Use browser default
+            // Audio settings
+            audio_config: crate::audio::AudioConfig::default(),
+            // Autofill settings
+            autofill_rules: Vec::new(),
+            autofill_credentials: None,
+            // Profile settings
+            profile_storage_directory: None, // Don't persist by default
+            create_profile_directory: false,
         }
     }
 }
@@ -161,6 +211,7 @@ impl ProtocolHandler for RbiHandler {
         Some(self)
     }
 
+    #[allow(unused_variables)]
     async fn connect(
         &self,
         params: HashMap<String, String>,
@@ -169,9 +220,39 @@ impl ProtocolHandler for RbiHandler {
     ) -> guacr_handlers::Result<()> {
         info!("RBI handler starting");
 
+        // Parse RBI-specific security settings
+        let security = RbiSecuritySettings::from_params(&params);
+        info!(
+            "RBI: Security - read_only={}, download={}, upload={}, print={}, allowlist_len={}",
+            security.base.read_only,
+            security.is_download_allowed(),
+            security.is_upload_allowed(),
+            security.is_print_allowed(),
+            security.url_allowlist.len()
+        );
+
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(&params);
+        if recording_config.is_enabled() {
+            info!(
+                "RBI: Recording enabled - ses={}, asciicast={}, typescript={}",
+                recording_config.is_ses_enabled(),
+                recording_config.is_asciicast_enabled(),
+                recording_config.is_typescript_enabled()
+            );
+        }
+
         let url = params
             .get("url")
             .ok_or_else(|| HandlerError::MissingParameter("url".to_string()))?;
+
+        // Security: Check URL against allowlist/blocklist
+        if !security.is_url_allowed(url) {
+            return Err(HandlerError::SecurityViolation(format!(
+                "URL not allowed: {}",
+                url
+            )));
+        }
 
         info!("RBI launching browser for URL: {}", url);
 
@@ -283,28 +364,51 @@ impl ProtocolHandler for RbiHandler {
         //
         // Reference: docs/guacr/RBI_SERVO_AND_DATABASE_OPTIONS.md
 
-        // Get browser dimensions from params or use defaults
-        let width = params
-            .get("width")
-            .and_then(|w| w.parse().ok())
-            .unwrap_or(self.config.default_width);
-        let height = params
-            .get("height")
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(self.config.default_height);
+        // IMPORTANT: Always use DEFAULT size during initialization (like guacd does)
+        // The client will send a resize instruction with actual browser dimensions after handshake
+        // This prevents "half screen" display issues
+        info!("RBI: Using default handshake size - will resize after client connects");
+        let _width = self.config.default_width;
+        let _height = self.config.default_height;
 
-        // Use browser client wrapper
-        use crate::browser_client::BrowserClient;
-        let mut browser_client = BrowserClient::new(width, height, self.config.clone());
+        // Use the appropriate backend
+        #[cfg(feature = "chrome")]
+        {
+            use crate::browser_client::BrowserClient;
+            let mut browser_client = BrowserClient::new(_width, _height, self.config.clone());
 
-        // Connect and handle session
-        browser_client
-            .connect(url, to_client, from_client)
-            .await
-            .map_err(HandlerError::ConnectionFailed)?;
+            // Connect and handle session
+            browser_client
+                .connect(url, to_client, from_client)
+                .await
+                .map_err(HandlerError::ConnectionFailed)?;
 
-        info!("RBI handler ended");
-        Ok(())
+            info!("RBI handler ended");
+            return Ok(());
+        }
+
+        #[cfg(feature = "cef")]
+        {
+            use crate::cef_browser_client::CefBrowserClient;
+            let mut cef_client = CefBrowserClient::new(_width, _height, self.config.clone());
+
+            // Connect and handle session
+            cef_client
+                .connect(url, to_client, from_client)
+                .await
+                .map_err(HandlerError::ConnectionFailed)?;
+
+            info!("RBI handler ended (CEF)");
+            return Ok(());
+        }
+
+        #[cfg(not(any(feature = "chrome", feature = "cef")))]
+        {
+            return Err(HandlerError::ConnectionFailed(
+                "No browser backend enabled. Build with --features chrome or --features cef"
+                    .to_string(),
+            ));
+        }
     }
 
     async fn health_check(&self) -> guacr_handlers::Result<HealthStatus> {
@@ -329,24 +433,14 @@ impl EventBasedHandler for RbiHandler {
         callback: Arc<dyn EventCallback>,
         from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        // Wrap the channel-based interface
-        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
-
-        let sender = InstructionSender::new(callback);
-        let sender_arc = Arc::new(sender);
-
-        // Spawn task to forward channel messages to event callback (zero-copy)
-        let sender_clone = Arc::clone(&sender_arc);
-        tokio::spawn(async move {
-            while let Some(msg) = handler_rx.recv().await {
-                sender_clone.send(msg); // Zero-copy: Bytes is reference-counted
-            }
-        });
-
-        // Call the existing channel-based connect method
-        self.connect(params, to_client, from_client).await?;
-
-        Ok(())
+        guacr_handlers::connect_with_event_adapter(
+            |params, to_client, from_client| self.connect(params, to_client, from_client),
+            params,
+            callback,
+            from_client,
+            4096, // channel capacity
+        )
+        .await
     }
 }
 

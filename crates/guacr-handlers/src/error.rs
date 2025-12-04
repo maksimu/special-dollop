@@ -31,6 +31,9 @@ pub enum HandlerError {
 
     #[error("Security violation: {0}")]
     SecurityViolation(String),
+
+    #[error("Disconnected: {0}")]
+    Disconnected(String),
 }
 
 pub type Result<T> = std::result::Result<T, HandlerError>;

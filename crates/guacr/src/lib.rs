@@ -32,6 +32,9 @@
 //! let handler = registry.get("ssh").expect("SSH handler not found");
 //! ```
 
+// Re-export async_trait for implementing EventCallback
+pub use async_trait::async_trait;
+
 // Re-export core handler traits and registry
 pub use guacr_handlers::{
     handle_guacd_with_handlers,

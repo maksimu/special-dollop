@@ -44,8 +44,10 @@ mod tests {
         use guacr_sftp::{SftpConfig, SftpHandler};
         use std::path::PathBuf;
 
-        let mut config = SftpConfig::default();
-        config.chroot_to_home = true;
+        let config = SftpConfig {
+            chroot_to_home: true,
+            ..Default::default()
+        };
         let handler = SftpHandler::new(config);
 
         // Create temporary directory structure for testing
@@ -81,8 +83,10 @@ mod tests {
         use guacr_sftp::{SftpConfig, SftpHandler};
         use std::path::PathBuf;
 
-        let mut config = SftpConfig::default();
-        config.chroot_to_home = true;
+        let config = SftpConfig {
+            chroot_to_home: true,
+            ..Default::default()
+        };
         let handler = SftpHandler::new(config);
 
         let temp_dir = std::env::temp_dir();
@@ -101,9 +105,8 @@ mod tests {
             let result = handler.test_validate_path(&path, &home);
             // Note: Some paths may not exist, so canonicalize might fail
             // But if they do resolve, they should be rejected
-            if result.is_ok() {
+            if let Ok(resolved) = result {
                 // If it resolved, verify it's still within home
-                let resolved = result.unwrap();
                 assert!(
                     resolved.starts_with(&home),
                     "Resolved path should be within home: {:?}",
@@ -117,8 +120,10 @@ mod tests {
     fn test_path_validation_with_chroot_disabled() {
         use guacr_sftp::{SftpConfig, SftpHandler};
 
-        let mut config = SftpConfig::default();
-        config.chroot_to_home = false; // Disable chroot
+        let config = SftpConfig {
+            chroot_to_home: false, // Disable chroot
+            ..Default::default()
+        };
         let handler = SftpHandler::new(config);
 
         let temp_dir = std::env::temp_dir();
@@ -138,8 +143,10 @@ mod tests {
     fn test_path_validation_nested_directories() {
         use guacr_sftp::{SftpConfig, SftpHandler};
 
-        let mut config = SftpConfig::default();
-        config.chroot_to_home = true;
+        let config = SftpConfig {
+            chroot_to_home: true,
+            ..Default::default()
+        };
         let handler = SftpHandler::new(config);
 
         let temp_dir = std::env::temp_dir();
@@ -158,8 +165,10 @@ mod tests {
     fn test_path_validation_symlink_traversal() {
         use guacr_sftp::{SftpConfig, SftpHandler};
 
-        let mut config = SftpConfig::default();
-        config.chroot_to_home = true;
+        let config = SftpConfig {
+            chroot_to_home: true,
+            ..Default::default()
+        };
         let handler = SftpHandler::new(config);
 
         let temp_dir = std::env::temp_dir();

@@ -20,7 +20,7 @@ serde_json.workspace = true
 reqwest = { version = "0.12", features = ["json"] }
 
 # Regex for tag matching
-regex = "1.11"
+regex = "1.12"
 
 # Utilities
 uuid.workspace = true

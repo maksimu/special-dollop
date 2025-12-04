@@ -8,7 +8,7 @@ description = "VNC protocol handler for guacr remote desktop"
 [dependencies]
 # Local dependencies
 guacr-handlers = { path = "../guacr-handlers" }
-guacr-rdp = { path = "../guacr-rdp" }  # Reuse framebuffer
+guacr-terminal = { path = "../guacr-terminal" }  # Reuse framebuffer
 
 # Workspace dependencies
 tokio.workspace = true

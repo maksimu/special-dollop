@@ -1,7 +1,13 @@
 // Browser client integration for RBI (Remote Browser Isolation)
-// Provides headless browser session management
+// Provides headless browser session management with proper input handling
 
+use crate::clipboard::RbiClipboard;
+use crate::cursor::format_standard_cursor;
+use crate::file_upload::{format_upload_dialog_instruction, UploadEngine};
+use crate::js_dialog::{JsDialogConfig, JsDialogManager};
+// Events module provides types used for more complex RBI scenarios
 use crate::handler::{RbiBackend, RbiConfig};
+use crate::input::{KeyboardShortcut, RbiInputHandler};
 use bytes::Bytes;
 use guacr_protocol::{BinaryEncoder, GuacamoleParser};
 use log::{debug, error, info, warn};
@@ -14,16 +20,38 @@ pub struct BrowserClient {
     width: u32,
     height: u32,
     config: RbiConfig,
+    input_handler: RbiInputHandler,
+    clipboard: RbiClipboard,
+    upload_engine: UploadEngine,
+    dialog_manager: JsDialogManager,
 }
 
 impl BrowserClient {
     /// Create a new browser client
     pub fn new(width: u32, height: u32, config: RbiConfig) -> Self {
+        let mut clipboard = RbiClipboard::new(config.clipboard_buffer_size);
+        clipboard.set_restrictions(config.disable_copy, config.disable_paste);
+
+        // Use upload config from RbiConfig
+        let upload_config = config.upload_config.clone();
+
+        // Setup dialog config
+        let dialog_config = JsDialogConfig {
+            show_dialogs: true,
+            auto_dismiss_alert_ms: Some(10000), // Auto-dismiss alerts after 10s
+            allow_beforeunload: false,          // Block beforeunload by default
+            ..Default::default()
+        };
+
         Self {
             binary_encoder: BinaryEncoder::new(),
             stream_id: 1,
             width,
             height,
+            input_handler: RbiInputHandler::new(),
+            clipboard,
+            upload_engine: UploadEngine::new(upload_config),
+            dialog_manager: JsDialogManager::new(dialog_config),
             config,
         }
     }
@@ -134,8 +162,6 @@ impl BrowserClient {
         // Setup download interception if enabled
         #[cfg(feature = "chrome")]
         if self.config.download_config.enabled {
-            // TODO: Setup CDP download event listener
-            // Listen for Page.downloadWillBegin events
             info!(
                 "RBI: Downloads enabled with config: max_size={}MB, allowed={:?}, blocked={:?}",
                 self.config.download_config.max_file_size_mb,
@@ -146,9 +172,37 @@ impl BrowserClient {
             info!("RBI: Downloads disabled (default for security)");
         }
 
+        // Install clipboard event listener (no Chrome patches needed)
+        if !self.config.disable_copy {
+            if let Err(e) = chrome_session.install_clipboard_listener().await {
+                warn!("RBI: Failed to install clipboard listener: {}", e);
+            }
+        }
+
+        // Install cursor tracker
+        if let Err(e) = chrome_session.install_cursor_tracker().await {
+            warn!("RBI: Failed to install cursor tracker: {}", e);
+        }
+
+        // Enable file chooser interception if uploads are enabled
+        if self.upload_engine.manager().is_enabled() {
+            if let Err(e) = chrome_session.enable_file_chooser_interception().await {
+                warn!("RBI: Failed to enable file chooser interception: {}", e);
+            } else {
+                info!("RBI: File upload support enabled");
+            }
+        }
+
         // Main event loop
         let mut capture_interval =
             interval(Duration::from_millis(1000 / self.config.capture_fps as u64));
+
+        // Clipboard polling interval (every 500ms)
+        let mut clipboard_interval = interval(Duration::from_millis(500));
+
+        // Resource monitoring interval (every 5 seconds)
+        let mut resource_interval = interval(Duration::from_secs(5));
+        let mut resource_check_count = 0u32;
 
         loop {
             tokio::select! {
@@ -170,19 +224,118 @@ impl BrowserClient {
                             warn!("RBI: Screenshot capture error: {}", e);
                         }
                     }
+                }
 
-                    // Check resource limits
+                // Resource monitoring (every 5 seconds)
+                _ = resource_interval.tick() => {
+                    resource_check_count = resource_check_count.wrapping_add(1);
+
+                    // Quick memory check
                     match chrome_session.check_resources(self.config.resource_limits.max_memory_mb).await {
                         Ok(false) => {
-                            error!("RBI: Resource limit exceeded");
+                            error!("RBI: Memory limit exceeded ({}MB max)", self.config.resource_limits.max_memory_mb);
                             break;
                         }
                         Err(e) => {
-                            warn!("RBI: Resource check error: {}", e);
+                            debug!("RBI: Resource check error: {}", e);
                         }
-                        Ok(true) => {
-                            // Resources OK
+                        Ok(true) => {}
+                    }
+
+                    // Detailed metrics every 30 seconds (6 checks)
+                    if resource_check_count % 6 == 0 {
+                        match chrome_session.get_performance_metrics().await {
+                            Ok(metrics) => {
+                                info!(
+                                    "RBI: Performance - heap={}MB, dom_nodes={}, resources={}",
+                                    metrics.js_heap_used_mb,
+                                    metrics.dom_node_count,
+                                    metrics.resource_count
+                                );
+
+                                if metrics.is_heavy_page() {
+                                    warn!(
+                                        "RBI: Heavy page detected - {} DOM nodes, {} resources",
+                                        metrics.dom_node_count,
+                                        metrics.resource_count
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                debug!("RBI: Performance metrics unavailable: {}", e);
+                            }
                         }
+                    }
+                }
+
+                // Poll for clipboard changes (browser → client)
+                _ = clipboard_interval.tick() => {
+                    if !self.config.disable_copy {
+                        match chrome_session.poll_clipboard().await {
+                            Ok(Some(text)) => {
+                                // Send clipboard to client
+                                if let Some(instr) = self.clipboard.handle_browser_clipboard(
+                                    text.as_bytes(), "text/plain"
+                                ).ok().flatten() {
+                                    if let Err(e) = to_client.send(instr).await {
+                                        warn!("RBI: Failed to send clipboard: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // No clipboard change
+                            }
+                            Err(e) => {
+                                debug!("RBI: Clipboard poll error: {}", e);
+                            }
+                        }
+                    }
+
+                    // Also poll for cursor changes
+                    match chrome_session.poll_cursor().await {
+                        Ok(Some(cursor_type)) => {
+                            // Send cursor instruction to client
+                            if let Some(cursor_instr) = format_standard_cursor(cursor_type) {
+                                if let Err(e) = to_client.send(Bytes::from(cursor_instr)).await {
+                                    warn!("RBI: Failed to send cursor: {}", e);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // No cursor change
+                        }
+                        Err(e) => {
+                            debug!("RBI: Cursor poll error: {}", e);
+                        }
+                    }
+
+                    // Poll for file chooser (upload) requests
+                    if self.upload_engine.manager().is_enabled() {
+                        match chrome_session.poll_file_chooser().await {
+                            Ok(Some(request)) => {
+                                info!("RBI: File chooser opened - multiple={}", request.multiple);
+                                // Send upload dialog request to client
+                                let instr = format_upload_dialog_instruction(&request);
+                                if let Err(e) = to_client.send(instr).await {
+                                    warn!("RBI: Failed to send upload dialog: {}", e);
+                                }
+                                // Track the pending request
+                                self.upload_engine.manager_mut().handle_dialog_request(
+                                    request.multiple,
+                                    request.accept,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug!("RBI: File chooser poll error: {}", e);
+                            }
+                        }
+                    }
+
+                    // Check for dialog timeouts
+                    if let Some(response) = self.dialog_manager.check_timeout() {
+                        debug!("RBI: Dialog timed out - id={}", response.id);
+                        // Dialog was auto-dismissed, no need to send anything
                     }
                 }
 
@@ -192,10 +345,6 @@ impl BrowserClient {
                         warn!("RBI: Error handling input: {}", e);
                     }
                 }
-
-                // Handle download requests (can be triggered manually or via CDP events)
-                // Note: Full CDP download event integration requires chromiumoxide API support
-                // For now, downloads can be triggered via custom protocol instructions
 
                 else => {
                     debug!("RBI: Connection closed");
@@ -208,7 +357,7 @@ impl BrowserClient {
         Ok(())
     }
 
-    /// Handle client input (keyboard, mouse, download)
+    /// Handle client input (keyboard, mouse, touch, navigation, clipboard)
     async fn handle_client_input(
         &mut self,
         chrome_session: &mut crate::chrome_session::ChromeSession,
@@ -224,50 +373,165 @@ impl BrowserClient {
                     if let (Ok(keysym), Ok(pressed)) =
                         (instr.args[0].parse::<u32>(), instr.args[1].parse::<u8>())
                     {
-                        chrome_session.inject_keyboard(keysym, pressed == 1).await?;
+                        let pressed = pressed == 1;
+
+                        // Use the new input handler for proper state tracking
+                        let _key_event = self.input_handler.handle_keyboard(keysym, pressed);
+
+                        // Check for keyboard shortcuts (Ctrl+C, Ctrl+V, etc.)
+                        if let Some(shortcut) = self.input_handler.check_shortcut(keysym, pressed) {
+                            match shortcut {
+                                KeyboardShortcut::Copy => {
+                                    info!("RBI: Copy shortcut detected");
+                                    // Browser handles copy internally
+                                }
+                                KeyboardShortcut::Paste => {
+                                    info!("RBI: Paste shortcut detected");
+                                    // Browser handles paste internally
+                                }
+                                KeyboardShortcut::Cut => {
+                                    info!("RBI: Cut shortcut detected");
+                                }
+                                KeyboardShortcut::SelectAll => {
+                                    info!("RBI: Select All shortcut detected");
+                                }
+                            }
+                            // Let the browser handle the shortcut
+                        }
+
+                        // Inject the key event into browser
+                        chrome_session.inject_keyboard(keysym, pressed).await?;
                     }
                 }
             }
             "mouse" => {
-                if instr.args.len() >= 4 {
-                    if let (Ok(mask), Ok(x), Ok(y), Ok(_buttons)) = (
-                        instr.args[0].parse::<u8>(),
+                if instr.args.len() >= 3 {
+                    if let (Ok(x), Ok(y), Ok(mask)) = (
+                        instr.args[0].parse::<i32>(),
                         instr.args[1].parse::<i32>(),
-                        instr.args[2].parse::<i32>(),
-                        instr.args[3].parse::<u8>(),
+                        instr.args[2].parse::<u32>(),
                     ) {
-                        // Extract button state from mask
-                        let left_pressed = (mask & 0x01) != 0;
-                        let middle_pressed = (mask & 0x02) != 0;
-                        let right_pressed = (mask & 0x04) != 0;
-
                         // Clamp coordinates
                         let x = x.max(0).min(self.width as i32 - 1);
                         let y = y.max(0).min(self.height as i32 - 1);
 
-                        // Send button events
-                        if left_pressed {
-                            chrome_session.inject_mouse(x, y, 0, true).await?;
+                        // Use the new input handler for proper button tracking
+                        let mouse_event = self.input_handler.handle_mouse(x, y, mask);
+
+                        // Handle button presses
+                        for button in &mouse_event.buttons_pressed {
+                            let button_num = match button {
+                                crate::input::MouseButton::Left => 0,
+                                crate::input::MouseButton::Middle => 1,
+                                crate::input::MouseButton::Right => 2,
+                            };
+                            chrome_session.inject_mouse(x, y, button_num, true).await?;
                         }
-                        if middle_pressed {
-                            chrome_session.inject_mouse(x, y, 1, true).await?;
+
+                        // Handle button releases
+                        for button in &mouse_event.buttons_released {
+                            let button_num = match button {
+                                crate::input::MouseButton::Left => 0,
+                                crate::input::MouseButton::Middle => 1,
+                                crate::input::MouseButton::Right => 2,
+                            };
+                            chrome_session.inject_mouse(x, y, button_num, false).await?;
                         }
-                        if right_pressed {
-                            chrome_session.inject_mouse(x, y, 2, true).await?;
+
+                        // Handle scroll
+                        if let Some(delta_y) = mouse_event.scroll_delta_y {
+                            chrome_session.inject_scroll(x, y, 0, delta_y).await?;
+                        }
+                    }
+                }
+            }
+            "touch" => {
+                // Touch event: touch,<id>,<x>,<y>,<radius_x>,<radius_y>,<angle>,<force>;
+                if instr.args.len() >= 7 {
+                    if let (
+                        Ok(id),
+                        Ok(x),
+                        Ok(y),
+                        Ok(radius_x),
+                        Ok(radius_y),
+                        Ok(angle),
+                        Ok(force),
+                    ) = (
+                        instr.args[0].parse::<i32>(),
+                        instr.args[1].parse::<i32>(),
+                        instr.args[2].parse::<i32>(),
+                        instr.args[3].parse::<i32>(),
+                        instr.args[4].parse::<i32>(),
+                        instr.args[5].parse::<f64>(),
+                        instr.args[6].parse::<f64>(),
+                    ) {
+                        if let Some(touch_event) = self
+                            .input_handler
+                            .handle_touch(id, x, y, radius_x, radius_y, angle, force)
+                        {
+                            chrome_session.inject_touch(&touch_event).await?;
                         }
                     }
                 }
             }
             "size" => {
-                if let Some(width_str) = instr.args.first() {
-                    if let Some(height_str) = instr.args.get(1) {
-                        if let (Ok(w), Ok(h)) =
-                            (width_str.parse::<u32>(), height_str.parse::<u32>())
+                if instr.args.len() >= 2 {
+                    if let (Ok(w), Ok(h)) =
+                        (instr.args[0].parse::<u32>(), instr.args[1].parse::<u32>())
+                    {
+                        info!("RBI: Resize requested: {}x{}", w, h);
+                        self.width = w;
+                        self.height = h;
+                        chrome_session.resize(w, h).await?;
+                    }
+                }
+            }
+            "clipboard" => {
+                // Clipboard instruction: clipboard,<mimetype>;
+                // Followed by blob instructions with data
+                if let Some(mimetype) = instr.args.first() {
+                    debug!("RBI: Clipboard stream started, mimetype: {}", mimetype);
+                    // Clipboard data will come in blob instructions
+                }
+            }
+            "blob" => {
+                // Blob instruction: blob,<stream_id>,<base64_data>;
+                if instr.args.len() >= 2 {
+                    let data = instr.args[1];
+                    use base64::Engine;
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        // Handle clipboard data
+                        if let Some(browser_data) = self
+                            .clipboard
+                            .handle_client_clipboard(&decoded, "text/plain")?
                         {
-                            info!("RBI: Resize requested: {}x{}", w, h);
-                            // TODO: Resize browser viewport via chromiumoxide
-                            // chrome_session.resize(w, h).await?;
+                            chrome_session.set_clipboard(&browser_data).await?;
                         }
+                    }
+                }
+            }
+            "navigate" => {
+                // Navigation: navigate,<position>;
+                // position: -1 = back, 0 = refresh, 1 = forward
+                if let Some(pos_str) = instr.args.first() {
+                    if let Ok(position) = pos_str.parse::<i32>() {
+                        if !self.config.allow_url_manipulation && position != 0 {
+                            warn!("RBI: URL manipulation disabled, blocking navigation");
+                        } else {
+                            chrome_session.navigate_history(position).await?;
+                        }
+                    }
+                }
+            }
+            "goto" => {
+                // Go to URL: goto,<url>;
+                if let Some(url) = instr.args.first() {
+                    if !self.config.allow_url_manipulation {
+                        warn!("RBI: URL manipulation disabled, blocking goto");
+                    } else if !self.is_url_allowed(url) {
+                        warn!("RBI: URL not in allowlist: {}", url);
+                    } else {
+                        chrome_session.navigate_to(url).await?;
                     }
                 }
             }
@@ -284,10 +548,136 @@ impl BrowserClient {
                     }
                 }
             }
-            _ => {}
+            "file" => {
+                // Start file upload: file,<stream_id>,<mimetype>,<filename>;
+                if instr.args.len() >= 3 {
+                    let stream_id = &instr.args[0];
+                    let mimetype = &instr.args[1];
+                    let filename = &instr.args[2];
+
+                    // Size will come from ack or be determined from blob data
+                    // For now, use 0 and track actual size from blobs
+                    match self
+                        .upload_engine
+                        .start_upload(stream_id, filename, mimetype, 0)
+                    {
+                        Ok(upload_id) => {
+                            info!("RBI: Upload started - id={}, file={}", upload_id, filename);
+                        }
+                        Err(e) => {
+                            warn!("RBI: Upload rejected: {}", e);
+                            // Send error ack
+                            let ack = format!(
+                                "3.ack,{}.{},6.UPLOAD,5.error;",
+                                stream_id.len(),
+                                stream_id
+                            );
+                            let _ = to_client.send(Bytes::from(ack)).await;
+                        }
+                    }
+                }
+            }
+            "upload-blob" => {
+                // Upload data chunk: upload-blob,<upload_id>,<base64_data>;
+                if instr.args.len() >= 2 {
+                    let upload_id = &instr.args[0];
+                    let data = instr.args[1];
+
+                    use base64::Engine;
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        match self.upload_engine.handle_chunk(upload_id, &decoded) {
+                            Ok(progress) => {
+                                debug!(
+                                    "RBI: Upload progress - id={}, {}%",
+                                    upload_id, progress as u32
+                                );
+                            }
+                            Err(e) => {
+                                warn!("RBI: Upload chunk error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            "upload-end" => {
+                // End file upload: upload-end,<upload_id>;
+                if let Some(upload_id) = instr.args.first() {
+                    match self.upload_engine.complete_upload(upload_id) {
+                        Ok((info, data)) => {
+                            info!(
+                                "RBI: Upload complete - file={}, size={}",
+                                info.filename,
+                                data.len()
+                            );
+
+                            // Submit file to browser
+                            let file_data =
+                                vec![(info.filename.clone(), info.mimetype.clone(), data)];
+                            if let Err(e) = chrome_session.submit_upload_files(&file_data).await {
+                                warn!("RBI: Failed to submit upload to browser: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("RBI: Upload completion error: {}", e);
+                        }
+                    }
+                }
+            }
+            "upload-cancel" => {
+                // Cancel file upload: upload-cancel,<upload_id>;
+                if let Some(upload_id) = instr.args.first() {
+                    if let Err(e) = self.upload_engine.cancel_upload(upload_id) {
+                        warn!("RBI: Upload cancel error: {}", e);
+                    } else {
+                        info!("RBI: Upload cancelled - id={}", upload_id);
+                    }
+                }
+            }
+            "dialog-response" => {
+                // Response to JS dialog: dialog-response,<id>,<confirmed>,<input>;
+                if instr.args.len() >= 2 {
+                    let id = instr.args[0].to_string();
+                    let confirmed = instr.args[1] == "1" || instr.args[1] == "true";
+                    let input = instr.args.get(2).map(|s| s.to_string());
+
+                    let response = crate::js_dialog::JsDialogResponse {
+                        id,
+                        confirmed,
+                        input,
+                    };
+
+                    if let Err(e) = self.dialog_manager.handle_response(response) {
+                        warn!("RBI: Dialog response error: {}", e);
+                    }
+                }
+            }
+            _ => {
+                debug!("RBI: Unknown instruction: {}", instr.opcode);
+            }
         }
 
         Ok(())
+    }
+
+    /// Check if URL is allowed by patterns
+    fn is_url_allowed(&self, url: &str) -> bool {
+        if self.config.allowed_url_patterns.is_empty() {
+            return true; // No restrictions
+        }
+
+        for pattern in &self.config.allowed_url_patterns {
+            if pattern.starts_with('*') {
+                // Wildcard pattern
+                let suffix = &pattern[1..];
+                if url.contains(suffix) {
+                    return true;
+                }
+            } else if url.contains(pattern) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Check if URL is compatible with Servo

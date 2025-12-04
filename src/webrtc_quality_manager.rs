@@ -1,9 +1,10 @@
 use crate::unlikely;
 use crate::webrtc_errors::WebRTCResult;
 use log::{debug, info, warn};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::time::interval;
@@ -187,7 +188,7 @@ impl BandwidthEstimator {
     /// Update bandwidth estimate based on new measurements
     pub fn update_estimate(&mut self, stats: &WebRTCStats, metrics: &NetworkQualityMetrics) {
         let now = Instant::now();
-        let mut last_update = self.last_update.lock().unwrap();
+        let mut last_update = self.last_update.lock();
 
         if now.duration_since(*last_update) < Duration::from_millis(100) {
             return; // Too frequent updates
@@ -339,7 +340,7 @@ impl BitrateController {
         bandwidth_estimate_bps: u64,
     ) -> bool {
         let now = Instant::now();
-        let mut last_adjustment = self.last_adjustment.lock().unwrap();
+        let mut last_adjustment = self.last_adjustment.lock();
 
         // Rate limit adjustments
         if now.duration_since(*last_adjustment) < Duration::from_millis(500) {
@@ -372,7 +373,7 @@ impl BitrateController {
             ),
         };
 
-        let mut history = self.adjustment_history.lock().unwrap();
+        let mut history = self.adjustment_history.lock();
         history.push_back(adjustment);
         if history.len() > 50 {
             history.pop_front();
@@ -423,7 +424,7 @@ impl BitrateController {
 
     #[allow(dead_code)]
     pub fn get_adjustment_history(&self) -> Vec<BitrateAdjustment> {
-        self.adjustment_history.lock().unwrap().clone().into()
+        self.adjustment_history.lock().clone().into()
     }
 }
 
@@ -455,9 +456,9 @@ impl CongestionDetector {
 
     /// Update congestion detection with new metrics
     pub fn update(&self, metrics: &NetworkQualityMetrics) {
-        let mut rtt_samples = self.rtt_samples.lock().unwrap();
-        let mut loss_samples = self.loss_samples.lock().unwrap();
-        let mut jitter_samples = self.jitter_samples.lock().unwrap();
+        let mut rtt_samples = self.rtt_samples.lock();
+        let mut loss_samples = self.loss_samples.lock();
+        let mut jitter_samples = self.jitter_samples.lock();
 
         // Add new samples
         rtt_samples.push_back(metrics.rtt_ms);
@@ -478,9 +479,9 @@ impl CongestionDetector {
 
     /// Detect congestion based on trend analysis
     pub fn detect_congestion(&self) -> CongestionLevel {
-        let rtt_samples = self.rtt_samples.lock().unwrap();
-        let loss_samples = self.loss_samples.lock().unwrap();
-        let jitter_samples = self.jitter_samples.lock().unwrap();
+        let rtt_samples = self.rtt_samples.lock();
+        let loss_samples = self.loss_samples.lock();
+        let jitter_samples = self.jitter_samples.lock();
 
         if rtt_samples.len() < 3 || loss_samples.len() < 3 || jitter_samples.len() < 3 {
             return CongestionLevel::Low; // Not enough data
@@ -597,7 +598,7 @@ impl QoSManager {
     }
 
     fn set_default_priorities(&mut self) {
-        let mut priorities = self.channel_priorities.write().unwrap();
+        let mut priorities = self.channel_priorities.write();
         priorities.insert("control".to_string(), 10); // Highest priority for control
         priorities.insert("data".to_string(), 5); // Medium priority for data
         priorities.insert("video".to_string(), 3); // Lower priority for video
@@ -606,7 +607,7 @@ impl QoSManager {
 
     /// Set priority for a channel
     pub async fn set_channel_priority(&self, channel: String, priority: u8) {
-        let mut priorities = self.channel_priorities.write().unwrap();
+        let mut priorities = self.channel_priorities.write();
         priorities.insert(channel.clone(), priority);
         self.qos_stats
             .priority_adjustments
@@ -616,14 +617,14 @@ impl QoSManager {
 
     /// Get priority for a channel
     pub fn get_channel_priority(&self, channel: &str) -> u8 {
-        let priorities = self.channel_priorities.read().unwrap();
+        let priorities = self.channel_priorities.read();
         priorities.get(channel).copied().unwrap_or(1) // Default priority: 1
     }
 
     /// Add traffic shaping rule
     #[allow(dead_code)]
     pub async fn add_shaping_rule(&self, rule: TrafficShapingRule) {
-        let mut rules = self.shaping_rules.write().unwrap();
+        let mut rules = self.shaping_rules.write();
         rules.push(rule.clone());
         debug!(
             "Added traffic shaping rule for pattern: {}",
@@ -634,7 +635,7 @@ impl QoSManager {
     /// Apply QoS to data transmission
     pub fn apply_qos(&self, channel: &str, data_size: usize) -> QoSDecision {
         let priority = self.get_channel_priority(channel);
-        let rules = self.shaping_rules.read().unwrap();
+        let rules = self.shaping_rules.read();
 
         // Find matching rule
         let matching_rule = rules
@@ -710,7 +711,8 @@ pub struct AdaptiveQualityManager {
     qos_manager: Arc<QoSManager>,
     current_metrics: Arc<TokioRwLock<NetworkQualityMetrics>>,
     stats_history: Arc<Mutex<VecDeque<WebRTCStats>>>,
-    monitoring_active: Arc<Mutex<bool>>,
+    /// Lock-free monitoring flag - replaces Mutex<bool>
+    monitoring_active: Arc<AtomicBool>,
     config: QualityManagerConfig,
     monitoring_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -763,7 +765,7 @@ impl AdaptiveQualityManager {
             stats_history: Arc::new(Mutex::new(VecDeque::with_capacity(
                 config.max_history_samples,
             ))),
-            monitoring_active: Arc::new(Mutex::new(false)),
+            monitoring_active: Arc::new(AtomicBool::new(false)),
             config,
             monitoring_task: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -771,12 +773,9 @@ impl AdaptiveQualityManager {
 
     /// Start adaptive quality monitoring
     pub async fn start_monitoring(&self) -> WebRTCResult<()> {
-        {
-            let mut active = self.monitoring_active.lock().unwrap();
-            if *active {
-                return Ok(()); // Already monitoring
-            }
-            *active = true;
+        // Atomic swap - if already true, return early
+        if self.monitoring_active.swap(true, Ordering::AcqRel) {
+            return Ok(()); // Already monitoring
         }
 
         debug!(
@@ -799,10 +798,8 @@ impl AdaptiveQualityManager {
 
     /// Stop quality monitoring
     pub fn stop_monitoring(&self) {
-        // Step 1: Set flag - task will exit on next interval tick (1 second max)
-        let mut active = self.monitoring_active.lock().unwrap();
-        *active = false;
-        drop(active); // Release lock before try_lock
+        // Step 1: Set flag atomically - task will exit on next interval tick (1 second max)
+        self.monitoring_active.store(false, Ordering::Release);
 
         // Step 2: Best-effort immediate abort (non-blocking)
         // If lock is held, task will exit via flag check anyway
@@ -825,7 +822,7 @@ impl AdaptiveQualityManager {
     pub async fn update_stats(&self, stats: WebRTCStats) -> WebRTCResult<()> {
         // Add to history
         {
-            let mut history = self.stats_history.lock().unwrap();
+            let mut history = self.stats_history.lock();
             history.push_back(stats.clone());
             if history.len() > self.config.max_history_samples {
                 history.pop_front();
@@ -837,14 +834,14 @@ impl AdaptiveQualityManager {
 
         // Update components
         {
-            let mut bandwidth_estimator = self.bandwidth_estimator.lock().unwrap();
+            let mut bandwidth_estimator = self.bandwidth_estimator.lock();
             bandwidth_estimator.update_estimate(&stats, &metrics);
         }
 
         self.congestion_detector.update(&metrics);
 
         let bandwidth_estimate = {
-            let bandwidth_estimator = self.bandwidth_estimator.lock().unwrap();
+            let bandwidth_estimator = self.bandwidth_estimator.lock();
             bandwidth_estimator.get_estimate_bps()
         };
 
@@ -946,10 +943,8 @@ impl AdaptiveQualityManager {
     async fn monitoring_loop(&self) {
         let mut interval = interval(self.config.stats_collection_interval);
 
-        while {
-            let active = self.monitoring_active.lock().unwrap();
-            *active
-        } {
+        // Lock-free check
+        while self.monitoring_active.load(Ordering::Acquire) {
             interval.tick().await;
 
             // Perform periodic quality assessment and adjustment
@@ -1031,7 +1026,7 @@ impl AdaptiveQualityManager {
 
     /// Get bandwidth estimate
     pub fn get_bandwidth_estimate_bps(&self) -> u64 {
-        let estimator = self.bandwidth_estimator.lock().unwrap();
+        let estimator = self.bandwidth_estimator.lock();
         estimator.get_estimate_bps()
     }
 
@@ -1050,12 +1045,12 @@ impl AdaptiveQualityManager {
     /// Get quality management statistics
     pub fn get_statistics(&self) -> QualityManagerStatistics {
         let bandwidth_estimate = {
-            let estimator = self.bandwidth_estimator.lock().unwrap();
+            let estimator = self.bandwidth_estimator.lock();
             estimator.get_estimate_bps()
         };
 
         let history_size = {
-            let history = self.stats_history.lock().unwrap();
+            let history = self.stats_history.lock();
             history.len()
         };
 

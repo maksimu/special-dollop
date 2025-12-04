@@ -15,4 +15,3 @@ pub use core::Channel;
 pub(crate) mod guacd_parser;
 pub(crate) mod protocol;
 pub(crate) mod socks5;
-pub(crate) mod udp;

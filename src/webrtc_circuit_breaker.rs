@@ -4,10 +4,12 @@
 //! This module implements error-type specific thresholds and adaptive timeouts
 //! to handle different failure scenarios appropriately.
 
+use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -127,9 +129,9 @@ struct CircuitMetrics {
     circuit_closes: AtomicUsize,
     timeouts: AtomicUsize,
 
-    // Error-type specific metrics
-    error_type_counts: Arc<Mutex<HashMap<String, u32>>>,
-    error_type_triggered_opens: Arc<Mutex<HashMap<String, u32>>>,
+    // Error-type specific metrics - DashMap for lock-free access
+    error_type_counts: Arc<DashMap<String, u32>>,
+    error_type_triggered_opens: Arc<DashMap<String, u32>>,
 }
 
 impl Default for CircuitMetrics {
@@ -141,8 +143,8 @@ impl Default for CircuitMetrics {
             circuit_opens: AtomicUsize::new(0),
             circuit_closes: AtomicUsize::new(0),
             timeouts: AtomicUsize::new(0),
-            error_type_counts: Arc::new(Mutex::new(HashMap::new())),
-            error_type_triggered_opens: Arc::new(Mutex::new(HashMap::new())),
+            error_type_counts: Arc::new(DashMap::new()),
+            error_type_triggered_opens: Arc::new(DashMap::new()),
         }
     }
 }
@@ -226,7 +228,7 @@ impl TubeCircuitBreaker {
 
         // FAST PATH: Check circuit state (optimized for closed state)
         let can_execute = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             match &mut *state {
                 CircuitState::Closed { .. } => true, // Fast path - most common case
 
@@ -264,7 +266,7 @@ impl TubeCircuitBreaker {
         };
 
         if !can_execute {
-            let error = match &*self.state.lock().unwrap() {
+            let error = match &*self.state.lock() {
                 CircuitState::Open { .. } => CircuitError::CircuitOpen,
                 CircuitState::HalfOpen { .. } => CircuitError::TooManyTestRequests,
                 _ => CircuitError::CircuitOpen,
@@ -298,7 +300,7 @@ impl TubeCircuitBreaker {
             .successful_requests
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         match &mut *state {
             CircuitState::Closed {
                 failure_count,
@@ -346,13 +348,14 @@ impl TubeCircuitBreaker {
     pub fn record_failure_with_type(&self, error: &str, error_type: &str) {
         self.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
 
-        // Update error type metrics
-        {
-            let mut error_counts = self.metrics.error_type_counts.lock().unwrap();
-            *error_counts.entry(error_type.to_string()).or_insert(0) += 1;
-        }
+        // Update error type metrics (DashMap - no lock needed)
+        self.metrics
+            .error_type_counts
+            .entry(error_type.to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let (should_open, trigger_error_type) = match &mut *state {
             CircuitState::Closed {
                 failure_count,
@@ -429,11 +432,12 @@ impl TubeCircuitBreaker {
 
             self.metrics.circuit_opens.fetch_add(1, Ordering::Relaxed);
 
-            // Track which error type triggered the opening
-            {
-                let mut triggered_opens = self.metrics.error_type_triggered_opens.lock().unwrap();
-                *triggered_opens.entry(trigger_error_type).or_insert(0) += 1;
-            }
+            // Track which error type triggered the opening (DashMap - no lock needed)
+            self.metrics
+                .error_type_triggered_opens
+                .entry(trigger_error_type)
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
         }
     }
 
@@ -463,7 +467,7 @@ impl TubeCircuitBreaker {
 
     /// Get current circuit state
     pub fn get_state(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         match &*state {
             CircuitState::Closed { failure_count, .. } => {
                 format!("Closed (failures: {})", failure_count)
@@ -513,20 +517,26 @@ impl TubeCircuitBreaker {
 
     /// Get error-type specific metrics
     pub fn get_error_type_metrics(&self) -> (HashMap<String, u32>, HashMap<String, u32>) {
-        let error_counts = self.metrics.error_type_counts.lock().unwrap().clone();
-        let triggered_opens = self
+        // DashMap - collect to HashMap
+        let error_counts: HashMap<String, u32> = self
+            .metrics
+            .error_type_counts
+            .iter()
+            .map(|r| (r.key().clone(), *r.value()))
+            .collect();
+        let triggered_opens: HashMap<String, u32> = self
             .metrics
             .error_type_triggered_opens
-            .lock()
-            .unwrap()
-            .clone();
+            .iter()
+            .map(|r| (r.key().clone(), *r.value()))
+            .collect();
         (error_counts, triggered_opens)
     }
 
     /// Get comprehensive circuit breaker statistics
     pub fn get_comprehensive_stats(&self) -> CircuitBreakerStats {
         let (error_counts, triggered_opens) = self.get_error_type_metrics();
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
 
         let (current_state, error_type_failures) = match &*state {
             CircuitState::Closed {
@@ -585,7 +595,7 @@ impl TubeCircuitBreaker {
     /// Force reset the circuit breaker (for manual recovery)
     pub fn force_reset(&self) {
         info!("Force resetting circuit breaker for tube {}", self.tube_id);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         *state = CircuitState::Closed {
             failure_count: 0,
             last_failure: None,
@@ -596,6 +606,6 @@ impl TubeCircuitBreaker {
 
     /// Check if circuit is healthy (closed)
     pub fn is_healthy(&self) -> bool {
-        matches!(*self.state.lock().unwrap(), CircuitState::Closed { .. })
+        matches!(*self.state.lock(), CircuitState::Closed { .. })
     }
 }

@@ -2,10 +2,31 @@ use crate::resource_manager::{IceAgentGuard, ResourceError, RESOURCE_MANAGER};
 use crate::tube_registry::SignalMessage;
 use crate::webrtc_circuit_breaker::TubeCircuitBreaker;
 use crate::webrtc_errors::{WebRTCError, WebRTCResult};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Monotonic epoch for lock-free timestamps (program start time)
+/// Using Instant ensures monotonic guarantees - time never goes backwards
+static MONOTONIC_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
+
+/// Get current time as milliseconds since monotonic epoch (for lock-free timestamps)
+/// CRITICAL: Uses Instant (monotonic) not SystemTime (wall-clock) to prevent
+/// time going backwards due to NTP adjustments or system clock changes
+#[inline]
+fn now_millis() -> u64 {
+    MONOTONIC_EPOCH.elapsed().as_millis() as u64
+}
+
+/// Calculate elapsed duration from a stored millisecond timestamp (since monotonic epoch)
+/// CRITICAL: Timestamps are relative to MONOTONIC_EPOCH, which is guaranteed monotonic
+#[inline]
+fn elapsed_from_millis(stored_millis: u64) -> Duration {
+    let now = now_millis();
+    Duration::from_millis(now.saturating_sub(stored_millis))
+}
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 // Removed unused imports - simplified API setup fixed the data channel issue
 
@@ -321,7 +342,8 @@ struct IceCandidateHandlerContext {
     conversation_id: Option<String>,
     pending_candidates: Arc<Mutex<Vec<String>>>,
     peer_connection: Arc<RTCPeerConnection>,
-    ice_gathering_start_time: Arc<Mutex<Option<Instant>>>,
+    /// Lock-free ICE gathering start timestamp (0 = not started, else millis since monotonic epoch)
+    ice_gathering_start_millis: Arc<AtomicU64>,
     ice_candidate_count: Arc<AtomicUsize>,
 }
 
@@ -334,7 +356,7 @@ impl IceCandidateHandlerContext {
             conversation_id: peer_connection.conversation_id.clone(),
             pending_candidates: Arc::clone(&peer_connection.pending_incoming_ice_candidates),
             peer_connection: Arc::clone(&peer_connection.peer_connection),
-            ice_gathering_start_time: Arc::clone(&peer_connection.ice_gathering_start_time),
+            ice_gathering_start_millis: Arc::clone(&peer_connection.ice_gathering_start_millis),
             ice_candidate_count: Arc::clone(&peer_connection.ice_candidate_count),
         }
     }
@@ -375,7 +397,8 @@ pub struct WebRTCPeerConnection {
     // Keepalive infrastructure for session timeout prevention
     keepalive_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     keepalive_interval: Duration,
-    last_activity: Arc<Mutex<Instant>>,
+    /// Lock-free timestamp of last activity (millis since monotonic epoch - program start)
+    last_activity_millis: Arc<AtomicU64>,
     keepalive_enabled: Arc<AtomicBool>,
 
     // Stats collection task for quality monitoring
@@ -395,11 +418,13 @@ pub struct WebRTCPeerConnection {
     ksm_config: Option<String>, // For fetching fresh credentials
     client_version: String,     // For API calls
 
-    // ICE gathering timing for minimum duration enforcement
-    ice_gathering_start_time: Arc<Mutex<Option<Instant>>>,
+    // ICE gathering timing for minimum duration enforcement (lock-free)
+    /// Lock-free ICE gathering start timestamp (0 = not started, else millis since monotonic epoch)
+    ice_gathering_start_millis: Arc<AtomicU64>,
     ice_candidate_count: Arc<AtomicUsize>,
     remote_candidate_count: Arc<AtomicUsize>,
-    remote_candidate_receive_start: Arc<Mutex<Option<Instant>>>,
+    /// Lock-free remote candidate receive start timestamp (0 = not started, else millis since monotonic epoch)
+    remote_candidate_receive_start_millis: Arc<AtomicU64>,
 
     // Consolidated state to prevent deadlocks
     activity_state: Arc<Mutex<ActivityState>>,
@@ -601,7 +626,7 @@ impl WebRTCPeerConnection {
             // Initialize keepalive infrastructure
             keepalive_task: Arc::new(Mutex::new(None)),
             keepalive_interval: limits.ice_keepalive_interval,
-            last_activity: Arc::new(Mutex::new(now)),
+            last_activity_millis: Arc::new(AtomicU64::new(now_millis())),
             keepalive_enabled: Arc::new(AtomicBool::new(false)),
 
             // Stats collection task for quality monitoring
@@ -620,11 +645,11 @@ impl WebRTCPeerConnection {
             ksm_config,
             client_version,
 
-            // Initialize ICE gathering timing
-            ice_gathering_start_time: Arc::new(Mutex::new(None)),
+            // Initialize ICE gathering timing (lock-free, 0 = not started)
+            ice_gathering_start_millis: Arc::new(AtomicU64::new(0)),
             ice_candidate_count: Arc::new(AtomicUsize::new(0)),
             remote_candidate_count: Arc::new(AtomicUsize::new(0)),
-            remote_candidate_receive_start: Arc::new(Mutex::new(None)),
+            remote_candidate_receive_start_millis: Arc::new(AtomicU64::new(0)),
 
             // Consolidated state to prevent deadlocks
             activity_state: Arc::new(Mutex::new(ActivityState::new(now))),
@@ -673,7 +698,7 @@ impl WebRTCPeerConnection {
                     debug!("Remote description set after signaling state change, flushing buffered INCOMING ICE candidates (tube_id: {})", context_clone.tube_id);
                     // Flush pending candidates manually (no self reference)
                     let candidates_to_flush = {
-                        let mut lock = context_clone.pending_candidates.lock().unwrap();
+                        let mut lock = context_clone.pending_candidates.lock();
                         std::mem::take(&mut *lock)
                     };
                     if !candidates_to_flush.is_empty() {
@@ -709,22 +734,21 @@ impl WebRTCPeerConnection {
 
             Box::pin(async move {
                 if let Some(c) = candidate {
-                    // Record gathering start time on first candidate
-                    {
-                        let mut start_time = context_handler.ice_gathering_start_time.lock().unwrap();
-                        if start_time.is_none() {
-                            *start_time = Some(Instant::now());
+                    // Record gathering start time on first candidate (lock-free compare-and-swap)
+                    let current = context_handler.ice_gathering_start_millis.load(Ordering::Acquire);
+                    if current == 0 {
+                        let now_ms = now_millis();
+                        // Only set if still 0 (first candidate wins)
+                        if context_handler.ice_gathering_start_millis.compare_exchange(
+                            0, now_ms, Ordering::AcqRel, Ordering::Acquire
+                        ).is_ok() {
                             debug!("ICE gathering started (tube_id: {})", context_handler.tube_id);
 
                             // Record metrics for ICE gathering start
                             if let Some(conversation_id) = &context_handler.conversation_id {
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis() as f64;
                                 crate::metrics::METRICS_COLLECTOR.update_ice_gathering_start(
                                     conversation_id,
-                                    now_ms
+                                    now_ms as f64
                                 );
                             }
                         }
@@ -761,8 +785,9 @@ impl WebRTCPeerConnection {
                     const MIN_GATHERING_DURATION_SECS: u64 = 6; // 6 seconds for TURN (2-5s) + signaling latency (3-5s)
 
                     let should_delay = if context_handler.trickle_ice {
-                        if let Some(start_time) = *context_handler.ice_gathering_start_time.lock().unwrap() {
-                            let elapsed = start_time.elapsed().as_secs();
+                        let start_millis = context_handler.ice_gathering_start_millis.load(Ordering::Acquire);
+                        if start_millis > 0 {
+                            let elapsed = elapsed_from_millis(start_millis).as_secs();
                             if elapsed < MIN_GATHERING_DURATION_SECS {
                                 let delay_needed = MIN_GATHERING_DURATION_SECS - elapsed;
                                 debug!(
@@ -787,9 +812,12 @@ impl WebRTCPeerConnection {
                     }
 
                     let final_count = context_handler.ice_candidate_count.load(Ordering::Relaxed);
-                    let gathering_duration = context_handler.ice_gathering_start_time.lock().unwrap()
-                        .map(|start| start.elapsed().as_secs_f64())
-                        .unwrap_or(0.0);
+                    let start_millis = context_handler.ice_gathering_start_millis.load(Ordering::Acquire);
+                    let gathering_duration = if start_millis > 0 {
+                        elapsed_from_millis(start_millis).as_secs_f64()
+                    } else {
+                        0.0
+                    };
 
                     debug!(
                         "ICE gathering complete (tube_id: {}, total_candidates: {}, duration: {:.1}s)",
@@ -798,10 +826,7 @@ impl WebRTCPeerConnection {
 
                     // Record metrics for ICE gathering complete
                     if let Some(conversation_id) = &context_handler.conversation_id {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as f64;
+                        let now_ms = now_millis() as f64;
                         crate::metrics::METRICS_COLLECTOR.update_ice_gathering_complete(
                             conversation_id,
                             now_ms
@@ -835,7 +860,7 @@ impl WebRTCPeerConnection {
 
         // Take the buffered candidates with a single lock operation
         let pending_candidates = {
-            let mut lock = self.pending_incoming_ice_candidates.lock().unwrap();
+            let mut lock = self.pending_incoming_ice_candidates.lock();
             std::mem::take(&mut *lock)
         };
 
@@ -1325,7 +1350,7 @@ impl WebRTCPeerConnection {
                 Box::pin(async move {
                     debug!("ICE gathering state changed (non-trickle {}) (tube_id: {}, new_state: {:?})", sdp_type_log, tube_id_log, state);
                     if state == RTCIceGathererState::Complete {
-                        if let Some(sender) = tx_for_handler.lock().unwrap().take() { // Use the Arc<Mutex<Option<Sender>>>
+                        if let Some(sender) = tx_for_handler.lock().take() { // Use the Arc<Mutex<Option<Sender>>>
                             let _ = sender.send(());
                         }
                         // Clear the handler after completion by setting a no-op one.
@@ -1559,11 +1584,17 @@ impl WebRTCPeerConnection {
         if can_add_immediately {
             // Connection is ready, add the candidate immediately
             if !candidate_str.is_empty() {
-                // Track remote candidate receipt timing and count
-                {
-                    let mut start_time = self.remote_candidate_receive_start.lock().unwrap();
-                    if start_time.is_none() {
-                        *start_time = Some(Instant::now());
+                // Track remote candidate receipt timing and count (lock-free)
+                let current = self
+                    .remote_candidate_receive_start_millis
+                    .load(Ordering::Acquire);
+                if current == 0 {
+                    let now_ms = now_millis();
+                    if self
+                        .remote_candidate_receive_start_millis
+                        .compare_exchange(0, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
                         debug!(
                             "Started receiving remote ICE candidates (tube_id: {})",
                             self.tube_id
@@ -1578,17 +1609,19 @@ impl WebRTCPeerConnection {
                     // Start a background task to check candidate count after 15 seconds
                     let tube_id = self.tube_id.clone();
                     let remote_count_check = Arc::clone(&self.remote_candidate_count);
-                    let start_time_check = Arc::clone(&self.remote_candidate_receive_start);
+                    let start_time_millis_check =
+                        Arc::clone(&self.remote_candidate_receive_start_millis);
 
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(15)).await;
                         let final_count = remote_count_check.load(Ordering::Relaxed);
                         if final_count < 3 {
-                            let elapsed = start_time_check
-                                .lock()
-                                .unwrap()
-                                .map(|start| start.elapsed().as_secs())
-                                .unwrap_or(0);
+                            let start_millis = start_time_millis_check.load(Ordering::Acquire);
+                            let elapsed = if start_millis > 0 {
+                                elapsed_from_millis(start_millis).as_secs()
+                            } else {
+                                0
+                            };
                             warn!(
                                 "[LOW_CANDIDATE_COUNT] Received only {} remote candidates after {}s (tube_id: {}) - connection may fail",
                                 final_count, elapsed, tube_id
@@ -1655,12 +1688,14 @@ impl WebRTCPeerConnection {
             } else {
                 // Empty candidate string means end-of-candidates, which is valid
                 let final_remote_count = self.remote_candidate_count.load(Ordering::Relaxed);
-                let receive_duration = self
-                    .remote_candidate_receive_start
-                    .lock()
-                    .unwrap()
-                    .map(|start| start.elapsed().as_secs_f64())
-                    .unwrap_or(0.0);
+                let start_millis = self
+                    .remote_candidate_receive_start_millis
+                    .load(Ordering::Acquire);
+                let receive_duration = if start_millis > 0 {
+                    elapsed_from_millis(start_millis).as_secs_f64()
+                } else {
+                    0.0
+                };
 
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!(
@@ -1681,7 +1716,7 @@ impl WebRTCPeerConnection {
             }
         } else {
             // Connection is not ready yet, buffer the incoming candidate
-            let mut candidates_lock = self.pending_incoming_ice_candidates.lock().unwrap();
+            let mut candidates_lock = self.pending_incoming_ice_candidates.lock();
             candidates_lock.push(candidate_str.clone());
             let buffered_count = candidates_lock.len();
             drop(candidates_lock);
@@ -1873,7 +1908,8 @@ impl WebRTCPeerConnection {
         self.quality_manager.stop_monitoring();
 
         // Stop stats collection task
-        if let Ok(mut task_guard) = self.stats_collection_task.lock() {
+        {
+            let mut task_guard = self.stats_collection_task.lock();
             if let Some(handle) = task_guard.take() {
                 handle.abort();
                 info!(
@@ -2280,11 +2316,10 @@ impl WebRTCPeerConnection {
             debug!("Stats collection task finished (tube_id: {})", tube_id);
         });
 
-        if let Ok(mut task_guard) = self.stats_collection_task.lock() {
+        {
+            let mut task_guard = self.stats_collection_task.lock();
             *task_guard = Some(stats_task_handle);
             debug!("Started stats collection task (tube_id: {})", self.tube_id);
-        } else {
-            return Err("Failed to acquire stats task lock".to_string());
         }
 
         Ok(())
@@ -2327,16 +2362,13 @@ impl WebRTCPeerConnection {
         // CRITICAL: Explicitly drop the ICE agent guard to ensure resource cleanup
         // This breaks any circular references that might prevent the guard from being dropped
         {
-            match self._ice_agent_guard.lock() {
-                Ok(mut guard_lock) => {
-                    if let Some(guard) = guard_lock.take() {
-                        info!("Explicitly dropping ICE agent guard to ensure resource cleanup (tube_id: {})", self.tube_id);
-                        drop(guard);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to acquire ICE agent guard lock during cleanup - proceeding anyway (tube_id: {}, error: {})", self.tube_id, e);
-                }
+            let mut guard_lock = self._ice_agent_guard.lock();
+            if let Some(guard) = guard_lock.take() {
+                info!(
+                    "Explicitly dropping ICE agent guard to ensure resource cleanup (tube_id: {})",
+                    self.tube_id
+                );
+                drop(guard);
             }
         }
 
@@ -2409,7 +2441,7 @@ impl WebRTCPeerConnection {
     pub fn get_ice_candidates(&self) -> Vec<String> {
         // NOTE: Outgoing candidates are sent immediately (no buffering)
         // This returns currently buffered incoming candidates
-        let candidates = self.pending_incoming_ice_candidates.lock().unwrap();
+        let candidates = self.pending_incoming_ice_candidates.lock();
         candidates.clone()
     }
 
@@ -2477,13 +2509,12 @@ impl WebRTCPeerConnection {
         });
 
         // Store the task handle
-        if let Ok(mut task_guard) = self.keepalive_task.lock() {
+        {
+            let mut task_guard = self.keepalive_task.lock();
             if let Some(old_task) = task_guard.take() {
                 old_task.abort(); // Clean up any existing task
             }
             *task_guard = Some(keepalive_task_handle);
-        } else {
-            return Err("Failed to acquire keepalive task lock".to_string());
         }
 
         debug!("NAT timeout prevention started - integrated with existing channel ping system (tube_id: {})", self.tube_id);
@@ -2495,7 +2526,8 @@ impl WebRTCPeerConnection {
         let now = Instant::now();
 
         // Update both activity timestamps in a single lock acquisition (deadlock-safe)
-        if let Ok(mut activity_state) = self.activity_state.lock() {
+        {
+            let mut activity_state = self.activity_state.lock();
             activity_state.update_both(now);
             // HOT PATH: Activity update happens
             if unlikely!(crate::logger::is_verbose_logging()) {
@@ -2504,17 +2536,11 @@ impl WebRTCPeerConnection {
                     self.tube_id
                 );
             }
-        } else {
-            warn!(
-                "Failed to acquire lock for activity update (tube_id: {})",
-                self.tube_id
-            );
         }
 
-        // Also update the legacy last_activity for backward compatibility
-        if let Ok(mut last_activity) = self.last_activity.lock() {
-            *last_activity = now;
-        }
+        // Also update the lock-free last_activity timestamp
+        self.last_activity_millis
+            .store(now_millis(), Ordering::Release);
     }
 
     // Stop keepalive mechanism
@@ -2523,7 +2549,8 @@ impl WebRTCPeerConnection {
         self.keepalive_enabled.store(false, Ordering::Relaxed);
 
         // Stop and cleanup the keepalive task
-        if let Ok(mut task_guard) = self.keepalive_task.lock() {
+        {
+            let mut task_guard = self.keepalive_task.lock();
             if let Some(task) = task_guard.take() {
                 task.abort();
                 info!(
@@ -2536,11 +2563,6 @@ impl WebRTCPeerConnection {
                     self.tube_id
                 );
             }
-        } else {
-            warn!(
-                "Failed to acquire keepalive task lock for cleanup (tube_id: {})",
-                self.tube_id
-            );
         }
 
         info!("NAT timeout prevention stopped (tube_id: {})", self.tube_id);
@@ -2642,15 +2664,14 @@ impl WebRTCPeerConnection {
 
         // Update restart tracking in single lock acquisition (deadlock-safe)
         let now = Instant::now();
-        if let Ok(mut restart_state) = self.ice_restart_state.lock() {
+        {
+            let mut restart_state = self.ice_restart_state.lock();
             restart_state.record_attempt(now);
             let count = restart_state.attempts;
             info!(
                 "ICE restart attempt #{} (tube_id: {}, attempt: {})",
                 count, self.tube_id, count
             );
-        } else {
-            return Err("Failed to acquire restart state lock".to_string());
         }
 
         // Set connection quality as degraded during restart
@@ -2728,29 +2749,22 @@ impl WebRTCPeerConnection {
 
         // Get all activity and restart state in single lock acquisitions (deadlock-safe)
         let (time_since_success, activity_timeout) = {
-            if let Ok(activity_state) = self.activity_state.lock() {
-                let time_since = now.duration_since(activity_state.last_successful_activity);
-                (
-                    time_since,
-                    time_since > Duration::from_secs(ACTIVITY_TIMEOUT_SECS),
-                )
-            } else {
-                // If we can't get the lock, assume recent activity to be safe
-                return false;
-            }
+            let activity_state = self.activity_state.lock();
+            let time_since = now.duration_since(activity_state.last_successful_activity);
+            (
+                time_since,
+                time_since > Duration::from_secs(ACTIVITY_TIMEOUT_SECS),
+            )
         };
 
         let (attempts, enough_time_passed, min_interval) = {
-            if let Ok(restart_state) = self.ice_restart_state.lock() {
-                let min_int = restart_state.get_min_interval();
-                let enough_time = restart_state
-                    .time_since_last_restart(now)
-                    .map(|duration| duration >= min_int)
-                    .unwrap_or(true); // Never restarted before
-                (restart_state.attempts, enough_time, min_int)
-            } else {
-                return false; // Can't get lock, be conservative
-            }
+            let restart_state = self.ice_restart_state.lock();
+            let min_int = restart_state.get_min_interval();
+            let enough_time = restart_state
+                .time_since_last_restart(now)
+                .map(|duration| duration >= min_int)
+                .unwrap_or(true); // Never restarted before
+            (restart_state.attempts, enough_time, min_int)
         };
 
         // Don't restart too many times
@@ -2779,31 +2793,34 @@ impl WebRTCPeerConnection {
     // Test helper methods (only compiled in test builds)
     #[cfg(test)]
     pub fn is_keepalive_running(&self) -> bool {
-        let task_guard = self.keepalive_task.lock().unwrap();
+        let task_guard = self.keepalive_task.lock();
         task_guard.is_some()
     }
 
     #[cfg(test)]
     pub fn get_last_activity(&self) -> Instant {
-        let activity_guard = self.last_activity.lock().unwrap();
-        *activity_guard
+        // Convert stored millis back to approximate Instant for test compatibility
+        let stored = self.last_activity_millis.load(Ordering::Acquire);
+        let elapsed = elapsed_from_millis(stored);
+        Instant::now() - elapsed
     }
 
     #[cfg(test)]
     pub fn set_last_activity(&self, time: Instant) {
-        let mut activity_guard = self.last_activity.lock().unwrap();
-        *activity_guard = time;
+        // Convert Instant to millis by calculating offset from now
+        let elapsed = time.elapsed();
+        let target_millis = now_millis().saturating_sub(elapsed.as_millis() as u64);
+        self.last_activity_millis
+            .store(target_millis, Ordering::Release);
     }
 
     /// Get time since last activity (for stale tube detection)
     /// Returns duration since last successful data channel activity
     /// Used by metrics collector to detect inactive Failed/Disconnected tubes
+    /// Lock-free: uses AtomicU64 timestamp, no possibility of deadlock or poison
     pub fn time_since_last_activity(&self) -> Duration {
-        if let Ok(activity_guard) = self.last_activity.try_lock() {
-            activity_guard.elapsed()
-        } else {
-            Duration::from_secs(0) // Can't get lock, assume recent activity to be safe
-        }
+        let stored = self.last_activity_millis.load(Ordering::Acquire);
+        elapsed_from_millis(stored)
     }
 
     /// Static version of UDP connectivity test

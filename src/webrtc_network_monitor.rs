@@ -1,10 +1,19 @@
+use crate::unlikely;
 use crate::webrtc_errors::WebRTCResult;
+use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
+
+// Option<bool> encoding for lock-free atomic access (avoids Mutex<Option<bool>>)
+const CONNECTIVITY_NONE: u8 = 0; // None - no check performed yet
+const CONNECTIVITY_FALSE: u8 = 1; // Some(false) - connectivity check failed
+const CONNECTIVITY_TRUE: u8 = 2; // Some(true) - connectivity check succeeded
 
 /// Network interface information
 #[derive(Debug, Clone, PartialEq)]
@@ -162,22 +171,22 @@ pub type NetworkChangeCallback = Box<
 
 /// Network monitor for detecting changes that require ICE restart
 pub struct NetworkMonitor {
-    /// Current network interfaces
-    interfaces: Arc<Mutex<HashMap<String, NetworkInterface>>>,
-    /// Network change callbacks
+    /// Current network interfaces - DashMap for lock-free concurrent access
+    interfaces: Arc<DashMap<String, NetworkInterface>>,
+    /// Network change callbacks - still needs Mutex (callback registration is rare)
     callbacks: Arc<Mutex<Vec<NetworkChangeCallback>>>,
     /// Monitor configuration
     config: NetworkMonitorConfig,
-    /// Last connectivity check result
-    last_connectivity_check: Arc<Mutex<Option<bool>>>,
-    /// Monitor task handle
-    monitoring_active: Arc<Mutex<bool>>,
+    /// Last connectivity check result - AtomicU8 encoding Option<bool> (see CONNECTIVITY_* constants)
+    last_connectivity_check: Arc<std::sync::atomic::AtomicU8>,
+    /// Monitor task handle - AtomicBool for lock-free check
+    monitoring_active: Arc<AtomicBool>,
     /// Connection migration manager
     connection_migrator: Arc<ConnectionMigrator>,
-    /// Primary interface tracker
+    /// Primary interface tracker - still needs Mutex (String can't be atomic)
     primary_interface: Arc<Mutex<Option<String>>>,
-    /// Quality history for predictive analysis
-    quality_history: Arc<Mutex<HashMap<String, Vec<NetworkQualityMetrics>>>>,
+    /// Quality history for predictive analysis - DashMap for lock-free access
+    quality_history: Arc<DashMap<String, Vec<NetworkQualityMetrics>>>,
     /// Track spawned tasks to prevent leaks
     monitoring_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
@@ -227,8 +236,8 @@ impl Default for NetworkMonitorConfig {
 /// Connection migration manager
 #[derive(Debug)]
 pub struct ConnectionMigrator {
-    /// Active migrations in progress
-    active_migrations: Arc<Mutex<HashMap<String, MigrationState>>>,
+    /// Active migrations in progress - DashMap for lock-free concurrent access
+    active_migrations: Arc<DashMap<String, MigrationState>>,
     /// Migration strategies
     migration_strategies: Vec<MigrationStrategy>,
     /// Configuration
@@ -270,7 +279,7 @@ pub enum MigrationStrategy {
 impl ConnectionMigrator {
     pub fn new(config: NetworkMonitorConfig) -> Self {
         Self {
-            active_migrations: Arc::new(Mutex::new(HashMap::new())),
+            active_migrations: Arc::new(DashMap::new()),
             migration_strategies: vec![
                 MigrationStrategy::Seamless,
                 MigrationStrategy::MakeBeforeBreak,
@@ -299,10 +308,9 @@ impl ConnectionMigrator {
             attempt_count: 1,
         };
 
-        {
-            let mut migrations = self.active_migrations.lock().unwrap();
-            migrations.insert(migration_id.clone(), migration_state);
-        }
+        // DashMap - no lock needed
+        self.active_migrations
+            .insert(migration_id.clone(), migration_state);
 
         // Execute migration asynchronously
         let migrator = self.clone();
@@ -341,10 +349,9 @@ impl ConnectionMigrator {
     }
 
     async fn prepare_migration(&self, migration_id: &str) -> WebRTCResult<()> {
-        // Get migration state to access target interface
+        // Get migration state to access target interface (DashMap - no lock needed)
         let (to_interface, from_interface) = {
-            let migrations = self.active_migrations.lock().unwrap();
-            if let Some(state) = migrations.get(migration_id) {
+            if let Some(state) = self.active_migrations.get(migration_id) {
                 (state.to_interface.clone(), state.from_interface.clone())
             } else {
                 return Err(crate::WebRTCError::Unknown {
@@ -434,10 +441,9 @@ impl ConnectionMigrator {
     }
 
     async fn complete_migration(&self, migration_id: &str) -> WebRTCResult<()> {
-        // Get migration timing and interfaces for completion event
+        // Get migration timing and interfaces for completion event (DashMap - no lock needed)
         let (from_interface, to_interface, migration_time_ms) = {
-            let migrations = self.active_migrations.lock().unwrap();
-            if let Some(state) = migrations.get(migration_id) {
+            if let Some(state) = self.active_migrations.get(migration_id) {
                 let elapsed_ms = state.start_time.elapsed().as_millis() as u64;
                 (
                     state.from_interface.clone(),
@@ -465,35 +471,32 @@ impl ConnectionMigrator {
     }
 
     fn update_migration_phase(&self, migration_id: &str, phase: MigrationPhase) {
-        let mut migrations = self.active_migrations.lock().unwrap();
-        if let Some(migration) = migrations.get_mut(migration_id) {
-            migration.phase = phase;
-            debug!(
-                "Migration {} phase updated to {:?}",
-                migration_id, migration.phase
-            );
+        // DashMap - get_mut returns a RefMut
+        if let Some(mut migration) = self.active_migrations.get_mut(migration_id) {
+            migration.phase = phase.clone();
+            debug!("Migration {} phase updated to {:?}", migration_id, phase);
         }
     }
 
     fn mark_migration_failed(&self, migration_id: &str, reason: &str) {
-        let mut migrations = self.active_migrations.lock().unwrap();
-        if let Some(migration) = migrations.get_mut(migration_id) {
+        // DashMap - get_mut returns a RefMut
+        if let Some(mut migration) = self.active_migrations.get_mut(migration_id) {
             migration.phase = MigrationPhase::Failed(reason.to_string());
             warn!("Migration {} failed: {}", migration_id, reason);
         }
     }
 
     pub fn get_migration_status(&self, migration_id: &str) -> Option<MigrationState> {
-        let migrations = self.active_migrations.lock().unwrap();
-        migrations.get(migration_id).cloned()
+        // DashMap - get returns Option<Ref>
+        self.active_migrations.get(migration_id).map(|r| r.clone())
     }
 
     pub fn cleanup_completed_migrations(&self) {
-        let mut migrations = self.active_migrations.lock().unwrap();
         let cutoff_time = Instant::now() - Duration::from_secs(300); // 5 minutes
 
-        migrations.retain(|_, migration| {
-            match migration.phase {
+        // DashMap - retain works directly
+        self.active_migrations.retain(|_, migration| {
+            match &migration.phase {
                 MigrationPhase::Completed | MigrationPhase::Failed(_) => {
                     migration.start_time > cutoff_time
                 }
@@ -601,30 +604,23 @@ impl NetworkMonitor {
         let connection_migrator = Arc::new(ConnectionMigrator::new(config.clone()));
 
         Self {
-            interfaces: Arc::new(Mutex::new(HashMap::new())),
+            interfaces: Arc::new(DashMap::new()),
             callbacks: Arc::new(Mutex::new(Vec::new())),
             connection_migrator,
             primary_interface: Arc::new(Mutex::new(None)),
-            quality_history: Arc::new(Mutex::new(HashMap::new())),
+            quality_history: Arc::new(DashMap::new()),
             config,
-            last_connectivity_check: Arc::new(Mutex::new(None)),
-            monitoring_active: Arc::new(Mutex::new(false)),
+            last_connectivity_check: Arc::new(std::sync::atomic::AtomicU8::new(CONNECTIVITY_NONE)),
+            monitoring_active: Arc::new(AtomicBool::new(false)),
             monitoring_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
     /// Start network monitoring
     pub async fn start_monitoring(&self) -> WebRTCResult<()> {
-        // Check if already monitoring
-        if let Ok(active) = self.monitoring_active.lock() {
-            if *active {
-                return Ok(());
-            }
-        }
-
-        // Mark as active
-        if let Ok(mut active) = self.monitoring_active.lock() {
-            *active = true;
+        // Atomic swap - if already true, return early
+        if self.monitoring_active.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
 
         // SOLUTION: Start background monitoring task but defer initial scan until triggered
@@ -657,11 +653,9 @@ impl NetworkMonitor {
 
     /// Stop network monitoring
     pub fn stop_monitoring(&self) {
-        // Step 1: Set flag - tasks will exit on next interval tick (5 seconds max)
+        // Step 1: Set flag atomically - tasks will exit on next interval tick (5 seconds max)
         // This is the PRIMARY shutdown mechanism
-        if let Ok(mut active) = self.monitoring_active.lock() {
-            *active = false;
-        }
+        self.monitoring_active.store(false, Ordering::Release);
 
         // Step 2: Best-effort immediate abort (non-blocking)
         // If lock is held, tasks will exit via flag check anyway
@@ -701,7 +695,8 @@ impl NetworkMonitor {
             + Sync
             + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.lock() {
+        {
+            let mut callbacks = self.callbacks.lock();
             callbacks.push(Box::new(callback));
             debug!("Registered network change callback");
         }
@@ -709,11 +704,11 @@ impl NetworkMonitor {
 
     /// Get current network interfaces
     pub fn get_current_interfaces(&self) -> HashMap<String, NetworkInterface> {
-        if let Ok(interfaces) = self.interfaces.lock() {
-            interfaces.clone()
-        } else {
-            HashMap::new()
-        }
+        // DashMap - iterate and collect
+        self.interfaces
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
     }
 
     /// Handle network transition (connection migration)
@@ -745,24 +740,22 @@ impl NetworkMonitor {
 
     /// Assess comprehensive network quality for an interface
     pub async fn assess_network_quality(&self, interface_name: &str) -> Option<u8> {
-        let interfaces = self.interfaces.lock().unwrap();
-        if let Some(interface) = interfaces.get(interface_name) {
-            let quality_score = NetworkQualityScorer::calculate_quality_score(interface);
-            Some(quality_score)
-        } else {
-            None
-        }
+        // DashMap - get returns Option<Ref>
+        self.interfaces
+            .get(interface_name)
+            .map(|interface| NetworkQualityScorer::calculate_quality_score(&interface))
     }
 
     /// Predict potential network changes based on quality trends
     pub async fn predict_network_changes(&self) -> Vec<PredictedNetworkEvent> {
         let mut predictions = Vec::new();
 
-        let quality_history = self.quality_history.lock().unwrap();
-        let interfaces = self.interfaces.lock().unwrap();
-
-        for (interface_name, interface) in interfaces.iter() {
-            if let Some(history) = quality_history.get(interface_name) {
+        // DashMap - iterate directly without locks
+        for interface_ref in self.interfaces.iter() {
+            let interface_name = interface_ref.key();
+            let interface = interface_ref.value();
+            if let Some(history_ref) = self.quality_history.get(interface_name) {
+                let history = history_ref.value();
                 if history.len() >= 5 {
                     // Analyze trend over last 5 measurements
                     let recent_scores: Vec<u8> = history
@@ -808,25 +801,23 @@ impl NetworkMonitor {
         interface_name: &str,
         metrics: NetworkQualityMetrics,
     ) {
-        // Update interface quality
-        {
-            let mut interfaces = self.interfaces.lock().unwrap();
-            if let Some(interface) = interfaces.get_mut(interface_name) {
-                interface.quality_metrics = metrics.clone();
-                interface.quality_metrics.quality_score =
-                    NetworkQualityScorer::calculate_quality_score(interface);
-            }
+        // Update interface quality (DashMap - get_mut returns RefMut)
+        if let Some(mut interface) = self.interfaces.get_mut(interface_name) {
+            interface.quality_metrics = metrics.clone();
+            interface.quality_metrics.quality_score =
+                NetworkQualityScorer::calculate_quality_score(&interface);
         }
 
-        // Add to quality history
-        {
-            let mut history = self.quality_history.lock().unwrap();
-            let interface_history = history.entry(interface_name.to_string()).or_default();
-            interface_history.push(metrics.clone());
+        // Add to quality history (DashMap)
+        self.quality_history
+            .entry(interface_name.to_string())
+            .or_default()
+            .push(metrics.clone());
 
-            // Keep only last 100 measurements per interface
-            if interface_history.len() > 100 {
-                interface_history.remove(0);
+        // Keep only last 100 measurements per interface
+        if let Some(mut history) = self.quality_history.get_mut(interface_name) {
+            if history.len() > 100 {
+                history.remove(0);
             }
         }
 
@@ -855,14 +846,14 @@ impl NetworkMonitor {
 
     /// Get current primary interface
     pub async fn get_primary_interface(&self) -> Option<String> {
-        let primary = self.primary_interface.lock().unwrap();
+        let primary = self.primary_interface.lock();
         primary.clone()
     }
 
     /// Set primary interface
     pub async fn set_primary_interface(&self, interface_name: String) {
         let (old_interface, should_trigger) = {
-            let mut primary = self.primary_interface.lock().unwrap();
+            let mut primary = self.primary_interface.lock();
             let old_interface = primary.clone();
             *primary = Some(interface_name.clone());
             let should_trigger = old_interface.as_ref() != Some(&interface_name);
@@ -884,7 +875,12 @@ impl NetworkMonitor {
 
     /// Find best migration target for current primary interface
     async fn find_best_migration_target(&self, current_interface: &str) -> Option<String> {
-        let interfaces = self.interfaces.lock().unwrap();
+        // DashMap - collect to HashMap for the scorer
+        let interfaces: HashMap<String, NetworkInterface> = self
+            .interfaces
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
         NetworkQualityScorer::find_best_migration_target(
             &interfaces,
             current_interface,
@@ -907,7 +903,10 @@ impl NetworkMonitor {
     pub async fn check_connectivity(&self) -> bool {
         for endpoint in &self.config.test_endpoints {
             if self.test_endpoint_connectivity(endpoint).await {
-                debug!("Connectivity check passed (endpoint: {})", endpoint);
+                // Connectivity checks can be frequent - only log in verbose mode
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("Connectivity check passed (endpoint: {})", endpoint);
+                }
                 return true;
             }
         }
@@ -929,73 +928,72 @@ impl NetworkMonitor {
 
     /// Scan current network interfaces
     async fn scan_network_interfaces(&self) -> WebRTCResult<()> {
-        debug!("Scanning network interfaces...");
+        // Interface scanning happens periodically - verbose only
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("Scanning network interfaces...");
+        }
 
         // Get system network interfaces (simplified implementation)
         let current_interfaces = self.get_system_interfaces().await?;
 
-        // Compare with stored interfaces and detect changes
-        let events = {
-            let stored_interfaces = self.interfaces.lock().unwrap();
-            let mut events = Vec::new();
+        // Compare with stored interfaces and detect changes (DashMap - no locks)
+        let mut events = Vec::new();
 
-            // Check for changes in existing interfaces
-            for (name, new_interface) in &current_interfaces {
-                if let Some(old_interface) = stored_interfaces.get(name) {
-                    // Check for status changes
-                    if old_interface.is_active != new_interface.is_active
-                        && self.config.monitor_interface_changes
-                    {
-                        events.push(NetworkChangeEvent::InterfaceStatusChanged {
-                            interface_name: name.clone(),
-                            was_active: old_interface.is_active,
-                            now_active: new_interface.is_active,
-                        });
-                    }
-
-                    // Check for IP address changes
-                    if old_interface.ip_address != new_interface.ip_address
-                        && self.config.monitor_ip_changes
-                    {
-                        events.push(NetworkChangeEvent::IpAddressChanged {
-                            interface_name: name.clone(),
-                            old_ip: old_interface.ip_address.clone(),
-                            new_ip: new_interface.ip_address.clone(),
-                        });
-                    }
-                } else if self.config.monitor_interface_changes {
-                    // New interface detected
-                    events.push(NetworkChangeEvent::InterfaceAdded {
-                        interface: new_interface.clone(),
+        // Check for changes in existing interfaces
+        for (name, new_interface) in &current_interfaces {
+            if let Some(old_interface) = self.interfaces.get(name) {
+                // Check for status changes
+                if old_interface.is_active != new_interface.is_active
+                    && self.config.monitor_interface_changes
+                {
+                    events.push(NetworkChangeEvent::InterfaceStatusChanged {
+                        interface_name: name.clone(),
+                        was_active: old_interface.is_active,
+                        now_active: new_interface.is_active,
                     });
                 }
-            }
 
-            // Check for removed interfaces
-            let removed_interfaces: Vec<String> = stored_interfaces
-                .keys()
-                .filter(|name| !current_interfaces.contains_key(*name))
-                .cloned()
-                .collect();
-
-            for name in removed_interfaces {
-                events.push(NetworkChangeEvent::InterfaceRemoved {
-                    interface_name: name,
+                // Check for IP address changes
+                if old_interface.ip_address != new_interface.ip_address
+                    && self.config.monitor_ip_changes
+                {
+                    events.push(NetworkChangeEvent::IpAddressChanged {
+                        interface_name: name.clone(),
+                        old_ip: old_interface.ip_address.clone(),
+                        new_ip: new_interface.ip_address.clone(),
+                    });
+                }
+            } else if self.config.monitor_interface_changes {
+                // New interface detected
+                events.push(NetworkChangeEvent::InterfaceAdded {
+                    interface: new_interface.clone(),
                 });
             }
+        }
 
-            events
-        }; // Lock released here
+        // Check for removed interfaces
+        let removed_interfaces: Vec<String> = self
+            .interfaces
+            .iter()
+            .filter(|r| !current_interfaces.contains_key(r.key()))
+            .map(|r| r.key().clone())
+            .collect();
 
-        // Trigger events without holding lock
+        for name in removed_interfaces {
+            events.push(NetworkChangeEvent::InterfaceRemoved {
+                interface_name: name,
+            });
+        }
+
+        // Trigger events
         for event in events {
             self.trigger_event(event).await;
         }
 
-        // Update stored interfaces
-        {
-            let mut stored_interfaces = self.interfaces.lock().unwrap();
-            *stored_interfaces = current_interfaces;
+        // Update stored interfaces (DashMap - clear and insert)
+        self.interfaces.clear();
+        for (name, interface) in current_interfaces {
+            self.interfaces.insert(name, interface);
         }
 
         Ok(())
@@ -1055,7 +1053,9 @@ impl NetworkMonitor {
             }
         }
 
-        debug!("Detected {} network interfaces", interfaces.len());
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!("Detected {} network interfaces", interfaces.len());
+        }
         Ok(interfaces)
     }
 
@@ -1125,11 +1125,15 @@ impl NetworkMonitor {
         .await
         {
             Ok(Ok(_)) => {
-                debug!("Connectivity test passed for {}", endpoint);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("Connectivity test passed for {}", endpoint);
+                }
                 true
             }
             Ok(Err(_)) | Err(_) => {
-                debug!("Connectivity test failed for {}", endpoint);
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("Connectivity test failed for {}", endpoint);
+                }
                 false
             }
         }
@@ -1137,13 +1141,15 @@ impl NetworkMonitor {
 
     /// Trigger a network change event
     async fn trigger_event(&self, event: NetworkChangeEvent) {
+        // Network events are important but not frequent - keep at debug level
         debug!("Network change detected: {:?}", event);
 
         // Add debounce delay
         sleep(self.config.change_debounce_delay).await;
 
         // Call all registered callbacks
-        if let Ok(callbacks) = self.callbacks.lock() {
+        {
+            let callbacks = self.callbacks.lock();
             for callback in callbacks.iter() {
                 let future = callback(event.clone());
                 tokio::spawn(future);
@@ -1155,11 +1161,11 @@ impl NetworkMonitor {
 /// Helper struct for background monitoring task
 struct NetworkMonitorForTask {
     #[allow(dead_code)]
-    interfaces: Arc<Mutex<HashMap<String, NetworkInterface>>>,
+    interfaces: Arc<DashMap<String, NetworkInterface>>,
     callbacks: Arc<Mutex<Vec<NetworkChangeCallback>>>,
     config: NetworkMonitorConfig,
-    last_connectivity_check: Arc<Mutex<Option<bool>>>,
-    monitoring_active: Arc<Mutex<bool>>,
+    last_connectivity_check: Arc<std::sync::atomic::AtomicU8>,
+    monitoring_active: Arc<AtomicBool>,
 }
 
 impl NetworkMonitorForTask {
@@ -1170,16 +1176,8 @@ impl NetworkMonitorForTask {
         loop {
             interval.tick().await;
 
-            // Check if monitoring is still active
-            let is_active = {
-                if let Ok(active) = self.monitoring_active.lock() {
-                    *active
-                } else {
-                    false
-                }
-            };
-
-            if !is_active {
+            // Check if monitoring is still active (lock-free)
+            if !self.monitoring_active.load(Ordering::Acquire) {
                 // debug!("Network monitoring loop terminated");
                 break;
             }
@@ -1194,15 +1192,21 @@ impl NetworkMonitorForTask {
             // Check connectivity
             let connectivity_ok = self.check_connectivity().await;
 
-            // Compare with last check
-            let last_connectivity = {
-                if let Ok(mut last) = self.last_connectivity_check.lock() {
-                    let previous = *last;
-                    *last = Some(connectivity_ok);
-                    previous
-                } else {
-                    None
-                }
+            // Compare with last check using AtomicU8 encoding for Option<bool>
+            let new_value = if connectivity_ok {
+                CONNECTIVITY_TRUE
+            } else {
+                CONNECTIVITY_FALSE
+            };
+            let last_value = self
+                .last_connectivity_check
+                .swap(new_value, Ordering::AcqRel);
+
+            let last_connectivity = match last_value {
+                CONNECTIVITY_NONE => None,
+                CONNECTIVITY_FALSE => Some(false),
+                CONNECTIVITY_TRUE => Some(true),
+                _ => Some(true), // Defensive: treat unknown values as true
             };
 
             // Trigger connectivity events if changed
@@ -1261,7 +1265,8 @@ impl NetworkMonitorForTask {
 
         sleep(self.config.change_debounce_delay).await;
 
-        if let Ok(callbacks) = self.callbacks.lock() {
+        {
+            let callbacks = self.callbacks.lock();
             for callback in callbacks.iter() {
                 let future = callback(event.clone());
                 tokio::spawn(future);
@@ -1276,14 +1281,15 @@ type TubeCallback = Box<dyn Fn() + Send + Sync>;
 /// Integration helper for WebRTC connections
 pub struct WebRTCNetworkIntegration {
     monitor: Arc<NetworkMonitor>,
-    tube_callbacks: Arc<Mutex<HashMap<String, TubeCallback>>>,
+    /// DashMap for lock-free tube callback access
+    tube_callbacks: Arc<DashMap<String, TubeCallback>>,
 }
 
 impl WebRTCNetworkIntegration {
     pub fn new(monitor: Arc<NetworkMonitor>) -> Self {
         let integration = Self {
             monitor: monitor.clone(),
-            tube_callbacks: Arc::new(Mutex::new(HashMap::new())),
+            tube_callbacks: Arc::new(DashMap::new()),
         };
 
         // Register network change handler
@@ -1303,47 +1309,45 @@ impl WebRTCNetworkIntegration {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.tube_callbacks.lock() {
-            callbacks.insert(tube_id.clone(), Box::new(ice_restart_callback));
-            debug!(
-                "Registered tube {} for network change notifications",
-                tube_id
-            );
-        }
+        // DashMap - no lock needed
+        self.tube_callbacks
+            .insert(tube_id.clone(), Box::new(ice_restart_callback));
+        debug!(
+            "Registered tube {} for network change notifications",
+            tube_id
+        );
     }
 
     /// Unregister a tube from network change notifications
     #[allow(dead_code)]
     pub fn unregister_tube(&self, tube_id: &str) {
-        if let Ok(mut callbacks) = self.tube_callbacks.lock() {
-            if callbacks.remove(tube_id).is_some() {
-                info!(
-                    "Unregistered tube {} from network change notifications",
-                    tube_id
-                );
-            }
+        // DashMap - no lock needed
+        if self.tube_callbacks.remove(tube_id).is_some() {
+            info!(
+                "Unregistered tube {} from network change notifications",
+                tube_id
+            );
         }
     }
 
     /// Trigger ICE restart for a specific tube (for connection state-based triggers)
     pub fn trigger_ice_restart(&self, tube_id: &str, reason: &str) {
-        if let Ok(callbacks) = self.tube_callbacks.lock() {
-            if let Some(callback) = callbacks.get(tube_id) {
-                info!(
-                    "Triggering ICE restart for tube {} due to: {}",
-                    tube_id, reason
-                );
-                callback();
-            } else {
-                debug!("No ICE restart callback registered for tube {}", tube_id);
-            }
+        // DashMap - no lock needed
+        if let Some(callback) = self.tube_callbacks.get(tube_id) {
+            info!(
+                "Triggering ICE restart for tube {} due to: {}",
+                tube_id, reason
+            );
+            callback();
+        } else {
+            debug!("No ICE restart callback registered for tube {}", tube_id);
         }
     }
 
     /// Handle network change events
     #[allow(dead_code)]
     async fn handle_network_change(
-        callbacks: Arc<Mutex<HashMap<String, TubeCallback>>>,
+        callbacks: Arc<DashMap<String, TubeCallback>>,
         event: NetworkChangeEvent,
     ) {
         // Determine if this change requires ICE restart
@@ -1389,15 +1393,15 @@ impl WebRTCNetworkIntegration {
         if requires_ice_restart {
             debug!("Network change requires ICE restart: {:?}", event);
 
-            // Trigger ICE restart for all registered tubes
-            if let Ok(callbacks) = callbacks.lock() {
-                for (tube_id, callback) in callbacks.iter() {
-                    debug!(
-                        "Triggering ICE restart for tube {} due to network change",
-                        tube_id
-                    );
-                    callback();
-                }
+            // Trigger ICE restart for all registered tubes (DashMap - no lock needed)
+            for entry in callbacks.iter() {
+                let tube_id = entry.key();
+                let callback = entry.value();
+                debug!(
+                    "Triggering ICE restart for tube {} due to network change",
+                    tube_id
+                );
+                callback();
             }
         } else {
             debug!("Network change does not require ICE restart: {:?}", event);

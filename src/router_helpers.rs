@@ -7,7 +7,7 @@ use crate::unlikely;
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use log::{debug, error, info, warn};
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use reqwest::{self};
 use serde::{Deserialize, Serialize};
@@ -43,15 +43,20 @@ static ROUTER_LAST_SUCCESS: Mutex<Option<Instant>> = Mutex::new(None);
 /// - Connection pooling across requests
 /// - DNS cache reuse
 /// - TLS session resumption
-static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30)) // Default, can be overridden per-request
-        .danger_accept_invalid_certs(!VERIFY_SSL)
-        .pool_max_idle_per_host(10) // Maintain connection pool
-        .pool_idle_timeout(Some(Duration::from_secs(90))) // Keep connections alive
-        .build()
-        .expect("Failed to create singleton HTTP client")
-});
+static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
+
+/// Get or initialize the HTTP client (fallible initialization)
+fn get_http_client() -> Result<&'static reqwest::Client, anyhow::Error> {
+    HTTP_CLIENT.get_or_try_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30)) // Default, can be overridden per-request
+            .danger_accept_invalid_certs(!VERIFY_SSL)
+            .pool_max_idle_per_host(10) // Maintain connection pool
+            .pool_idle_timeout(Some(Duration::from_secs(90))) // Keep connections alive
+            .build()
+            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))
+    })
+}
 
 // Custom error type to replace KRouterException
 #[derive(Debug)]
@@ -184,7 +189,7 @@ mod challenge_response {
             let url = format!("{router_http_host}/api/device/get_challenge");
 
             // Use singleton HTTP client (reuses connections, DNS cache, TLS sessions)
-            let response = match HTTP_CLIENT
+            let response = match get_http_client()?
                 .get(&url)
                 .timeout(WEBSOCKET_CONNECTION_TIMEOUT)
                 .send()
@@ -478,13 +483,14 @@ async fn router_request(
     // Use singleton HTTP client (reuses connections, DNS cache, TLS sessions)
     // Per-request timeout override (5s for fast failure detection)
     let request_timeout = crate::config::router_http_timeout();
+    let client = get_http_client()?;
 
     // Create request builder using singleton client
     let mut request_builder = match http_method {
-        "GET" => HTTP_CLIENT.get(&url),
-        "POST" => HTTP_CLIENT.post(&url),
-        "PUT" => HTTP_CLIENT.put(&url),
-        "DELETE" => HTTP_CLIENT.delete(&url),
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "DELETE" => client.delete(&url),
         _ => {
             return Err(Box::new(KRouterError(format!(
                 "Unsupported HTTP method: {http_method}"

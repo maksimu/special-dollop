@@ -150,17 +150,15 @@ impl Channel {
                 // In client mode, we just log and continue
                 self.handle_connection_opened(data).await?;
             }
-            ControlMessage::UdpAssociate => {
-                self.handle_udp_associate(data).await?;
-            }
-            ControlMessage::UdpAssociateOpened => {
-                self.handle_udp_associate_opened(data).await?;
-            }
-            ControlMessage::UdpPacket => {
-                self.handle_udp_packet(data).await?;
-            }
-            ControlMessage::UdpAssociateClosed => {
-                self.handle_udp_associate_closed(data).await?;
+            // UDP ASSOCIATE support removed - ignore these messages
+            ControlMessage::UdpAssociate
+            | ControlMessage::UdpAssociateOpened
+            | ControlMessage::UdpPacket
+            | ControlMessage::UdpAssociateClosed => {
+                warn!(
+                    "Channel({}): UDP ASSOCIATE not supported, ignoring {:?}",
+                    self.channel_id, message_type
+                );
             }
             ControlMessage::MetricsRequest => {
                 self.handle_metrics_request(data).await?;
@@ -214,10 +212,6 @@ impl Channel {
         // Close the connection WITHOUT sending another CloseConnection message
         // This prevents feedback loops where both sides keep sending CloseConnection messages
         self.internal_close_backend_no_message(target_connection_no, reason)
-            .await?;
-
-        // Clean up any UDP associations for this connection
-        self.cleanup_udp_associations_for_connection(target_connection_no)
             .await?;
 
         Ok(())

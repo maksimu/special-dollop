@@ -111,13 +111,6 @@ pub struct Channel {
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
-    // UDP associations for SOCKS5 UDP ASSOCIATE response handling (server mode)
-    pub(crate) udp_associations: super::udp::UdpAssociations,
-    // Reverse index: conn_no -> set of destination addresses for efficient cleanup
-    pub(crate) udp_conn_index:
-        Arc<std::sync::Mutex<HashMap<u32, std::collections::HashSet<std::net::SocketAddr>>>>,
-    // UDP receiver tasks for client mode (RAII: ensures proper cleanup)
-    pub(crate) udp_receiver_tasks: Arc<Mutex<HashMap<u32, JoinHandle<()>>>>,
     // Timestamp for the last channel-level ping sent (conn_no=0)
     pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
 
@@ -495,9 +488,6 @@ impl Channel {
             guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
 
             buffer_pool,
-            udp_associations: Arc::new(Mutex::new(HashMap::new())),
-            udp_conn_index: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            udp_receiver_tasks: Arc::new(Mutex::new(HashMap::new())), // RAII: Track client-side UDP receiver tasks
             channel_ping_sent_time: Mutex::new(None),
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
@@ -1428,17 +1418,6 @@ impl Drop for Channel {
                     conn.graceful_shutdown(conn_no, &channel_id).await;
                     // No logging here - avoid fd race during Python teardown
                 }
-            }
-            // No final log - avoid fd race during Python teardown
-        });
-
-        // Clean up ALL UDP receiver tasks in Drop (client mode)
-        let udp_receiver_tasks = self.udp_receiver_tasks.clone();
-        runtime.spawn(async move {
-            let mut tasks = udp_receiver_tasks.lock().await;
-            for (_conn_no, task) in tasks.drain() {
-                task.abort();
-                // No logging here - avoid fd race during Python teardown
             }
             // No final log - avoid fd race during Python teardown
         });

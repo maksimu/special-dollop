@@ -9,9 +9,10 @@
 //! - Magic numbers are eliminated - all values documented here
 //!
 //! ## Usage
-//! ```rust
-//! use crate::config::backend_flush_timeout;
+//! ```rust,ignore
+//! // Internal module - use via crate public API
 //! let timeout = backend_flush_timeout();
+//! assert!(timeout.as_millis() > 0);
 //! ```
 
 use std::time::Duration;
@@ -219,14 +220,14 @@ pub fn ice_gather_timeout() -> Duration {
 
 /// Timeout waiting for ICE restart answer from remote peer.
 ///
-/// **Default**: 15 seconds
+/// **Default**: 10 seconds
 ///
 /// **Rationale**: Signaling round-trip + remote SDP generation + processing.
-/// 15s covers slow gateways and high-latency links.
+/// 10s is enough for most networks; 5 attempts = 50s total before giving up.
 ///
 /// **Tuning**:
-/// - Fast signaling: 5-10s
-/// - Slow/satellite: 30s
+/// - Fast signaling: 5s
+/// - Slow/satellite: 15-30s
 ///
 /// **Env**: `KEEPER_GATEWAY_ICE_RESTART_ANSWER_TIMEOUT_SECS`
 pub fn ice_restart_answer_timeout() -> Duration {
@@ -234,20 +235,20 @@ pub fn ice_restart_answer_timeout() -> Duration {
         std::env::var("KEEPER_GATEWAY_ICE_RESTART_ANSWER_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(15),
+            .unwrap_or(10),
     )
 }
 
 /// Wait time after ICE disconnected before triggering restart.
 ///
-/// **Default**: 5 seconds
+/// **Default**: 2 seconds
 ///
-/// **Rationale**: Connection might recover on its own. 5s wait avoids restart storms
-/// during transient network blips while still being responsive.
+/// **Rationale**: WebRTC connections rarely self-recover after disconnect.
+/// 2s is enough to filter transient blips while being responsive.
 ///
 /// **Tuning**:
-/// - Aggressive recovery: 2-3s
-/// - Conservative: 10s
+/// - Aggressive recovery: 1s
+/// - Conservative: 5s
 ///
 /// **Env**: `KEEPER_GATEWAY_ICE_DISCONNECTED_WAIT_SECS`
 pub fn ice_disconnected_wait() -> Duration {
@@ -255,7 +256,7 @@ pub fn ice_disconnected_wait() -> Duration {
         std::env::var("KEEPER_GATEWAY_ICE_DISCONNECTED_WAIT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5),
+            .unwrap_or(2),
     )
 }
 

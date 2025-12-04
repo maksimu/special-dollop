@@ -31,16 +31,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
+          cache-on-failure: false
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -61,16 +55,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
+          cache-on-failure: false
 
       - name: Run unit tests
         run: |
@@ -101,16 +89,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-rbi-chrome-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-rbi-chrome-
+          cache-on-failure: false
 
       - name: Install Chromium
         run: |
@@ -141,6 +123,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            cmake ninja-build \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
             libgl1-mesa-dev libnss3-dev libatk1.0-dev libatk-bridge2.0-dev \
             libcups2-dev libdrm-dev libxcomposite-dev libxdamage-dev \
@@ -152,8 +135,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cef
-          # Using 'standard' in key to differentiate from minimal distribution
-          key: cef-linux64-standard-${{ env.CEF_VERSION }}-${{ env.CEF_COMMIT }}
+          # v3: Force fresh download with standard distribution (2024-12-04)
+          key: cef-linux64-v3-standard-${{ env.CEF_VERSION }}-${{ env.CEF_COMMIT }}
 
       - name: Download CEF binaries
         if: steps.cache-cef.outputs.cache-hit != 'true'
@@ -190,41 +173,78 @@ jobs:
           
           echo "CEF extracted to ~/cef/cef"
           ls -la ~/cef/cef/
+          
+          # Create archive.json - required by cef-dll-sys build script
+          # This tells the build script what version of CEF is installed
+          cat > ~/cef/cef/archive.json << EOF
+          {
+            "type": "standard",
+            "name": "cef_binary_${CEF_VERSION}+${CEF_COMMIT}+chromium-${CEF_CHROMIUM_VERSION}_linux64",
+            "sha1": "manual-download"
+          }
+          EOF
+          echo "Created archive.json:"
+          cat ~/cef/cef/archive.json
 
       - name: Verify CEF installation
         run: |
+          echo "=== CEF Installation Verification ==="
           echo "CEF_PATH will be: $HOME/cef/cef"
-          ls -la ~/cef/cef/ || echo "CEF directory not found!"
-          # Check for required files
-          if [ ! -d ~/cef/cef/include ]; then
-            echo "ERROR: CEF include directory not found"
+          echo ""
+          echo "Contents of ~/cef:"
+          ls -la ~/cef/ || echo "~/cef directory not found!"
+          echo ""
+          echo "Contents of ~/cef/cef:"
+          ls -la ~/cef/cef/ || echo "~/cef/cef directory not found!"
+          echo ""
+          # Check for required directories
+          if [ ! -d ~/cef/cef ]; then
+            echo "ERROR: CEF directory ~/cef/cef not found"
             exit 1
           fi
-          echo "CEF installation verified"
+          if [ ! -d ~/cef/cef/include ]; then
+            echo "ERROR: CEF include directory not found"
+            echo "Available directories:"
+            find ~/cef -type d -maxdepth 3
+            exit 1
+          fi
+          if [ ! -d ~/cef/cef/Release ]; then
+            echo "WARNING: CEF Release directory not found (may be in different location)"
+          fi
+          echo ""
+          echo "CEF installation verified successfully"
 
       - name: Set CEF environment
         run: |
           echo "CEF_PATH=$HOME/cef/cef" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$HOME/cef/cef/Release:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-rbi-cef-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-rbi-cef-
+          cache-on-failure: false
+
+      - name: Debug CEF path before build
+        run: |
+          echo "CEF_PATH=$CEF_PATH"
+          echo ""
+          echo "=== CEF root contents ==="
+          ls -la $CEF_PATH
+          echo ""
+          echo "=== CEF Release contents ==="
+          ls -la $CEF_PATH/Release || echo "Release dir missing!"
+          echo ""
+          echo "=== CEF include contents ==="
+          ls -la $CEF_PATH/include | head -20
+          echo ""
+          echo "=== Looking for libcef.so ==="
+          find $CEF_PATH -name "libcef.so" -o -name "libcef*.so*" 2>/dev/null || echo "No libcef.so found"
 
       - name: Build with CEF feature
         run: cargo build -p guacr-rbi --features cef
-        continue-on-error: true  # CEF crate may have build issues
 
       - name: Run RBI tests with CEF
         run: cargo test -p guacr-rbi --features cef --lib
-        continue-on-error: true  # CEF runtime may have issues in CI
 
   # ============================================================================
   # Build Check (ensure it compiles on multiple platforms)
@@ -241,16 +261,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
+          cache-on-failure: false
 
       - name: Build all crates
         run: cargo build --all-targets
@@ -291,16 +305,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-integration-
+          cache-on-failure: false
 
       - name: Wait for SSH service
         run: |
@@ -348,16 +356,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-docs-
+          cache-on-failure: false
 
       - name: Check documentation
         # Note: Not using --all-features because CEF requires binaries to compile

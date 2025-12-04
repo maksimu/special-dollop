@@ -701,6 +701,104 @@ mod tests {
         assert!(result.unwrap_err().contains("Invalid base32"));
     }
 
+    /// RFC 6238 Appendix B test vectors
+    /// These validate our TOTP implementation against the standard
+    #[test]
+    fn test_totp_rfc6238_test_vectors() {
+        // Test helper to generate TOTP at a specific timestamp
+        fn totp_at_time(secret_bytes: &[u8], timestamp: u64, algorithm: TotpAlgorithm) -> String {
+            let time_step = timestamp / 30;
+            hotp(secret_bytes, time_step, 8, algorithm)
+        }
+
+        // RFC 6238 Appendix B - SHA1 Test Vectors
+        // Secret: "12345678901234567890" (ASCII, 20 bytes)
+        let secret_sha1 = b"12345678901234567890";
+
+        assert_eq!(
+            totp_at_time(secret_sha1, 59, TotpAlgorithm::Sha1),
+            "94287082"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha1, 1111111109, TotpAlgorithm::Sha1),
+            "07081804"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha1, 1111111111, TotpAlgorithm::Sha1),
+            "14050471"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha1, 1234567890, TotpAlgorithm::Sha1),
+            "89005924"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha1, 2000000000, TotpAlgorithm::Sha1),
+            "69279037"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha1, 20000000000, TotpAlgorithm::Sha1),
+            "65353130"
+        );
+
+        // RFC 6238 Appendix B - SHA256 Test Vectors
+        // Secret: "12345678901234567890123456789012" (ASCII, 32 bytes)
+        let secret_sha256 = b"12345678901234567890123456789012";
+
+        assert_eq!(
+            totp_at_time(secret_sha256, 59, TotpAlgorithm::Sha256),
+            "46119246"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha256, 1111111109, TotpAlgorithm::Sha256),
+            "68084774"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha256, 1111111111, TotpAlgorithm::Sha256),
+            "67062674"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha256, 1234567890, TotpAlgorithm::Sha256),
+            "91819424"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha256, 2000000000, TotpAlgorithm::Sha256),
+            "90698825"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha256, 20000000000, TotpAlgorithm::Sha256),
+            "77737706"
+        );
+
+        // RFC 6238 Appendix B - SHA512 Test Vectors
+        // Secret: "1234567890123456789012345678901234567890123456789012345678901234" (ASCII, 64 bytes)
+        let secret_sha512 = b"1234567890123456789012345678901234567890123456789012345678901234";
+
+        assert_eq!(
+            totp_at_time(secret_sha512, 59, TotpAlgorithm::Sha512),
+            "90693936"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha512, 1111111109, TotpAlgorithm::Sha512),
+            "25091201"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha512, 1111111111, TotpAlgorithm::Sha512),
+            "99943326"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha512, 1234567890, TotpAlgorithm::Sha512),
+            "93441116"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha512, 2000000000, TotpAlgorithm::Sha512),
+            "38618901"
+        );
+        assert_eq!(
+            totp_at_time(secret_sha512, 20000000000, TotpAlgorithm::Sha512),
+            "47863826"
+        );
+    }
+
     #[test]
     fn test_credentials_default() {
         let creds = AutofillCredentials::default();

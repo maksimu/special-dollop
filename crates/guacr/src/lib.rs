@@ -41,6 +41,8 @@ pub use guacr_handlers::{
     // Zero-copy event-based interface
     EventBasedHandler,
     EventCallback,
+    // Error type (needed for EventCallback implementations)
+    HandlerError,
     HandlerEvent,
     HandlerStats,
     HealthStatus,

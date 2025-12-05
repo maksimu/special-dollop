@@ -297,6 +297,42 @@ impl WebRTCDataChannel {
         }
     }
 
+    /// Wait for the WebRTC buffer to drain (without closing the channel).
+    ///
+    /// Use this when you've just sent an important message (like an error or
+    /// disconnect notification) and want to ensure it's transmitted before
+    /// the connection task exits. Does NOT close the channel.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum time to wait for buffer to drain
+    ///
+    /// # Returns
+    /// * `true` - Buffer drained completely
+    /// * `false` - Timeout reached, data may still be buffered
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < timeout {
+            // Check if already closing (buffer will report 0)
+            if self.is_closing.load(Ordering::Acquire) {
+                return true;
+            }
+
+            let buffered = self.data_channel.buffered_amount().await;
+            if buffered == 0 {
+                return true;
+            }
+            // Cooperative yield - avoids busy loop, no timer overhead
+            tokio::task::yield_now().await;
+        }
+
+        warn!(
+            "WebRTC buffer drain timeout after {:?}, data may still be buffered",
+            timeout
+        );
+        false
+    }
+
     pub fn ready_state(&self) -> String {
         // Fast path for closing
         if self.is_closing.load(Ordering::Acquire) {

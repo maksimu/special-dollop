@@ -8,9 +8,36 @@
  * ------------------------------------------------------------------------------------------- */
 use crate::buffer_pool::BufferPool;
 use crate::likely; // Import branch prediction macros
+use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// === CAPABILITY FLAGS ===
+//
+// Capabilities are defined at tube creation time and indicate which
+// features the tube supports. These are NOT negotiated per-connection
+// (no V2 protocol) - both sides must be configured with matching capabilities.
+
+bitflags! {
+    /// Capabilities that can be enabled for a tube
+    ///
+    /// These are set at tube creation time and apply to all connections
+    /// on that tube. Both sides must have matching capabilities.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub struct Capabilities: u32 {
+        /// No capabilities (legacy mode)
+        const NONE = 0x0000;
+        /// Can use multiple WebRTC data channels for higher throughput
+        const MULTI_CHANNEL = 0x0001;
+        /// Can fragment/reassemble large frames across channels
+        const FRAGMENTATION = 0x0002;
+        /// Supports session persistence across WebRTC reconnection
+        const SESSION_PERSIST = 0x0004;
+        /// Can dynamically add/remove data channels based on load
+        const ADAPTIVE_CHANNELS = 0x0008;
+    }
+}
 
 pub(crate) const CONN_NO_LEN: usize = 4;
 pub(crate) const CTRL_NO_LEN: usize = 2;
@@ -89,11 +116,6 @@ pub enum ControlMessage {
     CloseConnection = 102,
     SendEOF = 104,
     ConnectionOpened = 103,
-    // UDP ASSOCIATE support
-    UdpAssociate = 201,
-    UdpAssociateOpened = 202,
-    UdpPacket = 203,
-    UdpAssociateClosed = 204,
     // Metrics support
     MetricsRequest = 301,
     MetricsResponse = 302,
@@ -108,10 +130,6 @@ impl std::fmt::Display for ControlMessage {
             ControlMessage::CloseConnection => write!(f, "CloseConnection"),
             ControlMessage::SendEOF => write!(f, "SendEOF"),
             ControlMessage::ConnectionOpened => write!(f, "ConnectionOpened"),
-            ControlMessage::UdpAssociate => write!(f, "UdpAssociate"),
-            ControlMessage::UdpAssociateOpened => write!(f, "UdpAssociateOpened"),
-            ControlMessage::UdpPacket => write!(f, "UdpPacket"),
-            ControlMessage::UdpAssociateClosed => write!(f, "UdpAssociateClosed"),
             ControlMessage::MetricsRequest => write!(f, "MetricsRequest"),
             ControlMessage::MetricsResponse => write!(f, "MetricsResponse"),
             ControlMessage::MetricsConfig => write!(f, "MetricsConfig"),
@@ -130,10 +148,6 @@ impl TryFrom<u16> for ControlMessage {
             102 => Ok(CloseConnection),
             104 => Ok(SendEOF),
             103 => Ok(ConnectionOpened),
-            201 => Ok(UdpAssociate),
-            202 => Ok(UdpAssociateOpened),
-            203 => Ok(UdpPacket),
-            204 => Ok(UdpAssociateClosed),
             301 => Ok(MetricsRequest),
             302 => Ok(MetricsResponse),
             303 => Ok(MetricsConfig),
@@ -309,16 +323,15 @@ impl Frame {
     }
 
     /// Create a control frame directly with a pre-allocated buffer
+    /// The buffer should already contain the control message data (e.g., conn_no + reason).
+    /// This function prepends the control message type to the existing buffer contents.
     pub(crate) fn new_control_with_buffer(msg: ControlMessage, buf: &mut BytesMut) -> Self {
-        // Clear the buffer but keep its capacity
-        buf.clear();
-
-        // Write the control message code
-        buf.put_u16(msg as u16);
-
-        // Clone the buffer contents for our own use
-        // This is more efficient than copying raw slice data
-        let payload = buf.clone().freeze();
+        // Prepend control message type to existing buffer data
+        // Don't clear the buffer - it already contains the data (conn_no, reason, etc.)
+        let mut full_buf = BytesMut::with_capacity(2 + buf.len());
+        full_buf.put_u16(msg as u16);
+        full_buf.extend_from_slice(&buf[..]);
+        let payload = full_buf.freeze();
 
         Self {
             connection_no: 0,
@@ -640,5 +653,83 @@ mod tests {
         // Verify correct parsing
         assert_eq!(decoded.connection_no, 789);
         assert_eq!(decoded.payload, Bytes::from_static(guac_payload));
+    }
+
+    #[tokio::test]
+    async fn test_new_control_with_buffer_preserves_data() {
+        // Test that new_control_with_buffer correctly prepends the message type
+        // without clearing the buffer data (conn_no + reason)
+        let mut buf = BytesMut::new();
+        let conn_no: u32 = 42;
+        let reason = CloseConnectionReason::GuacdError;
+
+        // Add conn_no and reason to buffer (as done in connections.rs)
+        buf.extend_from_slice(&conn_no.to_be_bytes());
+        buf.put_u8(reason as u8);
+
+        // Create control frame - should prepend message type without clearing
+        let frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut buf);
+
+        // Verify the payload contains: [message_type (2 bytes)][conn_no (4 bytes)][reason (1 byte)]
+        assert_eq!(
+            frame.payload.len(),
+            2 + 4 + 1,
+            "Payload should be 7 bytes total"
+        );
+
+        // Verify message type at the beginning
+        let message_type = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+        assert_eq!(message_type, ControlMessage::CloseConnection as u16);
+
+        // Verify conn_no after message type
+        let decoded_conn_no = u32::from_be_bytes([
+            frame.payload[2],
+            frame.payload[3],
+            frame.payload[4],
+            frame.payload[5],
+        ]);
+        assert_eq!(decoded_conn_no, conn_no);
+
+        // Verify reason at the end
+        let decoded_reason = frame.payload[6];
+        assert_eq!(decoded_reason, reason as u8);
+    }
+
+    #[tokio::test]
+    async fn test_close_connection_reason_preserved_through_encoding() {
+        // End-to-end test: encode a CloseConnection frame and verify the reason survives
+        let pool = BufferPool::default();
+        let conn_no: u32 = 123;
+        let reason = CloseConnectionReason::GuacdError;
+
+        // Create buffer with conn_no + reason (as done in connections.rs)
+        let mut buf = pool.acquire();
+        buf.clear();
+        buf.extend_from_slice(&conn_no.to_be_bytes());
+        buf.put_u8(reason as u8);
+
+        // Create and encode the frame
+        let frame = Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut buf);
+        let encoded = frame.encode_with_pool(&pool);
+
+        // Parse the frame back
+        let mut decode_buf = BytesMut::from(&encoded[..]);
+        let decoded = try_parse_frame(&mut decode_buf).expect("Should parse frame");
+
+        // Extract the data after the control message type (skip first 2 bytes)
+        let data = &decoded.payload[2..];
+
+        // Verify conn_no is preserved
+        assert!(data.len() >= 4, "Data should contain at least conn_no");
+        let decoded_conn_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(decoded_conn_no, conn_no);
+
+        // Verify reason is preserved
+        assert!(data.len() >= 5, "Data should contain conn_no + reason");
+        let decoded_reason = data[4];
+        assert_eq!(
+            decoded_reason, reason as u8,
+            "Reason should be GuacdError (not Normal)"
+        );
     }
 }

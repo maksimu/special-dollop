@@ -1,12 +1,15 @@
 // Connection management functionality for Channel
 
 use crate::buffer_pool::BufferPool;
+use crate::channel::assembler::{
+    fragment_frame, DEFAULT_FRAGMENT_THRESHOLD, DEFAULT_MAX_FRAGMENTS,
+};
 use crate::channel::guacd_parser::{
     GuacdInstruction, GuacdParser, OpcodeAction, PeekError, SpecialOpcode,
 };
 use crate::channel::types::ActiveProtocol;
 use crate::models::Conn;
-use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
+use crate::tube_protocol::{Capabilities, CloseConnectionReason, ControlMessage, Frame};
 use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
 use anyhow::Result;
@@ -135,6 +138,7 @@ pub async fn setup_outbound_task(
     let buffer_pool = channel.buffer_pool.clone();
     let is_channel_server_mode = channel.server_mode;
     let channel_close_reason_arc = channel.channel_close_reason.clone(); // For checking if Python already closed
+    let fragmentation_enabled = channel.capabilities.contains(Capabilities::FRAGMENTATION);
 
     // TRACE: Ultra-verbose task lifecycle logging (only in verbose mode)
     if unlikely!(crate::logger::is_verbose_logging()) {
@@ -301,6 +305,7 @@ pub async fn setup_outbound_task(
         let event_sender = EventDrivenSender::new(Arc::new(dc.clone()), STANDARD_BUFFER_THRESHOLD);
 
         // **OPTIMIZED EVENT-DRIVEN HELPER** - Zero polling, instant backpressure
+        // Now with optional fragmentation support for large frames
         #[inline(always)] // Hot path optimization
         async fn send_with_event_backpressure(
             frame_to_send: bytes::Bytes,
@@ -308,7 +313,49 @@ pub async fn setup_outbound_task(
             event_sender: &EventDrivenSender,
             channel_id_local: &str,
             context_msg: &str,
+            fragmentation_enabled: bool,
         ) -> Result<(), ()> {
+            // Check if we need to fragment this frame
+            if fragmentation_enabled && frame_to_send.len() > DEFAULT_FRAGMENT_THRESHOLD {
+                // Large frame + fragmentation enabled: split into fragments
+                if let Some(fragments) = fragment_frame(
+                    &frame_to_send,
+                    DEFAULT_FRAGMENT_THRESHOLD,
+                    DEFAULT_MAX_FRAGMENTS,
+                ) {
+                    // Send each fragment through backpressure system
+                    for (i, fragment) in fragments.into_iter().enumerate() {
+                        match event_sender.send_with_natural_backpressure(fragment).await {
+                            Ok(_) => {
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    log::trace!(
+                                        "Fragment {}/{} sent (channel_id: {}, conn_no: {}, context: {})",
+                                        i + 1,
+                                        frame_to_send.len().div_ceil(DEFAULT_FRAGMENT_THRESHOLD - 9),
+                                        channel_id_local,
+                                        conn_no_local,
+                                        context_msg
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if !e.to_string().contains("DataChannel is not opened")
+                                    && !e.to_string().contains("Channel is closing")
+                                {
+                                    error!(
+                                        "Fragment send failed (channel_id: {}, conn_no: {}, fragment: {}, error: {})",
+                                        channel_id_local, conn_no_local, i, e
+                                    );
+                                }
+                                return Err(());
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                // If fragment_frame returns None (frame too large), fall through to send as-is
+            }
+
             // **FAST PATH**: Event-driven sending with native WebRTC backpressure
             match event_sender
                 .send_with_natural_backpressure(frame_to_send)
@@ -427,7 +474,7 @@ pub async fn setup_outbound_task(
                 // Rate-limited logging (once every 5 seconds max)
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or(Duration::ZERO)
                     .as_secs();
                 let last = LAST_BACKPRESSURE_LOG.load(Ordering::Relaxed);
 
@@ -560,6 +607,7 @@ pub async fn setup_outbound_task(
                             &event_sender,
                             &channel_id_for_task,
                             "EOF frame",
+                            fragmentation_enabled,
                         )
                         .await;
                         eof_sent = true;
@@ -647,6 +695,7 @@ pub async fn setup_outbound_task(
                                                 &event_sender,
                                                 &channel_id_for_task,
                                                 "Guacd close instruction forward",
+                                                fragmentation_enabled,
                                             )
                                             .await
                                             .is_err()
@@ -701,6 +750,7 @@ pub async fn setup_outbound_task(
                                                     &event_sender,
                                                     &channel_id_for_task,
                                                     "Guacd close",
+                                                    fragmentation_enabled,
                                                 )
                                                 .await
                                                 .is_err()
@@ -762,6 +812,7 @@ pub async fn setup_outbound_task(
                                                         &event_sender,
                                                         &channel_id_for_task,
                                                         "pre-sync batch flush",
+                                                        fragmentation_enabled,
                                                     )
                                                     .await
                                                     .is_err()
@@ -789,6 +840,7 @@ pub async fn setup_outbound_task(
                                                 &event_sender,
                                                 &channel_id_for_task,
                                                 "Guacd sync forward to client",
+                                                fragmentation_enabled,
                                             )
                                             .await
                                             .is_err()
@@ -963,6 +1015,7 @@ pub async fn setup_outbound_task(
                                                     &event_sender,
                                                     &channel_id_for_task,
                                                     "(pre-large) batch",
+                                                    fragmentation_enabled,
                                                 )
                                                 .await
                                                 .is_err()
@@ -990,6 +1043,7 @@ pub async fn setup_outbound_task(
                                                 &event_sender,
                                                 &channel_id_for_task,
                                                 "large instruction",
+                                                fragmentation_enabled,
                                             )
                                             .await
                                             .is_err()
@@ -1018,6 +1072,7 @@ pub async fn setup_outbound_task(
                                                     &event_sender,
                                                     &channel_id_for_task,
                                                     "batch",
+                                                    fragmentation_enabled,
                                                 )
                                                 .await
                                                 .is_err()
@@ -1065,6 +1120,7 @@ pub async fn setup_outbound_task(
                                         &event_sender,
                                         &channel_id_for_task,
                                         "Guacd parsing error close",
+                                        fragmentation_enabled,
                                     )
                                     .await
                                     .is_err()
@@ -1103,6 +1159,7 @@ pub async fn setup_outbound_task(
                                     &event_sender,
                                     &channel_id_for_task,
                                     "per-read flush",
+                                    fragmentation_enabled,
                                 )
                                 .await
                                 .is_err()
@@ -1142,6 +1199,7 @@ pub async fn setup_outbound_task(
                             &event_sender,
                             &channel_id_for_task,
                             "PortForward/SOCKS5 data",
+                            fragmentation_enabled,
                         )
                         .await
                         .is_err()

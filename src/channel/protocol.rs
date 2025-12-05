@@ -42,7 +42,19 @@ impl Channel {
 
         let state_tx_open = state_tx.clone();
         let channel_id_for_open = channel_id_base.clone(); // Clone for on_open
+
+        // Clone the WebRTCDataChannel's shared notification mechanism so we can
+        // notify waiters when the channel opens. This is important because we're
+        // overwriting the on_open callback set in WebRTCDataChannel::new().
+        let is_open_flag = webrtc.is_open.clone();
+        let open_notify = webrtc.open_notify.clone();
+
         data_channel.on_open(Box::new(move || {
+            // Update the shared is_open flag and notify waiters
+            // This ensures wait_for_channel_open() works even though we replaced the callback
+            is_open_flag.store(true, std::sync::atomic::Ordering::Release);
+            open_notify.notify_waiters();
+
             let tx = state_tx_open.clone();
             let channel_id_log = channel_id_for_open.clone(); // Clone for async block
             tokio::spawn(async move {
@@ -150,16 +162,6 @@ impl Channel {
                 // In client mode, we just log and continue
                 self.handle_connection_opened(data).await?;
             }
-            // UDP ASSOCIATE support removed - ignore these messages
-            ControlMessage::UdpAssociate
-            | ControlMessage::UdpAssociateOpened
-            | ControlMessage::UdpPacket
-            | ControlMessage::UdpAssociateClosed => {
-                warn!(
-                    "Channel({}): UDP ASSOCIATE not supported, ignoring {:?}",
-                    self.channel_id, message_type
-                );
-            }
             ControlMessage::MetricsRequest => {
                 self.handle_metrics_request(data).await?;
             }
@@ -202,8 +204,15 @@ impl Channel {
             self.should_exit
                 .store(true, std::sync::atomic::Ordering::Release);
             // Store the close reason for the channel - use try_lock to avoid blocking
+            // Don't overwrite a critical error reason (like GuacdError) with Normal
             if let Ok(mut guard) = self.channel_close_reason.try_lock() {
-                *guard = Some(reason);
+                let should_store = match &*guard {
+                    None => true,
+                    Some(existing) => !existing.is_critical() || reason.is_critical(),
+                };
+                if should_store {
+                    *guard = Some(reason);
+                }
             }
             // Even if we can't store the reason, we still need to exit
             return Ok(());

@@ -39,6 +39,20 @@ pub struct WebRTCDataChannel {
     /// Callback for buffered amount low - still needs Mutex (callback is not Copy)
     pub(crate) on_buffered_amount_low_callback: BufferedAmountLowCallback,
     pub(crate) threshold_monitor: Arc<AtomicBool>,
+    /// Notification for when data channel opens - allows multiple waiters without callback conflicts
+    pub(crate) open_notify: Arc<tokio::sync::Notify>,
+    /// Flag indicating if data channel is open - set once and never reset
+    pub(crate) is_open: Arc<AtomicBool>,
+
+    /// Early message buffer - captures messages arriving before handlers are ready.
+    /// This is critical for on_data_channel callbacks where messages can arrive
+    /// before setup_channel_for_data_channel completes (~100ms race window).
+    /// Uses lock-free SegQueue for zero-contention message capture.
+    pub(crate) early_message_buffer: Arc<SegQueue<Bytes>>,
+    /// Count of messages in early buffer (for logging/debugging)
+    pub(crate) early_message_count: Arc<AtomicUsize>,
+    /// Flag indicating if early buffering is active (set to false once real handler takes over)
+    pub(crate) early_buffering_active: Arc<AtomicBool>,
 
     #[cfg(test)]
     pub(crate) test_send_hook: TestSendHook,
@@ -52,6 +66,11 @@ impl Clone for WebRTCDataChannel {
             buffered_amount_low_threshold: Arc::clone(&self.buffered_amount_low_threshold),
             on_buffered_amount_low_callback: Arc::clone(&self.on_buffered_amount_low_callback),
             threshold_monitor: Arc::clone(&self.threshold_monitor),
+            open_notify: Arc::clone(&self.open_notify),
+            is_open: Arc::clone(&self.is_open),
+            early_message_buffer: Arc::clone(&self.early_message_buffer),
+            early_message_count: Arc::clone(&self.early_message_count),
+            early_buffering_active: Arc::clone(&self.early_buffering_active),
 
             #[cfg(test)]
             test_send_hook: Arc::clone(&self.test_send_hook),
@@ -61,12 +80,72 @@ impl Clone for WebRTCDataChannel {
 
 impl WebRTCDataChannel {
     pub fn new(data_channel: Arc<RTCDataChannel>) -> Self {
+        let open_notify = Arc::new(tokio::sync::Notify::new());
+        let is_open = Arc::new(AtomicBool::new(false));
+
+        // Early message buffering - captures messages before real handler is set up
+        let early_message_buffer = Arc::new(SegQueue::new());
+        let early_message_count = Arc::new(AtomicUsize::new(0));
+        let early_buffering_active = Arc::new(AtomicBool::new(true));
+
+        // Check if already open (for received data channels that may already be open)
+        let already_open = data_channel.ready_state()
+            == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open;
+        if already_open {
+            is_open.store(true, Ordering::Release);
+            open_notify.notify_waiters();
+        }
+
+        // Set up on_open callback to notify waiters (this is the ONLY place on_open is set)
+        let is_open_for_callback = Arc::clone(&is_open);
+        let open_notify_for_callback = Arc::clone(&open_notify);
+        data_channel.on_open(Box::new(move || {
+            is_open_for_callback.store(true, Ordering::Release);
+            open_notify_for_callback.notify_waiters();
+            Box::pin(async {})
+        }));
+
+        // CRITICAL: Set up early message buffering IMMEDIATELY.
+        // This captures messages that arrive before setup_channel_for_data_channel
+        // completes (there can be a ~100ms race window in on_data_channel callbacks).
+        let early_buffer_for_callback = Arc::clone(&early_message_buffer);
+        let early_count_for_callback = Arc::clone(&early_message_count);
+        let early_active_for_callback = Arc::clone(&early_buffering_active);
+        let label_for_log = data_channel.label().to_string();
+        data_channel.on_message(Box::new(move |msg| {
+            let buffer = Arc::clone(&early_buffer_for_callback);
+            let count = Arc::clone(&early_count_for_callback);
+            let active = Arc::clone(&early_active_for_callback);
+            let label = label_for_log.clone();
+            let data = Bytes::copy_from_slice(&msg.data);
+
+            Box::pin(async move {
+                // Only buffer if early buffering is still active
+                if active.load(Ordering::Acquire) {
+                    let msg_count = count.fetch_add(1, Ordering::AcqRel) + 1;
+                    buffer.push(data);
+                    debug!(
+                        "[EARLY_BUFFER] Captured early message #{} ({} bytes) on channel '{}' before handler ready",
+                        msg_count, buffer.len(), label
+                    );
+                }
+                // If early_buffering_active is false, this callback should have been
+                // replaced by the real handler - but if not, the message is dropped
+                // (this shouldn't happen in normal operation)
+            })
+        }));
+
         Self {
             data_channel,
             is_closing: Arc::new(AtomicBool::new(false)),
             buffered_amount_low_threshold: Arc::new(AtomicU64::new(0)),
             on_buffered_amount_low_callback: Arc::new(std::sync::Mutex::new(None)),
             threshold_monitor: Arc::new(AtomicBool::new(false)),
+            open_notify,
+            is_open,
+            early_message_buffer,
+            early_message_count,
+            early_buffering_active,
 
             #[cfg(test)]
             test_send_hook: Arc::new(std::sync::Mutex::new(None)),
@@ -107,7 +186,7 @@ impl WebRTCDataChannel {
                         Box::pin(async move {
                             // Buffer drain event logging - verbose only (can be frequent)
                             if unlikely!(crate::logger::is_verbose_logging()) {
-                                log::debug!(
+                                debug!(
                                     "Native bufferedAmountLow event triggered (buffer below {})",
                                     threshold_value
                                 );
@@ -199,84 +278,71 @@ impl WebRTCDataChannel {
         self.data_channel.buffered_amount().await as u64
     }
 
-    #[cfg(test)]
+    /// Wait for the data channel to be open, with an optional timeout.
+    /// Returns Ok(true) if channel opened, Ok(false) if closed/timeout, Err if closing.
+    /// This is essential for server-mode channels to wait before accepting TCP connections.
+    ///
+    /// This uses a simple polling approach combined with the shared notification to be
+    /// robust against callback conflicts. Even if callbacks are overwritten elsewhere,
+    /// we'll still detect the open state via polling.
     pub async fn wait_for_channel_open(&self, timeout: Option<Duration>) -> Result<bool, String> {
         let timeout_duration = timeout.unwrap_or(Duration::from_secs(10));
+        let poll_interval = Duration::from_millis(50);
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        let label = self.data_channel.label().to_string();
 
-        // Use oneshot channel for event-driven notification
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        debug!(
+            "Waiting for data channel to open: {} (timeout: {:?})",
+            label, timeout_duration
+        );
 
-        // Wrap sender in Arc<Mutex<Option<>>> so we can safely consume it from either callback
-        let sender = Arc::new(std::sync::Mutex::new(Some(tx)));
+        loop {
+            let current_state = self.data_channel.ready_state();
 
-        // Create shared flags for state
-        let is_open = Arc::new(AtomicBool::new(false));
-        let is_open_for_close = Arc::clone(&is_open);
-
-        // We don't need this variable anymore
-        let is_closing = self.is_closing.clone();
-
-        // Set up onOpen callback if not already open
-        if self.data_channel.ready_state()
-            != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-        {
-            let sender_clone = Arc::clone(&sender);
-
-            self.data_channel.on_open(Box::new(move || {
-                // Set the is_open flag
-                is_open.store(true, Ordering::Release);
-
-                // Send the notification, consuming the sender
-                if let Ok(mut guard) = sender_clone.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(true);
-                    }
-                }
-
-                Box::pin(async {})
-            }));
-        }
-
-        // Set up onClose callback
-        let sender_for_close = Arc::clone(&sender);
-
-        self.data_channel.on_close(Box::new(move || {
-            // If opened and then closed during this wait, send it false
-            if is_open_for_close.load(Ordering::Acquire) {
-                // Send false to indicate a closed state, consuming the sender
-                if let Ok(mut guard) = sender_for_close.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(false);
-                    }
-                }
+            // Check if already closed (error case)
+            if self.is_closing.load(Ordering::Acquire) {
+                warn!("wait_for_channel_open CLOSING: channel={}", label);
+                return Err("Data channel is closing".to_string());
             }
 
-            Box::pin(async {})
-        }));
-
-        // Check if already closed first (fast path)
-        if is_closing.load(Ordering::Acquire) {
-            return Err("Data channel is closing".to_string());
-        }
-
-        // Check if already open the second (fast path)
-        if self.data_channel.ready_state()
-            == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-        {
-            return Ok(true);
-        }
-
-        // Wait for the event or timeout
-        match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(state)) => Ok(state),
-            Ok(Err(_)) => {
-                // Channel closed without sending a value
-                Ok(false)
+            // Check if open via our flag (set by on_open callback)
+            if self.is_open.load(Ordering::Acquire) {
+                return Ok(true);
             }
-            Err(_) => {
-                // Timeout occurred
-                Ok(self.data_channel.ready_state()
-                    == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open)
+
+            // Also check native state (in case callback was overwritten)
+            if current_state == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            {
+                // Update our flag to match
+                debug!(
+                    "Data channel opened (detected via native state polling): {}",
+                    label
+                );
+                self.is_open.store(true, Ordering::Release);
+                self.open_notify.notify_waiters();
+                return Ok(true);
+            }
+
+            // Check for timeout
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "Data channel did not open within timeout ({:?}), final state: {:?} (channel: {})",
+                    timeout_duration, current_state, label
+                );
+                return Ok(false);
+            }
+
+            // Use select to wait for either notification or poll interval
+            // This combines event-driven and polling for robustness
+            tokio::select! {
+                _ = self.open_notify.notified() => {
+                    // Notification received, check state again
+                    continue;
+                }
+                _ = tokio::time::sleep(poll_interval) => {
+                    // Poll interval, check state again
+                    continue;
+                }
             }
         }
     }
@@ -344,6 +410,47 @@ impl WebRTCDataChannel {
 
     pub fn label(&self) -> String {
         self.data_channel.label().to_string()
+    }
+
+    /// Take ownership of all early-buffered messages and disable early buffering.
+    ///
+    /// CRITICAL: This must be called by setup_channel_for_data_channel AFTER
+    /// setting the real on_message handler. The correct order is:
+    /// 1. Set new on_message handler (replaces early buffer callback)
+    /// 2. Call take_early_messages() to drain buffer
+    /// 3. Forward returned messages to the channel
+    ///
+    /// This order ensures no messages are lost:
+    /// - Messages arriving after step 1 go directly to new handler
+    /// - Messages that arrived before step 1 are returned by step 2
+    ///
+    /// After this call:
+    /// - early_buffering_active is set to false
+    /// - All buffered messages are returned
+    ///
+    /// # Returns
+    /// Vec of early messages in arrival order, empty if none were buffered
+    pub fn take_early_messages(&self) -> Vec<Bytes> {
+        // Disable early buffering FIRST (atomic release)
+        self.early_buffering_active.store(false, Ordering::Release);
+
+        // Drain all buffered messages
+        let mut messages = Vec::new();
+        while let Some(msg) = self.early_message_buffer.pop() {
+            messages.push(msg);
+        }
+
+        let count = self.early_message_count.load(Ordering::Acquire);
+        if !messages.is_empty() {
+            log::info!(
+                "[EARLY_BUFFER] Drained {} early messages from channel '{}' (total captured: {})",
+                messages.len(),
+                self.label(),
+                count
+            );
+        }
+
+        messages
     }
 }
 
@@ -458,7 +565,7 @@ impl EventDrivenSender {
                         // Permanent failure - WebRTC is dead, don't queue
                         // Only log once per channel to avoid spam during shutdown
                         if unlikely!(crate::logger::is_verbose_logging()) {
-                            log::debug!(
+                            debug!(
                                 "WebRTC permanently closed, failing send (frame_size: {} bytes)",
                                 frame_len
                             );

@@ -8,7 +8,7 @@ import base64 # Add base64 import
 
 import keeper_pam_webrtc_rs
 
-from test_utils import with_runtime, BaseWebRTCTest, run_ack_server_in_thread
+from test_utils import with_runtime, BaseWebRTCTest, run_ack_server_in_thread, ExactEchoServer
 
 # Special test mode values that might be recognized by the Rust code
 TEST_KSM_CONFIG = "TEST_MODE_KSM_CONFIG"
@@ -275,6 +275,45 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             logging.warning("Neither connection attempted to connect - possible configuration issue")
         return False
 
+    def wait_for_tubes_ready(self, tube_id1, tube_id2, timeout=10):
+        """Wait for both tubes to be ready (data channels open and operational).
+
+        This should be called AFTER wait_for_tube_connection succeeds.
+        The 'ready' status indicates the data channel is open and we can safely send/receive data.
+        """
+        logging.info(f"Waiting for tubes to be ready: {tube_id1} and {tube_id2} (timeout: {timeout}s)")
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                status1 = self.tube_registry.get_tube_status(tube_id1)
+                status2 = self.tube_registry.get_tube_status(tube_id2)
+                logging.debug(f"Poll tube status: {tube_id1}={status1}, {tube_id2}={status2}")
+
+                if status1 == "ready" and status2 == "ready":
+                    logging.info(f"Both tubes ready: {tube_id1} and {tube_id2}")
+                    return True
+
+                # Check for failure states
+                if status1 in ["failed", "closed", "disconnected"] or status2 in ["failed", "closed", "disconnected"]:
+                    logging.warning(f"Tube entered failure state: {tube_id1}={status1}, {tube_id2}={status2}")
+                    return False
+
+            except Exception as e:
+                logging.warning(f"Error getting tube status: {e}")
+
+            time.sleep(0.1)
+
+        # Final status check for logging
+        try:
+            status1 = self.tube_registry.get_tube_status(tube_id1)
+            status2 = self.tube_registry.get_tube_status(tube_id2)
+            logging.warning(f"Timeout waiting for tubes ready. Final status: {tube_id1}={status1}, {tube_id2}={status2}")
+        except Exception as e:
+            logging.warning(f"Could not get final tube status: {e}")
+
+        return False
+
     @with_runtime
     def test_e2e_echo_flow(self):
         logging.info("Starting E2E echo flow test")
@@ -295,7 +334,12 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             client_tube_id = None
             
             # 3. Server Tube Setup
-            server_conv_id = "e2e-server-conv"
+            # IMPORTANT: Both tubes must use the SAME conversation_id because WebRTC data channels
+            # are shared between peers. The offerer creates a channel with label=conversation_id,
+            # and the answerer receives that same channel. If they use different conversation_ids,
+            # the answerer will receive a channel with the offerer's conversation_id, not its own.
+            shared_conv_id = "e2e-shared-conv"  # Use same ID for both server and client
+            server_conv_id = shared_conv_id
             server_settings = {
                 "conversationType": "tunnel", # As per Rust test
                 "local_listen_addr": "127.0.0.1:0" # Server tube listens here, dynamic port
@@ -331,7 +375,7 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
             logging.info(f"[E2E_Test] Server tube {server_tube_id} created. Offer generated. Listening on {server_actual_listen_addr_str}")
 
             # 4. Client Tube Setup
-            client_conv_id = "e2e-client-conv"
+            client_conv_id = shared_conv_id  # Use SAME conversation_id as server
             client_settings = {
                 "conversationType": "tunnel",
                 "target_host": "127.0.0.1",
@@ -411,9 +455,24 @@ class TestWebRTCPerformance(BaseWebRTCTest, unittest.TestCase):
 
             logging.info(f"[E2E_Test] WebRTC connection established.")
 
-            # At this point, data channels should be ready if the library follows WebRTC standards.
-            # The Rust test waits for data channels to open. Here, we assume the connection implies data channel readiness for simplicity,
-            # unless specific API calls for data channel status are available and necessary.
+            # 7b. Wait for data channels to be ready (tube status == "ready")
+            # This is critical! The ICE connection being established doesn't mean data channels are open.
+            # We must wait for tubes to reach "ready" state before attempting to send/receive data.
+            # Note: WebRTC negotiation can take several seconds, especially in test environments.
+            # The Rust P2P test takes ~8s, so allow up to 30s for Python overhead and variability.
+            logging.info(f"[E2E_Test] Waiting for data channels to be ready...")
+            ready = self.wait_for_tubes_ready(server_tube_id, client_tube_id, timeout=30)
+            if not ready:
+                # Get status for diagnosis
+                try:
+                    server_status = self.tube_registry.get_tube_status(server_tube_id)
+                    client_status = self.tube_registry.get_tube_status(client_tube_id)
+                    logging.error(f"Final tube status: server={server_status}, client={client_status}")
+                except Exception as e:
+                    logging.error(f"Could not get final tube status: {e}")
+                self.fail("E2E test failed: Data channels did not become ready in time")
+
+            logging.info(f"[E2E_Test] Data channels ready.")
 
             # 8. Simulate External Client connecting to Server Tube's local TCP endpoint
             self.assertIsNotNone(server_actual_listen_addr_str, "Server actual_local_listen_addr is None") # Check from .get()
@@ -617,13 +676,187 @@ class TestWebRTCFragmentation(BaseWebRTCTest, unittest.TestCase):
 
         logging.info(f"Non-trickle ICE connection established in {connection_time:.2f} seconds")
 
-        # TODO: send different sized messages through the tube and verify we got them
-        
         # Clean up
         self.close_and_untrack_tube(server_id)
         self.close_and_untrack_tube(client_id)
-        
+
         logging.info("Tube connection reliability test completed")
+
+    @with_runtime
+    def test_e2e_fragmentation_bidirectional(self):
+        """
+        End-to-end test for WebRTC multi-channel fragmentation integration.
+
+        This test validates that the fragmentation pipeline is correctly wired up:
+        1. enable_multi_channel=True enables FRAGMENTATION capability
+        2. Assembler is created for each channel with cleanup task
+        3. Large data (up to 100KB) flows correctly through WebRTC in both directions
+        4. Data integrity is maintained across the full pipeline
+
+        Note: The TCP backend reads in 8KB chunks (MAX_READ_SIZE), so individual frames
+        won't exceed the 16KB fragment threshold in this test. However, this verifies
+        the integration is correctly plumbed. The Rust unit tests (assembler_tests.rs)
+        directly verify the fragment_frame() code path for frames > 16KB.
+        """
+        logging.info("Starting E2E fragmentation bidirectional test")
+        echo_server = None
+        external_client_socket = None
+        server_tube_id = None
+        client_tube_id = None
+
+        # Test payloads: small (no frag), medium (some frags), large (many frags)
+        # Fragment threshold is 16KB, so:
+        # - 8KB: no fragmentation needed
+        # - 24KB: ~2 fragments
+        # - 50KB: ~4 fragments
+        # - 100KB: ~7 fragments
+        test_sizes = [8 * 1024, 24 * 1024, 50 * 1024, 100 * 1024]
+
+        try:
+            # 1. Start an exact echo server (echoes bytes back exactly)
+            echo_server = ExactEchoServer()
+            echo_server.start()
+
+            # Wait for server to be ready
+            timeout = 5
+            start_time = time.time()
+            while not echo_server.actual_port and time.time() - start_time < timeout:
+                time.sleep(0.01)
+
+            self.assertIsNotNone(echo_server.actual_port, "Echo server did not start")
+            logging.info(f"[FragTest] ExactEchoServer running on 127.0.0.1:{echo_server.actual_port}")
+
+            # 2. Create server tube (accepts external TCP connections)
+            server_settings = {
+                "conversationType": "tunnel",
+                "local_listen_addr": "127.0.0.1:0"  # Dynamic port
+            }
+
+            server_tube_info = self.create_and_track_tube(
+                conversation_id="frag-e2e-server",
+                settings=server_settings,
+                trickle_ice=False,  # Non-trickle for simpler test
+                callback_token=TEST_CALLBACK_TOKEN,
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG,
+                enable_multi_channel=True  # Enable fragmentation
+            )
+
+            server_offer_b64 = server_tube_info['offer']
+            server_tube_id = server_tube_info['tube_id']
+            server_listen_addr = server_tube_info.get('actual_local_listen_addr')
+
+            self.assertIsNotNone(server_offer_b64, "Server should generate an offer")
+            self.assertIsNotNone(server_listen_addr, "Server should have listen address")
+            logging.info(f"[FragTest] Server tube {server_tube_id} listening on {server_listen_addr}")
+
+            # 3. Create client tube (connects to echo server backend)
+            client_settings = {
+                "conversationType": "tunnel",
+                "target_host": "127.0.0.1",
+                "target_port": str(echo_server.actual_port)
+            }
+
+            client_tube_info = self.create_and_track_tube(
+                conversation_id="frag-e2e-client",
+                settings=client_settings,
+                trickle_ice=False,
+                callback_token=TEST_CALLBACK_TOKEN,
+                krelay_server="test.relay.server.com",
+                client_version="ms16.5.0",
+                ksm_config=TEST_KSM_CONFIG,
+                offer=server_offer_b64,
+                enable_multi_channel=True  # Enable fragmentation
+            )
+
+            client_answer_b64 = client_tube_info['answer']
+            client_tube_id = client_tube_info['tube_id']
+
+            self.assertIsNotNone(client_answer_b64, "Client should generate an answer")
+            logging.info(f"[FragTest] Client tube {client_tube_id} created")
+
+            # 4. Complete signaling
+            self.tube_registry.set_remote_description(server_tube_id, client_answer_b64, is_answer=True)
+
+            # 5. Wait for WebRTC connection
+            connected = self.wait_for_tube_connection(server_tube_id, client_tube_id, timeout=20)
+            if not connected:
+                server_state = self.tube_registry.get_connection_state(server_tube_id)
+                client_state = self.tube_registry.get_connection_state(client_tube_id)
+                self.fail(f"WebRTC connection failed. States: server={server_state}, client={client_state}")
+
+            logging.info("[FragTest] WebRTC connection established")
+
+            # 6. Connect external client to server tube's TCP listener
+            parts = server_listen_addr.split(':')
+            server_host = parts[0]
+            server_port = int(parts[1])
+
+            external_client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            external_client_socket.settimeout(30)  # Long timeout for large payloads
+            external_client_socket.connect((server_host, server_port))
+            logging.info(f"[FragTest] External client connected to {server_listen_addr}")
+
+            # 7. Test each payload size
+            for size in test_sizes:
+                # Generate deterministic test data
+                test_data = bytes([(i % 256) for i in range(size)])
+
+                frag_info = ""
+                if size > 16 * 1024:
+                    num_frags = (size + 16 * 1024 - 1) // (16 * 1024)
+                    frag_info = f" (~{num_frags} fragments)"
+
+                logging.info(f"[FragTest] Testing {size // 1024}KB payload{frag_info}")
+
+                # Send data
+                external_client_socket.sendall(test_data)
+
+                # Receive echoed data
+                received = bytearray()
+                recv_start = time.time()
+                while len(received) < size and time.time() - recv_start < 30:
+                    try:
+                        chunk = external_client_socket.recv(min(65536, size - len(received)))
+                        if not chunk:
+                            break
+                        received.extend(chunk)
+                    except socket.timeout:
+                        continue
+
+                # Verify
+                self.assertEqual(len(received), size,
+                    f"Size mismatch for {size // 1024}KB: got {len(received)} bytes")
+                self.assertEqual(bytes(received), test_data,
+                    f"Data corruption for {size // 1024}KB payload")
+
+                logging.info(f"[FragTest] {size // 1024}KB payload verified successfully")
+
+            logging.info("[FragTest] All fragmentation tests passed!")
+
+        except Exception as e:
+            logging.error(f"[FragTest] Exception: {e}", exc_info=True)
+            self.fail(f"E2E fragmentation test failed: {e}")
+        finally:
+            logging.info("[FragTest] Cleaning up...")
+
+            if external_client_socket:
+                try:
+                    external_client_socket.close()
+                except Exception as e:
+                    logging.error(f"[FragTest] Error closing socket: {e}")
+
+            if server_tube_id:
+                self.close_and_untrack_tube(server_tube_id)
+
+            if client_tube_id:
+                self.close_and_untrack_tube(client_tube_id)
+
+            if echo_server:
+                echo_server.stop()
+
+            logging.info("[FragTest] Cleanup completed")
     
     def wait_for_tube_connection(self, tube_id1, tube_id2, timeout=10):
         """Wait for both tubes to establish a connection"""

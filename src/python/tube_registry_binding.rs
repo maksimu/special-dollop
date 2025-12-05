@@ -206,6 +206,10 @@ impl PyTubeRegistry {
     // =============================================================================
 
     /// Create a tube with settings
+    ///
+    /// Args:
+    ///     enable_multi_channel: If True, enables multi-channel fragmentation for
+    ///         higher throughput on large frames. Both sides must have this enabled.
     #[pyo3(signature = (
         conversation_id,
         settings,
@@ -217,6 +221,7 @@ impl PyTubeRegistry {
         offer = None,
         signal_callback = None,
         tube_id = None,
+        enable_multi_channel = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create_tube(
@@ -232,6 +237,7 @@ impl PyTubeRegistry {
         offer: Option<&str>,
         signal_callback: Option<Py<PyAny>>,
         tube_id: Option<&str>,
+        enable_multi_channel: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         let master_runtime = get_runtime();
 
@@ -266,6 +272,14 @@ impl PyTubeRegistry {
                     );
                 }
 
+                // Build capabilities based on enable_multi_channel parameter
+                let capabilities = if enable_multi_channel.unwrap_or(false) {
+                    crate::tube_protocol::Capabilities::FRAGMENTATION
+                        | crate::tube_protocol::Capabilities::MULTI_CHANNEL
+                } else {
+                    crate::tube_protocol::Capabilities::NONE
+                };
+
                 // Build CreateTubeRequest for actor
                 let req = crate::tube_registry::CreateTubeRequest {
                     conversation_id: conversation_id_owned,
@@ -278,6 +292,7 @@ impl PyTubeRegistry {
                     client_version: client_version_owned,
                     signal_sender: signal_sender_rust,
                     tube_id: tube_id_owned,
+                    capabilities,
                 };
 
                 // LOCK-FREE + NON-BLOCKING: Send via actor
@@ -450,7 +465,7 @@ impl PyTubeRegistry {
         Ok(())
     }
 
-    /// Get connection state of a tube
+    /// Get connection state of a tube (ICE connection state: Connected, Disconnected, etc.)
     fn get_connection_state(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
         let master_runtime = get_runtime();
         let tube_id_owned = tube_id.to_string();
@@ -463,6 +478,23 @@ impl PyTubeRegistry {
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!("Failed to get connection state: {e}"))
                     })
+            })
+        })
+    }
+
+    /// Get tube status (new, initializing, connecting, active, ready, failed, closing, closed, disconnected)
+    /// "ready" indicates the data channel is open and operational - safe to send/receive data.
+    /// Use this instead of get_connection_state() when you need to know if the tube is ready for data.
+    fn get_tube_status(&self, py: Python<'_>, tube_id: &str) -> PyResult<String> {
+        let master_runtime = get_runtime();
+        let tube_id_owned = tube_id.to_string();
+        Python::detach(py, || {
+            master_runtime.clone().block_on(async move {
+                // LOCK-FREE: Direct call to registry (no locks!)
+                REGISTRY
+                    .get_tube_status(&tube_id_owned)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to get tube status: {e}")))
             })
         })
     }

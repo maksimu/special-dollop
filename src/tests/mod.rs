@@ -5,6 +5,25 @@
 // - Python stress tests: ../tests/manual_stress_tests.py (manual only, not CI)
 // - Performance benchmarks: See docs/HOT_PATH_OPTIMIZATION_SUMMARY.md
 //
+
+// Initialize rustls crypto provider for all tests
+#[cfg(test)]
+#[ctor::ctor]
+fn init_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider for tests");
+        println!("Initialized rustls crypto provider for tests");
+    });
+}
+
+#[cfg(test)]
+mod adaptive_pool_tests;
+#[cfg(test)]
+mod assembler_tests;
 #[cfg(test)]
 mod channel_tests;
 #[cfg(test)]
@@ -25,6 +44,8 @@ mod protocol_tests;
 mod registry_actor_tests;
 #[cfg(test)]
 mod size_instruction_integration_tests;
+#[cfg(test)]
+mod socks_tests;
 #[cfg(test)]
 mod thread_lifecycle_tests;
 #[cfg(test)]

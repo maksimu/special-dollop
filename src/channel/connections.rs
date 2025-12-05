@@ -726,6 +726,12 @@ pub async fn setup_outbound_task(
                                                     }
                                                 }
                                             }
+
+                                            // Wait for WebRTC buffer to drain before exiting
+                                            // This ensures the error/disconnect message is transmitted
+                                            // to the client before the connection task exits
+                                            dc.drain(Duration::from_millis(500)).await;
+
                                             close_conn_and_break = true;
                                             break;
                                         }

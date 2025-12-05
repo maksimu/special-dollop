@@ -1,6 +1,8 @@
 /target
 /venv
 /.venv
+src/python/keeper_pam_webrtc_rs/
+src/python/__pycache__/
 
 # IntelliJ project files
 .idea/

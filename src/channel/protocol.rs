@@ -42,7 +42,19 @@ impl Channel {
 
         let state_tx_open = state_tx.clone();
         let channel_id_for_open = channel_id_base.clone(); // Clone for on_open
+
+        // Clone the WebRTCDataChannel's shared notification mechanism so we can
+        // notify waiters when the channel opens. This is important because we're
+        // overwriting the on_open callback set in WebRTCDataChannel::new().
+        let is_open_flag = webrtc.is_open.clone();
+        let open_notify = webrtc.open_notify.clone();
+
         data_channel.on_open(Box::new(move || {
+            // Update the shared is_open flag and notify waiters
+            // This ensures wait_for_channel_open() works even though we replaced the callback
+            is_open_flag.store(true, std::sync::atomic::Ordering::Release);
+            open_notify.notify_waiters();
+
             let tx = state_tx_open.clone();
             let channel_id_log = channel_id_for_open.clone(); // Clone for async block
             tokio::spawn(async move {
@@ -150,16 +162,6 @@ impl Channel {
                 // In client mode, we just log and continue
                 self.handle_connection_opened(data).await?;
             }
-            // UDP ASSOCIATE support removed - ignore these messages
-            ControlMessage::UdpAssociate
-            | ControlMessage::UdpAssociateOpened
-            | ControlMessage::UdpPacket
-            | ControlMessage::UdpAssociateClosed => {
-                warn!(
-                    "Channel({}): UDP ASSOCIATE not supported, ignoring {:?}",
-                    self.channel_id, message_type
-                );
-            }
             ControlMessage::MetricsRequest => {
                 self.handle_metrics_request(data).await?;
             }
@@ -190,7 +192,27 @@ impl Channel {
             CloseConnectionReason::Normal
         };
 
-        if unlikely!(crate::logger::is_verbose_logging()) {
+        // Extract optional error message (backward compatible extension)
+        // Format after reason byte: [msg_len: 2 bytes][msg: N bytes]
+        let error_message = if data.len() > CONN_NO_LEN + 1 + 2 {
+            // 4 (conn_no) + 1 (reason) + 2 (len) = 7 minimum for message
+            let msg_len = u16::from_be_bytes([data[5], data[6]]) as usize;
+            if data.len() >= 7 + msg_len {
+                Some(String::from_utf8_lossy(&data[7..7 + msg_len]).to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Log error message if present (always log errors, not just in verbose mode)
+        if let Some(ref msg) = error_message {
+            error!(
+                "Connection {} closed with error: {} (reason: {:?}, channel_id: {})",
+                target_connection_no, msg, reason, self.channel_id
+            );
+        } else if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Closing connection {} (reason: {:?}) (channel_id: {})",
                 target_connection_no, reason, self.channel_id
@@ -202,8 +224,15 @@ impl Channel {
             self.should_exit
                 .store(true, std::sync::atomic::Ordering::Release);
             // Store the close reason for the channel - use try_lock to avoid blocking
+            // Don't overwrite a critical error reason (like GuacdError) with Normal
             if let Ok(mut guard) = self.channel_close_reason.try_lock() {
-                *guard = Some(reason);
+                let should_store = match &*guard {
+                    None => true,
+                    Some(existing) => !existing.is_critical() || reason.is_critical(),
+                };
+                if should_store {
+                    *guard = Some(reason);
+                }
             }
             // Even if we can't store the reason, we still need to exit
             return Ok(());
@@ -600,10 +629,16 @@ impl Channel {
         temp_payload_buffer.clear();
 
         if let Err(e) = open_result {
+            let error_str = e.to_string();
             error!("Channel({}): Failed to process OpenConnection for target_conn_no {}: {}. Sending CloseConnection back.",
-                self.channel_id, target_connection_no, e);
+                self.channel_id, target_connection_no, error_str);
             temp_payload_buffer.put_u32(target_connection_no);
             temp_payload_buffer.put_u8(CloseConnectionReason::ConnectionFailed as u8);
+            // Add error message (backward compatible extension)
+            let error_bytes = error_str.as_bytes();
+            let error_len = error_bytes.len().min(1024) as u16; // Cap at 1KB
+            temp_payload_buffer.put_u16(error_len);
+            temp_payload_buffer.extend_from_slice(&error_bytes[..error_len as usize]);
             // Use self.send_control_message for sending
             if let Err(send_err) = self
                 .send_control_message(ControlMessage::CloseConnection, &temp_payload_buffer)

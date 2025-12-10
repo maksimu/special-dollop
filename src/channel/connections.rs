@@ -1,12 +1,15 @@
 // Connection management functionality for Channel
 
 use crate::buffer_pool::BufferPool;
+use crate::channel::assembler::{
+    fragment_frame, DEFAULT_FRAGMENT_THRESHOLD, DEFAULT_MAX_FRAGMENTS,
+};
 use crate::channel::guacd_parser::{
     GuacdInstruction, GuacdParser, OpcodeAction, PeekError, SpecialOpcode,
 };
 use crate::channel::types::ActiveProtocol;
 use crate::models::Conn;
-use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
+use crate::tube_protocol::{Capabilities, CloseConnectionReason, ControlMessage, Frame};
 use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
 use anyhow::Result;
@@ -135,6 +138,7 @@ pub async fn setup_outbound_task(
     let buffer_pool = channel.buffer_pool.clone();
     let is_channel_server_mode = channel.server_mode;
     let channel_close_reason_arc = channel.channel_close_reason.clone(); // For checking if Python already closed
+    let fragmentation_enabled = channel.capabilities.contains(Capabilities::FRAGMENTATION);
 
     // TRACE: Ultra-verbose task lifecycle logging (only in verbose mode)
     if unlikely!(crate::logger::is_verbose_logging()) {
@@ -182,15 +186,21 @@ pub async fn setup_outbound_task(
                 }
             }
             Ok(Err(e)) => {
+                let error_str = e.to_string();
                 error!(
                     "Channel({}): Guacd handshake failed for conn_no {}: {}",
-                    channel_id_clone, conn_no, e
+                    channel_id_clone, conn_no, error_str
                 );
                 // Reuse a single buffer for both operations to avoid acquire/release cycles
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
                 reusable_control_buf.put_u8(CloseConnectionReason::GuacdError as u8);
+                // Add error message (backward compatible extension)
+                let error_bytes = error_str.as_bytes();
+                let error_len = error_bytes.len().min(1024) as u16;
+                reusable_control_buf.put_u16(error_len);
+                reusable_control_buf.extend_from_slice(&error_bytes[..error_len as usize]);
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
                     &mut reusable_control_buf,
@@ -217,15 +227,21 @@ pub async fn setup_outbound_task(
                 return Err(e);
             }
             Err(_) => {
+                let error_str = "Guacd handshake timed out";
                 error!(
-                    "Channel({}): Guacd handshake timed out for conn_no {}",
-                    channel_id_clone, conn_no
+                    "Channel({}): {} for conn_no {}",
+                    channel_id_clone, error_str, conn_no
                 );
                 // Reuse a single buffer for both operations to avoid acquire/release cycles
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
                 reusable_control_buf.put_u8(CloseConnectionReason::GuacdError as u8);
+                // Add error message (backward compatible extension)
+                let error_bytes = error_str.as_bytes();
+                let error_len = error_bytes.len().min(1024) as u16;
+                reusable_control_buf.put_u16(error_len);
+                reusable_control_buf.extend_from_slice(&error_bytes[..error_len as usize]);
                 let close_frame = Frame::new_control_with_buffer(
                     ControlMessage::CloseConnection,
                     &mut reusable_control_buf,
@@ -301,6 +317,7 @@ pub async fn setup_outbound_task(
         let event_sender = EventDrivenSender::new(Arc::new(dc.clone()), STANDARD_BUFFER_THRESHOLD);
 
         // **OPTIMIZED EVENT-DRIVEN HELPER** - Zero polling, instant backpressure
+        // Now with optional fragmentation support for large frames
         #[inline(always)] // Hot path optimization
         async fn send_with_event_backpressure(
             frame_to_send: bytes::Bytes,
@@ -308,7 +325,49 @@ pub async fn setup_outbound_task(
             event_sender: &EventDrivenSender,
             channel_id_local: &str,
             context_msg: &str,
+            fragmentation_enabled: bool,
         ) -> Result<(), ()> {
+            // Check if we need to fragment this frame
+            if fragmentation_enabled && frame_to_send.len() > DEFAULT_FRAGMENT_THRESHOLD {
+                // Large frame + fragmentation enabled: split into fragments
+                if let Some(fragments) = fragment_frame(
+                    &frame_to_send,
+                    DEFAULT_FRAGMENT_THRESHOLD,
+                    DEFAULT_MAX_FRAGMENTS,
+                ) {
+                    // Send each fragment through backpressure system
+                    for (i, fragment) in fragments.into_iter().enumerate() {
+                        match event_sender.send_with_natural_backpressure(fragment).await {
+                            Ok(_) => {
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    log::trace!(
+                                        "Fragment {}/{} sent (channel_id: {}, conn_no: {}, context: {})",
+                                        i + 1,
+                                        frame_to_send.len().div_ceil(DEFAULT_FRAGMENT_THRESHOLD - 9),
+                                        channel_id_local,
+                                        conn_no_local,
+                                        context_msg
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if !e.to_string().contains("DataChannel is not opened")
+                                    && !e.to_string().contains("Channel is closing")
+                                {
+                                    error!(
+                                        "Fragment send failed (channel_id: {}, conn_no: {}, fragment: {}, error: {})",
+                                        channel_id_local, conn_no_local, i, e
+                                    );
+                                }
+                                return Err(());
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                // If fragment_frame returns None (frame too large), fall through to send as-is
+            }
+
             // **FAST PATH**: Event-driven sending with native WebRTC backpressure
             match event_sender
                 .send_with_natural_backpressure(frame_to_send)
@@ -427,7 +486,7 @@ pub async fn setup_outbound_task(
                 // Rate-limited logging (once every 5 seconds max)
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or(Duration::ZERO)
                     .as_secs();
                 let last = LAST_BACKPRESSURE_LOG.load(Ordering::Relaxed);
 
@@ -560,6 +619,7 @@ pub async fn setup_outbound_task(
                             &event_sender,
                             &channel_id_for_task,
                             "EOF frame",
+                            fragmentation_enabled,
                         )
                         .await;
                         eof_sent = true;
@@ -608,24 +668,39 @@ pub async fn setup_outbound_task(
                                         OpcodeAction::CloseConnection => {
                                             // **COLD PATH**: Error or disconnect opcode detected
                                             // Parse instruction to determine which opcode it is
-                                            match GuacdParser::peek_instruction(current_slice) {
-                                                Ok(instr) => {
-                                                    if instr.opcode == crate::channel::guacd_parser::DISCONNECT_OPCODE {
+                                            // Also extract error message for CloseConnection
+                                            let guacd_error_message: Option<String> =
+                                                match GuacdParser::peek_instruction(current_slice) {
+                                                    Ok(instr) => {
+                                                        if instr.opcode == crate::channel::guacd_parser::DISCONNECT_OPCODE {
                                                         // Guacd sent disconnect instruction - clean connection closure
                                                         warn!("Guacd sent disconnect instruction - closing connection cleanly (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
+                                                        Some("Guacd disconnect".to_string())
                                                     } else if instr.opcode == crate::channel::guacd_parser::ERROR_OPCODE {
                                                         // Guacd sent error instruction - error condition
+                                                        // Extract error message from args (typically args[0] is the error text)
+                                                        let error_msg = if !instr.args.is_empty() {
+                                                            format!("Guacd error: {}", instr.args.join(", "))
+                                                        } else {
+                                                            "Guacd error".to_string()
+                                                        };
                                                         error!("Guacd sent error opcode - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
+                                                        Some(error_msg)
                                                     } else {
                                                         // Unknown close opcode
                                                         warn!("Guacd sent close instruction - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
+                                                        Some(format!("Guacd close: {}", instr.opcode))
                                                     }
-                                                }
-                                                Err(_) => {
-                                                    // Failed to parse - assume error
-                                                    error!("Guacd sent close opcode but failed to parse - closing connection (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
-                                                }
-                                            }
+                                                    }
+                                                    Err(_) => {
+                                                        // Failed to parse - assume error
+                                                        error!("Guacd sent close opcode but failed to parse - closing connection (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
+                                                        Some(
+                                                            "Guacd close opcode (parse failed)"
+                                                                .to_string(),
+                                                        )
+                                                    }
+                                                };
 
                                             // Forward the close instruction to the other side before closing
                                             // (could be error or disconnect opcode)
@@ -647,6 +722,7 @@ pub async fn setup_outbound_task(
                                                 &event_sender,
                                                 &channel_id_for_task,
                                                 "Guacd close instruction forward",
+                                                fragmentation_enabled,
                                             )
                                             .await
                                             .is_err()
@@ -687,6 +763,16 @@ pub async fn setup_outbound_task(
                                                 temp_buf_for_control.put_u8(
                                                     CloseConnectionReason::GuacdError as u8,
                                                 );
+                                                // Add error message (backward compatible extension)
+                                                if let Some(ref error_msg) = guacd_error_message {
+                                                    let error_bytes = error_msg.as_bytes();
+                                                    let error_len =
+                                                        error_bytes.len().min(1024) as u16;
+                                                    temp_buf_for_control.put_u16(error_len);
+                                                    temp_buf_for_control.extend_from_slice(
+                                                        &error_bytes[..error_len as usize],
+                                                    );
+                                                }
 
                                                 let close_frame = Frame::new_control_with_buffer(
                                                     ControlMessage::CloseConnection,
@@ -701,6 +787,7 @@ pub async fn setup_outbound_task(
                                                     &event_sender,
                                                     &channel_id_for_task,
                                                     "Guacd close",
+                                                    fragmentation_enabled,
                                                 )
                                                 .await
                                                 .is_err()
@@ -762,6 +849,7 @@ pub async fn setup_outbound_task(
                                                         &event_sender,
                                                         &channel_id_for_task,
                                                         "pre-sync batch flush",
+                                                        fragmentation_enabled,
                                                     )
                                                     .await
                                                     .is_err()
@@ -789,6 +877,7 @@ pub async fn setup_outbound_task(
                                                 &event_sender,
                                                 &channel_id_for_task,
                                                 "Guacd sync forward to client",
+                                                fragmentation_enabled,
                                             )
                                             .await
                                             .is_err()
@@ -963,6 +1052,7 @@ pub async fn setup_outbound_task(
                                                     &event_sender,
                                                     &channel_id_for_task,
                                                     "(pre-large) batch",
+                                                    fragmentation_enabled,
                                                 )
                                                 .await
                                                 .is_err()
@@ -990,6 +1080,7 @@ pub async fn setup_outbound_task(
                                                 &event_sender,
                                                 &channel_id_for_task,
                                                 "large instruction",
+                                                fragmentation_enabled,
                                             )
                                             .await
                                             .is_err()
@@ -1018,6 +1109,7 @@ pub async fn setup_outbound_task(
                                                     &event_sender,
                                                     &channel_id_for_task,
                                                     "batch",
+                                                    fragmentation_enabled,
                                                 )
                                                 .await
                                                 .is_err()
@@ -1042,6 +1134,8 @@ pub async fn setup_outbound_task(
                                 }
                                 Err(e) => {
                                     // Other PeekErrors
+                                    let error_str =
+                                        format!("Guacd protocol parsing error: {:?}", e);
                                     error!(
                                         "Channel({}): Conn {}: Error peeking/parsing Guacd instruction: {:?}. Buffer content (approx): {:?}. Closing connection.",
                                         channel_id_for_task, conn_no, e, &main_read_buffer[..std::cmp::min(main_read_buffer.len(), 100)]
@@ -1051,6 +1145,12 @@ pub async fn setup_outbound_task(
                                     temp_buf_for_control.extend_from_slice(&conn_no.to_be_bytes());
                                     temp_buf_for_control
                                         .put_u8(CloseConnectionReason::ProtocolError as u8);
+                                    // Add error message (backward compatible extension)
+                                    let error_bytes = error_str.as_bytes();
+                                    let error_len = error_bytes.len().min(1024) as u16;
+                                    temp_buf_for_control.put_u16(error_len);
+                                    temp_buf_for_control
+                                        .extend_from_slice(&error_bytes[..error_len as usize]);
                                     let close_frame = Frame::new_control_with_buffer(
                                         ControlMessage::CloseConnection,
                                         &mut temp_buf_for_control,
@@ -1065,6 +1165,7 @@ pub async fn setup_outbound_task(
                                         &event_sender,
                                         &channel_id_for_task,
                                         "Guacd parsing error close",
+                                        fragmentation_enabled,
                                     )
                                     .await
                                     .is_err()
@@ -1103,6 +1204,7 @@ pub async fn setup_outbound_task(
                                     &event_sender,
                                     &channel_id_for_task,
                                     "per-read flush",
+                                    fragmentation_enabled,
                                 )
                                 .await
                                 .is_err()
@@ -1142,6 +1244,7 @@ pub async fn setup_outbound_task(
                             &event_sender,
                             &channel_id_for_task,
                             "PortForward/SOCKS5 data",
+                            fragmentation_enabled,
                         )
                         .await
                         .is_err()

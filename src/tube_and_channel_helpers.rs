@@ -49,6 +49,7 @@ pub(crate) async fn setup_channel_for_data_channel(
     callback_token: Option<String>,
     ksm_config: Option<String>,
     client_version: String,
+    capabilities: crate::tube_protocol::Capabilities,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -68,6 +69,7 @@ pub(crate) async fn setup_channel_for_data_channel(
         callback_token,
         ksm_config,
         client_version,
+        capabilities,
     })
     .await?;
 
@@ -78,12 +80,21 @@ pub(crate) async fn setup_channel_for_data_channel(
         crate::buffer_pool::STANDARD_BUFFER_CONFIG,
     ));
 
-    // Tx is cloned for the on_message closure. The original tx's receiver (rx) is in channel_instance.
+    // CRITICAL: Set the new on_message handler FIRST, before draining the early buffer.
+    // This ensures no messages are lost in the transition window.
+    // Order matters:
+    // 1. Set new handler (replaces early buffer callback)
+    // 2. Drain early buffer (returns messages captured before step 1)
+    // 3. Forward early messages to channel
+    // Any messages arriving after step 1 go directly to the new handler.
+    // Messages that arrived before step 1 are in the buffer and get forwarded in step 3.
     let peer_connection_clone = peer_connection.clone();
+    let tx_for_handler = tx.clone();
+    let label_for_handler = label.clone();
     data_channel_ref.on_message(Box::new(move |msg| {
-        let tx_clone = tx.clone(); // Clone tx for the async block
+        let tx_clone = tx_for_handler.clone(); // Clone tx for the async block
         let buffer_pool_clone = buffer_pool.clone();
-        let label_clone = label.clone(); // Clone label for the async block
+        let label_clone = label_for_handler.clone(); // Clone label for the async block
         let pc_clone = peer_connection_clone.clone();
 
         Box::pin(async move {
@@ -117,6 +128,40 @@ pub(crate) async fn setup_channel_for_data_channel(
             }
         })
     }));
+
+    // NOW drain the early buffer (after new handler is set).
+    // The new handler is already active, so any new messages go there.
+    // This just returns messages that arrived before we set the new handler.
+    let early_messages = data_channel.take_early_messages();
+    let early_count = early_messages.len();
+
+    // Forward any early-buffered messages to the channel
+    // These messages arrived before the new handler was set.
+    if early_count > 0 {
+        debug!(
+            "Channel: Forwarding {} early-buffered messages to channel (channel_id: {})",
+            early_count, label
+        );
+        for msg in early_messages {
+            let message_len = msg.len();
+            // Record metrics for early messages too
+            crate::metrics::METRICS_COLLECTOR.record_message_received(
+                &label,
+                message_len as u64,
+                None,
+            );
+            if let Err(_e) = tx.send(msg) {
+                error!(
+                    "Channel: Failed to forward early message to MPSC channel (channel_id: {})",
+                    label
+                );
+            }
+        }
+        debug!(
+            "Channel: Finished forwarding early messages (channel_id: {})",
+            label
+        );
+    }
 
     Ok(channel_instance)
 }

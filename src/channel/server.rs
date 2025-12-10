@@ -74,8 +74,15 @@ impl Channel {
         );
 
         // Store the listener for cleanup
-        self.local_client_server = Some(Arc::new(listener));
+        let listener_arc = Arc::new(listener);
+        self.local_client_server = Some(listener_arc.clone());
         self.actual_listen_addr = Some(actual_addr);
+
+        // Get the connection sender - required for server mode
+        let connection_tx = self
+            .local_client_server_conn_tx
+            .clone()
+            .ok_or_else(|| anyhow!("Connection sender not initialized for server mode"))?;
 
         // Spawn a task to accept connections
         let (tx, _rx) = oneshot::channel();
@@ -83,13 +90,38 @@ impl Channel {
         let webrtc = self.webrtc.clone();
         let active_protocol = self.active_protocol;
         let buffer_pool = self.buffer_pool.clone();
-        let connection_tx = self.local_client_server_conn_tx.clone();
         let should_exit = self.should_exit.clone();
-        let listener_clone = self.local_client_server.clone().unwrap();
+        let listener_clone = listener_arc;
 
         let server_task = tokio::spawn(async move {
-            // Signal that we're ready
+            // Signal that we're ready to accept connections
             let _ = tx.send(());
+
+            // Wait for the WebRTC data channel to be open before accepting TCP connections
+            // This prevents race conditions where TCP clients connect before the data channel is ready
+            debug!(
+                "Channel({}): Waiting for data channel to be open before accepting connections",
+                channel_id
+            );
+            match webrtc
+                .wait_for_channel_open(Some(std::time::Duration::from_secs(30)))
+                .await
+            {
+                Ok(true) => {
+                    debug!(
+                        "Channel({}): Data channel is open, ready to accept TCP connections",
+                        channel_id
+                    );
+                }
+                Ok(false) => {
+                    warn!("Channel({}): Data channel did not open (closed or timed out), server task exiting", channel_id);
+                    return;
+                }
+                Err(e) => {
+                    error!("Channel({}): Error waiting for data channel to open: {}, server task exiting", channel_id, e);
+                    return;
+                }
+            }
 
             let mut next_conn_no = 1;
 
@@ -150,7 +182,7 @@ impl Channel {
                         // Handle based on protocol
                         match active_protocol {
                             ActiveProtocol::Socks5 => {
-                                let conn_tx_clone = connection_tx.clone().unwrap();
+                                let conn_tx_clone = connection_tx.clone();
                                 let webrtc_clone = webrtc.clone();
                                 let buffer_pool_clone = buffer_pool.clone();
                                 let task_channel_id = channel_id.clone();
@@ -177,7 +209,7 @@ impl Channel {
                                 });
                             }
                             ActiveProtocol::PortForward | ActiveProtocol::Guacd => {
-                                let conn_tx_clone = connection_tx.clone().unwrap();
+                                let conn_tx_clone = connection_tx.clone();
                                 let webrtc_clone = webrtc.clone();
                                 let buffer_pool_clone = buffer_pool.clone();
                                 let task_channel_id = channel_id.clone();

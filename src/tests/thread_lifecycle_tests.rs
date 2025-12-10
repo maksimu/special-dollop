@@ -101,6 +101,7 @@ async fn test_no_zombie_tasks_after_tube_close() {
         client_version: "ms16.5.0".to_string(),
         signal_sender: signal_tx,
         tube_id: None,
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     let result = REGISTRY.create_tube(req).await;

@@ -16,7 +16,11 @@ pub(crate) async fn handle_ping_timeout(channel: &mut Channel) -> Result<(), Cha
             channel.channel_id, channel.ping_attempt
         );
         channel
-            .close_backend(0, crate::tube_protocol::CloseConnectionReason::Timeout)
+            .close_backend(
+                0,
+                crate::tube_protocol::CloseConnectionReason::Timeout,
+                Some("Too many ping timeouts"),
+            )
             .await?;
         return Err(ChannelError::Timeout(format!(
             "Too many ping timeouts for endpoint {}",

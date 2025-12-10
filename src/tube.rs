@@ -83,6 +83,12 @@ pub struct Tube {
     /// Flag to prevent concurrent close operations on the same tube
     /// When set to true, indicates a close is in progress
     pub(crate) closing: Arc<std::sync::atomic::AtomicBool>,
+
+    // ============================================================================
+    // MULTI-CHANNEL CAPABILITIES
+    // ============================================================================
+    /// Capabilities enabled for this tube (e.g., FRAGMENTATION for multi-channel)
+    pub(crate) capabilities: crate::tube_protocol::Capabilities,
 }
 
 impl Tube {
@@ -103,6 +109,7 @@ impl Tube {
         original_conversation_id: Option<String>,
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         custom_tube_id: Option<String>,
+        capabilities: crate::tube_protocol::Capabilities,
     ) -> Result<Arc<Self>> {
         let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();
@@ -133,6 +140,9 @@ impl Tube {
 
             // Concurrent close protection:
             closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+
+            // Multi-channel capabilities:
+            capabilities,
         });
 
         Ok(tube)
@@ -212,9 +222,18 @@ impl Tube {
                 match state {
                     RTCPeerConnectionState::Connected => {
                         debug!("Connection established (tube_id: {})", tube_id_log);
-                        // Tube status update
-                        *status_clone.write().await = TubeStatus::Active;
-                        debug!("Tube connection state changed to Active (tube_id: {})", tube_id_log);
+                        // Tube status update - only upgrade to Active, don't downgrade from Ready
+                        // This prevents race condition where on_data_channel sets Ready
+                        // but on_peer_connection_state_change(Connected) resets it to Active
+                        {
+                            let mut status_guard = status_clone.write().await;
+                            if !matches!(*status_guard, TubeStatus::Ready) {
+                                *status_guard = TubeStatus::Active;
+                                debug!("Tube connection state changed to Active (tube_id: {})", tube_id_log);
+                            } else {
+                                debug!("Tube already Ready, not downgrading to Active (tube_id: {})", tube_id_log);
+                            }
+                        }
 
                         // Start monitoring and quality management
                         if let Err(e) = connection_for_signals.start_monitoring().await {
@@ -485,7 +504,9 @@ impl Tube {
         let tube_client_version_for_on_data_channel = self.client_version.clone(); // Clone for on_data_channel
         let peer_connection_for_on_data_channel = connection_arc.clone(); // Clone peer connection for data channel handler
         connection_arc.peer_connection.on_data_channel(Box::new(move |rtc_data_channel| {
-            debug!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), rtc_data_channel.label(), rtc_data_channel.id());
+            let channel_label = rtc_data_channel.label();
+            let channel_id = rtc_data_channel.id();
+            debug!("[DATA_CHANNEL_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {}", tube_clone.id(), channel_label, channel_id);
             let tube = tube_clone.clone();
             // Use the protocol_settings cloned for the on_data_channel closure
             let protocol_settings_for_channel_setup = protocol_settings_clone_for_on_data_channel.clone();
@@ -496,8 +517,70 @@ impl Tube {
             let rtc_data_channel_label = rtc_data_channel.label().to_string(); // Get the label once for logging
             let rtc_data_channel_id = rtc_data_channel.id();
 
-            Box::pin(async move {
-                debug!("[TUBE_CALLBACK] on_data_channel FIRED! tube_id: {}, channel_label: {}, rtc_channel_id: {:?}", tube.id, rtc_data_channel_label, rtc_data_channel_id);
+            // CRITICAL FIX: Create WebRTCDataChannel wrapper IMMEDIATELY in the synchronous callback.
+            // This sets up the early message buffer BEFORE any async work starts.
+            // Messages can arrive at the RTCDataChannel at any moment after on_data_channel fires,
+            // and without this, they would be lost during the async spawn latency (~5-100ms).
+            let data_channel = WebRTCDataChannel::new(rtc_data_channel);
+            debug!("[DATA_CHANNEL_CALLBACK] Early message buffer active (tube_id: {}, channel_label: {})", tube.id(), rtc_data_channel_label);
+
+            // FIX: Spawn the async work independently instead of returning a future to WebRTC.
+            // This avoids issues where WebRTC might not properly poll the returned future.
+            // The returned future completes immediately while actual work happens in spawned task.
+            debug!("[DATA_CHANNEL_CALLBACK] PRE_SPAWN - about to spawn async task (tube_id: {}, channel_label: {})", tube.id(), rtc_data_channel_label);
+            let runtime = crate::runtime::get_runtime();
+            runtime.spawn(async move {
+                debug!("[DATA_CHANNEL_CALLBACK] ASYNC_START - spawned task running (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+
+                // CRITICAL: Use atomic entry() API for check-and-insert.
+                // This prevents race conditions when multiple on_data_channel callbacks fire concurrently
+                // for the same channel (WebRTC library bug where both offerer and answerer receive callback).
+                // For multichannel support, this allows genuinely NEW channels while blocking duplicates.
+
+                // NOTE: data_channel (WebRTCDataChannel) was created synchronously above, before spawn.
+                // This ensures early messages are captured in its buffer before we get here.
+
+                debug!("[DATA_CHANNEL_CALLBACK] ACQUIRING_LOCK - about to acquire data_channels write lock (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+
+                // FIX: Use timeout on write lock to prevent deadlocks
+                let channels_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tube.data_channels.write()
+                ).await;
+
+                let mut channels = match channels_result {
+                    Ok(guard) => {
+                        debug!("[DATA_CHANNEL_CALLBACK] LOCK_ACQUIRED - got data_channels write lock (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                        guard
+                    }
+                    Err(_) => {
+                        error!("[DATA_CHANNEL_CALLBACK] LOCK_TIMEOUT - failed to acquire data_channels write lock within 10s, possible deadlock (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
+                        return;
+                    }
+                };
+
+                match channels.entry(rtc_data_channel_label.clone()) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        // Channel already exists - duplicate callback (race condition)
+                        debug!(
+                            "[DATA_CHANNEL_CALLBACK] DUPLICATE - ignoring (already exists or being processed) (tube_id: {}, channel_label: {})",
+                            tube.id, rtc_data_channel_label
+                        );
+                        return;
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                        // We won the race - insert immediately to claim ownership
+                        vacant_entry.insert(data_channel.clone());
+                        info!(
+                            "[DATA_CHANNEL_CALLBACK] NEW CHANNEL - processing (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})",
+                            tube.id, rtc_data_channel_label, rtc_data_channel_id
+                        );
+                    }
+                }
+                // Release write lock before continuing with setup
+                drop(channels);
+
+                info!("[TUBE_CALLBACK] on_data_channel processing new channel (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
                 debug!("on_data_channel: Received data channel from remote peer. (tube_id: {}, channel_label: {}, rtc_channel_id: {:?})", tube.id, rtc_data_channel_label, rtc_data_channel_id);
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("on_data_channel: Protocol settings for this channel. (tube_id: {}, channel_label: {}, protocol_settings_for_channel_setup: {:?})", tube.id, rtc_data_channel_label, protocol_settings_for_channel_setup);
@@ -512,17 +595,8 @@ impl Tube {
                     }
                 };
 
-                // Create our WebRTCDataChannel wrapper
-                let data_channel = WebRTCDataChannel::new(rtc_data_channel);
-
-                // Add it to our data channels map
-                if let Err(e) = tube.add_data_channel(data_channel.clone()).await {
-                    error!("on_data_channel: Failed to add data channel to tube: {} (tube_id: {}, channel_label: {})", e, tube.id, rtc_data_channel_label);
-                    return;
-                }
-                if unlikely!(crate::logger::is_verbose_logging()) {
-                    debug!("on_data_channel: Data channel added to tube's map. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
-                }
+                // NOTE: Channel already inserted atomically via entry API above (line 534)
+                // No need to call add_data_channel() - would be duplicate insert
 
                 // If this is the control channel, store it specially
                 if rtc_data_channel_label == "control" {
@@ -556,6 +630,7 @@ impl Tube {
                     Some(callback_token_for_channel), // Use callback_token from tube creation
                     Some(ksm_config_for_channel), // Use ksm_config from tube creation
                     client_version,
+                    tube.capabilities, // Pass tube's capabilities to channel
                 ).await;
 
                 let mut owned_channel = match channel_result {
@@ -570,6 +645,10 @@ impl Tube {
                         return;
                     }
                 };
+
+                // Note: TubeStatus::Ready is set by setup_data_channel_handlers when the
+                // data channel actually opens, not here when we just receive it.
+                // This ensures the tube is marked ready only when data can be sent/received.
 
                 // Register the channel metadata with the tube for tracking
                 let metadata = ChannelMetadata {
@@ -597,6 +676,16 @@ impl Tube {
                 // Store the close reason tracker for this channel (for preventing duplicate CloseConnection)
                 let channel_close_reason_arc = Arc::clone(&owned_channel.channel_close_reason);
                 tube.channel_close_reasons.write().await.insert(rtc_data_channel_label.clone(), channel_close_reason_arc);
+
+                // Setup data channel handlers (waits for channel open and sets TubeStatus::Ready)
+                // This must be called for ALL data channels (server and client) to properly signal readiness.
+                tube.setup_data_channel_handlers(
+                    &owned_channel.webrtc,
+                    rtc_data_channel_label.clone(),
+                    owned_channel.ksm_config.clone().unwrap_or_default(),
+                    owned_channel.callback_token.clone().unwrap_or_default(),
+                    &owned_channel.client_version,
+                );
 
                 if owned_channel.server_mode {
                     if let Some(listen_addr_str) = owned_channel.local_listen_addr.clone() {
@@ -737,7 +826,11 @@ impl Tube {
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!("on_data_channel: Successfully set up and spawned channel task. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
                 }
-            })
+            });
+
+            // Return empty future to WebRTC - actual work happens in spawned task above
+            // This ensures the callback completes immediately and doesn't depend on WebRTC polling
+            Box::pin(async {})
         }));
 
         // Store connection atomically (lock-free, instant, can't deadlock)
@@ -877,34 +970,92 @@ impl Tube {
         // Store references directly where possible
         let dc_ref = &data_channel.data_channel;
 
-        // Set up a state change handler-use string literals to avoid clones
+        // Spawn a task that waits for the data channel to open and then performs actions.
+        // We use the WebRTCDataChannel's shared notification mechanism instead of setting
+        // our own on_open callback, which would overwrite the one set in WebRTCDataChannel::new().
         let label_for_open = label.clone();
         let ksm_config_for_open = ksm_config.clone();
         let callback_token_for_open = callback_token.clone();
         let client_version_for_open = client_version.to_string();
         let self_clone_for_open = Arc::clone(self);
+        let status_for_open = Arc::clone(&self.status);
+        let tube_id_for_open = self.id.clone();
+        let data_channel_clone = data_channel.clone();
 
-        dc_ref.on_open(Box::new(move || {
-            let label_clone = label_for_open.clone();
-            let ksm_config_clone = ksm_config_for_open.clone();
-            let callback_token_clone = callback_token_for_open.clone();
-            let client_version_clone = client_version_for_open.clone();
-            let self_clone = self_clone_for_open.clone();
+        // FIX: Track spawned task and log if it panics (detached tasks swallow panics silently)
+        let label_for_spawn_log = label.clone();
+        let tube_id_for_spawn_log = self.id.clone();
+        let handle = tokio::spawn(async move {
+            debug!(
+                "[SETUP_DATA_CHANNEL_HANDLERS] Task started - waiting for channel open (tube_id: {}, label: {})",
+                tube_id_for_open, label_for_open
+            );
 
-            Box::pin(async move {
-                info!("Data channel '{}' opened", label_clone);
-                if let Err(e) = self_clone
-                    .report_connection_open(
-                        ksm_config_clone,
-                        callback_token_clone,
-                        &client_version_clone,
-                    )
-                    .await
-                {
-                    error!("Failed to report connection open: {}", e);
+            // Wait for the data channel to open (uses shared notification from WebRTCDataChannel)
+            match data_channel_clone
+                .wait_for_channel_open(Some(std::time::Duration::from_secs(60)))
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        "Data channel '{}' opened, setting tube status to Ready (tube_id: {})",
+                        label_for_open, tube_id_for_open
+                    );
+
+                    // Update tube status to Ready - data channel is now operational
+                    *status_for_open.write().await = TubeStatus::Ready;
+                    info!(
+                        "Tube status changed to Ready (tube_id: {}, label: {})",
+                        tube_id_for_open, label_for_open
+                    );
+
+                    if let Err(e) = self_clone_for_open
+                        .report_connection_open(
+                            ksm_config_for_open,
+                            callback_token_for_open,
+                            &client_version_for_open,
+                        )
+                        .await
+                    {
+                        error!("Failed to report connection open: {}", e);
+                    }
                 }
-            })
-        }));
+                Ok(false) => {
+                    warn!(
+                        "Data channel '{}' did not open (closed or timed out) (tube_id: {})",
+                        label_for_open, tube_id_for_open
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Error waiting for data channel '{}' to open: {} (tube_id: {})",
+                        label_for_open, e, tube_id_for_open
+                    );
+                }
+            }
+        });
+
+        // FIX: Spawn a monitor task to catch panics from the main task
+        tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {
+                    // Task completed normally
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "[SETUP_DATA_CHANNEL_HANDLERS] Task completed normally (tube_id: {}, label: {})",
+                            tube_id_for_spawn_log, label_for_spawn_log
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Task panicked or was cancelled
+                    error!(
+                        "[SETUP_DATA_CHANNEL_HANDLERS] Task PANICKED or was cancelled: {} (tube_id: {}, label: {})",
+                        e, tube_id_for_spawn_log, label_for_spawn_log
+                    );
+                }
+            }
+        });
 
         let self_clone_for_close = Arc::clone(self);
         let client_version_for_close = client_version.to_string();
@@ -1090,6 +1241,7 @@ impl Tube {
             callback_token,
             ksm_config,
             client_version,
+            self.capabilities, // Pass tube's capabilities to channel
         )
         .await;
 

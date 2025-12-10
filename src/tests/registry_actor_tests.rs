@@ -24,6 +24,7 @@ async fn test_tube_with_raii_signal_sender() {
         Some("test_conv".to_string()),
         Some(signal_tx),
         Some("test_tube_123".to_string()),
+        crate::tube_protocol::Capabilities::NONE,
     )
     .expect("Failed to create tube");
 
@@ -75,6 +76,7 @@ async fn test_registry_lock_free_reads() {
         client_version: "test-1.0".to_string(),
         signal_sender: signal_tx,
         tube_id: Some("concurrent_test_tube".to_string()),
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     // This might fail due to missing setup, but that's OK - we're testing the lock-free part
@@ -142,6 +144,7 @@ async fn test_registry_get_by_conversation_id() {
         client_version: "test-1.0".to_string(),
         signal_sender: signal_tx,
         tube_id: Some("mapping_test_tube".to_string()),
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -206,6 +209,7 @@ async fn test_tube_raii_metrics_cleanup() {
         Some(conversation_id.clone()),
         Some(signal_tx),
         Some("raii_metrics_tube".to_string()),
+        crate::tube_protocol::Capabilities::NONE,
     )
     .expect("Failed to create tube");
 
@@ -266,6 +270,7 @@ async fn test_registry_all_tube_ids_lock_free() {
         client_version: "test-1.0".to_string(),
         signal_sender: signal_tx,
         tube_id: Some("all_ids_test_tube".to_string()),
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -322,6 +327,7 @@ async fn test_registry_find_tubes() {
         client_version: "test-1.0".to_string(),
         signal_sender: signal_tx,
         tube_id: Some(tube_id_with_term.clone()),
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -347,8 +353,14 @@ async fn test_registry_find_tubes() {
 async fn test_tube_drop_closes_peer_connection() {
     // Verify that Tube::drop() actually closes the WebRTC peer connection
 
-    let tube = Tube::new(false, None, None, Some("drop_test_tube".to_string()))
-        .expect("Failed to create tube");
+    let tube = Tube::new(
+        false,
+        None,
+        None,
+        Some("drop_test_tube".to_string()),
+        crate::tube_protocol::Capabilities::NONE,
+    )
+    .expect("Failed to create tube");
 
     let tube_id = tube.id();
     println!("Created tube for drop test: {}", tube_id);
@@ -385,6 +397,7 @@ async fn test_registry_tube_count() {
         client_version: "test-1.0".to_string(),
         signal_sender: signal_tx,
         tube_id: Some(test_tube_id.clone()),
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -456,6 +469,7 @@ async fn test_actor_admission_control() {
             client_version: "test-1.0".to_string(),
             signal_sender: signal_tx,
             tube_id: Some(format!("backpressure_tube_{}", i)),
+            capabilities: crate::tube_protocol::Capabilities::NONE,
         };
 
         let handle = tokio::spawn(async move { REGISTRY.create_tube(req).await });
@@ -543,6 +557,7 @@ async fn test_concurrent_tube_creation_no_deadlock() {
                 client_version: "test-1.0".to_string(),
                 signal_sender: signal_tx,
                 tube_id: Some(format!("concurrent_tube_{}", i)),
+                capabilities: crate::tube_protocol::Capabilities::NONE,
             };
 
             match REGISTRY.create_tube(req).await {
@@ -648,6 +663,7 @@ async fn test_raii_cleanup_on_registry_close() {
         client_version: "test-1.0".to_string(),
         signal_sender: signal_tx,
         tube_id: Some("raii_close_test_tube".to_string()),
+        capabilities: crate::tube_protocol::Capabilities::NONE,
     };
 
     match REGISTRY.create_tube(req).await {

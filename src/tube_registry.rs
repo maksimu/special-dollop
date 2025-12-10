@@ -62,6 +62,8 @@ pub struct CreateTubeRequest {
     pub client_version: String,
     pub signal_sender: UnboundedSender<SignalMessage>,
     pub tube_id: Option<String>,
+    /// Capabilities to enable for this tube (e.g., FRAGMENTATION for multi-channel)
+    pub capabilities: crate::tube_protocol::Capabilities,
 }
 
 /// Commands for the registry actor
@@ -604,6 +606,7 @@ impl RegistryActor {
             Some(conversation_id.to_string()),
             Some(req.signal_sender.clone()),
             tube_id_opt,
+            req.capabilities,
         )?;
         let tube_id = tube_arc.id();
 
@@ -656,29 +659,44 @@ impl RegistryActor {
             .await
             .map_err(|e| anyhow!("Failed to create peer connection: {}", e))?;
 
-        // Create data channel
-        let ksm_config_for_channel = req.ksm_config.clone().unwrap_or_default();
-        let data_channel = tube_arc
-            .create_data_channel(
-                conversation_id,
-                ksm_config_for_channel.clone(),
-                req.callback_token.clone(),
-                &req.client_version,
-            )
-            .await?;
+        // Create data channel and logical channel ONLY for server mode (offerer)
+        // Client mode (answerer) will receive the data channel via on_data_channel callback
+        let actual_listening_port = if is_server_mode {
+            let ksm_config_for_channel = req.ksm_config.clone().unwrap_or_default();
+            debug!(
+                "Server tube creating data channel locally (tube_id: {}, conversation_id: {})",
+                tube_id, conversation_id
+            );
+            let data_channel = tube_arc
+                .create_data_channel(
+                    conversation_id,
+                    ksm_config_for_channel.clone(),
+                    req.callback_token.clone(),
+                    &req.client_version,
+                )
+                .await?;
 
-        // Create logical channel and capture actual listening port (if server mode)
-        let actual_listening_port = tube_arc
-            .create_channel(
-                conversation_id,
-                &data_channel,
-                None,
-                req.settings.clone(),
-                Some(req.callback_token.clone()),
-                Some(ksm_config_for_channel),
-                Some(req.client_version.clone()),
-            )
-            .await?;
+            // Create logical channel and capture actual listening port
+            tube_arc
+                .create_channel(
+                    conversation_id,
+                    &data_channel,
+                    None,
+                    req.settings.clone(),
+                    Some(req.callback_token.clone()),
+                    Some(ksm_config_for_channel),
+                    Some(req.client_version.clone()),
+                )
+                .await?
+        } else {
+            debug!(
+                "Client tube will receive data channel via on_data_channel (tube_id: {})",
+                tube_id
+            );
+            // Client tube doesn't create a data channel - it will receive one via on_data_channel
+            // The logical channel will be created in the on_data_channel callback
+            None
+        };
 
         // Generate offer/answer (BASE64-ENCODE for Python boundary)
         let mut result_map = HashMap::new();
@@ -1098,6 +1116,18 @@ impl RegistryHandle {
             Some(state) => Ok(format!("{:?}", state)),
             None => Ok("Unknown".to_string()),
         }
+    }
+
+    /// Get tube status (New, Initializing, Connecting, Active, Ready, Failed, etc.)
+    /// Ready indicates data channel is open and operational.
+    #[allow(dead_code)] // Used by Python bindings
+    pub async fn get_tube_status(&self, tube_id: &str) -> Result<String> {
+        let tube = self
+            .get_tube_fast(tube_id)
+            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
+
+        let status = tube.status().await;
+        Ok(status.to_string())
     }
 
     /// Add external ICE candidate to a tube

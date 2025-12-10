@@ -27,9 +27,11 @@ use tokio::task::JoinHandle;
 // Add this
 
 // Import from sibling modules
+use super::assembler::{has_fragment_header, FragmentBuffer, FragmentHeader, FRAGMENT_HEADER_SIZE};
 use super::frame_handling::handle_incoming_frame;
 use super::guacd_parser::{GuacdInstruction, GuacdParser};
 use super::utils::handle_ping_timeout;
+use crate::tube_protocol::Capabilities;
 
 // --- Protocol-specific state definitions ---
 #[derive(Default, Clone, Debug)]
@@ -128,6 +130,14 @@ pub struct Channel {
     pub(crate) ksm_config: Option<String>,
     // Client version for router communication
     pub(crate) client_version: String,
+    /// Capabilities enabled for this channel
+    pub(crate) capabilities: crate::tube_protocol::Capabilities,
+    /// Multi-channel assembler (created when FRAGMENTATION capability is enabled)
+    #[allow(dead_code)] // Used at runtime when FRAGMENTATION enabled
+    pub(crate) assembler: Option<super::assembler::Assembler>,
+    /// Pending fragment buffers for reassembly (seq_id -> buffer)
+    /// Used when FRAGMENTATION capability is enabled to reassemble fragmented frames
+    pub(crate) pending_fragments: DashMap<u32, FragmentBuffer>,
 }
 
 // NOTE: Channel is intentionally NOT Clone because it contains a single-consumer receiver
@@ -145,6 +155,8 @@ pub struct ChannelParams {
     pub callback_token: Option<String>,
     pub ksm_config: Option<String>,
     pub client_version: String,
+    /// Capabilities enabled for this channel (e.g., FRAGMENTATION for multi-channel)
+    pub capabilities: crate::tube_protocol::Capabilities,
 }
 
 impl Channel {
@@ -160,6 +172,7 @@ impl Channel {
             callback_token,
             ksm_config,
             client_version,
+            capabilities,
         } = params;
         debug!("Channel::new called (channel_id: {})", channel_id);
         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -496,14 +509,72 @@ impl Channel {
             callback_token,
             ksm_config,
             client_version,
+            capabilities,
+            assembler: None, // Will be created below if FRAGMENTATION enabled
+            pending_fragments: DashMap::new(),
         };
 
         debug!(
-            "Channel initialized (channel_id: {}, server_mode: {})",
-            new_channel.channel_id, new_channel.server_mode
+            "Channel initialized (channel_id: {}, server_mode: {}, capabilities: {:?})",
+            new_channel.channel_id, new_channel.server_mode, new_channel.capabilities
         );
 
         Ok(new_channel)
+    }
+
+    /// Process an incoming fragment, reassembling if all fragments are received.
+    /// Returns Some(reassembled_data) when the complete frame is ready,
+    /// None if still waiting for more fragments.
+    fn process_fragment(&self, data: Bytes) -> Option<Bytes> {
+        // Parse fragment header
+        let header = match FragmentHeader::decode(&data) {
+            Some(h) => h,
+            None => {
+                warn!("Channel({}): Invalid fragment header", self.channel_id);
+                return None;
+            }
+        };
+
+        // Extract payload (skip header)
+        let payload = data.slice(FRAGMENT_HEADER_SIZE..);
+
+        // Get or create fragment buffer
+        let mut entry = self
+            .pending_fragments
+            .entry(header.seq_id)
+            .or_insert_with(|| FragmentBuffer::new(header.total_frags));
+
+        // Add fragment
+        let complete = entry.add_fragment(header.frag_idx, payload);
+
+        if complete {
+            // All fragments received - reassemble
+            let result = entry.reassemble();
+            drop(entry); // Release the entry reference
+
+            // Remove from pending
+            self.pending_fragments.remove(&header.seq_id);
+
+            if crate::logger::is_verbose_logging() {
+                debug!(
+                    "Channel({}): Reassembled fragmented frame (seq_id: {}, fragments: {})",
+                    self.channel_id, header.seq_id, header.total_frags
+                );
+            }
+
+            result
+        } else {
+            if crate::logger::is_verbose_logging() {
+                debug!(
+                    "Channel({}): Received fragment {}/{} (seq_id: {})",
+                    self.channel_id,
+                    header.frag_idx + 1,
+                    header.total_frags,
+                    header.seq_id
+                );
+            }
+            None // Still waiting for more fragments
+        }
     }
 
     pub async fn run(mut self) -> Result<(), ChannelError> {
@@ -573,9 +644,24 @@ impl Channel {
                 maybe_chunk = self.rx_from_dc.recv() => {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
-                            buf.extend_from_slice(&chunk);
-                            if unlikely!(crate::logger::is_verbose_logging()) {
-                                debug!("Buffer size after adding chunk (channel_id: {}, buffer_size: {})", self.channel_id, buf.len());
+                            // Check if this is a fragment that needs reassembly
+                            if self.capabilities.contains(Capabilities::FRAGMENTATION)
+                                && has_fragment_header(&chunk)
+                            {
+                                // Process fragment through reassembly
+                                if let Some(reassembled) = self.process_fragment(chunk) {
+                                    buf.extend_from_slice(&reassembled);
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!("Buffer size after reassembled frame (channel_id: {}, buffer_size: {})", self.channel_id, buf.len());
+                                    }
+                                }
+                                // If None, still waiting for more fragments - don't add anything to buf
+                            } else {
+                                // Not a fragment (or fragmentation disabled), add directly to buffer
+                                buf.extend_from_slice(&chunk);
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!("Buffer size after adding chunk (channel_id: {}, buffer_size: {})", self.channel_id, buf.len());
+                                }
                             }
 
                             // Process pending messages might be triggered by buffer low,
@@ -613,14 +699,14 @@ impl Channel {
 
                               // Explicitly close the failed data connection first
                               info!("Closing failed data connection ({}) due to critical upstream closure. (channel_id: {})", closed_conn_no, self.channel_id);
-                              if let Err(e) = self.close_backend(closed_conn_no, CloseConnectionReason::UpstreamClosed).await {
+                              if let Err(e) = self.close_backend(closed_conn_no, CloseConnectionReason::UpstreamClosed, Some("Critical upstream closure")).await {
                                   warn!("Error closing failed data connection ({}) during critical shutdown. (channel_id: {}, error: {})", closed_conn_no, self.channel_id, e);
                               }
 
                               // Close control connection (conn_no 0) if needed
                               if closed_conn_no != 0 {
                                   info!("Shutting down control connection (0) due to critical upstream closure. (channel_id: {})", self.channel_id);
-                                  if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed).await {
+                                  if let Err(e) = self.close_backend(0, CloseConnectionReason::UpstreamClosed, Some("Critical upstream closure")).await {
                                       debug!("Error explicitly closing control connection (0) during critical shutdown. (channel_id: {}, error: {})", self.channel_id, e);
                                   }
                               }
@@ -761,7 +847,7 @@ impl Channel {
         let conn_keys = self.get_connection_ids();
         for conn_no in conn_keys {
             if conn_no != 0 {
-                self.close_backend(conn_no, CloseConnectionReason::Normal)
+                self.close_backend(conn_no, CloseConnectionReason::Normal, None)
                     .await?;
             }
         }
@@ -822,17 +908,27 @@ impl Channel {
         &mut self,
         conn_no: u32,
         reason: CloseConnectionReason,
+        error_message: Option<&str>,
     ) -> Result<()> {
         let total_connections = self.conns.len();
         let remaining_connections = self.get_connection_ids_except(conn_no);
 
-        debug!("Closing connection - Connection summary (channel_id: {}, conn_no: {}, reason: {:?}, total_connections: {}, remaining_connections: {:?})",
-              self.channel_id, conn_no, reason, total_connections, remaining_connections);
+        debug!("Closing connection - Connection summary (channel_id: {}, conn_no: {}, reason: {:?}, error_message: {:?}, total_connections: {}, remaining_connections: {:?})",
+              self.channel_id, conn_no, reason, error_message, total_connections, remaining_connections);
 
         let mut buffer = self.buffer_pool.acquire();
         buffer.clear();
         buffer.extend_from_slice(&conn_no.to_be_bytes());
         buffer.put_u8(reason as u8);
+        // Add optional error message (backward compatible extension)
+        // Format: [msg_len: 2 bytes][msg: N bytes] - only if error_message is Some
+        if let Some(msg) = error_message {
+            let msg_bytes = msg.as_bytes();
+            // Cap at 1KB to prevent oversized messages
+            let len = msg_bytes.len().min(1024) as u16;
+            buffer.put_u16(len);
+            buffer.extend_from_slice(&msg_bytes[..len as usize]);
+        }
         let msg_data = buffer.freeze();
 
         self.internal_handle_connection_close(conn_no, reason)

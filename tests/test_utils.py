@@ -204,6 +204,80 @@ class BaseWebRTCTest:
         logging.warning(f"ICE exchange timed out after {candidates_exchanged} candidates exchanged")
         return False
 
+class ExactEchoServer(threading.Thread):
+    """Echo server that returns exact bytes received (no modification).
+
+    Used for fragmentation testing where data integrity must be verified.
+    """
+
+    def __init__(self, host="127.0.0.1", port=0):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.actual_port = None
+        self.running = False
+        self._stop_event = threading.Event()
+
+    def run(self):
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.actual_port = self.server_socket.getsockname()[1]
+            self.server_socket.listen(1)
+            logging.info(f"[ExactEchoServer] Listening on {self.host}:{self.actual_port}")
+            self.running = True
+
+            while not self._stop_event.is_set():
+                self.server_socket.settimeout(0.1)
+                try:
+                    conn, addr = self.server_socket.accept()
+                except socket.timeout:
+                    continue
+
+                logging.info(f"[ExactEchoServer] Accepted connection from {addr}")
+                with conn:
+                    while not self._stop_event.is_set():
+                        try:
+                            conn.settimeout(0.1)
+                            data = conn.recv(65536)  # Large buffer for big payloads
+                            if not data:
+                                logging.info(f"[ExactEchoServer] Client {addr} disconnected.")
+                                break
+                            # Echo exact bytes back (no modification)
+                            conn.sendall(data)
+                        except socket.timeout:
+                            continue
+                        except ConnectionResetError:
+                            logging.warning(f"[ExactEchoServer] Connection reset by {addr}")
+                            break
+                        except Exception as e:
+                            logging.error(f"[ExactEchoServer] Error: {e}")
+                            break
+                if self._stop_event.is_set():
+                    break
+        except Exception as e:
+            logging.error(f"[ExactEchoServer] Server error: {e}")
+        finally:
+            if self.server_socket:
+                self.server_socket.close()
+            self.running = False
+            logging.info("[ExactEchoServer] Stopped.")
+
+    def stop(self):
+        logging.info("[ExactEchoServer] Stopping...")
+        self._stop_event.set()
+        self.join(timeout=2)
+        if self.is_alive():
+            logging.warning("[ExactEchoServer] Thread did not stop in time.")
+            if self.server_socket:
+                try:
+                    self.server_socket.close()
+                except Exception as e:
+                    logging.error(f"[ExactEchoServer] Error force closing: {e}")
+
+
 class AckServer(threading.Thread):
     def __init__(self, host="127.0.0.1", port=0):
         super().__init__(daemon=True)

@@ -215,7 +215,11 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
             );
             // Connection reference is dropped, safe to call close_backend
             channel
-                .close_backend(conn_no, CloseConnectionReason::ConnectionLost)
+                .close_backend(
+                    conn_no,
+                    CloseConnectionReason::ConnectionLost,
+                    Some("Backend task is dead"),
+                )
                 .await?;
             return Err(anyhow!("Backend task for connection {} is dead", conn_no));
         }

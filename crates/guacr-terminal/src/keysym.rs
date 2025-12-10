@@ -45,6 +45,8 @@ impl ModifierState {
 /// Guacamole protocol uses X11 keysyms for keyboard input.
 /// This function converts them to the appropriate bytes to send to a terminal.
 ///
+/// Uses default backspace code (127 = DEL).
+///
 /// # Arguments
 ///
 /// * `keysym` - X11 keysym value
@@ -54,6 +56,25 @@ pub fn x11_keysym_to_bytes(
     keysym: u32,
     pressed: bool,
     modifiers: Option<&ModifierState>,
+) -> Vec<u8> {
+    x11_keysym_to_bytes_with_backspace(keysym, pressed, modifiers, 127)
+}
+
+/// Convert X11 keysym to terminal input bytes with configurable backspace
+///
+/// Like `x11_keysym_to_bytes` but allows specifying the backspace code.
+///
+/// # Arguments
+///
+/// * `keysym` - X11 keysym value
+/// * `pressed` - Whether the key is pressed (true) or released (false)
+/// * `modifiers` - Optional modifier state for control character handling
+/// * `backspace_code` - Code to send for backspace key (127 = DEL, 8 = BS)
+pub fn x11_keysym_to_bytes_with_backspace(
+    keysym: u32,
+    pressed: bool,
+    modifiers: Option<&ModifierState>,
+    backspace_code: u8,
 ) -> Vec<u8> {
     // Only handle key press events
     if !pressed {
@@ -103,8 +124,8 @@ pub fn x11_keysym_to_bytes(
         // Return/Enter
         0xFF0D => vec![b'\r'],
 
-        // Backspace
-        0xFF08 => vec![0x7F],
+        // Backspace - use configurable code (127 = DEL, 8 = BS)
+        0xFF08 => vec![backspace_code],
 
         // Tab
         0xFF09 => vec![b'\t'],

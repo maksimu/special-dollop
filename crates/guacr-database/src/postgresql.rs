@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
     EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
+    RecordingConfig,
 };
 use guacr_terminal::QueryResult;
 use log::{debug, info, warn};
@@ -14,6 +15,10 @@ use tokio::sync::mpsc;
 use crate::csv_export::{generate_csv_filename, CsvExporter};
 use crate::csv_import::CsvImporter;
 use crate::query_executor::{execute_with_timing, QueryExecutor};
+use crate::recording::{
+    finalize_recording, init_recording, record_error_output, record_query_input,
+    record_query_output,
+};
 use crate::security::{
     check_csv_export_allowed, check_csv_import_allowed, check_query_allowed, is_postgres_copy_in,
     is_postgres_copy_out, DatabaseSecuritySettings,
@@ -82,6 +87,9 @@ impl ProtocolHandler for PostgreSqlHandler {
             info!("PostgreSQL: Read-only mode enabled");
         }
 
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(&params);
+
         // Parse connection parameters
         let hostname = params
             .get("hostname")
@@ -114,6 +122,12 @@ impl ProtocolHandler for PostgreSqlHandler {
         };
         let mut executor = QueryExecutor::new(prompt, "postgresql")
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+        // Get terminal dimensions for recording
+        let (rows, cols) = executor.terminal.size();
+
+        // Initialize recording if enabled
+        let mut recorder = init_recording(&recording_config, &params, "PostgreSQL", cols, rows);
 
         // Send initial screen
         executor
@@ -271,6 +285,9 @@ impl ProtocolHandler for PostgreSqlHandler {
                     if let Some(query) = pending_query {
                         info!("PostgreSQL: Executing query: {}", query);
 
+                        // Record query input
+                        record_query_input(&mut recorder, &recording_config, &query);
+
                         // Handle built-in commands
                         if handle_builtin_command(&query, &mut executor, &to_client, &security)
                             .await?
@@ -369,11 +386,18 @@ impl ProtocolHandler for PostgreSqlHandler {
                         match execute_with_timing(|| execute_postgres_query(&pool, &query)).await {
                             Ok(exec_result) => {
                                 let result = exec_result.into_query_result();
+
+                                // Record query output
+                                record_query_output(&mut recorder, &result);
+
                                 executor
                                     .write_result(&result)
                                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                             }
                             Err(e) => {
+                                // Record error output
+                                record_error_output(&mut recorder, &e);
+
                                 executor
                                     .write_error(&e)
                                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
@@ -407,6 +431,9 @@ impl ProtocolHandler for PostgreSqlHandler {
                 }
             }
         }
+
+        // Finalize recording
+        finalize_recording(recorder, "PostgreSQL");
 
         info!("PostgreSQL handler ended");
         Ok(())

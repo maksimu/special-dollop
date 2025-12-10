@@ -5,17 +5,24 @@
 // managing and dispatching to handlers.
 //
 // Also provides shared security, recording, and connection infrastructure used by all handlers.
+//
+// Feature flags:
+// - `guacd-compat`: Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
 
 mod connection;
 mod error;
 mod events;
 mod handler;
+mod host_key;
 mod integration;
 mod multi_channel;
 mod pipe;
 mod recording;
 mod registry;
 mod security;
+
+#[cfg(feature = "guacd-compat")]
+mod handshake;
 
 #[cfg(test)]
 mod mock;
@@ -28,7 +35,10 @@ pub use error::{HandlerError, Result};
 pub use events::{
     connect_with_event_adapter, EventBasedHandler, EventCallback, HandlerEvent, InstructionSender,
 };
+#[cfg(feature = "guacd-compat")]
+pub use handler::HandlerArg;
 pub use handler::{HandlerStats, HealthStatus, ProtocolHandler};
+pub use host_key::{calculate_fingerprint, HostKeyConfig, HostKeyResult, HostKeyVerifier};
 pub use integration::handle_guacd_with_handlers;
 pub use multi_channel::{SimpleMultiChannelSender, WebRTCDataChannel};
 pub use pipe::{
@@ -88,6 +98,16 @@ pub use security::{
     CLIPBOARD_DEFAULT_SIZE,
     CLIPBOARD_MAX_SIZE,
     CLIPBOARD_MIN_SIZE,
+};
+
+// guacd wire protocol compatibility exports
+#[cfg(feature = "guacd-compat")]
+pub use handshake::{
+    get_protocol_arg_names, get_protocol_args, handle_guacd_connection,
+    handle_guacd_connection_with_timeout, protocol_args, run_guacd_server, status, ArgDescriptor,
+    ConnectResult, GuacdHandshake, GuacdServer, HandshakeError, SelectResult,
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, GUACAMOLE_PROTOCOL_VERSION, GUACD_DEFAULT_PORT,
+    MAX_INSTRUCTION_SIZE,
 };
 
 #[cfg(test)]

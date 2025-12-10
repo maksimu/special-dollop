@@ -8,25 +8,22 @@ description = "SSH protocol handler for guacr"
 [dependencies]
 # Local dependencies
 guacr-handlers = { path = "../guacr-handlers" }
+guacr-protocol = { path = "../guacr-protocol" }
 guacr-terminal = { path = "../guacr-terminal" }
 
 # Workspace dependencies
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
 # SSH client
 russh = "0.45"
 russh-keys = "0.45"
-rustls = { version = "0.23", features = ["ring"] }
 
 # Utilities
 base64.workspace = true
-dirs = "5.0"
-uuid.workspace = true
 
 # Threat detection (optional)
 guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }

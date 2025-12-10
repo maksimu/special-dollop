@@ -11,6 +11,7 @@ mod mysql;
 mod oracle;
 mod postgresql;
 mod query_executor;
+mod recording;
 mod redis;
 mod security;
 mod sqlserver;

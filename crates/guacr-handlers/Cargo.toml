@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Protocol handler trait and registry for guacr remote desktop protocols"
 
+[features]
+default = []
+# Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
+# This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
+guacd-compat = ["dep:uuid"]
+
 [dependencies]
 # Workspace dependencies
 tokio.workspace = true
@@ -22,6 +28,14 @@ guacr-protocol = { path = "../guacr-protocol" }
 parking_lot = "0.12"
 chrono = "0.4"
 base64.workspace = true
+
+# Host key verification
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+
+# Optional dependencies for guacd-compat feature
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

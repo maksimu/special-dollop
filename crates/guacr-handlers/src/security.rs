@@ -132,7 +132,8 @@ impl HandlerSecuritySettings {
             disable_paste: parse_bool(params.get("disable-paste")),
             clipboard_buffer_size,
             connection_timeout_secs: params
-                .get("connection-timeout")
+                .get("timeout") // guacd name
+                .or_else(|| params.get("connection-timeout")) // legacy name
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::DEFAULT_CONNECTION_TIMEOUT_SECS),
             idle_timeout_secs: params

@@ -29,8 +29,9 @@ use guacr_handlers::{
 };
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, mouse_event_to_x11_sequence,
-    parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes,
-    DirtyTracker, ModifierState, MouseSelection, TerminalEmulator, TerminalRenderer,
+    parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction,
+    x11_keysym_to_bytes_with_backspace, DirtyTracker, ModifierState, MouseSelection,
+    TerminalConfig, TerminalEmulator, TerminalRenderer,
 };
 #[cfg(feature = "threat-detection")]
 use log::error;
@@ -128,6 +129,16 @@ impl ProtocolHandler for TelnetHandler {
             );
         }
 
+        // Parse terminal configuration (font, color-scheme, terminal-type, scrollback, backspace)
+        let terminal_config = TerminalConfig::from_params(&params);
+        info!(
+            "Telnet: Terminal config - type={}, scrollback={}, color_scheme={}, backspace={}",
+            terminal_config.terminal_type,
+            terminal_config.scrollback_size,
+            terminal_config.color_scheme.name(),
+            terminal_config.backspace_code
+        );
+
         // Extract connection parameters
         let hostname = params
             .get("hostname")
@@ -170,10 +181,22 @@ impl ProtocolHandler for TelnetHandler {
 
         let (mut read_half, mut write_half) = stream.into_split();
 
-        // Create terminal emulator with browser-requested dimensions and scrollback buffer
-        let mut terminal = TerminalEmulator::new_with_scrollback(rows, cols, 150);
-        let renderer =
-            TerminalRenderer::new().map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        // Create terminal emulator with browser-requested dimensions and configured scrollback
+        let mut terminal =
+            TerminalEmulator::new_with_scrollback(rows, cols, terminal_config.scrollback_size);
+
+        // Calculate font size from cell height (70% fits well)
+        let font_size = (CHAR_H as f32) * 0.70;
+        let renderer = TerminalRenderer::new_with_dimensions_and_scheme(
+            CHAR_W,
+            CHAR_H,
+            font_size,
+            terminal_config.color_scheme,
+        )
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+        // Store backspace code for key handling
+        let backspace_code = terminal_config.backspace_code;
 
         // Dirty region tracker for optimization
         let mut dirty_tracker = DirtyTracker::new(rows, cols);
@@ -372,6 +395,17 @@ impl ProtocolHandler for TelnetHandler {
                             terminal.process(&buf[..n])
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+                            // Check for BEL character (0x07) and send audio beep to client
+                            if buf[..n].contains(&0x07) {
+                                debug!("Telnet: BEL detected, sending audio beep");
+                                let bell_instrs = guacr_protocol::format_bell_audio(100);
+                                for instr in bell_instrs {
+                                    to_client.send(Bytes::from(instr))
+                                        .await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+
                             // Dirty tracker updates automatically when find_dirty_region is called
                         }
                         Err(e) => {
@@ -401,8 +435,13 @@ impl ProtocolHandler for TelnetHandler {
                             continue;
                         }
 
-                        // Convert to terminal bytes with current modifier state
-                        let bytes = x11_keysym_to_bytes(key_event.keysym, key_event.pressed, Some(&modifier_state));
+                        // Convert to terminal bytes with current modifier state and configured backspace
+                        let bytes = x11_keysym_to_bytes_with_backspace(
+                            key_event.keysym,
+                            key_event.pressed,
+                            Some(&modifier_state),
+                            backspace_code,
+                        );
                         if !bytes.is_empty() {
                             // Threat detection: Analyze live keyboard input before sending to server
                             #[cfg(feature = "threat-detection")]

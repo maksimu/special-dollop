@@ -22,6 +22,7 @@
 
 mod buffer_pool;
 mod clipboard;
+mod config;
 mod database_renderer;
 mod dirty_tracker;
 mod emulator;
@@ -35,6 +36,7 @@ mod simd;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use clipboard::{RdpClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
+pub use config::{ColorScheme, TerminalConfig};
 pub use database_renderer::{DatabaseTerminal, QueryResult, SpreadsheetRenderer};
 pub use dirty_tracker::{DirtyRect, DirtyTracker};
 pub use emulator::{Rect, ScrollbackLine, TerminalEmulator};
@@ -45,7 +47,10 @@ pub use guacamole_input::{
     MouseSelection,
 };
 pub use input_handler::{RdpInputHandler, RdpKeyEvent, RdpPointerEvent};
-pub use keysym::{mouse_event_to_x11_sequence, x11_keysym_to_bytes, ModifierState};
+pub use keysym::{
+    mouse_event_to_x11_sequence, x11_keysym_to_bytes, x11_keysym_to_bytes_with_backspace,
+    ModifierState,
+};
 pub use recorder::{
     create_recording_transports, AsciicastHeader, AsciicastRecorder, AsyncDualFormatRecorder,
     ChannelRecordingTransport, DualFormatRecorder, EventType, FileRecordingTransport,

@@ -16,6 +16,9 @@ use guacr_handlers::{
     HandlerSecuritySettings,
     HandlerStats,
     HealthStatus,
+    // Host key verification
+    HostKeyConfig,
+    HostKeyVerifier,
     // Connection utilities (timeout, keep-alive)
     KeepAliveManager,
     MultiFormatRecorder,
@@ -30,12 +33,14 @@ use guacr_handlers::{
 };
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, parse_clipboard_blob,
-    parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes, DirtyTracker,
-    ModifierState, MouseSelection, TerminalEmulator, TerminalRenderer,
+    parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes_with_backspace,
+    DirtyTracker, ModifierState, MouseSelection, TerminalConfig, TerminalEmulator,
+    TerminalRenderer,
 };
 use log::{debug, error, info, trace, warn};
 use russh::client;
 use russh_keys::key;
+use russh_keys::PublicKeyBase64;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,6 +131,33 @@ impl ProtocolHandler for SshHandler {
             );
         }
 
+        // Parse terminal configuration (font, color-scheme, terminal-type, scrollback, backspace)
+        let terminal_config = TerminalConfig::from_params(&params);
+        info!(
+            "SSH: Terminal config - type={}, scrollback={}, color_scheme={}, font_size={}, backspace={}",
+            terminal_config.terminal_type,
+            terminal_config.scrollback_size,
+            terminal_config.color_scheme.name(),
+            terminal_config.font_size,
+            terminal_config.backspace_code
+        );
+
+        // Parse host key verification configuration
+        let host_key_config = HostKeyConfig::from_params(&params);
+        if host_key_config.ignore_host_key {
+            warn!("SSH: Host key verification DISABLED (ignore-host-key=true) - INSECURE");
+        } else if host_key_config.known_hosts_path.is_some() {
+            info!(
+                "SSH: Host key verification via known_hosts: {}",
+                host_key_config
+                    .known_hosts_path
+                    .as_deref()
+                    .unwrap_or("(none)")
+            );
+        } else if host_key_config.host_key_fingerprint.is_some() {
+            info!("SSH: Host key verification via pinned fingerprint");
+        }
+
         // Extract connection parameters
         let hostname = params.get("hostname").ok_or_else(|| {
             error!("SSH handler: Missing hostname parameter");
@@ -170,6 +202,9 @@ impl ProtocolHandler for SshHandler {
         // Create SSH config
         let ssh_config = client::Config::default();
 
+        // Create SSH client handler with host key verification
+        let ssh_client_handler = SshClientHandler::new(hostname.clone(), port, host_key_config);
+
         // Connect with timeout (matches guacd's timeout parameter)
         let connection_timeout = Duration::from_secs(security.connection_timeout_secs);
         let mut sh = tokio::time::timeout(
@@ -177,7 +212,7 @@ impl ProtocolHandler for SshHandler {
             client::connect(
                 Arc::new(ssh_config),
                 (hostname.as_str(), port),
-                SshClientHandler,
+                ssh_client_handler,
             ),
         )
         .await
@@ -192,8 +227,15 @@ impl ProtocolHandler for SshHandler {
             ))
         })?
         .map_err(|e| {
-            error!("SSH handler: Connection failed: {}", e);
-            HandlerError::ConnectionFailed(e.to_string())
+            // Check if this is a host key verification failure
+            let error_str = e.to_string();
+            if error_str.contains("host key") || error_str.contains("fingerprint") {
+                error!("SSH handler: Host key verification failed: {}", e);
+                HandlerError::AuthenticationFailed(format!("Host key verification failed: {}", e))
+            } else {
+                error!("SSH handler: Connection failed: {}", e);
+                HandlerError::ConnectionFailed(e.to_string())
+            }
         })?;
 
         debug!("SSH handler: Connected to SSH server, starting authentication");
@@ -268,8 +310,8 @@ impl ProtocolHandler for SshHandler {
 
         channel
             .request_pty(
-                false, // want_reply
-                "xterm-256color",
+                false,                       // want_reply
+                terminal_config.term_type(), // Use configured terminal type
                 cols as u32,
                 rows as u32,
                 0,
@@ -279,15 +321,37 @@ impl ProtocolHandler for SshHandler {
             .await
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        // Set environment variables (locale/timezone) before shell/command
+        // Note: Many SSH servers have AcceptEnv disabled by default, so these may be ignored
+        if let Some(locale) = params.get("locale") {
+            debug!("SSH: Setting LANG={}", locale);
+            // Ignore errors - server may reject env vars
+            let _ = channel.set_env(false, "LANG", locale.as_str()).await;
+        }
+        if let Some(timezone) = params.get("timezone") {
+            debug!("SSH: Setting TZ={}", timezone);
+            let _ = channel.set_env(false, "TZ", timezone.as_str()).await;
+        }
 
-        debug!("SSH handler: SSH shell established");
+        // Either execute a specific command or open interactive shell
+        if let Some(command) = params.get("command") {
+            info!("SSH: Executing command: {}", command);
+            channel
+                .exec(false, command.as_str())
+                .await
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            debug!("SSH handler: Command execution started");
+        } else {
+            channel
+                .request_shell(false)
+                .await
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            debug!("SSH handler: SSH shell established");
+        }
 
-        // Create terminal emulator with browser-requested dimensions
-        let mut terminal = TerminalEmulator::new(rows, cols);
+        // Create terminal emulator with browser-requested dimensions and configured scrollback
+        let mut terminal =
+            TerminalEmulator::new_with_scrollback(rows, cols, terminal_config.scrollback_size);
 
         // CRITICAL: Read any initial data (banner/MOTD) that arrived immediately after shell request
         // SSH servers often send welcome banners right away, before we enter the event loop
@@ -344,12 +408,23 @@ impl ProtocolHandler for SshHandler {
         let font_size = (char_height as f32) * 0.70;
 
         info!(
-            "SSH: Creating renderer with {}x{} px cells, {:.1}pt font",
-            char_width, char_height, font_size
+            "SSH: Creating renderer with {}x{} px cells, {:.1}pt font, color_scheme={}",
+            char_width,
+            char_height,
+            font_size,
+            terminal_config.color_scheme.name()
         );
 
-        let renderer = TerminalRenderer::new_with_dimensions(char_width, char_height, font_size)
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+        let renderer = TerminalRenderer::new_with_dimensions_and_scheme(
+            char_width,
+            char_height,
+            font_size,
+            terminal_config.color_scheme,
+        )
+        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+        // Store backspace code for key handling (before terminal_config moves)
+        let backspace_code = terminal_config.backspace_code;
 
         // Dirty region tracker (guacd optimization - only send changed portions)
         let mut dirty_tracker = DirtyTracker::new(rows, cols);
@@ -763,6 +838,17 @@ impl ProtocolHandler for SshHandler {
                             terminal.process(data)
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+                            // Check for BEL character (0x07) and send audio beep to client
+                            if data.contains(&0x07) {
+                                debug!("SSH: BEL detected, sending audio beep");
+                                let bell_instrs = guacr_protocol::format_bell_audio(100);
+                                for instr in bell_instrs {
+                                    to_client.send(Bytes::from(instr))
+                                        .await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+
                             // Don't render immediately - let debounce batch updates
                         }
                         russh::ChannelMsg::ExitStatus { exit_status } => {
@@ -812,10 +898,15 @@ impl ProtocolHandler for SshHandler {
                             continue;
                         }
 
-                        // Convert to terminal bytes with modifier state
+                        // Convert to terminal bytes with modifier state and configured backspace
                         // This enables Ctrl+C (0x03), Ctrl+D (0x04), etc.
                         // Let the remote terminal handle paste based on its OS/config
-                        let bytes = x11_keysym_to_bytes(key_event.keysym, key_event.pressed, Some(&modifier_state));
+                        let bytes = x11_keysym_to_bytes_with_backspace(
+                            key_event.keysym,
+                            key_event.pressed,
+                            Some(&modifier_state),
+                            backspace_code,
+                        );
                         debug!("SSH: Key converted to {} bytes: {:?}", bytes.len(), bytes);
                         if !bytes.is_empty() {
                             // Record input if enabled
@@ -1122,8 +1213,22 @@ fn extract_osc52_clipboard(data: &[u8]) -> Option<String> {
     None
 }
 
-// Simple SSH client handler
-struct SshClientHandler;
+/// SSH client handler with host key verification support
+struct SshClientHandler {
+    verifier: HostKeyVerifier,
+    hostname: String,
+    port: u16,
+}
+
+impl SshClientHandler {
+    fn new(hostname: String, port: u16, config: HostKeyConfig) -> Self {
+        Self {
+            verifier: HostKeyVerifier::new(config),
+            hostname,
+            port,
+        }
+    }
+}
 
 #[async_trait]
 impl client::Handler for SshClientHandler {
@@ -1131,10 +1236,59 @@ impl client::Handler for SshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &key::PublicKey,
+        server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all server keys for now (INSECURE - TODO: proper verification)
-        Ok(true)
+        use guacr_handlers::HostKeyResult;
+
+        // Get key type and raw bytes from the public key
+        let key_type = server_public_key.name();
+        let key_bytes = server_public_key.public_key_bytes();
+
+        // Verify the host key
+        let result = self
+            .verifier
+            .verify(&self.hostname, self.port, key_type, &key_bytes);
+
+        match &result {
+            HostKeyResult::Verified => {
+                info!("SSH: Host key verified for {}:{}", self.hostname, self.port);
+            }
+            HostKeyResult::Skipped => {
+                warn!(
+                    "SSH: Host key verification skipped for {}:{} (INSECURE)",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::NotConfigured => {
+                debug!(
+                    "SSH: No host key verification configured for {}:{}",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::UnknownHost => {
+                warn!(
+                    "SSH: Unknown host {}:{} - not in known_hosts",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::Mismatch { expected, actual } => {
+                error!(
+                    "SSH: HOST KEY MISMATCH for {}:{}\nExpected: {}\nActual: {}",
+                    self.hostname, self.port, expected, actual
+                );
+            }
+        }
+
+        // Check if connection should be allowed based on config
+        if result.is_allowed(&self.verifier.config) {
+            Ok(true)
+        } else {
+            // Return error with descriptive message
+            if let Some(msg) = result.error_message() {
+                error!("SSH: {}", msg);
+            }
+            Ok(false) // Reject the connection
+        }
     }
 }
 

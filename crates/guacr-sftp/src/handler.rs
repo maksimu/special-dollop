@@ -7,13 +7,19 @@ use guacr_handlers::{
     HandlerError,
     HandlerStats,
     HealthStatus,
+    // Host key verification
+    HostKeyConfig,
+    HostKeyResult,
+    HostKeyVerifier,
     ProtocolHandler,
     // Security
     SftpSecuritySettings,
 };
 use guacr_terminal::TerminalRenderer;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use russh::client;
+use russh_keys::key;
+use russh_keys::PublicKeyBase64;
 use russh_sftp::client::SftpSession;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -122,6 +128,22 @@ impl ProtocolHandler for SftpHandler {
             security.root_directory
         );
 
+        // Parse host key verification configuration
+        let host_key_config = HostKeyConfig::from_params(&params);
+        if host_key_config.ignore_host_key {
+            warn!("SFTP: Host key verification DISABLED (ignore-host-key=true) - INSECURE");
+        } else if host_key_config.known_hosts_path.is_some() {
+            info!(
+                "SFTP: Host key verification via known_hosts: {}",
+                host_key_config
+                    .known_hosts_path
+                    .as_deref()
+                    .unwrap_or("(none)")
+            );
+        } else if host_key_config.host_key_fingerprint.is_some() {
+            info!("SFTP: Host key verification via pinned fingerprint");
+        }
+
         let hostname = params
             .get("hostname")
             .ok_or_else(|| HandlerError::MissingParameter("hostname".to_string()))?;
@@ -144,15 +166,23 @@ impl ProtocolHandler for SftpHandler {
         // Connect via SSH (reuse SSH connection logic)
         let config = Arc::new(client::Config::default());
 
-        // Create a minimal handler for SFTP (no host key checking needed for SFTP-only)
-        struct SftpClientHandler;
-        impl client::Handler for SftpClientHandler {
-            type Error = russh::Error;
-        }
+        // Create SFTP client handler with host key verification
+        let sftp_client_handler = SftpClientHandler::new(hostname.clone(), port, host_key_config);
 
-        let mut session = client::connect(config, (hostname.as_str(), port), SftpClientHandler)
+        let mut session = client::connect(config, (hostname.as_str(), port), sftp_client_handler)
             .await
-            .map_err(|e| HandlerError::ConnectionFailed(format!("SSH connection failed: {}", e)))?;
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("host key") || error_str.contains("fingerprint") {
+                    error!("SFTP: Host key verification failed: {}", e);
+                    HandlerError::AuthenticationFailed(format!(
+                        "Host key verification failed: {}",
+                        e
+                    ))
+                } else {
+                    HandlerError::ConnectionFailed(format!("SSH connection failed: {}", e))
+                }
+            })?;
 
         // Authenticate
         let authenticated = if let Some(pwd) = password {
@@ -624,6 +654,86 @@ impl ProtocolHandler for SftpHandler {
 
     async fn stats(&self) -> guacr_handlers::Result<HandlerStats> {
         Ok(HandlerStats::default())
+    }
+}
+
+/// SFTP client handler with host key verification support
+struct SftpClientHandler {
+    verifier: HostKeyVerifier,
+    hostname: String,
+    port: u16,
+}
+
+impl SftpClientHandler {
+    fn new(hostname: String, port: u16, config: HostKeyConfig) -> Self {
+        Self {
+            verifier: HostKeyVerifier::new(config),
+            hostname,
+            port,
+        }
+    }
+}
+
+#[async_trait]
+impl client::Handler for SftpClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // Get key type and raw bytes from the public key
+        let key_type = server_public_key.name();
+        let key_bytes = server_public_key.public_key_bytes();
+
+        // Verify the host key
+        let result = self
+            .verifier
+            .verify(&self.hostname, self.port, key_type, &key_bytes);
+
+        match &result {
+            HostKeyResult::Verified => {
+                info!(
+                    "SFTP: Host key verified for {}:{}",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::Skipped => {
+                warn!(
+                    "SFTP: Host key verification skipped for {}:{} (INSECURE)",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::NotConfigured => {
+                debug!(
+                    "SFTP: No host key verification configured for {}:{}",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::UnknownHost => {
+                warn!(
+                    "SFTP: Unknown host {}:{} - not in known_hosts",
+                    self.hostname, self.port
+                );
+            }
+            HostKeyResult::Mismatch { expected, actual } => {
+                error!(
+                    "SFTP: HOST KEY MISMATCH for {}:{}\nExpected: {}\nActual: {}",
+                    self.hostname, self.port, expected, actual
+                );
+            }
+        }
+
+        // Check if connection should be allowed based on config
+        if result.is_allowed(&self.verifier.config) {
+            Ok(true)
+        } else {
+            // Return error with descriptive message
+            if let Some(msg) = result.error_message() {
+                error!("SFTP: {}", msg);
+            }
+            Ok(false) // Reject the connection
+        }
     }
 }
 

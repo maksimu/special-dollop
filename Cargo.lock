@@ -1849,27 +1849,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users",
- "windows-sys 0.48.0",
-]
-
-[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2709,12 +2688,16 @@ dependencies = [
  "chrono",
  "dashmap",
  "guacr-protocol",
+ "hmac 0.12.1",
  "log",
  "parking_lot",
  "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2806,32 +2789,28 @@ dependencies = [
 name = "guacr-ssh"
 version = "1.1.7"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "dirs",
  "guacr-handlers",
+ "guacr-protocol",
  "guacr-terminal",
  "guacr-threat-detection",
  "log",
  "russh 0.45.0",
  "russh-keys 0.45.0",
- "rustls 0.23.35",
  "thiserror 2.0.17",
  "tokio",
- "uuid",
 ]
 
 [[package]]
 name = "guacr-telnet"
 version = "1.1.7"
 dependencies = [
- "anyhow",
  "async-trait",
- "base64 0.22.1",
  "bytes",
  "guacr-handlers",
+ "guacr-protocol",
  "guacr-terminal",
  "guacr-threat-detection",
  "log",
@@ -4579,12 +4558,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "option-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
 name = "oracle"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5506,17 +5479,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.10.0",
-]
-
-[[package]]
-name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.16",
- "libredox",
- "thiserror 1.0.69",
 ]
 
 [[package]]

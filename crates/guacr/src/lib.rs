@@ -72,3 +72,13 @@ pub use guacr_database as database;
 
 #[cfg(feature = "rbi")]
 pub use guacr_rbi as rbi;
+
+// guacd wire protocol compatibility (select/args/connect/ready handshake)
+#[cfg(feature = "guacd-compat")]
+pub use guacr_handlers::{
+    get_protocol_arg_names, get_protocol_args, handle_guacd_connection,
+    handle_guacd_connection_with_timeout, protocol_args, run_guacd_server, status, ArgDescriptor,
+    ConnectResult, GuacdHandshake, GuacdServer, HandlerArg, HandshakeError, SelectResult,
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, GUACAMOLE_PROTOCOL_VERSION, GUACD_DEFAULT_PORT,
+    MAX_INSTRUCTION_SIZE,
+};

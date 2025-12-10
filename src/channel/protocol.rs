@@ -192,7 +192,27 @@ impl Channel {
             CloseConnectionReason::Normal
         };
 
-        if unlikely!(crate::logger::is_verbose_logging()) {
+        // Extract optional error message (backward compatible extension)
+        // Format after reason byte: [msg_len: 2 bytes][msg: N bytes]
+        let error_message = if data.len() > CONN_NO_LEN + 1 + 2 {
+            // 4 (conn_no) + 1 (reason) + 2 (len) = 7 minimum for message
+            let msg_len = u16::from_be_bytes([data[5], data[6]]) as usize;
+            if data.len() >= 7 + msg_len {
+                Some(String::from_utf8_lossy(&data[7..7 + msg_len]).to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Log error message if present (always log errors, not just in verbose mode)
+        if let Some(ref msg) = error_message {
+            error!(
+                "Connection {} closed with error: {} (reason: {:?}, channel_id: {})",
+                target_connection_no, msg, reason, self.channel_id
+            );
+        } else if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Closing connection {} (reason: {:?}) (channel_id: {})",
                 target_connection_no, reason, self.channel_id
@@ -609,10 +629,16 @@ impl Channel {
         temp_payload_buffer.clear();
 
         if let Err(e) = open_result {
+            let error_str = e.to_string();
             error!("Channel({}): Failed to process OpenConnection for target_conn_no {}: {}. Sending CloseConnection back.",
-                self.channel_id, target_connection_no, e);
+                self.channel_id, target_connection_no, error_str);
             temp_payload_buffer.put_u32(target_connection_no);
             temp_payload_buffer.put_u8(CloseConnectionReason::ConnectionFailed as u8);
+            // Add error message (backward compatible extension)
+            let error_bytes = error_str.as_bytes();
+            let error_len = error_bytes.len().min(1024) as u16; // Cap at 1KB
+            temp_payload_buffer.put_u16(error_len);
+            temp_payload_buffer.extend_from_slice(&error_bytes[..error_len as usize]);
             // Use self.send_control_message for sending
             if let Err(send_err) = self
                 .send_control_message(ControlMessage::CloseConnection, &temp_payload_buffer)

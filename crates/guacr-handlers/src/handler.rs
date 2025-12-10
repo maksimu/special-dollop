@@ -6,6 +6,42 @@ use tokio::sync::mpsc;
 use crate::error::Result;
 use crate::events::EventBasedHandler;
 
+/// Argument descriptor for protocol handler parameters
+///
+/// Used by handlers to declare what connection parameters they accept,
+/// enabling guacd wire protocol compatibility.
+#[cfg(feature = "guacd-compat")]
+#[derive(Debug, Clone)]
+pub struct HandlerArg {
+    /// Argument name (e.g., "hostname", "port", "username")
+    pub name: &'static str,
+    /// Whether this argument is required
+    pub required: bool,
+    /// Human-readable description
+    pub description: &'static str,
+}
+
+#[cfg(feature = "guacd-compat")]
+impl HandlerArg {
+    /// Create a required argument descriptor
+    pub const fn required(name: &'static str, description: &'static str) -> Self {
+        Self {
+            name,
+            required: true,
+            description,
+        }
+    }
+
+    /// Create an optional argument descriptor
+    pub const fn optional(name: &'static str, description: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            description,
+        }
+    }
+}
+
 /// Health status of a protocol handler
 #[derive(Debug, Clone, PartialEq)]
 pub enum HealthStatus {
@@ -136,6 +172,20 @@ pub trait ProtocolHandler: Send + Sync {
     /// implements it, allowing zero-copy integration with keeper-pam-webrtc-rs.
     /// Returns None if the handler only supports the channel-based interface.
     fn as_event_based(&self) -> Option<&dyn EventBasedHandler> {
+        None
+    }
+
+    /// Get the list of arguments this handler accepts
+    ///
+    /// Used for guacd wire protocol compatibility. Returns the argument
+    /// descriptors that will be sent in the "args" instruction during
+    /// the Guacamole handshake.
+    ///
+    /// The default implementation returns None, which means the handler
+    /// uses the standard argument set from the handshake module.
+    /// Handlers can override this to provide custom arguments.
+    #[cfg(feature = "guacd-compat")]
+    fn required_args(&self) -> Option<&'static [HandlerArg]> {
         None
     }
 }

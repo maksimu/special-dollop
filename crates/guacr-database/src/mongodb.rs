@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
     EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
+    RecordingConfig,
 };
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -10,6 +11,9 @@ use tokio::sync::mpsc;
 
 use crate::csv_export::{generate_csv_filename, CsvExporter};
 use crate::query_executor::QueryExecutor;
+use crate::recording::{
+    finalize_recording, init_recording, record_error_output, record_query_input,
+};
 use crate::security::DatabaseSecuritySettings;
 
 use std::sync::atomic::AtomicI32;
@@ -75,6 +79,9 @@ impl ProtocolHandler for MongoDbHandler {
             info!("MongoDB: Read-only mode enabled");
         }
 
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(&params);
+
         // Parse connection parameters
         let hostname = params
             .get("hostname")
@@ -111,6 +118,12 @@ impl ProtocolHandler for MongoDbHandler {
         };
         let mut executor = QueryExecutor::new(prompt, "mongodb")
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+        // Get terminal dimensions for recording
+        let (rows, cols) = executor.terminal.size();
+
+        // Initialize recording if enabled
+        let mut recorder = init_recording(&recording_config, &params, "MongoDB", cols, rows);
 
         // Send initial screen
         executor
@@ -325,6 +338,9 @@ impl ProtocolHandler for MongoDbHandler {
                     if let Some(command) = pending_query {
                         info!("MongoDB: Executing command: {}", command);
 
+                        // Record query input
+                        record_query_input(&mut recorder, &recording_config, &command);
+
                         // Handle built-in commands
                         if let Some(new_db) = handle_builtin_command(
                             &command,
@@ -405,6 +421,9 @@ impl ProtocolHandler for MongoDbHandler {
                                 }
                             }
                             Err(e) => {
+                                // Record error output
+                                record_error_output(&mut recorder, &e);
+
                                 executor
                                     .terminal
                                     .write_error(&e)
@@ -444,6 +463,9 @@ impl ProtocolHandler for MongoDbHandler {
                 }
             }
         }
+
+        // Finalize recording
+        finalize_recording(recorder, "MongoDB");
 
         info!("MongoDB handler ended");
         Ok(())

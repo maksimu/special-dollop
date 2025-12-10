@@ -21,36 +21,36 @@
 
 | Feature | guacd | Our Implementation | Priority | Complexity |
 |---------|-------|-------------------|----------|------------|
-| **Clipboard (copy/paste)** | ✅ Bidirectional | ❌ Missing | HIGH | Medium (~100 lines) |
-| **Mouse events** | ✅ xterm mouse protocol | ❌ Missing | MEDIUM | Medium (~80 lines) |
-| **Scrollback buffer** | ✅ Configurable history | ❌ Missing | MEDIUM | Medium (~150 lines) |
-| **Audio (BEL)** | ✅ Plays beep | ❌ Missing | LOW | Low (~20 lines) |
+| **Clipboard (copy/paste)** | ✅ Bidirectional | ✅ Working | - | - |
+| **Mouse events** | ✅ xterm mouse protocol | ✅ Working | - | - |
+| **Scrollback buffer** | ✅ Configurable history | ✅ Working | - | - |
+| **Audio (BEL)** | ✅ Plays beep | ✅ Working | - | - |
 
 ### File Transfer Features
 
 | Feature | guacd | Our Implementation | Priority | Complexity |
 |---------|-------|-------------------|----------|------------|
-| **SFTP integration** | ✅ Full filesystem | 📦 Stubbed (guacr-sftp) | HIGH | High (~500 lines) |
-| **File download** | ✅ Browser download | ❌ Missing | HIGH | Medium (part of SFTP) |
-| **File upload** | ✅ Drag & drop | ❌ Missing | HIGH | Medium (part of SFTP) |
+| **SFTP integration** | ✅ Full filesystem | ✅ Working | - | - |
+| **File download** | ✅ Browser download | ✅ Working | - | - |
+| **File upload** | ✅ Drag & drop | ✅ Working | - | - |
 
 ### Authentication & Security
 
 | Feature | guacd | Our Implementation | Priority | Complexity |
 |---------|-------|-------------------|----------|------------|
 | **Password auth** | ✅ Yes | ✅ Working | - | - |
-| **Private key auth** | ✅ Yes | 📦 Stubbed | HIGH | Low (~40 lines) |
+| **Private key auth** | ✅ Yes | ✅ Working | - | - |
 | **Agent forwarding** | ✅ Yes | ❌ Missing | LOW | Medium (~100 lines) |
-| **Host key verification** | ✅ known_hosts | ❌ Missing | MEDIUM | Medium (~80 lines) |
+| **Host key verification** | ✅ known_hosts | ✅ Working | - | - |
 
 ### Configuration & Customization
 
 | Feature | guacd | Our Implementation | Priority | Complexity |
 |---------|-------|-------------------|----------|------------|
-| **Color schemes** | ✅ Configurable | ❌ Hardcoded | LOW | Low (~30 lines) |
+| **Color schemes** | ✅ Configurable | ✅ Working | - | - |
 | **Font selection** | ✅ System fonts | ✅ Noto Sans Mono (embedded) | - | - |
-| **Locale/timezone** | ✅ ENV vars | ❌ Missing | LOW | Trivial (~10 lines) |
-| **Command execution** | ✅ Run specific command | ❌ Always shell | MEDIUM | Low (~20 lines) |
+| **Locale/timezone** | ✅ ENV vars | ✅ Working | - | - |
+| **Command execution** | ✅ Run specific command | ✅ Working | - | - |
 
 ## Implementation Roadmap
 
@@ -101,10 +101,11 @@
    - Send xterm mouse escape codes
    - Enable for vim/tmux/etc
 
-7. **Host key verification** (~80 lines)
-   - Check against known_hosts
-   - Prompt user for unknown hosts
-   - Prevent MITM attacks
+7. **Host key verification** ✅ COMPLETE
+   - Check against known_hosts file
+   - Pinned fingerprint support (`host-key` parameter)
+   - Configurable: `ignore-host-key`, `allow-unknown-hosts`
+   - MITM attack protection with clear error messages
 
 ### Phase 4: Polish (Week 4)
 **Goal:** Production ready

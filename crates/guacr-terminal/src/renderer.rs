@@ -1,3 +1,4 @@
+use crate::config::ColorScheme;
 use crate::Result;
 use fontdue::{Font, FontSettings};
 use guacr_protocol::{
@@ -19,6 +20,8 @@ pub struct TerminalRenderer {
     char_height: u32,
     font_size: f32,
     font: Font,
+    /// Color scheme for terminal rendering
+    color_scheme: ColorScheme,
 }
 
 impl TerminalRenderer {
@@ -54,6 +57,28 @@ impl TerminalRenderer {
     /// # }
     /// ```
     pub fn new_with_dimensions(char_width: u32, char_height: u32, font_size: f32) -> Result<Self> {
+        Self::new_with_dimensions_and_scheme(
+            char_width,
+            char_height,
+            font_size,
+            ColorScheme::default(),
+        )
+    }
+
+    /// Create a new renderer with specific dimensions and color scheme
+    ///
+    /// # Arguments
+    ///
+    /// * `char_width` - Width of each character cell in pixels
+    /// * `char_height` - Height of each character cell in pixels
+    /// * `font_size` - Font size in points (typically 70-75% of char_height for good fit)
+    /// * `color_scheme` - Color scheme for terminal rendering
+    pub fn new_with_dimensions_and_scheme(
+        char_width: u32,
+        char_height: u32,
+        font_size: f32,
+        color_scheme: ColorScheme,
+    ) -> Result<Self> {
         let font = Font::from_bytes(FONT_DATA, FontSettings::default()).map_err(|e| {
             crate::TerminalError::FontError(format!("Failed to load embedded font: {}", e))
         })?;
@@ -63,7 +88,18 @@ impl TerminalRenderer {
             char_height,
             font_size,
             font,
+            color_scheme,
         })
+    }
+
+    /// Get the current color scheme
+    pub fn color_scheme(&self) -> &ColorScheme {
+        &self.color_scheme
+    }
+
+    /// Set the color scheme
+    pub fn set_color_scheme(&mut self, scheme: ColorScheme) {
+        self.color_scheme = scheme;
     }
 
     /// Render terminal screen to JPEG
@@ -356,14 +392,17 @@ impl TerminalRenderer {
     fn vt100_color_to_rgb(&self, color: vt100::Color, is_foreground: bool) -> Rgb<u8> {
         match color {
             vt100::Color::Default => {
+                // Use color scheme for default colors
                 if is_foreground {
-                    Rgb([229, 229, 229]) // Default fg = light gray (like most terminals)
+                    Rgb(self.color_scheme.foreground)
                 } else {
-                    Rgb([0, 0, 0]) // Default bg = black
+                    Rgb(self.color_scheme.background)
                 }
             }
             vt100::Color::Idx(n) => {
                 // Standard 16-color palette
+                // For index 0 (black) and 7 (white), use color scheme if they match
+                // the default foreground/background to maintain theme consistency
                 match n {
                     0 => Rgb([0, 0, 0]),        // Black
                     1 => Rgb([205, 0, 0]),      // Red
@@ -576,7 +615,31 @@ mod tests {
     #[test]
     fn test_vt100_color_to_rgb() {
         let renderer = TerminalRenderer::new().unwrap();
-        let color = renderer.vt100_color_to_rgb(vt100::Color::Default, true);
-        assert_eq!(color.0, [229, 229, 229]); // Light gray
+        // Default color scheme is GRAY_BLACK (gray foreground, black background)
+        let fg_color = renderer.vt100_color_to_rgb(vt100::Color::Default, true);
+        assert_eq!(fg_color.0, [229, 229, 229]); // Gray foreground
+
+        let bg_color = renderer.vt100_color_to_rgb(vt100::Color::Default, false);
+        assert_eq!(bg_color.0, [0, 0, 0]); // Black background
+    }
+
+    #[test]
+    fn test_color_scheme_application() {
+        use crate::config::ColorScheme;
+
+        // Test with green-black scheme
+        let renderer = TerminalRenderer::new_with_dimensions_and_scheme(
+            19,
+            38,
+            28.0,
+            ColorScheme::GREEN_BLACK,
+        )
+        .unwrap();
+
+        let fg_color = renderer.vt100_color_to_rgb(vt100::Color::Default, true);
+        assert_eq!(fg_color.0, [0, 255, 0]); // Green foreground
+
+        let bg_color = renderer.vt100_color_to_rgb(vt100::Color::Default, false);
+        assert_eq!(bg_color.0, [0, 0, 0]); // Black background
     }
 }

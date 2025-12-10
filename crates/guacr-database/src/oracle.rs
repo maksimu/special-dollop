@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
     EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
+    RecordingConfig,
 };
 use log::{info, warn};
 use std::collections::HashMap;
@@ -11,6 +12,9 @@ use tokio::sync::mpsc;
 use crate::csv_export::{generate_csv_filename, CsvExporter};
 use crate::csv_import::CsvImporter;
 use crate::query_executor::QueryExecutor;
+use crate::recording::{
+    finalize_recording, init_recording, record_error_output, record_query_input,
+};
 use crate::security::{check_query_allowed, DatabaseSecuritySettings};
 
 use std::sync::atomic::AtomicI32;
@@ -113,6 +117,9 @@ impl ProtocolHandler for OracleHandler {
             info!("Oracle: Read-only mode enabled");
         }
 
+        // Parse recording configuration
+        let recording_config = RecordingConfig::from_params(&params);
+
         // Parse connection parameters
         let hostname = params
             .get("hostname")
@@ -149,6 +156,12 @@ impl ProtocolHandler for OracleHandler {
         let mut executor = QueryExecutor::new(prompt, "oracle")
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+        // Get terminal dimensions for recording
+        let (rows, cols) = executor.terminal.size();
+
+        // Initialize recording if enabled
+        let mut recorder = init_recording(&recording_config, &params, "Oracle", cols, rows);
+
         // Check if real Oracle mode is available
         let real_mode = oracle_client_available();
 
@@ -181,6 +194,8 @@ impl ProtocolHandler for OracleHandler {
                     self.run_real_mode_session(
                         conn,
                         &security,
+                        &recording_config,
+                        &mut recorder,
                         &mut executor,
                         &to_client,
                         &mut from_client,
@@ -222,6 +237,8 @@ impl ProtocolHandler for OracleHandler {
                         &username,
                         &service,
                         &security,
+                        &recording_config,
+                        &mut recorder,
                         &mut executor,
                         &to_client,
                         &mut from_client,
@@ -238,6 +255,8 @@ impl ProtocolHandler for OracleHandler {
                 &username,
                 &service,
                 &security,
+                &recording_config,
+                &mut recorder,
                 &mut executor,
                 &to_client,
                 &mut from_client,
@@ -265,14 +284,19 @@ struct OracleQueryResult {
     message: String,
 }
 
+use guacr_handlers::MultiFormatRecorder;
+
 impl OracleHandler {
     /// Run a real Oracle session
     ///
     /// Note: This uses spawn_blocking for each query since oracle::Connection is not Send
+    #[allow(clippy::too_many_arguments)]
     async fn run_real_mode_session(
         &self,
         conn: oracle::Connection,
         security: &DatabaseSecuritySettings,
+        recording_config: &RecordingConfig,
+        recorder: &mut Option<MultiFormatRecorder>,
         executor: &mut QueryExecutor,
         to_client: &mpsc::Sender<Bytes>,
         from_client: &mut mpsc::Receiver<Bytes>,
@@ -351,6 +375,9 @@ impl OracleHandler {
                     if let Some(query) = pending_query {
                         info!("Oracle: Query: {}", query);
 
+                        // Record query input
+                        record_query_input(recorder, recording_config, &query);
+
                         // Handle built-in commands
                         if handle_builtin_command(&query, executor, to_client, security).await? {
                             continue;
@@ -427,6 +454,9 @@ impl OracleHandler {
             }
         }
 
+        // Finalize recording
+        finalize_recording(recorder.take(), "Oracle");
+
         info!("Oracle handler ended");
         Ok(())
     }
@@ -440,6 +470,8 @@ impl OracleHandler {
         username: &str,
         service: &str,
         security: &DatabaseSecuritySettings,
+        recording_config: &RecordingConfig,
+        recorder: &mut Option<MultiFormatRecorder>,
         executor: &mut QueryExecutor,
         to_client: &mpsc::Sender<Bytes>,
         from_client: &mut mpsc::Receiver<Bytes>,
@@ -526,6 +558,9 @@ impl OracleHandler {
                     if let Some(query) = pending_query {
                         info!("Oracle: Command: {}", query);
 
+                        // Record query input
+                        record_query_input(recorder, recording_config, &query);
+
                         // Handle built-in commands
                         if handle_builtin_command(&query, executor, to_client, security).await? {
                             continue;
@@ -579,6 +614,9 @@ impl OracleHandler {
                                 }
                             }
                             Err(e) => {
+                                // Record error output
+                                record_error_output(recorder, &e);
+
                                 executor
                                     .terminal
                                     .write_error(&e)
@@ -618,6 +656,9 @@ impl OracleHandler {
                 }
             }
         }
+
+        // Finalize recording
+        finalize_recording(recorder.take(), "Oracle");
 
         info!("Oracle handler ended");
         Ok(())

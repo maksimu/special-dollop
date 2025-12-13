@@ -1,6 +1,7 @@
 // Frame handling functionality for Channel
 
-use super::core::Channel;
+use super::core::{Channel, ProtocolLogicState, PythonHandlerMessage};
+use super::types::ActiveProtocol;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame, CTRL_NO_LEN};
 use crate::unlikely; // Branch prediction optimization
 use anyhow::{anyhow, Result};
@@ -174,6 +175,11 @@ pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
 // **COMPLETELY LOCK-FREE: Uses channel communication instead of mutex!**
 #[inline(always)] // Force inlining for maximum performance
 async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes) -> Result<()> {
+    // **PythonHandler FAST PATH**: Route directly to Python, bypassing connection lookup
+    if channel.active_protocol == ActiveProtocol::PythonHandler {
+        return forward_to_python_handler(channel, conn_no, payload).await;
+    }
+
     // Skip inbound special instruction detection - user only wants outbound and handshake sizes
     // **COMPLETELY LOCK-FREE**: DashMap provides efficient concurrent access
     // **MEMORY OPTIMIZATION**: Smart prefetching for 2-connection pattern (always enabled)
@@ -239,4 +245,48 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
 
     log_connection_not_found(&channel.channel_id, conn_no);
     Ok(())
+}
+
+/// Forward data to Python handler for PythonHandler protocol mode
+/// **HOT PATH for PythonHandler mode**
+#[inline(always)]
+async fn forward_to_python_handler(channel: &mut Channel, conn_no: u32, payload: Bytes) -> Result<()> {
+    // Verify the connection is registered (was confirmed via ConnectionOpened)
+    let is_registered = if let ProtocolLogicState::PythonHandler(ref state) = channel.protocol_state {
+        state.active_connections.contains(&conn_no)
+    } else {
+        false
+    };
+
+    if !is_registered {
+        // Data arrived for unregistered connection - this can happen if:
+        // 1. Data arrives before ConnectionOpened (race condition)
+        // 2. Connection was never opened or was closed
+        // Log and drop the data rather than crashing
+        warn!(
+            "Data received for unregistered PythonHandler connection (channel_id: {}, conn_no: {}), dropping {} bytes",
+            channel.channel_id, conn_no, payload.len()
+        );
+        return Ok(());
+    }
+
+    if let Some(ref tx) = channel.python_handler_tx {
+        // Send data message to Python handler
+        if tx.send(PythonHandlerMessage::Data { conn_no, payload }).await.is_err() {
+            // Channel closed - Python handler is gone
+            warn!(
+                "Python handler channel closed, cannot forward data (channel_id: {}, conn_no: {})",
+                channel.channel_id, conn_no
+            );
+            return Err(anyhow!("Python handler channel closed"));
+        }
+        Ok(())
+    } else {
+        // Should not happen - PythonHandler mode requires python_handler_tx
+        error!(
+            "PythonHandler mode but python_handler_tx is None (channel_id: {})",
+            channel.channel_id
+        );
+        Err(anyhow!("PythonHandler mode missing python_handler_tx"))
+    }
 }

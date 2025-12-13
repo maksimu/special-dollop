@@ -64,6 +64,9 @@ pub struct CreateTubeRequest {
     pub tube_id: Option<String>,
     /// Capabilities to enable for this tube (e.g., FRAGMENTATION for multi-channel)
     pub capabilities: crate::tube_protocol::Capabilities,
+    /// Optional Python handler channel for PythonHandler protocol mode
+    /// When set, channels with python_handler conversation type will route data to this channel
+    pub python_handler_tx: Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>,
 }
 
 /// Commands for the registry actor
@@ -548,6 +551,10 @@ impl RegistryActor {
                     .await
                 {
                     Ok(data_channel) => {
+                        // Store python_handler_tx on existing tube if provided
+                        if let Some(ref handler_tx) = req.python_handler_tx {
+                            existing_tube.set_python_handler_tx(handler_tx.clone()).await;
+                        }
                         match existing_tube
                             .create_channel(
                                 conversation_id,
@@ -557,6 +564,7 @@ impl RegistryActor {
                                 Some(req.callback_token.clone()),
                                 Some(ksm_config_for_channel),
                                 Some(req.client_version.clone()),
+                                req.python_handler_tx.clone(), // Pass python_handler_tx for PythonHandler protocol mode
                             )
                             .await
                         {
@@ -609,6 +617,15 @@ impl RegistryActor {
             req.capabilities,
         )?;
         let tube_id = tube_arc.id();
+
+        // Store python_handler_tx on tube BEFORE creating channels (fixes race condition)
+        if let Some(ref handler_tx) = req.python_handler_tx {
+            tube_arc.set_python_handler_tx(handler_tx.clone()).await;
+            debug!(
+                "Stored python_handler_tx on tube during creation (tube_id: {}, conversation_id: {})",
+                tube_id, conversation_id
+            );
+        }
 
         // Prepare ICE servers (includes TURN credential fetch - OUTSIDE locks!)
         let ice_servers = self
@@ -677,7 +694,7 @@ impl RegistryActor {
                 .await?;
 
             // Create logical channel and capture actual listening port
-            tube_arc
+            let actual_listening_port = tube_arc
                 .create_channel(
                     conversation_id,
                     &data_channel,
@@ -686,17 +703,10 @@ impl RegistryActor {
                     Some(req.callback_token.clone()),
                     Some(ksm_config_for_channel),
                     Some(req.client_version.clone()),
-                )
-                .await?
-        } else {
-            debug!(
-                "Client tube will receive data channel via on_data_channel (tube_id: {})",
-                tube_id
-            );
-            // Client tube doesn't create a data channel - it will receive one via on_data_channel
-            // The logical channel will be created in the on_data_channel callback
-            None
-        };
+                    req.python_handler_tx.clone(), // Pass python_handler_tx for PythonHandler protocol mode
+            )
+            .await?;
+>>>>>>> c7a6896 (Initial commit for guacd tunnel support)
 
         // Generate offer/answer (BASE64-ENCODE for Python boundary)
         let mut result_map = HashMap::new();

@@ -219,6 +219,49 @@ impl Channel {
             );
         }
 
+        // Handle PythonHandler mode - notify Python and clean up virtual connection
+        if self.active_protocol == super::types::ActiveProtocol::PythonHandler {
+            // Notify Python handler of connection closure
+            if let Some(ref tx) = self.python_handler_tx {
+                let msg = super::core::PythonHandlerMessage::ConnectionClosed {
+                    conn_no: target_connection_no,
+                    reason,
+                };
+                if tx.send(msg).await.is_err() {
+                    warn!(
+                        "Channel({}): Failed to send ConnectionClosed to Python handler for conn_no {}",
+                        self.channel_id, target_connection_no
+                    );
+                }
+            }
+
+            // Clean up the virtual connection from our state
+            if let super::core::ProtocolLogicState::PythonHandler(ref mut state) = self.protocol_state {
+                if state.active_connections.remove(&target_connection_no) {
+                    debug!(
+                        "Channel({}): PythonHandler removed virtual connection {} (remaining: {})",
+                        self.channel_id, target_connection_no, state.active_connections.len()
+                    );
+                } else {
+                    debug!(
+                        "Channel({}): PythonHandler conn_no {} was not in active_connections (may have been unconfirmed)",
+                        self.channel_id, target_connection_no
+                    );
+                }
+            }
+
+            // For PythonHandler, connection 0 still means channel close
+            if target_connection_no == 0 {
+                self.should_exit
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Ok(mut guard) = self.channel_close_reason.try_lock() {
+                    *guard = Some(reason);
+                }
+            }
+            // No TCP backend to close for PythonHandler virtual connections
+            return Ok(());
+        }
+
         // Special case for connection 0 (control connection)
         if target_connection_no == 0 {
             self.should_exit
@@ -622,6 +665,22 @@ impl Channel {
                     Err(anyhow!("SOCKS5 OpenConnection not supported in this mode"))
                 }
             }
+            super::types::ActiveProtocol::PythonHandler => {
+                // PythonHandler mode: connections are virtual - notify Python and acknowledge
+                debug!("Channel({}): PythonHandler OpenConnection for virtual conn_no {}", self.channel_id, target_connection_no);
+
+                // Send ConnectionOpened event to Python handler
+                if let Some(ref tx) = self.python_handler_tx {
+                    if tx.send(super::core::PythonHandlerMessage::ConnectionOpened {
+                        conn_no: target_connection_no
+                    }).await.is_err() {
+                        warn!("Channel({}): Failed to send ConnectionOpened to Python handler", self.channel_id);
+                    }
+                }
+
+                // Return Ok - no TCP backend needed for PythonHandler
+                Ok(())
+            }
         };
 
         // --- Post OpenConnection Attempt ---
@@ -814,6 +873,64 @@ impl Channel {
     async fn handle_connection_opened(&mut self, data: &[u8]) -> Result<()> {
         // This is called when we receive a ConnectionOpened control message from WebRTC
         // In server_mode, this completes the connection setup
+        // In PythonHandler mode, this is the lazy initialization point for virtual connections
+
+        if data.len() < CONN_NO_LEN {
+            return Err(anyhow!("ConnectionOpened message too short"));
+        }
+
+        let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+
+        // Handle PythonHandler mode specially - lazy initialization of virtual connections
+        if self.active_protocol == super::types::ActiveProtocol::PythonHandler {
+            debug!(
+                "Channel({}): PythonHandler received ConnectionOpened for conn_no {}",
+                self.channel_id, connection_no
+            );
+
+            // Register the virtual connection in our state
+            if let super::core::ProtocolLogicState::PythonHandler(ref mut state) = self.protocol_state {
+                if state.active_connections.contains(&connection_no) {
+                    warn!(
+                        "Channel({}): PythonHandler conn_no {} already registered, ignoring duplicate ConnectionOpened",
+                        self.channel_id, connection_no
+                    );
+                    return Ok(());
+                }
+                state.active_connections.insert(connection_no);
+                debug!(
+                    "Channel({}): PythonHandler registered virtual connection {} (total active: {})",
+                    self.channel_id, connection_no, state.active_connections.len()
+                );
+            }
+
+            // Notify Python handler that the connection is now open and ready for data
+            if let Some(ref tx) = self.python_handler_tx {
+                if tx.send(super::core::PythonHandlerMessage::ConnectionOpened {
+                    conn_no: connection_no
+                }).await.is_err() {
+                    warn!(
+                        "Channel({}): Failed to send ConnectionOpened to Python handler for conn_no {}",
+                        self.channel_id, connection_no
+                    );
+                    // Clean up the registration since Python won't know about it
+                    if let super::core::ProtocolLogicState::PythonHandler(ref mut state) = self.protocol_state {
+                        state.active_connections.remove(&connection_no);
+                    }
+                    return Err(anyhow!("Python handler channel closed"));
+                }
+            } else {
+                error!(
+                    "Channel({}): PythonHandler mode but python_handler_tx is None",
+                    self.channel_id
+                );
+                return Err(anyhow!("PythonHandler mode missing python_handler_tx"));
+            }
+
+            return Ok(());
+        }
+
+        // Non-PythonHandler modes: require server_mode and pre-existing connection
         if !self.server_mode {
             if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
@@ -824,11 +941,6 @@ impl Channel {
             return Ok(());
         }
 
-        if data.len() < CONN_NO_LEN {
-            return Err(anyhow!("ConnectionOpened message too short"));
-        }
-
-        let connection_no = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Endpoint Starting reader for connection {} (channel_id: {})",

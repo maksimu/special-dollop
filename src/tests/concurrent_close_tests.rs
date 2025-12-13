@@ -43,6 +43,7 @@ async fn test_concurrent_closes_dont_block() {
             signal_sender: signal_tx,
             tube_id: Some(format!("concurrent_close_tube_{}", i)),
             capabilities: crate::tube_protocol::Capabilities::NONE,
+            python_handler_tx: None,
         };
 
         match REGISTRY.create_tube(req).await {
@@ -147,6 +148,7 @@ async fn test_atomic_closing_flag_prevents_double_close() {
         signal_sender: signal_tx,
         tube_id: Some("double_close_test_tube".to_string()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     let tube_id = match REGISTRY.create_tube(req).await {
@@ -257,6 +259,7 @@ async fn test_actor_responsive_during_closes() {
             signal_sender: signal_tx,
             tube_id: Some(format!("responsive_close_tube_{}", i)),
             capabilities: crate::tube_protocol::Capabilities::NONE,
+            python_handler_tx: None,
         };
 
         if let Ok(result) = REGISTRY.create_tube(req).await {
@@ -316,6 +319,7 @@ async fn test_actor_responsive_during_closes() {
                 signal_sender: signal_tx,
                 tube_id: Some(format!("responsive_create_tube_{}", i)),
                 capabilities: crate::tube_protocol::Capabilities::NONE,
+                python_handler_tx: None,
             };
 
             let start_create = Instant::now();
@@ -402,6 +406,7 @@ async fn test_actor_response_time_is_microseconds() {
         signal_sender: signal_tx,
         tube_id: Some("response_time_test_tube".to_string()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     let tube_id = match REGISTRY.create_tube(req).await {
@@ -490,6 +495,7 @@ async fn test_stress_50_concurrent_closes() {
                 signal_sender: signal_tx,
                 tube_id: Some(format!("stress_test_tube_{}", i)),
                 capabilities: crate::tube_protocol::Capabilities::NONE,
+                python_handler_tx: None,
             };
 
             if let Ok(result) = REGISTRY.create_tube(req).await {

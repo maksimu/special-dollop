@@ -5,9 +5,9 @@ Simulates various network conditions and interface changes.
 """
 
 import asyncio
+import inspect
 import logging
 import time
-import random
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Callable
 from enum import Enum
@@ -20,6 +20,7 @@ from connection_manager import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class NetworkCondition(Enum):
     """Different network conditions to simulate"""
@@ -140,7 +141,7 @@ class NetworkSimulator:
             # Notify callbacks
             for callback in self.event_callbacks:
                 try:
-                    if asyncio.iscoroutinefunction(callback):
+                    if inspect.iscoroutinefunction(callback):
                         await callback(tube_id, event, manager)
                     else:
                         callback(tube_id, event, manager)

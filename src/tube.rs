@@ -89,6 +89,13 @@ pub struct Tube {
     // ============================================================================
     /// Capabilities enabled for this tube (e.g., FRAGMENTATION for multi-channel)
     pub(crate) capabilities: crate::tube_protocol::Capabilities,
+    // ============================================================================
+    // PYTHON HANDLER PROTOCOL MODE
+    // ============================================================================
+    /// Channel sender for PythonHandler protocol mode
+    /// When set, data received on channels with python_handler conversation type
+    /// is forwarded to Python via this channel
+    pub(crate) python_handler_tx: Arc<TokioRwLock<Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>>>,
 }
 
 impl Tube {
@@ -143,6 +150,8 @@ impl Tube {
 
             // Multi-channel capabilities:
             capabilities,
+            // Python handler protocol mode:
+            python_handler_tx: Arc::new(TokioRwLock::new(None)),
         });
 
         Ok(tube)
@@ -620,6 +629,8 @@ impl Tube {
                     debug!("on_data_channel: Determined server_mode for channel setup. (tube_id: {}, channel_label: {}, server_mode: {})", tube.id, rtc_data_channel_label, current_server_mode);
                     debug!("on_data_channel: About to call setup_channel_for_data_channel. (tube_id: {}, channel_label: {})", tube.id, rtc_data_channel_label);
                 }
+                // Get python_handler_tx from tube if set (for PythonHandler protocol mode)
+                let python_handler_tx = tube.get_python_handler_tx().await;
                 let channel_result = setup_channel_for_data_channel(
                     &data_channel,
                     &peer_connection_for_channel,
@@ -631,6 +642,7 @@ impl Tube {
                     Some(ksm_config_for_channel), // Use ksm_config from tube creation
                     client_version,
                     tube.capabilities, // Pass tube's capabilities to channel
+                    python_handler_tx, // For PythonHandler protocol mode
                 ).await;
 
                 let mut owned_channel = match channel_result {
@@ -1183,6 +1195,7 @@ impl Tube {
         callback_token: Option<String>,
         ksm_config: Option<String>,
         client_version: Option<String>,
+        python_handler_tx: Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>,
     ) -> Result<Option<u16>> {
         if unlikely!(crate::logger::is_verbose_logging()) {
             debug!("create_channel: Initial parameters. (tube_id: {}, channel_name: {}, timeout_seconds: {:?}, protocol_settings: {:?})", self.id, name, timeout_seconds, protocol_settings);
@@ -1242,6 +1255,7 @@ impl Tube {
             ksm_config,
             client_version,
             self.capabilities, // Pass tube's capabilities to channel
+            python_handler_tx,
         )
         .await;
 
@@ -2172,6 +2186,134 @@ impl Tube {
             "Tube {} close() completed successfully (total time: {:?})",
             tube_id,
             start_time.elapsed()
+        );
+
+        Ok(())
+    }
+
+    // =============================================================================
+    // PYTHON HANDLER PROTOCOL MODE METHODS
+    // =============================================================================
+
+    /// Set the python handler sender for PythonHandler protocol mode
+    /// Called by Python binding when a handler_callback is provided
+    #[allow(dead_code)] // Used by Python bindings
+    pub(crate) async fn set_python_handler_tx(
+        &self,
+        tx: tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>,
+    ) {
+        let mut guard = self.python_handler_tx.write().await;
+        *guard = Some(tx);
+        debug!("Python handler tx set for tube {}", self.id);
+    }
+
+    /// Get a clone of the python handler sender if set
+    /// Used when creating channels to pass to ChannelParams
+    #[allow(dead_code)] // Used in on_data_channel callback
+    pub(crate) async fn get_python_handler_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>> {
+        let guard = self.python_handler_tx.read().await;
+        guard.clone()
+    }
+
+    /// Send data from Python handler to WebRTC for a specific channel/connection
+    /// Used in PythonHandler protocol mode
+    #[allow(dead_code)] // Used by Python bindings
+    pub(crate) async fn send_data_from_handler(
+        &self,
+        channel_name: &str,
+        conn_no: u32,
+        data: bytes::Bytes,
+    ) -> Result<()> {
+        let data_channels = self.data_channels.read().await;
+        let channel = data_channels.get(channel_name).ok_or_else(|| {
+            anyhow::anyhow!("Channel not found: {}", channel_name)
+        })?;
+
+        // Create a data frame and send it over WebRTC
+        let buffer_pool = BufferPool::default();
+        let frame = Frame::new_data_with_pool(conn_no, &data, &buffer_pool);
+        let encoded = frame.encode_with_pool(&buffer_pool);
+
+        channel.send(encoded).await.map_err(|e| {
+            anyhow::anyhow!("Failed to send data frame over WebRTC: {}", e)
+        })?;
+
+        Ok(())
+    }
+
+    /// Open a virtual connection in PythonHandler protocol mode
+    /// Sends an OpenConnection control message to the remote peer
+    /// This is used when Python wants to initiate a connection (e.g., guacd tunnel)
+    #[allow(dead_code)] // Used by Python bindings
+    pub(crate) async fn open_handler_connection(
+        &self,
+        channel_name: &str,
+        conn_no: u32,
+    ) -> Result<()> {
+        let data_channels = self.data_channels.read().await;
+        let channel = data_channels.get(channel_name).ok_or_else(|| {
+            anyhow::anyhow!("Channel not found: {}", channel_name)
+        })?;
+
+        // Build OpenConnection control message - payload is just conn_no
+        let open_data = conn_no.to_be_bytes();
+
+        let buffer_pool = BufferPool::default();
+        let open_frame = Frame::new_control_with_pool(
+            ControlMessage::OpenConnection,
+            &open_data,
+            &buffer_pool,
+        );
+
+        let encoded = open_frame.encode_with_pool(&buffer_pool);
+        channel.send(encoded).await.map_err(|e| {
+            anyhow::anyhow!("Failed to send OpenConnection frame: {}", e)
+        })?;
+
+        debug!(
+            "Sent OpenConnection for conn_no {} on channel {}",
+            conn_no, channel_name
+        );
+
+        Ok(())
+    }
+
+    /// Close a virtual connection in PythonHandler protocol mode
+    /// Sends a CloseConnection control message to the remote peer
+    #[allow(dead_code)] // Used by Python bindings
+    pub(crate) async fn close_handler_connection(
+        &self,
+        channel_name: &str,
+        conn_no: u32,
+        reason: CloseConnectionReason,
+    ) -> Result<()> {
+        let data_channels = self.data_channels.read().await;
+        let channel = data_channels.get(channel_name).ok_or_else(|| {
+            anyhow::anyhow!("Channel not found: {}", channel_name)
+        })?;
+
+        // Build CloseConnection control message
+        let mut close_data = Vec::with_capacity(5);
+        close_data.extend_from_slice(&conn_no.to_be_bytes());
+        close_data.push(reason as u8);
+
+        let buffer_pool = BufferPool::default();
+        let close_frame = Frame::new_control_with_pool(
+            ControlMessage::CloseConnection,
+            &close_data,
+            &buffer_pool,
+        );
+
+        let encoded = close_frame.encode_with_pool(&buffer_pool);
+        channel.send(encoded).await.map_err(|e| {
+            anyhow::anyhow!("Failed to send CloseConnection frame: {}", e)
+        })?;
+
+        debug!(
+            "Sent CloseConnection for conn_no {} with reason {:?} on channel {}",
+            conn_no, reason, channel_name
         );
 
         Ok(())

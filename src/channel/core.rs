@@ -32,6 +32,28 @@ use super::frame_handling::handle_incoming_frame;
 use super::guacd_parser::{GuacdInstruction, GuacdParser};
 use super::utils::handle_ping_timeout;
 use crate::tube_protocol::Capabilities;
+use crate::tube_protocol::CloseConnectionReason as TubeCloseReason;
+
+/// Message types sent from Channel to Python handler
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Used by Python bindings
+pub enum PythonHandlerMessage {
+    /// A new connection was opened
+    ConnectionOpened { conn_no: u32 },
+    /// Data received on a connection
+    Data { conn_no: u32, payload: Bytes },
+    /// A connection was closed
+    ConnectionClosed { conn_no: u32, reason: TubeCloseReason },
+}
+
+/// Message types sent from Python handler back to WebRTC (outbound)
+/// These are queued by send_handler_data and processed by the outbound sender task
+#[derive(Debug)]
+pub struct PythonHandlerOutbound {
+    pub conversation_id: String,
+    pub conn_no: u32,
+    pub data: Bytes,
+}
 
 // --- Protocol-specific state definitions ---
 #[derive(Default, Clone, Debug)]
@@ -52,11 +74,19 @@ pub(crate) struct ChannelPortForwardState {
     pub target_port: Option<u16>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ChannelPythonHandlerState {
+    // Track active virtual connections in PythonHandler mode
+    // These are connections that have been confirmed via ConnectionOpened
+    pub active_connections: std::collections::HashSet<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ProtocolLogicState {
     Socks5(ChannelSocks5State),
     Guacd(ChannelGuacdState),
     PortForward(ChannelPortForwardState),
+    PythonHandler(ChannelPythonHandlerState),
 }
 
 impl Default for ProtocolLogicState {
@@ -138,6 +168,8 @@ pub struct Channel {
     /// Pending fragment buffers for reassembly (seq_id -> buffer)
     /// Used when FRAGMENTATION capability is enabled to reassemble fragmented frames
     pub(crate) pending_fragments: DashMap<u32, FragmentBuffer>,
+    // Python handler channel for PythonHandler protocol mode
+    pub(crate) python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
 }
 
 // NOTE: Channel is intentionally NOT Clone because it contains a single-consumer receiver
@@ -157,6 +189,8 @@ pub struct ChannelParams {
     pub client_version: String,
     /// Capabilities enabled for this channel (e.g., FRAGMENTATION for multi-channel)
     pub capabilities: crate::tube_protocol::Capabilities,
+    /// Optional Python handler channel for PythonHandler protocol mode
+    pub python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
 }
 
 impl Channel {
@@ -173,6 +207,7 @@ impl Channel {
             ksm_config,
             client_version,
             capabilities,
+            python_handler_tx,
         } = params;
         debug!("Channel::new called (channel_id: {})", channel_id);
         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -380,6 +415,20 @@ impl Channel {
                                             .map(String::from);
                                     }
                                 }
+                                ConversationType::PythonHandler => {
+                                    // PythonHandler mode: Data goes to Python callback instead of backend
+                                    debug!("Configuring for PythonHandler protocol (channel_id: {})", channel_id);
+                                    if python_handler_tx.is_none() {
+                                        return Err(anyhow::anyhow!(
+                                            "PythonHandler protocol requires python_handler_tx to be set (channel_id: {})",
+                                            channel_id
+                                        ));
+                                    }
+                                    determined_protocol = ActiveProtocol::PythonHandler;
+                                    initial_protocol_state = ProtocolLogicState::PythonHandler(
+                                        ChannelPythonHandlerState::default(),
+                                    );
+                                }
                                 _ => {
                                     // Other non-Guacd types
                                     if network_checker.is_some() {
@@ -512,6 +561,7 @@ impl Channel {
             capabilities,
             assembler: None, // Will be created below if FRAGMENTATION enabled
             pending_fragments: DashMap::new(),
+            python_handler_tx,
         };
 
         debug!(
@@ -1371,6 +1421,9 @@ impl Channel {
             }
             ActiveProtocol::PortForward => {
                 // Port forwarding connections are just TCP streams, no special cleanup needed
+            }
+            ActiveProtocol::PythonHandler => {
+                // PythonHandler connections send close events to Python, no special cleanup needed here
             }
         }
 

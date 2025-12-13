@@ -77,6 +77,7 @@ async fn test_registry_lock_free_reads() {
         signal_sender: signal_tx,
         tube_id: Some("concurrent_test_tube".to_string()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     // This might fail due to missing setup, but that's OK - we're testing the lock-free part
@@ -145,6 +146,7 @@ async fn test_registry_get_by_conversation_id() {
         signal_sender: signal_tx,
         tube_id: Some("mapping_test_tube".to_string()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -271,6 +273,7 @@ async fn test_registry_all_tube_ids_lock_free() {
         signal_sender: signal_tx,
         tube_id: Some("all_ids_test_tube".to_string()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -328,6 +331,7 @@ async fn test_registry_find_tubes() {
         signal_sender: signal_tx,
         tube_id: Some(tube_id_with_term.clone()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -398,6 +402,7 @@ async fn test_registry_tube_count() {
         signal_sender: signal_tx,
         tube_id: Some(test_tube_id.clone()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     match REGISTRY.create_tube(req).await {
@@ -470,6 +475,7 @@ async fn test_actor_admission_control() {
             signal_sender: signal_tx,
             tube_id: Some(format!("backpressure_tube_{}", i)),
             capabilities: crate::tube_protocol::Capabilities::NONE,
+            python_handler_tx: None,
         };
 
         let handle = tokio::spawn(async move { REGISTRY.create_tube(req).await });
@@ -558,6 +564,7 @@ async fn test_concurrent_tube_creation_no_deadlock() {
                 signal_sender: signal_tx,
                 tube_id: Some(format!("concurrent_tube_{}", i)),
                 capabilities: crate::tube_protocol::Capabilities::NONE,
+                python_handler_tx: None,
             };
 
             match REGISTRY.create_tube(req).await {
@@ -664,6 +671,7 @@ async fn test_raii_cleanup_on_registry_close() {
         signal_sender: signal_tx,
         tube_id: Some("raii_close_test_tube".to_string()),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     match REGISTRY.create_tube(req).await {

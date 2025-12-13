@@ -211,11 +211,6 @@ impl PyTubeRegistry {
 
     /// Create a tube with settings
     ///
-<<<<<<< HEAD
-    /// Args:
-    ///     enable_multi_channel: If True, enables multi-channel fragmentation for
-    ///         higher throughput on large frames. Both sides must have this enabled.
-=======
     /// # Arguments
     /// * `conversation_id` - The conversation ID for the tube
     /// * `settings` - Dictionary of settings including `conversationType`
@@ -227,9 +222,10 @@ impl PyTubeRegistry {
     /// * `offer` - Optional initial SDP offer (base64-encoded)
     /// * `signal_callback` - Optional callback for signaling events
     /// * `tube_id` - Optional specific tube ID
+    /// * `enable_multi_channel` - If True, enables multi-channel fragmentation for
+    ///     higher throughput on large frames. Both sides must have this enabled.
     /// * `handler_callback` - Optional callback for PythonHandler protocol mode
     ///   When set and `conversationType` is "python_handler", all data goes to this callback
->>>>>>> c7a6896 (Initial commit for guacd tunnel support)
     #[pyo3(signature = (
         conversation_id,
         settings,

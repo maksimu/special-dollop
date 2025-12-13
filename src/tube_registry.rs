@@ -694,7 +694,7 @@ impl RegistryActor {
                 .await?;
 
             // Create logical channel and capture actual listening port
-            let actual_listening_port = tube_arc
+            tube_arc
                 .create_channel(
                     conversation_id,
                     &data_channel,
@@ -704,9 +704,17 @@ impl RegistryActor {
                     Some(ksm_config_for_channel),
                     Some(req.client_version.clone()),
                     req.python_handler_tx.clone(), // Pass python_handler_tx for PythonHandler protocol mode
-            )
-            .await?;
->>>>>>> c7a6896 (Initial commit for guacd tunnel support)
+                )
+                .await?
+        } else {
+            debug!(
+                "Client tube will receive data channel via on_data_channel (tube_id: {})",
+                tube_id
+            );
+            // Client tube doesn't create a data channel - it will receive one via on_data_channel
+            // The logical channel will be created in the on_data_channel callback
+            None
+        };
 
         // Generate offer/answer (BASE64-ENCODE for Python boundary)
         let mut result_map = HashMap::new();

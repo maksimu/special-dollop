@@ -102,6 +102,7 @@ async fn test_no_zombie_tasks_after_tube_close() {
         signal_sender: signal_tx,
         tube_id: None,
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     };
 
     let result = REGISTRY.create_tube(req).await;

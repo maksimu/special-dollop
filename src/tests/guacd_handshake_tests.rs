@@ -250,6 +250,7 @@ async fn test_guacd_handshake_successful() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel");
@@ -470,6 +471,7 @@ async fn test_guacd_handshake_join_existing_connection_readonly() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel for join test");
@@ -570,6 +572,7 @@ async fn test_guacd_handshake_join_existing_connection_not_readonly() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel for join_not_readonly test");
@@ -666,6 +669,7 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_args() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel for fail_args test");
@@ -754,6 +758,7 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel for fail_ready test");
@@ -941,6 +946,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel for timeout_args test");
@@ -1035,6 +1041,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await
     .expect("Failed to create channel for timeout_ready test");

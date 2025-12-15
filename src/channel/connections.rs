@@ -173,6 +173,7 @@ pub async fn setup_outbound_task(
                 conn_no,
                 guacd_params_clone,
                 buffer_pool_clone,
+                &dc, // NEW: for sending CloseConnection on EOF
             ),
         )
         .await
@@ -405,6 +406,7 @@ pub async fn setup_outbound_task(
 
         let mut reader = backend_reader;
         let mut eof_sent = false;
+        let mut clean_disconnect_received = false; // Track if disconnect opcode was seen
         let mut loop_iterations = 0;
 
         let mut main_read_buffer = buffer_pool.acquire();
@@ -605,26 +607,116 @@ pub async fn setup_outbound_task(
 
             match n_read {
                 0 => {
+                    // EOF detected - guacd closed connection
                     if !eof_sent {
-                        let eof_frame = Frame::new_control_with_pool(
-                            ControlMessage::SendEOF,
-                            &conn_no.to_be_bytes(),
-                            &buffer_pool,
-                        );
-                        let encoded = eof_frame.encode_with_pool(&buffer_pool);
-                        // **OPTIMIZED**: Use event-driven sending instead of polling
-                        let _ = send_with_event_backpressure(
-                            encoded,
-                            conn_no,
-                            &event_sender,
-                            &channel_id_for_task,
-                            "EOF frame",
-                            fragmentation_enabled,
-                        )
-                        .await;
-                        eof_sent = true;
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        // First EOF detection
+
+                        // Check if this is a clean disconnect (disconnect opcode was sent)
+                        // or an unexpected EOF (guacd crashed, network failure, auth error without protocol error)
+                        if clean_disconnect_received {
+                            // Clean disconnect - guacd sent disconnect opcode first
+                            // Send SendEOF as half-close signal (existing behavior)
+                            let eof_frame = Frame::new_control_with_pool(
+                                ControlMessage::SendEOF,
+                                &conn_no.to_be_bytes(),
+                                &buffer_pool,
+                            );
+                            let encoded = eof_frame.encode_with_pool(&buffer_pool);
+                            let _ = send_with_event_backpressure(
+                                encoded,
+                                conn_no,
+                                &event_sender,
+                                &channel_id_for_task,
+                                "EOF frame (clean disconnect)",
+                                fragmentation_enabled,
+                            )
+                            .await;
+                            eof_sent = true;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        } else {
+                            // Unexpected EOF - guacd closed without sending disconnect/error opcode
+                            // This indicates a problem: crash, auth failure, network error, etc.
+                            warn!(
+                                "Unexpected EOF from guacd - connection closed without disconnect opcode \
+                                (channel_id: {}, conn_no: {})",
+                                channel_id_for_task, conn_no
+                            );
+
+                            // Check if Python already sent a CloseConnection
+                            let python_already_closed = channel_close_reason_arc
+                                .try_lock()
+                                .ok()
+                                .and_then(|guard| *guard)
+                                .is_some();
+
+                            if !python_already_closed {
+                                // Send CloseConnection with ConnectionLost reason
+                                let mut temp_buf_for_control = buffer_pool.acquire();
+                                temp_buf_for_control.clear();
+                                temp_buf_for_control.extend_from_slice(&conn_no.to_be_bytes());
+                                temp_buf_for_control
+                                    .put_u8(CloseConnectionReason::ConnectionLost as u8);
+
+                                // Add error message
+                                let error_msg = "Backend connection closed unexpectedly";
+                                let error_bytes = error_msg.as_bytes();
+                                let error_len = error_bytes.len().min(1024) as u16;
+                                temp_buf_for_control.put_u16(error_len);
+                                temp_buf_for_control
+                                    .extend_from_slice(&error_bytes[..error_len as usize]);
+
+                                let close_frame = Frame::new_control_with_buffer(
+                                    ControlMessage::CloseConnection,
+                                    &mut temp_buf_for_control,
+                                );
+                                buffer_pool.release(temp_buf_for_control);
+                                let encoded_close_frame =
+                                    close_frame.encode_with_pool(&buffer_pool);
+
+                                if send_with_event_backpressure(
+                                    encoded_close_frame,
+                                    conn_no,
+                                    &event_sender,
+                                    &channel_id_for_task,
+                                    "Unexpected EOF close",
+                                    fragmentation_enabled,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    error!(
+                                        "Channel({}): Conn {}: Failed to send CloseConnection for unexpected EOF",
+                                        channel_id_for_task, conn_no
+                                    );
+                                }
+
+                                // Store close reason
+                                if let Ok(mut guard) = channel_close_reason_arc.try_lock() {
+                                    *guard = Some(CloseConnectionReason::ConnectionLost);
+                                    if unlikely!(should_log_connection(false)) {
+                                        debug!(
+                                            "Stored ConnectionLost as close reason for unexpected EOF \
+                                            (channel_id: {}, conn_no: {})",
+                                            channel_id_for_task, conn_no
+                                        );
+                                    }
+                                }
+
+                                // CRITICAL: Drain buffer to ensure CloseConnection transmits
+                                dc.drain(Duration::from_millis(500)).await;
+                            } else if unlikely!(should_log_connection(false)) {
+                                debug!(
+                                    "Channel({}): Conn {}: Skipping CloseConnection for unexpected EOF \
+                                    (Python already sent with specific reason)",
+                                    channel_id_for_task, conn_no
+                                );
+                            }
+
+                            // Exit immediately - connection is dead
+                            break;
+                        }
                     } else {
+                        // Second EOF after SendEOF was sent - exit
                         break;
                     }
                     continue;
@@ -674,6 +766,7 @@ pub async fn setup_outbound_task(
                                                     Ok(instr) => {
                                                         if instr.opcode == crate::channel::guacd_parser::DISCONNECT_OPCODE {
                                                         // Guacd sent disconnect instruction - clean connection closure
+                                                        clean_disconnect_received = true;  // Mark as clean disconnect
                                                         warn!("Guacd sent disconnect instruction - closing connection cleanly (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
                                                         Some("Guacd disconnect".to_string())
                                                     } else if instr.opcode == crate::channel::guacd_parser::ERROR_OPCODE {
@@ -1317,6 +1410,52 @@ pub async fn setup_outbound_task(
 
 // --- Helper function for Guacd Handshake ---
 // A stateless GuacdParser that manages its own BytesMut buffer for reading from the socket,
+/// Send CloseConnection with error message during handshake failure
+/// This ensures the UI receives error notification even when guacd closes without sending error instructions
+async fn send_handshake_error_close(
+    dc: &crate::webrtc_data_channel::WebRTCDataChannel,
+    conn_no: u32,
+    reason: CloseConnectionReason,
+    error_message: &str,
+    buffer_pool: &BufferPool,
+    channel_id: &str,
+) {
+    // Build CloseConnection frame with error message
+    let mut control_buf = buffer_pool.acquire();
+    control_buf.clear();
+    control_buf.extend_from_slice(&conn_no.to_be_bytes());
+    control_buf.put_u8(reason as u8);
+
+    // Add error message (backward compatible extension)
+    let error_bytes = error_message.as_bytes();
+    let error_len = error_bytes.len().min(1024) as u16;
+    control_buf.put_u16(error_len);
+    control_buf.extend_from_slice(&error_bytes[..error_len as usize]);
+
+    let close_frame =
+        Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut control_buf);
+    buffer_pool.release(control_buf);
+    let encoded_frame = close_frame.encode_with_pool(buffer_pool);
+
+    // Send immediately (handshake context - no event_sender available)
+    match dc.send(encoded_frame.clone()).await {
+        Ok(_) => {
+            if unlikely!(should_log_connection(false)) {
+                debug!(
+                    "Sent handshake error CloseConnection (channel_id: {}, conn_no: {})",
+                    channel_id, conn_no
+                );
+            }
+        }
+        Err(e) => {
+            error!("Failed to send handshake error CloseConnection (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, e);
+        }
+    }
+
+    // CRITICAL: Drain buffer to ensure message transmission
+    dc.drain(Duration::from_millis(500)).await;
+}
+
 // then passes slices of this buffer to GuacdParser::peek_instruction and GuacdParser::parse_instruction_content.
 pub(crate) async fn perform_guacd_handshake<R, W>(
     reader: &mut R,
@@ -1325,6 +1464,7 @@ pub(crate) async fn perform_guacd_handshake<R, W>(
     conn_no: u32,
     guacd_params_arc: Arc<Mutex<HashMap<String, String>>>,
     buffer_pool: BufferPool,
+    dc: &crate::webrtc_data_channel::WebRTCDataChannel, // NEW: for sending CloseConnection on EOF
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + ?Sized,
@@ -1333,6 +1473,7 @@ where
     let mut handshake_buffer = buffer_pool.acquire();
     let mut current_handshake_buffer_len = 0;
 
+    #[allow(clippy::too_many_arguments)]
     async fn read_expected_instruction_stateless<'a, SHelper>(
         reader: &'a mut SHelper,
         handshake_buffer: &'a mut BytesMut,
@@ -1340,6 +1481,8 @@ where
         channel_id: &'a str,
         conn_no: u32,
         expected_opcode: &'a str,
+        dc: &'a crate::webrtc_data_channel::WebRTCDataChannel, // NEW: for sending CloseConnection
+        buffer_pool: &'a BufferPool,                           // NEW: for frame encoding
     ) -> Result<GuacdInstruction>
     where
         SHelper: AsyncRead + Unpin + Send + ?Sized,
@@ -1421,7 +1564,26 @@ where
             let mut temp_read_buf = [0u8; 1024];
             match reader.read(&mut temp_read_buf).await {
                 Ok(0) => {
-                    error!("EOF during Guacd handshake (channel_id: {}, expected_opcode: {}, buffer_len: {})", channel_id, expected_opcode, *current_buffer_len);
+                    let error_msg = format!(
+                        "Connection closed during handshake (expected: {}, buffer_len: {})",
+                        expected_opcode, *current_buffer_len
+                    );
+                    error!(
+                        "EOF during Guacd handshake (channel_id: {}, conn_no: {}, error: {})",
+                        channel_id, conn_no, error_msg
+                    );
+
+                    // Send CloseConnection to UI before returning error
+                    send_handshake_error_close(
+                        dc,
+                        conn_no,
+                        CloseConnectionReason::GuacdError,
+                        &error_msg,
+                        buffer_pool,
+                        channel_id,
+                    )
+                    .await;
+
                     return Err(anyhow::anyhow!("EOF during Guacd handshake while waiting for '{}' (incomplete data in buffer)", expected_opcode));
                 }
                 Ok(n_read) => {
@@ -1571,6 +1733,8 @@ where
         channel_id,
         conn_no,
         "args",
+        dc,
+        &buffer_pool,
     )
     .await?;
     if unlikely!(should_log_connection(false)) {
@@ -1775,6 +1939,8 @@ where
         channel_id,
         conn_no,
         "ready",
+        dc,
+        &buffer_pool,
     )
     .await?;
     if let Some(client_id_from_ready) = ready_instruction.args.first() {

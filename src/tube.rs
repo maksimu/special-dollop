@@ -95,7 +95,9 @@ pub struct Tube {
     /// Channel sender for PythonHandler protocol mode
     /// When set, data received on channels with python_handler conversation type
     /// is forwarded to Python via this channel
-    pub(crate) python_handler_tx: Arc<TokioRwLock<Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>>>,
+    pub(crate) python_handler_tx: Arc<
+        TokioRwLock<Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>>,
+    >,
 }
 
 impl Tube {
@@ -1195,7 +1197,9 @@ impl Tube {
         callback_token: Option<String>,
         ksm_config: Option<String>,
         client_version: Option<String>,
-        python_handler_tx: Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>,
+        python_handler_tx: Option<
+            tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>,
+        >,
     ) -> Result<Option<u16>> {
         if unlikely!(crate::logger::is_verbose_logging()) {
             debug!("create_channel: Initial parameters. (tube_id: {}, channel_name: {}, timeout_seconds: {:?}, protocol_settings: {:?})", self.id, name, timeout_seconds, protocol_settings);
@@ -2227,18 +2231,19 @@ impl Tube {
         data: bytes::Bytes,
     ) -> Result<()> {
         let data_channels = self.data_channels.read().await;
-        let channel = data_channels.get(channel_name).ok_or_else(|| {
-            anyhow::anyhow!("Channel not found: {}", channel_name)
-        })?;
+        let channel = data_channels
+            .get(channel_name)
+            .ok_or_else(|| anyhow::anyhow!("Channel not found: {}", channel_name))?;
 
         // Create a data frame and send it over WebRTC
         let buffer_pool = BufferPool::default();
         let frame = Frame::new_data_with_pool(conn_no, &data, &buffer_pool);
         let encoded = frame.encode_with_pool(&buffer_pool);
 
-        channel.send(encoded).await.map_err(|e| {
-            anyhow::anyhow!("Failed to send data frame over WebRTC: {}", e)
-        })?;
+        channel
+            .send(encoded)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send data frame over WebRTC: {}", e))?;
 
         Ok(())
     }
@@ -2253,24 +2258,22 @@ impl Tube {
         conn_no: u32,
     ) -> Result<()> {
         let data_channels = self.data_channels.read().await;
-        let channel = data_channels.get(channel_name).ok_or_else(|| {
-            anyhow::anyhow!("Channel not found: {}", channel_name)
-        })?;
+        let channel = data_channels
+            .get(channel_name)
+            .ok_or_else(|| anyhow::anyhow!("Channel not found: {}", channel_name))?;
 
         // Build OpenConnection control message - payload is just conn_no
         let open_data = conn_no.to_be_bytes();
 
         let buffer_pool = BufferPool::default();
-        let open_frame = Frame::new_control_with_pool(
-            ControlMessage::OpenConnection,
-            &open_data,
-            &buffer_pool,
-        );
+        let open_frame =
+            Frame::new_control_with_pool(ControlMessage::OpenConnection, &open_data, &buffer_pool);
 
         let encoded = open_frame.encode_with_pool(&buffer_pool);
-        channel.send(encoded).await.map_err(|e| {
-            anyhow::anyhow!("Failed to send OpenConnection frame: {}", e)
-        })?;
+        channel
+            .send(encoded)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send OpenConnection frame: {}", e))?;
 
         debug!(
             "Sent OpenConnection for conn_no {} on channel {}",
@@ -2290,9 +2293,9 @@ impl Tube {
         reason: CloseConnectionReason,
     ) -> Result<()> {
         let data_channels = self.data_channels.read().await;
-        let channel = data_channels.get(channel_name).ok_or_else(|| {
-            anyhow::anyhow!("Channel not found: {}", channel_name)
-        })?;
+        let channel = data_channels
+            .get(channel_name)
+            .ok_or_else(|| anyhow::anyhow!("Channel not found: {}", channel_name))?;
 
         // Build CloseConnection control message
         let mut close_data = Vec::with_capacity(5);
@@ -2307,9 +2310,10 @@ impl Tube {
         );
 
         let encoded = close_frame.encode_with_pool(&buffer_pool);
-        channel.send(encoded).await.map_err(|e| {
-            anyhow::anyhow!("Failed to send CloseConnection frame: {}", e)
-        })?;
+        channel
+            .send(encoded)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send CloseConnection frame: {}", e))?;
 
         debug!(
             "Sent CloseConnection for conn_no {} with reason {:?} on channel {}",

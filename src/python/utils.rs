@@ -39,13 +39,15 @@ where
                          Check if send_handler_data is being called from within handle_events callback."
                     );
                     Err(PyRuntimeError::new_err(
-                        "Async task timed out after 10s - possible deadlock in callback context"
+                        "Async task timed out after 10s - possible deadlock in callback context",
                     ))
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    log::error!("safe_python_async_execute: Task channel disconnected unexpectedly");
+                    log::error!(
+                        "safe_python_async_execute: Task channel disconnected unexpectedly"
+                    );
                     Err(PyRuntimeError::new_err(
-                        "Async task failed: task panicked or was cancelled"
+                        "Async task failed: task panicked or was cancelled",
                     ))
                 }
             }

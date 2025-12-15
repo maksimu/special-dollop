@@ -66,7 +66,8 @@ pub struct CreateTubeRequest {
     pub capabilities: crate::tube_protocol::Capabilities,
     /// Optional Python handler channel for PythonHandler protocol mode
     /// When set, channels with python_handler conversation type will route data to this channel
-    pub python_handler_tx: Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>,
+    pub python_handler_tx:
+        Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>,
 }
 
 /// Commands for the registry actor
@@ -553,7 +554,9 @@ impl RegistryActor {
                     Ok(data_channel) => {
                         // Store python_handler_tx on existing tube if provided
                         if let Some(ref handler_tx) = req.python_handler_tx {
-                            existing_tube.set_python_handler_tx(handler_tx.clone()).await;
+                            existing_tube
+                                .set_python_handler_tx(handler_tx.clone())
+                                .await;
                         }
                         match existing_tube
                             .create_channel(

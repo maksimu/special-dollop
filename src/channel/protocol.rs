@@ -236,11 +236,15 @@ impl Channel {
             }
 
             // Clean up the virtual connection from our state
-            if let super::core::ProtocolLogicState::PythonHandler(ref mut state) = self.protocol_state {
+            if let super::core::ProtocolLogicState::PythonHandler(ref mut state) =
+                self.protocol_state
+            {
                 if state.active_connections.remove(&target_connection_no) {
                     debug!(
                         "Channel({}): PythonHandler removed virtual connection {} (remaining: {})",
-                        self.channel_id, target_connection_no, state.active_connections.len()
+                        self.channel_id,
+                        target_connection_no,
+                        state.active_connections.len()
                     );
                 } else {
                     debug!(
@@ -667,14 +671,24 @@ impl Channel {
             }
             super::types::ActiveProtocol::PythonHandler => {
                 // PythonHandler mode: connections are virtual - notify Python and acknowledge
-                debug!("Channel({}): PythonHandler OpenConnection for virtual conn_no {}", self.channel_id, target_connection_no);
+                debug!(
+                    "Channel({}): PythonHandler OpenConnection for virtual conn_no {}",
+                    self.channel_id, target_connection_no
+                );
 
                 // Send ConnectionOpened event to Python handler
                 if let Some(ref tx) = self.python_handler_tx {
-                    if tx.send(super::core::PythonHandlerMessage::ConnectionOpened {
-                        conn_no: target_connection_no
-                    }).await.is_err() {
-                        warn!("Channel({}): Failed to send ConnectionOpened to Python handler", self.channel_id);
+                    if tx
+                        .send(super::core::PythonHandlerMessage::ConnectionOpened {
+                            conn_no: target_connection_no,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            "Channel({}): Failed to send ConnectionOpened to Python handler",
+                            self.channel_id
+                        );
                     }
                 }
 
@@ -889,7 +903,9 @@ impl Channel {
             );
 
             // Register the virtual connection in our state
-            if let super::core::ProtocolLogicState::PythonHandler(ref mut state) = self.protocol_state {
+            if let super::core::ProtocolLogicState::PythonHandler(ref mut state) =
+                self.protocol_state
+            {
                 if state.active_connections.contains(&connection_no) {
                     warn!(
                         "Channel({}): PythonHandler conn_no {} already registered, ignoring duplicate ConnectionOpened",
@@ -906,15 +922,21 @@ impl Channel {
 
             // Notify Python handler that the connection is now open and ready for data
             if let Some(ref tx) = self.python_handler_tx {
-                if tx.send(super::core::PythonHandlerMessage::ConnectionOpened {
-                    conn_no: connection_no
-                }).await.is_err() {
+                if tx
+                    .send(super::core::PythonHandlerMessage::ConnectionOpened {
+                        conn_no: connection_no,
+                    })
+                    .await
+                    .is_err()
+                {
                     warn!(
                         "Channel({}): Failed to send ConnectionOpened to Python handler for conn_no {}",
                         self.channel_id, connection_no
                     );
                     // Clean up the registration since Python won't know about it
-                    if let super::core::ProtocolLogicState::PythonHandler(ref mut state) = self.protocol_state {
+                    if let super::core::ProtocolLogicState::PythonHandler(ref mut state) =
+                        self.protocol_state
+                    {
                         state.active_connections.remove(&connection_no);
                     }
                     return Err(anyhow!("Python handler channel closed"));

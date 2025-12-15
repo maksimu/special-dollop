@@ -202,7 +202,10 @@ fn deliver_batch_to_python(
 /// Returns (sender, receiver) where:
 /// - sender: Used by the Channel to send messages to Python
 /// - receiver: Used by the handler task to receive messages
-pub fn create_handler_channel() -> (mpsc::Sender<PythonHandlerMessage>, mpsc::Receiver<PythonHandlerMessage>) {
+pub fn create_handler_channel() -> (
+    mpsc::Sender<PythonHandlerMessage>,
+    mpsc::Receiver<PythonHandlerMessage>,
+) {
     // Use a bounded channel to provide backpressure
     // 1000 messages should be plenty for most use cases
     mpsc::channel(1000)
@@ -212,7 +215,10 @@ pub fn create_handler_channel() -> (mpsc::Sender<PythonHandlerMessage>, mpsc::Re
 /// Returns (sender, receiver) where:
 /// - sender: Stored globally and used by send_handler_data() to queue messages
 /// - receiver: Used by the outbound sender task to process messages
-pub fn create_outbound_channel() -> (mpsc::Sender<PythonHandlerOutbound>, mpsc::Receiver<PythonHandlerOutbound>) {
+pub fn create_outbound_channel() -> (
+    mpsc::Sender<PythonHandlerOutbound>,
+    mpsc::Receiver<PythonHandlerOutbound>,
+) {
     // Use a bounded channel for backpressure
     // 1000 messages should be plenty - sync responses are small
     mpsc::channel(1000)
@@ -303,7 +309,8 @@ pub fn setup_outbound_sender_task(
 
 /// Global outbound sender for Python handler mode
 /// This is set up when a PythonHandler tube is created
-static OUTBOUND_SENDER: std::sync::OnceLock<mpsc::Sender<PythonHandlerOutbound>> = std::sync::OnceLock::new();
+static OUTBOUND_SENDER: std::sync::OnceLock<mpsc::Sender<PythonHandlerOutbound>> =
+    std::sync::OnceLock::new();
 
 /// Initialize the global outbound sender
 /// Called when setting up a PythonHandler tube
@@ -318,7 +325,8 @@ pub fn init_outbound_sender(sender: mpsc::Sender<PythonHandlerOutbound>) {
 /// Returns Ok(()) if the message was queued successfully
 /// Returns Err if the outbound channel is not initialized or full
 pub fn queue_outbound_message(msg: PythonHandlerOutbound) -> Result<(), String> {
-    let sender = OUTBOUND_SENDER.get()
+    let sender = OUTBOUND_SENDER
+        .get()
         .ok_or_else(|| "Outbound sender not initialized".to_string())?;
 
     sender.try_send(msg).map_err(|e| match e {

@@ -250,9 +250,14 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
 /// Forward data to Python handler for PythonHandler protocol mode
 /// **HOT PATH for PythonHandler mode**
 #[inline(always)]
-async fn forward_to_python_handler(channel: &mut Channel, conn_no: u32, payload: Bytes) -> Result<()> {
+async fn forward_to_python_handler(
+    channel: &mut Channel,
+    conn_no: u32,
+    payload: Bytes,
+) -> Result<()> {
     // Verify the connection is registered (was confirmed via ConnectionOpened)
-    let is_registered = if let ProtocolLogicState::PythonHandler(ref state) = channel.protocol_state {
+    let is_registered = if let ProtocolLogicState::PythonHandler(ref state) = channel.protocol_state
+    {
         state.active_connections.contains(&conn_no)
     } else {
         false
@@ -272,7 +277,11 @@ async fn forward_to_python_handler(channel: &mut Channel, conn_no: u32, payload:
 
     if let Some(ref tx) = channel.python_handler_tx {
         // Send data message to Python handler
-        if tx.send(PythonHandlerMessage::Data { conn_no, payload }).await.is_err() {
+        if tx
+            .send(PythonHandlerMessage::Data { conn_no, payload })
+            .await
+            .is_err()
+        {
             // Channel closed - Python handler is gone
             warn!(
                 "Python handler channel closed, cannot forward data (channel_id: {}, conn_no: {})",

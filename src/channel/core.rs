@@ -43,7 +43,10 @@ pub enum PythonHandlerMessage {
     /// Data received on a connection
     Data { conn_no: u32, payload: Bytes },
     /// A connection was closed
-    ConnectionClosed { conn_no: u32, reason: TubeCloseReason },
+    ConnectionClosed {
+        conn_no: u32,
+        reason: TubeCloseReason,
+    },
 }
 
 /// Message types sent from Python handler back to WebRTC (outbound)
@@ -417,7 +420,10 @@ impl Channel {
                                 }
                                 ConversationType::PythonHandler => {
                                     // PythonHandler mode: Data goes to Python callback instead of backend
-                                    debug!("Configuring for PythonHandler protocol (channel_id: {})", channel_id);
+                                    debug!(
+                                        "Configuring for PythonHandler protocol (channel_id: {})",
+                                        channel_id
+                                    );
                                     if python_handler_tx.is_none() {
                                         return Err(anyhow::anyhow!(
                                             "PythonHandler protocol requires python_handler_tx to be set (channel_id: {})",

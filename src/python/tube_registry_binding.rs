@@ -2238,9 +2238,7 @@ impl PyTubeRegistry {
                 .open_handler_connection(&conversation_id_owned, conn_no)
                 .await
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "Failed to open handler connection: {e}"
-                    ))
+                    PyRuntimeError::new_err(format!("Failed to open handler connection: {e}"))
                 })
         })
     }
@@ -2282,9 +2280,7 @@ impl PyTubeRegistry {
                 .close_handler_connection(&conversation_id_owned, conn_no, close_reason)
                 .await
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "Failed to close handler connection: {e}"
-                    ))
+                    PyRuntimeError::new_err(format!("Failed to close handler connection: {e}"))
                 })
         })
     }

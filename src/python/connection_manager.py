@@ -3,9 +3,9 @@ WebRTC Connection Management with proper state handling and network resilience.
 """
 
 import asyncio
+import inspect
 import logging
 import time
-import json
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Callable, Any
@@ -357,7 +357,7 @@ class TunnelConnectionManager:
         """Notify all callbacks of state change"""
         for callback in self.state_change_callbacks:
             try:
-                if asyncio.iscoroutinefunction(callback):
+                if inspect.iscoroutinefunction(callback):
                     await callback(self.tube_id, self.state)
                 else:
                     callback(self.tube_id, self.state)

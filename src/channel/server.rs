@@ -233,6 +233,11 @@ impl Channel {
                                     }
                                 });
                             }
+                            ActiveProtocol::PythonHandler => {
+                                // PythonHandler doesn't use the server mode for accepting connections
+                                // All data flows through the WebRTC data channel to Python
+                                warn!("Channel({}): PythonHandler protocol does not support server mode", channel_id);
+                            }
                         }
                     }
                     Err(e) => {

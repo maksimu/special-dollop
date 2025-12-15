@@ -173,6 +173,7 @@ fn test_tube_channel_creation() {
             Some("TEST_CALLBACK_TOKEN_1".to_string()),
             Some("TEST_MODE_KSM_CONFIG_1".to_string()),
             Some("ms16.5.0".to_string()),
+            None, // python_handler_tx
         ).await.expect("Call to create_channel itself failed");
 
         // Verify channel shutdown signal exists
@@ -312,6 +313,7 @@ async fn test_tube_create_channel() {
             Some("token_val".to_string()),
             Some("ksm_config_val".to_string()),
             Some("ms16.5.0".to_string()),
+            None, // python_handler_tx
         )
         .await
         .expect("Failed to create channel instance");

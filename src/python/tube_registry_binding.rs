@@ -1,4 +1,8 @@
 use super::connectivity::test_webrtc_connectivity_internal;
+use super::handler_task::{
+    create_handler_channel, create_outbound_channel, init_outbound_sender,
+    setup_outbound_sender_task, setup_python_handler_task,
+};
 use super::signal_handler::setup_signal_handler;
 use super::utils::{pyobj_to_json_hashmap, safe_python_async_execute};
 use crate::router_helpers::post_connection_state;
@@ -207,9 +211,21 @@ impl PyTubeRegistry {
 
     /// Create a tube with settings
     ///
-    /// Args:
-    ///     enable_multi_channel: If True, enables multi-channel fragmentation for
-    ///         higher throughput on large frames. Both sides must have this enabled.
+    /// # Arguments
+    /// * `conversation_id` - The conversation ID for the tube
+    /// * `settings` - Dictionary of settings including `conversationType`
+    /// * `trickle_ice` - Whether to use trickle ICE
+    /// * `callback_token` - Token for callback authentication
+    /// * `krelay_server` - The krelay server URL
+    /// * `client_version` - The client version string (required)
+    /// * `ksm_config` - Optional KSM configuration
+    /// * `offer` - Optional initial SDP offer (base64-encoded)
+    /// * `signal_callback` - Optional callback for signaling events
+    /// * `tube_id` - Optional specific tube ID
+    /// * `enable_multi_channel` - If True, enables multi-channel fragmentation for
+    ///     higher throughput on large frames. Both sides must have this enabled.
+    /// * `handler_callback` - Optional callback for PythonHandler protocol mode
+    ///   When set and `conversationType` is "python_handler", all data goes to this callback
     #[pyo3(signature = (
         conversation_id,
         settings,
@@ -222,6 +238,7 @@ impl PyTubeRegistry {
         signal_callback = None,
         tube_id = None,
         enable_multi_channel = None,
+        handler_callback = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create_tube(
@@ -238,6 +255,7 @@ impl PyTubeRegistry {
         signal_callback: Option<Py<PyAny>>,
         tube_id: Option<&str>,
         enable_multi_channel: Option<bool>,
+        handler_callback: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let master_runtime = get_runtime();
 
@@ -253,6 +271,15 @@ impl PyTubeRegistry {
         let (signal_sender_rust, signal_receiver_py) =
             unbounded_channel::<crate::tube_registry::SignalMessage>();
 
+        // Create handler channel BEFORE calling create_tube if handler_callback is provided
+        // This fixes the race condition where the channel was created after the tube
+        let (handler_tx_opt, handler_rx_opt) = if handler_callback.is_some() {
+            let (tx, rx) = create_handler_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         // Prepare owned versions of string parameters to move into async blocks
         let offer_string_owned = offer.map(String::from);
         let conversation_id_owned = conversation_id.to_string();
@@ -262,9 +289,12 @@ impl PyTubeRegistry {
         let client_version_owned = client_version.to_string();
         let tube_id_owned = tube_id.map(String::from);
 
+        // Clone master_runtime before the move closure since it's used again later
+        let runtime_for_create = master_runtime.clone();
+
         // This outer block_on will handle the call to the registry's create_tube and setup signal handler
-        let creation_result_map = Python::detach(py, || {
-            master_runtime.clone().block_on(async move {
+        let creation_result_map = Python::detach(py, move || {
+            runtime_for_create.clone().block_on(async move {
                 if unlikely!(crate::logger::is_verbose_logging()) {
                     debug!(
                         "PyBind: Creating tube via actor (conversation_id: {})",
@@ -293,6 +323,7 @@ impl PyTubeRegistry {
                     signal_sender: signal_sender_rust,
                     tube_id: tube_id_owned,
                     capabilities,
+                    python_handler_tx: handler_tx_opt, // Pass handler_tx during tube creation (fixes race condition)
                 };
 
                 // LOCK-FREE + NON-BLOCKING: Send via actor
@@ -323,6 +354,33 @@ impl PyTubeRegistry {
                 signal_receiver_py,
                 master_runtime.clone(),
                 cb,
+            );
+        }
+
+        // Start the Python handler task if a handler_callback was provided
+        // The handler_tx was already passed to create_tube above, so channel is ready to receive
+        if let (Some(handler_cb), Some(handler_rx)) = (handler_callback, handler_rx_opt) {
+            // Set up the inbound handler task (Rust -> Python)
+            setup_python_handler_task(
+                conversation_id.to_string(),
+                handler_rx,
+                master_runtime.clone(),
+                handler_cb,
+            );
+
+            // Set up the outbound sender task (Python -> WebRTC)
+            // This is critical for enabling Python callbacks to send data without blocking
+            let (outbound_tx, outbound_rx) = create_outbound_channel();
+            init_outbound_sender(outbound_tx);
+            setup_outbound_sender_task(
+                conversation_id.to_string(),
+                outbound_rx,
+                master_runtime.clone(),
+            );
+
+            debug!(
+                "Python handler tasks started for conversation_id: {} (inbound + outbound)",
+                conversation_id
             );
         }
 
@@ -2080,6 +2138,150 @@ impl PyTubeRegistry {
                     )))
                 }
             })
+        })
+    }
+
+    // =============================================================================
+    // PYTHON HANDLER PROTOCOL MODE
+    // =============================================================================
+
+    /// Send data from Python handler to WebRTC for forwarding to the remote peer
+    /// Used in PythonHandler protocol mode where Python code processes data
+    ///
+    /// **NON-BLOCKING**: This method queues the message for async sending and returns
+    /// immediately. This prevents deadlocks when called from within Python callbacks
+    /// that are invoked by Rust's handler task.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation/channel ID
+    /// * `conn_no` - The connection number within the channel
+    /// * `data` - The data to send (as bytes)
+    ///
+    /// # Returns
+    /// * Ok(()) if the message was queued successfully
+    /// * Err if the outbound queue is not initialized or full
+    fn send_handler_data(
+        &self,
+        _py: Python<'_>,
+        conversation_id: &str,
+        conn_no: u32,
+        data: &[u8],
+    ) -> PyResult<()> {
+        use crate::channel::core::PythonHandlerOutbound;
+        use crate::python::handler_task::queue_outbound_message;
+
+        let data_len = data.len();
+
+        debug!(
+            "send_handler_data called (conversation_id: {}, conn_no: {}, data_len: {})",
+            conversation_id, conn_no, data_len
+        );
+
+        // Create the outbound message
+        let msg = PythonHandlerOutbound {
+            conversation_id: conversation_id.to_string(),
+            conn_no,
+            data: bytes::Bytes::copy_from_slice(data),
+        };
+
+        // Queue the message (non-blocking)
+        queue_outbound_message(msg).map_err(|e| {
+            error!(
+                "send_handler_data: Failed to queue message (conversation_id: {}, error: {})",
+                conversation_id, e
+            );
+            PyRuntimeError::new_err(format!("Failed to queue handler data: {e}"))
+        })?;
+
+        debug!(
+            "send_handler_data: Message queued successfully (conversation_id: {}, conn_no: {}, bytes: {})",
+            conversation_id, conn_no, data_len
+        );
+
+        Ok(())
+    }
+
+    /// Open a virtual connection in PythonHandler protocol mode
+    /// Used when Python handler wants to initiate a connection (e.g., guacd tunnel)
+    ///
+    /// This sends an OpenConnection control message to the remote peer.
+    /// The remote peer (e.g., Gateway running guacd protocol) will receive this
+    /// and establish the backend connection.
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation/channel ID
+    /// * `conn_no` - The connection number to open
+    ///
+    /// # Returns
+    /// * Ok(()) on success - the remote peer will send ConnectionOpened when ready
+    /// * Err if the conversation/channel is not found or sending fails
+    fn open_handler_connection(
+        &self,
+        py: Python<'_>,
+        conversation_id: &str,
+        conn_no: u32,
+    ) -> PyResult<()> {
+        let conversation_id_owned = conversation_id.to_string();
+
+        safe_python_async_execute(py, async move {
+            // Get the tube by conversation ID
+            let tube_arc = REGISTRY
+                .get_by_conversation_id(&conversation_id_owned)
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "No tube found for conversation ID: {conversation_id_owned}"
+                    ))
+                })?;
+
+            // Send OpenConnection command via the tube
+            tube_arc
+                .open_handler_connection(&conversation_id_owned, conn_no)
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to open handler connection: {e}"))
+                })
+        })
+    }
+
+    /// Close a virtual connection in PythonHandler protocol mode
+    /// Used when Python handler wants to close a connection
+    ///
+    /// # Arguments
+    /// * `conversation_id` - The conversation/channel ID
+    /// * `conn_no` - The connection number to close
+    /// * `reason` - Optional close reason code
+    fn close_handler_connection(
+        &self,
+        py: Python<'_>,
+        conversation_id: &str,
+        conn_no: u32,
+        reason: Option<u16>,
+    ) -> PyResult<()> {
+        let conversation_id_owned = conversation_id.to_string();
+
+        safe_python_async_execute(py, async move {
+            // Get the tube by conversation ID
+            let tube_arc = REGISTRY
+                .get_by_conversation_id(&conversation_id_owned)
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "No tube found for conversation ID: {conversation_id_owned}"
+                    ))
+                })?;
+
+            // Convert the reason code to CloseConnectionReason enum
+            let close_reason = match reason {
+                Some(code) => CloseConnectionReason::from_code(code),
+                None => CloseConnectionReason::Normal,
+            };
+
+            // Send close command via the tube
+            tube_arc
+                .close_handler_connection(&conversation_id_owned, conn_no, close_reason)
+                .await
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to close handler connection: {e}"))
+                })
         })
     }
 }

@@ -527,6 +527,7 @@ pub enum ConversationType {
     Mysql,
     SqlServer,
     Postgresql,
+    PythonHandler,
 }
 
 // Implement Display for enum -> string conversion
@@ -543,6 +544,7 @@ impl fmt::Display for ConversationType {
             ConversationType::Mysql => write!(f, "mysql"),
             ConversationType::SqlServer => write!(f, "sql-server"),
             ConversationType::Postgresql => write!(f, "postgres"),
+            ConversationType::PythonHandler => write!(f, "python_handler"),
         }
     }
 }
@@ -573,6 +575,7 @@ impl FromStr for ConversationType {
             "mysql" => Ok(ConversationType::Mysql),
             "sql-server" => Ok(ConversationType::SqlServer),
             "postgresql" | "postgres" => Ok(ConversationType::Postgresql),
+            "python_handler" => Ok(ConversationType::PythonHandler),
             _ => Err(ParseConversationTypeError),
         }
     }

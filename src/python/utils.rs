@@ -6,6 +6,10 @@ use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyNone, PyStrin
 use std::collections::HashMap;
 
 /// Helper function to safely execute async code from Python bindings
+///
+/// IMPORTANT: This function has special handling for when called from within
+/// a Python callback that was invoked by Rust. In that case, we use spawn_blocking
+/// to avoid blocking the async executor.
 /// Returns PyResult<T> to properly propagate errors to Python
 pub fn safe_python_async_execute<F, T>(py: Python<'_>, future: F) -> PyResult<T>
 where
@@ -16,21 +20,37 @@ where
         // Check if we're already in a runtime context
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // We're in a runtime context, spawn the task and wait for it
+            // Use a timeout to detect potential deadlocks
             let (tx, rx) = std::sync::mpsc::channel();
             handle.spawn(async move {
                 let result = future.await;
                 let _ = tx.send(result);
             });
-            // Block on the std channel receiver (safe in runtime context)
-            rx.recv().unwrap_or_else(|e| {
-                warn!(
-                    "Async task failed to complete: channel closed unexpectedly: {}",
-                    e
-                );
-                Err(PyRuntimeError::new_err(
-                    "Async task failed: task panicked or was cancelled",
-                ))
-            })
+
+            // Block on the std channel receiver with timeout
+            // 10 second timeout should be enough for any normal operation
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Log detailed error - this indicates a potential deadlock
+                    log::error!(
+                        "safe_python_async_execute: TIMEOUT after 10s waiting for async task. \
+                         This may indicate a deadlock when sending from within a Python callback. \
+                         Check if send_handler_data is being called from within handle_events callback."
+                    );
+                    Err(PyRuntimeError::new_err(
+                        "Async task timed out after 10s - possible deadlock in callback context",
+                    ))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    log::error!(
+                        "safe_python_async_execute: Task channel disconnected unexpectedly"
+                    );
+                    Err(PyRuntimeError::new_err(
+                        "Async task failed: task panicked or was cancelled",
+                    ))
+                }
+            }
         } else {
             // We're not in a runtime, safe to use block_on
             let runtime = get_runtime();

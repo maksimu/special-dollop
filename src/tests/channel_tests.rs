@@ -101,6 +101,7 @@ async fn test_server_mode_data_flow() -> Result<()> {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await?;
 
@@ -288,6 +289,7 @@ async fn test_client_mode_data_flow() -> Result<()> {
         ksm_config: Some("test_ksm_config".to_string()),
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
+        python_handler_tx: None,
     })
     .await?;
 

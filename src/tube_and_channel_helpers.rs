@@ -1,4 +1,4 @@
-use crate::channel::Channel;
+use crate::channel::{Channel, PythonHandlerMessage};
 use crate::models::{NetworkAccessChecker, TunnelTimeouts};
 use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::WebRTCDataChannel;
@@ -50,6 +50,7 @@ pub(crate) async fn setup_channel_for_data_channel(
     ksm_config: Option<String>,
     client_version: String,
     capabilities: crate::tube_protocol::Capabilities,
+    python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -70,6 +71,7 @@ pub(crate) async fn setup_channel_for_data_channel(
         ksm_config,
         client_version,
         capabilities,
+        python_handler_tx,
     })
     .await?;
 

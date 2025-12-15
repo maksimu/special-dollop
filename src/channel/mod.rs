@@ -13,6 +13,7 @@ mod utils; // Added a new connect_as module
 
 // Re-export the main Channel struct to maintain API compatibility
 pub use core::Channel;
+pub use core::PythonHandlerMessage;
 
 // Re-export adaptive pool for multi-channel management
 #[allow(unused_imports)]

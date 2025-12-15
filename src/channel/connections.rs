@@ -702,7 +702,13 @@ pub async fn setup_outbound_task(
                                     }
                                 }
 
-                                // CRITICAL: Drain buffer to ensure CloseConnection transmits
+                                // CRITICAL: Drain buffer to ensure CloseConnection transmits.
+                                // We wait up to 500ms to allow the CloseConnection control message to be sent
+                                // over the network before the connection is torn down. This is necessary because
+                                // without draining, the message may remain buffered and never reach the client,
+                                // especially if the underlying transport is unreliable or slow. The 500ms timeout
+                                // is chosen as a balance between giving the message a reasonable chance to transmit
+                                // and not delaying shutdown excessively.
                                 dc.drain(Duration::from_millis(500)).await;
                             } else if unlikely!(should_log_connection(false)) {
                                 debug!(
@@ -907,9 +913,13 @@ pub async fn setup_outbound_task(
                                                 }
                                             }
 
-                                            // Wait for WebRTC buffer to drain before exiting
-                                            // This ensures the error/disconnect message is transmitted
-                                            // to the client before the connection task exits
+                                            // CRITICAL: Drain buffer to ensure CloseConnection transmits.
+                                            // We wait up to 500ms to allow the CloseConnection control message to be sent
+                                            // over the network before the connection is torn down. This is necessary because
+                                            // without draining, the message may remain buffered and never reach the client,
+                                            // especially if the underlying transport is unreliable or slow. The 500ms timeout
+                                            // is chosen as a balance between giving the message a reasonable chance to transmit
+                                            // and not delaying shutdown excessively.
                                             dc.drain(Duration::from_millis(500)).await;
 
                                             close_conn_and_break = true;
@@ -1438,7 +1448,7 @@ async fn send_handshake_error_close(
     let encoded_frame = close_frame.encode_with_pool(buffer_pool);
 
     // Send immediately (handshake context - no event_sender available)
-    match dc.send(encoded_frame.clone()).await {
+    match dc.send(encoded_frame).await {
         Ok(_) => {
             if unlikely!(should_log_connection(false)) {
                 debug!(
@@ -1452,7 +1462,13 @@ async fn send_handshake_error_close(
         }
     }
 
-    // CRITICAL: Drain buffer to ensure message transmission
+    // CRITICAL: Drain buffer to ensure CloseConnection transmits.
+    // We wait up to 500ms to allow the CloseConnection control message to be sent
+    // over the network before the connection is torn down. This is necessary because
+    // without draining, the message may remain buffered and never reach the client,
+    // especially if the underlying transport is unreliable or slow. The 500ms timeout
+    // is chosen as a balance between giving the message a reasonable chance to transmit
+    // and not delaying shutdown excessively.
     dc.drain(Duration::from_millis(500)).await;
 }
 

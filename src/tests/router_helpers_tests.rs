@@ -12,8 +12,7 @@ fn test_router_url_prod_govcloud() {
 #[test]
 fn test_router_url_dev_govcloud() {
     // DEV GOV: keep govcloud in URL
-    let ksm_config =
-        r#"{"hostname": "govcloud.dev.keepersecurity.us", "clientId": "test", "privateKey": "test"}"#;
+    let ksm_config = r#"{"hostname": "govcloud.dev.keepersecurity.us", "clientId": "test", "privateKey": "test"}"#;
     let result = router_url_from_ksm_config(ksm_config).unwrap();
     assert_eq!(result, "connect.govcloud.dev.keepersecurity.us");
 }
@@ -21,8 +20,7 @@ fn test_router_url_dev_govcloud() {
 #[test]
 fn test_router_url_qa_govcloud() {
     // QA GOV: keep govcloud in URL
-    let ksm_config =
-        r#"{"hostname": "govcloud.qa.keepersecurity.us", "clientId": "test", "privateKey": "test"}"#;
+    let ksm_config = r#"{"hostname": "govcloud.qa.keepersecurity.us", "clientId": "test", "privateKey": "test"}"#;
     let result = router_url_from_ksm_config(ksm_config).unwrap();
     assert_eq!(result, "connect.govcloud.qa.keepersecurity.us");
 }

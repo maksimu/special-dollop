@@ -45,6 +45,21 @@ static ROUTER_LAST_SUCCESS: Mutex<Option<Instant>> = Mutex::new(None);
 /// - TLS session resumption
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
 
+/// Global instance ID for router requests
+static INSTANCE_ID: OnceCell<String> = OnceCell::new();
+
+/// Initialize the global instance ID (call once at startup)
+pub fn initialize_instance_id(instance_id: String) -> Result<(), String> {
+    INSTANCE_ID
+        .set(instance_id)
+        .map_err(|_| "Instance ID already initialized".to_string())
+}
+
+/// Get the global instance ID if initialized
+fn get_instance_id() -> Option<&'static str> {
+    INSTANCE_ID.get().map(|s| s.as_str())
+}
+
 /// Get or initialize the HTTP client (fallible initialization)
 fn get_http_client() -> Result<&'static reqwest::Client, anyhow::Error> {
     HTTP_CLIENT.get_or_try_init(|| {
@@ -432,9 +447,12 @@ async fn router_request(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     // Debug log the request details
     if unlikely!(crate::logger::is_verbose_logging()) {
+        let instance_id_debug = get_instance_id()
+            .map(|id| format!("'{}'", id))
+            .unwrap_or_else(|| "NOT_SET".to_string());
         debug!(
-            "Router request (method: {}, path: {}, ksm_config: {:?}, client_version: {})",
-            http_method, url_path, ksm_config, client_version
+            "Router request (method: {}, path: {}, instance_id: {}, ksm_config: {:?}, client_version: {})",
+            http_method, url_path, instance_id_debug, ksm_config, client_version
         );
     }
 
@@ -506,6 +524,11 @@ async fn router_request(
         .header("Signature", signature)
         .header("Authorization", format!("KeeperDevice {client_id}"))
         .header("ClientVersion", client_version);
+
+    // Add InstanceId header from global state
+    if let Some(id) = get_instance_id() {
+        request_builder = request_builder.header("InstanceId", id);
+    }
 
     // Add query parameters if provided
     if let Some(params) = query_params {

@@ -2284,6 +2284,21 @@ impl PyTubeRegistry {
                 })
         })
     }
+
+    /// Initialize the global instance ID for all router requests
+    ///
+    /// # Arguments
+    /// * `instance_id` - The unique instance identifier to use for all router requests
+    ///                   Can be None or empty string (will use empty string internally)
+    ///
+    /// # Returns
+    /// * `None` on success
+    /// * `PyRuntimeError` if already initialized
+    #[pyo3(signature = (instance_id = None))]
+    fn initialize_instance_id(&self, instance_id: Option<String>) -> PyResult<()> {
+        let id = instance_id.unwrap_or_default();
+        crate::router_helpers::initialize_instance_id(id).map_err(PyRuntimeError::new_err)
+    }
 }
 
 // Implement Drop trait for PyTubeRegistry as a safety net

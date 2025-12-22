@@ -410,6 +410,7 @@ async fn test_guacd_handshake_successful() {
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
     let buffer_pool_clone = channel.buffer_pool.clone();
+    let dc_clone = channel.webrtc.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
         crate::channel::connections::perform_guacd_handshake(
@@ -419,6 +420,7 @@ async fn test_guacd_handshake_successful() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &dc_clone,
         ),
     )
     .await;
@@ -525,6 +527,7 @@ async fn test_guacd_handshake_join_existing_connection_readonly() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &channel.webrtc,
         ),
     )
     .await;
@@ -626,6 +629,7 @@ async fn test_guacd_handshake_join_existing_connection_not_readonly() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &channel.webrtc,
         ),
     )
     .await;
@@ -702,6 +706,7 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_args() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &channel.webrtc,
         ),
     )
     .await;
@@ -886,6 +891,7 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &channel.webrtc,
         ),
     )
     .await;
@@ -978,6 +984,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &channel.webrtc,
         ),
     )
     .await;
@@ -1212,6 +1219,7 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
             conn_no,
             guacd_params_clone,
             buffer_pool_clone,
+            &channel.webrtc,
         ),
     )
     .await;

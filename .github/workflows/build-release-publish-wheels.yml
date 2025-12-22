@@ -44,7 +44,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install "maturin>=1.8,<1.9"
+          pip install "maturin>=1.8"
         shell: bash
 
       - name: Build wheel
@@ -137,7 +137,7 @@ jobs:
             source \$HOME/.cargo/env
           
             # Install maturin
-            /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8,<1.9'
+            /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
           
             # Build the wheel
             cd /io
@@ -239,7 +239,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install "maturin>=1.8,<1.9"
+          pip install "maturin>=1.8"
         shell: bash
 
       - name: Build wheels (x86_64 and arm64)
@@ -286,7 +286,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install "maturin>=1.8,<1.9"
+          pip install "maturin>=1.8"
         shell: bash
 
       - name: Build wheel
@@ -360,7 +360,7 @@ jobs:
             source \$HOME/.cargo/env
           
             # Install maturin with patchelf support
-            pip3 install 'maturin[patchelf]>=1.8,<1.9'
+            pip3 install 'maturin[patchelf]>=1.8'
           
             # Build the wheel directly in a temporary directory within the container
             TEMP_DIR=\$(mktemp -d)
@@ -479,7 +479,7 @@ jobs:
       - name: Install maturin
         run: |
           python -m pip install --upgrade pip
-          pip install "maturin>=1.8,<1.9"
+          pip install "maturin>=1.8"
 
       - name: Build source distribution
         run: |

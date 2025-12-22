@@ -376,9 +376,10 @@ pub(crate) fn router_url_from_ksm_config(ksm_config_str: &str) -> anyhow::Result
         .map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
     let mut ka_hostname = ksm_config.hostname;
 
-    // Handle the gov cloud domain
-    if ka_hostname.contains("govcloud.") {
-        ka_hostname = ka_hostname.replace("govcloud.", "");
+    // Only PROD GovCloud strips the subdomain (workaround for prod infrastructure).
+    // DEV/QA GOV (govcloud.dev.keepersecurity.us, govcloud.qa.keepersecurity.us) keep govcloud.
+    if ka_hostname == "govcloud.keepersecurity.us" {
+        ka_hostname = "keepersecurity.us".to_string();
     }
 
     let router_hostname = format!("connect.{ka_hostname}");

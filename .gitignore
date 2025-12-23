@@ -6,13 +6,53 @@ src/python/__pycache__/
 tests/__pycache__/
 **/__pycache__/
 
-# IntelliJ project files
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# JetBrains IDEs (IntelliJ, PyCharm, CLion, RustRover, etc.)
 .idea/
 *.iml
 *.iws
 *.ipr
 .idea_modules/
 out/
+*.swp
+cmake-build-*/
+.ijwb/
+
+# Vim
+*.swp
+*.swo
+*.swn
+*~
+.*.sw?
+Session.vim
+.netrwhist
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
 
 # Distribution folder
 /dist/

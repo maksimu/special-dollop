@@ -7,19 +7,30 @@ use guacr_protocol::{
 use image::{Rgb, RgbImage};
 use std::io::Cursor;
 
-// Embedded monospace font (Noto Sans Mono - SIL Open Font License)
-const FONT_DATA: &[u8] = include_bytes!("../fonts/NotoSansMono-Regular.ttf");
+// Primary font: Noto Sans Mono (SIL Open Font License)
+// Good coverage for Latin, Cyrillic, Greek, and common symbols
+const FONT_DATA_PRIMARY: &[u8] = include_bytes!("../fonts/NotoSansMono-Regular.ttf");
+
+// Fallback font: DejaVu Sans Mono (Bitstream Vera license - permissive)
+// Broader Unicode coverage including mathematical/technical symbols
+// This matches guacd's behavior which requires dejavu-sans-mono-fonts
+const FONT_DATA_FALLBACK: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
 
 /// Terminal renderer - converts terminal screen to JPEG images or Guacamole instructions
 ///
-/// Uses fontdue for actual text rendering instead of colored blocks.
+/// Uses fontdue for actual text rendering with font fallback support.
+/// Primary font is Noto Sans Mono; falls back to DejaVu Sans Mono for missing glyphs.
+/// This matches guacd's behavior which requires dejavu-sans-mono-fonts package.
 /// Character cell dimensions and font size are calculated dynamically based on screen size.
 /// JPEG encoding (quality 95) is used for fast rendering with minimal visual loss.
 pub struct TerminalRenderer {
     char_width: u32,
     char_height: u32,
     font_size: f32,
-    font: Font,
+    /// Primary font (Noto Sans Mono)
+    font_primary: Font,
+    /// Fallback font (DejaVu Sans Mono) for broader Unicode coverage
+    font_fallback: Font,
     /// Color scheme for terminal rendering
     color_scheme: ColorScheme,
 }
@@ -79,17 +90,53 @@ impl TerminalRenderer {
         font_size: f32,
         color_scheme: ColorScheme,
     ) -> Result<Self> {
-        let font = Font::from_bytes(FONT_DATA, FontSettings::default()).map_err(|e| {
-            crate::TerminalError::FontError(format!("Failed to load embedded font: {}", e))
-        })?;
+        let font_primary =
+            Font::from_bytes(FONT_DATA_PRIMARY, FontSettings::default()).map_err(|e| {
+                crate::TerminalError::FontError(format!(
+                    "Failed to load primary font (Noto Sans Mono): {}",
+                    e
+                ))
+            })?;
+
+        let font_fallback =
+            Font::from_bytes(FONT_DATA_FALLBACK, FontSettings::default()).map_err(|e| {
+                crate::TerminalError::FontError(format!(
+                    "Failed to load fallback font (DejaVu Sans Mono): {}",
+                    e
+                ))
+            })?;
 
         Ok(Self {
             char_width,
             char_height,
             font_size,
-            font,
+            font_primary,
+            font_fallback,
             color_scheme,
         })
+    }
+
+    /// Check if a character has a renderable glyph in the given font
+    ///
+    /// Returns true if the font can render this character (has non-zero width glyph)
+    fn has_glyph(font: &Font, c: char, font_size: f32) -> bool {
+        let (metrics, _) = font.rasterize(c, font_size);
+        metrics.width > 0
+    }
+
+    /// Get the best font for rendering a character
+    ///
+    /// Tries primary font first, falls back to DejaVu Sans Mono for missing glyphs.
+    /// This matches guacd's behavior which uses Pango with system font fallback.
+    fn get_font_for_char(&self, c: char) -> &Font {
+        if Self::has_glyph(&self.font_primary, c, self.font_size) {
+            &self.font_primary
+        } else if Self::has_glyph(&self.font_fallback, c, self.font_size) {
+            &self.font_fallback
+        } else {
+            // Neither font has the glyph - return primary (will show placeholder)
+            &self.font_primary
+        }
     }
 
     /// Get the current color scheme
@@ -250,14 +297,17 @@ impl TerminalRenderer {
                     return Ok(());
                 }
 
-                // Rasterize glyph at dynamic font size
-                let (metrics, bitmap) = self.font.rasterize(c, self.font_size);
+                // Get the best font for this character (primary or fallback)
+                // This matches guacd's behavior which uses Pango with system font fallback
+                let font = self.get_font_for_char(c);
 
-                // If font doesn't have this glyph, try to render as a simple rectangle
-                // (catches other missing characters beyond block elements)
+                // Rasterize glyph at dynamic font size
+                let (metrics, bitmap) = font.rasterize(c, self.font_size);
+
+                // If neither font has this glyph, render a placeholder rectangle
+                // This ensures the user sees SOMETHING instead of invisible characters
                 if bitmap.is_empty() && metrics.width == 0 {
                     // Draw a small centered rectangle as a fallback "missing glyph" indicator
-                    // This is better than showing nothing
                     let margin_x = self.char_width / 4;
                     let margin_y = self.char_height / 4;
                     for py in (y + margin_y)..(y + self.char_height - margin_y).min(img.height()) {

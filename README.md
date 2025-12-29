@@ -8,11 +8,26 @@ Designed to work with WebRTC-based secure tunneling systems like [keeper-pam-web
 
 - **SSH** - Secure Shell protocol handler
 - **Telnet** - Telnet protocol handler
-- **RDP** - Remote Desktop Protocol handler
+- **RDP** - Remote Desktop Protocol handler (requires FreeRDP)
 - **VNC** - Virtual Network Computing handler
 - **SFTP** - SSH File Transfer Protocol handler
 - **Database** - Database protocol handlers (MySQL, PostgreSQL, MongoDB, Redis, Oracle, SQL Server)
 - **RBI** - Remote Browser Isolation handler
+
+### RDP System Requirements
+
+RDP support requires FreeRDP development libraries:
+
+```bash
+# Ubuntu/Debian
+apt install freerdp2-dev libwinpr2-dev
+
+# Fedora/RHEL
+dnf install freerdp-devel
+
+# macOS
+brew install freerdp
+```
 
 ## Usage
 
@@ -23,7 +38,7 @@ Add to your `Cargo.toml`:
 guacr = { version = "1.1", features = ["ssh", "telnet"] }
 ```
 
-Available features: `ssh`, `telnet`, `rdp`, `vnc`, `sftp`, `database`, `rbi`, `all`
+Available features: `ssh`, `telnet`, `vnc`, `sftp`, `database`, `rbi`, `all`
 
 ## Example
 

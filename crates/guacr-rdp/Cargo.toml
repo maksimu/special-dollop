@@ -3,53 +3,42 @@ name = "guacr-rdp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RDP protocol handler for guacr remote desktop"
+description = "RDP protocol handler for guacr remote desktop (FreeRDP backend)"
+links = "freerdp2"
+build = "build.rs"
 
 [dependencies]
 # Local dependencies
 guacr-handlers = { path = "../guacr-handlers" }
+guacr-protocol = { path = "../guacr-protocol" }
+guacr-terminal = { path = "../guacr-terminal" }
 
 # Workspace dependencies
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
-
-# RDP client - using ironrdp (pure Rust)
-ironrdp = { version = "0.13.0", features = ["connector", "session", "graphics", "input", "cliprdr"] }
-ironrdp-async = "0.7.0"
-ironrdp-tokio = "0.7.0"
-ironrdp-pdu = "0.6.0"
-tokio-rustls = "0.26"
-rustls = "0.23"
-x509-cert = "0.2"
-
-# Image processing
-image = "0.25.9"
-
-# Utilities
 base64.workspace = true
 
-# Zero-copy optimizations
-guacr-terminal = { path = "../guacr-terminal" }
-guacr-protocol = { path = "../guacr-protocol" }
-crossbeam-queue = "0.3"
+# Image processing
+image = "0.25"
 
-# Hardware encoding support comes from guacr-terminal (shared across protocols)
+# FFI utilities
+libc = "0.2"
+
 # SFTP integration support
 guacr-sftp = { path = "../guacr-sftp", optional = true }
-russh = { version = "0.46", optional = true }
-russh-sftp = { version = "2.1", optional = true }
-russh-keys = { version = "0.46", optional = true }
+
+[build-dependencies]
+# FFI binding generator
+bindgen = "0.72"
+pkg-config = "0.3"
 
 [features]
 default = []
-# Hardware encoding features temporarily disabled
-# nvenc = ["guacr-terminal/nvenc"]
-# quicksync = ["guacr-terminal/quicksync"]
-# videotoolbox = ["guacr-terminal/videotoolbox"]
-# vaapi = ["guacr-terminal/vaapi"]
-# SFTP integration feature
-sftp = ["guacr-sftp", "russh", "russh-sftp", "russh-keys"]
+# SFTP integration for file transfer over RDP
+sftp = ["guacr-sftp"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

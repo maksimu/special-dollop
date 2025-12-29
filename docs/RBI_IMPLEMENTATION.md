@@ -17,10 +17,10 @@ RBI provides isolated browser sessions using headless Chrome/Chromium. Browser r
 - Production-ready
 
 **Future**: Servo (Rust-native browser)
-- Experimental (v0.0.1)
+- Experimental (v0.0.3 as of Dec 2025, monthly releases)
 - 50-100MB RAM target
-- Limited compatibility
-- Not production-ready (2024)
+- Has embedding API (`libservo` with `WebView`/`WebViewBuilder`)
+- Limited web compatibility - not production-ready yet
 
 ### Process Pooling
 

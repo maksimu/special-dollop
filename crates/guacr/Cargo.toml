@@ -42,6 +42,7 @@ rbi-cef = ["rbi", "guacr-rbi/cef"]
 # This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
 guacd-compat = ["guacr-handlers/guacd-compat"]
 
+# All protocols (RDP requires FreeRDP system library)
 all = ["ssh", "telnet", "rdp", "vnc", "sftp", "database", "rbi"]
 # All handlers with Chrome/CDP for RBI (easy setup, no audio)
 all-chrome = ["all", "rbi-chrome"]

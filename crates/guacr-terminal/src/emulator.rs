@@ -10,6 +10,36 @@ pub struct Rect {
     pub height: u16,
 }
 
+/// Mouse tracking mode as set by the remote application
+///
+/// Terminal applications enable mouse reporting via escape sequences:
+/// - Normal mode (1000): Report button press/release
+/// - Button event mode (1002): Report press/release and motion while pressed
+/// - Any event mode (1003): Report all motion events
+/// - SGR extended mode (1006): Extended coordinates for large terminals
+///
+/// Without mouse mode enabled, sending X11 mouse sequences to the terminal
+/// will result in garbage characters being displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MouseMode {
+    /// Mouse tracking disabled (default) - do NOT send mouse events to terminal
+    #[default]
+    Disabled,
+    /// Normal tracking mode (1000) - report button press/release
+    Normal,
+    /// Button event tracking mode (1002) - report press/release + motion while pressed  
+    ButtonEvent,
+    /// Any event tracking mode (1003) - report all motion
+    AnyEvent,
+}
+
+impl MouseMode {
+    /// Returns true if mouse mode is enabled (any tracking mode active)
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, MouseMode::Disabled)
+    }
+}
+
 /// A line of terminal content with cell information
 #[derive(Debug, Clone)]
 pub struct ScrollbackLine {
@@ -40,6 +70,7 @@ impl ScrollbackLine {
 ///
 /// Wraps the vt100 crate and provides dirty tracking for efficient rendering.
 /// Maintains a scrollback buffer of lines that have scrolled off the top.
+/// Tracks mouse mode state for proper X11 mouse event handling.
 pub struct TerminalEmulator {
     parser: Parser,
     rows: u16,
@@ -48,6 +79,10 @@ pub struct TerminalEmulator {
     scrollback: VecDeque<ScrollbackLine>,
     scrollback_max_lines: usize,
     last_screen_state: Vec<String>, // For detecting scrolls
+    /// Current mouse tracking mode set by the remote application
+    mouse_mode: MouseMode,
+    /// Whether SGR extended mouse mode (1006) is active
+    sgr_mouse_mode: bool,
 }
 
 impl TerminalEmulator {
@@ -89,11 +124,17 @@ impl TerminalEmulator {
             scrollback: VecDeque::with_capacity(scrollback_lines),
             scrollback_max_lines: scrollback_lines,
             last_screen_state,
+            mouse_mode: MouseMode::Disabled,
+            sgr_mouse_mode: false,
         }
     }
 
     /// Process terminal output data
     pub fn process(&mut self, data: &[u8]) -> Result<()> {
+        // Check for mouse mode escape sequences BEFORE processing
+        // This ensures we track mouse mode changes as they happen
+        self.detect_mouse_mode_changes(data);
+
         let screen = self.parser.screen();
 
         // Capture current screen state before processing
@@ -219,6 +260,110 @@ impl TerminalEmulator {
     /// Clear scrollback buffer
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
+    }
+
+    /// Get current mouse tracking mode
+    ///
+    /// Returns the mouse mode set by the remote application via escape sequences.
+    /// If this returns `MouseMode::Disabled`, X11 mouse sequences should NOT be
+    /// sent to the terminal (they will appear as garbage characters).
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    /// Check if mouse tracking is enabled
+    ///
+    /// Returns true if any mouse tracking mode is active (Normal, ButtonEvent, or AnyEvent).
+    /// Only send X11 mouse sequences to the terminal when this returns true.
+    pub fn is_mouse_enabled(&self) -> bool {
+        self.mouse_mode.is_enabled()
+    }
+
+    /// Check if SGR extended mouse mode (1006) is active
+    ///
+    /// SGR mode uses a different escape sequence format for coordinates.
+    pub fn is_sgr_mouse_mode(&self) -> bool {
+        self.sgr_mouse_mode
+    }
+
+    /// Detect mouse mode changes from escape sequences in the data
+    ///
+    /// Scans for DEC private mode set/reset sequences that control mouse tracking:
+    /// - ESC [ ? 1000 h/l - Normal tracking mode (enable/disable)
+    /// - ESC [ ? 1002 h/l - Button event tracking mode
+    /// - ESC [ ? 1003 h/l - Any event tracking mode
+    /// - ESC [ ? 1006 h/l - SGR extended mode
+    fn detect_mouse_mode_changes(&mut self, data: &[u8]) {
+        // Look for CSI ? <mode> h (set) or CSI ? <mode> l (reset)
+        // ESC = 0x1b, [ = 0x5b, ? = 0x3f, h = 0x68, l = 0x6c
+        let mut i = 0;
+        while i + 5 < data.len() {
+            // Look for ESC [
+            if data[i] == 0x1b && data[i + 1] == 0x5b {
+                // Check for ? (DEC private mode)
+                if data[i + 2] == 0x3f {
+                    // Find the mode number and terminator
+                    let start = i + 3;
+                    let mut end = start;
+
+                    // Scan for digits
+                    while end < data.len() && data[end].is_ascii_digit() {
+                        end += 1;
+                    }
+
+                    if end > start && end < data.len() {
+                        // Parse mode number
+                        if let Ok(mode_str) = std::str::from_utf8(&data[start..end]) {
+                            if let Ok(mode_num) = mode_str.parse::<u32>() {
+                                let terminator = data[end];
+                                let enable = terminator == 0x68; // 'h'
+                                let disable = terminator == 0x6c; // 'l'
+
+                                if enable || disable {
+                                    self.apply_mouse_mode_change(mode_num, enable);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Apply a mouse mode change based on DEC private mode number
+    fn apply_mouse_mode_change(&mut self, mode: u32, enable: bool) {
+        match mode {
+            1000 => {
+                // Normal tracking mode
+                if enable {
+                    self.mouse_mode = MouseMode::Normal;
+                } else if self.mouse_mode == MouseMode::Normal {
+                    self.mouse_mode = MouseMode::Disabled;
+                }
+            }
+            1002 => {
+                // Button event tracking mode
+                if enable {
+                    self.mouse_mode = MouseMode::ButtonEvent;
+                } else if self.mouse_mode == MouseMode::ButtonEvent {
+                    self.mouse_mode = MouseMode::Disabled;
+                }
+            }
+            1003 => {
+                // Any event tracking mode
+                if enable {
+                    self.mouse_mode = MouseMode::AnyEvent;
+                } else if self.mouse_mode == MouseMode::AnyEvent {
+                    self.mouse_mode = MouseMode::Disabled;
+                }
+            }
+            1006 => {
+                // SGR extended mode (affects coordinate encoding, not tracking mode)
+                self.sgr_mouse_mode = enable;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -364,5 +509,97 @@ mod tests {
         let line = ScrollbackLine::new(80);
         assert_eq!(line.cols, 80);
         assert!(line.cells.is_empty());
+    }
+
+    #[test]
+    fn test_mouse_mode_default() {
+        let term = TerminalEmulator::new(24, 80);
+        assert_eq!(term.mouse_mode(), MouseMode::Disabled);
+        assert!(!term.is_mouse_enabled());
+        assert!(!term.is_sgr_mouse_mode());
+    }
+
+    #[test]
+    fn test_mouse_mode_normal_enable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // ESC [ ? 1000 h - Enable normal tracking
+        term.process(b"\x1b[?1000h").unwrap();
+        assert_eq!(term.mouse_mode(), MouseMode::Normal);
+        assert!(term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mouse_mode_normal_disable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable then disable
+        term.process(b"\x1b[?1000h").unwrap();
+        assert!(term.is_mouse_enabled());
+
+        term.process(b"\x1b[?1000l").unwrap();
+        assert_eq!(term.mouse_mode(), MouseMode::Disabled);
+        assert!(!term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mouse_mode_button_event() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // ESC [ ? 1002 h - Enable button event tracking
+        term.process(b"\x1b[?1002h").unwrap();
+        assert_eq!(term.mouse_mode(), MouseMode::ButtonEvent);
+        assert!(term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mouse_mode_any_event() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // ESC [ ? 1003 h - Enable any event tracking
+        term.process(b"\x1b[?1003h").unwrap();
+        assert_eq!(term.mouse_mode(), MouseMode::AnyEvent);
+        assert!(term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mouse_mode_sgr() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // ESC [ ? 1006 h - Enable SGR extended mode
+        term.process(b"\x1b[?1006h").unwrap();
+        assert!(term.is_sgr_mouse_mode());
+
+        // Disable
+        term.process(b"\x1b[?1006l").unwrap();
+        assert!(!term.is_sgr_mouse_mode());
+    }
+
+    #[test]
+    fn test_mouse_mode_in_mixed_data() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Mouse enable sequence embedded in regular text
+        term.process(b"Hello \x1b[?1000h World").unwrap();
+        assert!(term.is_mouse_enabled());
+
+        // Verify text was still processed
+        let screen = term.screen();
+        let contents = screen.contents();
+        assert!(contents.contains("Hello"));
+        assert!(contents.contains("World"));
+    }
+
+    #[test]
+    fn test_mouse_mode_vim_like_sequence() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Vim typically enables mouse with: ESC[?1000h ESC[?1002h ESC[?1006h
+        term.process(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h").unwrap();
+
+        // Last one wins for mode, SGR should be enabled
+        assert_eq!(term.mouse_mode(), MouseMode::ButtonEvent);
+        assert!(term.is_mouse_enabled());
+        assert!(term.is_sgr_mouse_mode());
     }
 }

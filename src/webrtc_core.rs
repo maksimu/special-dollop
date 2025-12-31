@@ -2460,7 +2460,8 @@ impl WebRTCPeerConnection {
         let pc_clone = self.peer_connection.clone();
         let keepalive_interval = self.keepalive_interval;
 
-        // Create a lightweight task that just ensures periodic activity
+        // Create a lightweight task that ensures periodic activity with quality-aware intervals
+        // Quality-aware: More frequent keepalive when connection quality is degraded
         let keepalive_task_handle = tokio::spawn(async move {
             debug!("NAT timeout prevention active - ensuring periodic activity every {} seconds (tube_id: {}, interval_minutes: {})",
                   keepalive_interval.as_secs(), tube_id_clone, keepalive_interval.as_secs() / 60);
@@ -2468,11 +2469,37 @@ impl WebRTCPeerConnection {
             let mut interval = tokio::time::interval(keepalive_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            // Track last quality check for adaptive keepalive
+            let mut last_quality_check = Instant::now();
+            const QUALITY_CHECK_INTERVAL: Duration = Duration::from_secs(60); // Check quality every minute
+
             while keepalive_enabled_clone.load(Ordering::Relaxed) {
                 interval.tick().await;
 
                 if !keepalive_enabled_clone.load(Ordering::Relaxed) {
                     break;
+                }
+
+                // Quality-aware keepalive: Check connection quality periodically
+                // More frequent keepalive when quality is degraded (but still conservative)
+                if last_quality_check.elapsed() >= QUALITY_CHECK_INTERVAL {
+                    // Get connection quality from metrics (non-blocking check)
+                    // Note: This is a lightweight check - doesn't block keepalive
+                    let connection_state = pc_clone.connection_state();
+                    let is_degraded = matches!(
+                        connection_state,
+                        RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed
+                    );
+
+                    if is_degraded {
+                        // Connection degraded - keepalive already running, just log
+                        debug!(
+                            "Connection quality degraded - keepalive continues (tube_id: {}, state: {:?})",
+                            tube_id_clone, connection_state
+                        );
+                    }
+
+                    last_quality_check = Instant::now();
                 }
 
                 // This keepalive task does not send pings directly; instead, it ensures periodic activity

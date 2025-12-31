@@ -98,6 +98,15 @@ pub struct Tube {
     pub(crate) python_handler_tx: Arc<
         TokioRwLock<Option<tokio::sync::mpsc::Sender<crate::channel::core::PythonHandlerMessage>>>,
     >,
+
+    // ============================================================================
+    // SPAWNED TASK TRACKING
+    // ============================================================================
+    /// Channel for tracking spawned task completion (lock-free!)
+    /// Tasks send () when they complete, allowing tube.close() to wait without deadlocks
+    /// Prevents task accumulation during rapid create/close cycles (e.g., Ephemeral SSH)
+    pub(crate) spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
+    spawned_task_completion_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
 }
 
 impl Tube {
@@ -128,6 +137,9 @@ impl Tube {
             .as_ref()
             .map(|conv_id| crate::metrics::MetricsHandle::new(conv_id.clone(), id.clone()));
 
+        // Create channel for spawned task completion tracking (lock-free!)
+        let (spawned_task_tx, spawned_task_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let tube = Arc::new(Self {
             id: id.clone(),
             peer_connection: ArcSwap::from_pointee(None),
@@ -154,6 +166,10 @@ impl Tube {
             capabilities,
             // Python handler protocol mode:
             python_handler_tx: Arc::new(TokioRwLock::new(None)),
+
+            // Spawned task tracking (channel-based, lock-free):
+            spawned_task_completion_tx: Arc::new(spawned_task_tx),
+            spawned_task_completion_rx: Arc::new(tokio::sync::Mutex::new(spawned_task_rx)),
         });
 
         Ok(tube)
@@ -211,6 +227,8 @@ impl Tube {
         let status = self.status.clone();
 
         let tube_arc_for_pc_state = Arc::clone(self);
+        let spawned_task_tx_for_pc_state =
+            Arc::clone(&tube_arc_for_pc_state.spawned_task_completion_tx);
 
         debug!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
         connection_arc.setup_ice_candidate_handler();
@@ -221,6 +239,7 @@ impl Tube {
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
             let tube_clone_for_closure = tube_arc_for_pc_state.clone();
+            let spawned_task_tx = Arc::clone(&spawned_task_tx_for_pc_state);
             let is_closing_for_handler = Arc::clone(&is_closing_for_tube);
             let connection_for_signals = Arc::clone(&connection_arc_for_signals);
 
@@ -290,6 +309,7 @@ impl Tube {
                             *status_clone.write().await = TubeStatus::Failed;
 
                             let runtime = get_runtime();
+                            let completion_tx = Arc::clone(&spawned_task_tx);
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection failure. (tube_id: {})", tube_id_log);
 
@@ -302,6 +322,9 @@ impl Tube {
                                 } else {
                                     debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
                                 }
+
+                                // Signal completion (lock-free, non-blocking)
+                                let _ = completion_tx.send(());
                             });
                         } else {
                             debug!("Peer connection failed, but tube already closing/closed. (tube_id: {}, current_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
@@ -324,6 +347,7 @@ impl Tube {
                             *status_clone.write().await = TubeStatus::Closed;
 
                             let runtime = get_runtime();
+                            let completion_tx = Arc::clone(&spawned_task_tx);
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection closure. (tube_id: {})", tube_id_log);
                                 // LOCK-FREE: Close via actor (no deadlock possible!)
@@ -335,6 +359,9 @@ impl Tube {
                                 } else {
                                     debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
                                 }
+
+                                // Signal completion (lock-free, non-blocking)
+                                let _ = completion_tx.send(());
                             });
                         } else {
                             debug!("Peer connection closed, but tube already closing/closed. (tube_id: {}, current_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
@@ -355,6 +382,7 @@ impl Tube {
                             *status_clone.write().await = TubeStatus::Disconnected;
 
                             let runtime = get_runtime();
+                            let completion_tx = Arc::clone(&spawned_task_tx);
                             runtime.spawn(async move {
                                 debug!("Spawning task to close tube due to peer connection disconnection. (tube_id: {})", tube_id_log);
                                 // LOCK-FREE: Close via actor (no deadlock possible!)
@@ -366,6 +394,9 @@ impl Tube {
                                 } else {
                                     debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
                                 }
+
+                                // Signal completion (lock-free, non-blocking)
+                                let _ = completion_tx.send(());
                             });
                         } else {
                             debug!("Peer connection disconnected, but tube already closing/closed. (tube_id: {}, current_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
@@ -699,7 +730,7 @@ impl Tube {
                     owned_channel.ksm_config.clone().unwrap_or_default(),
                     owned_channel.callback_token.clone().unwrap_or_default(),
                     &owned_channel.client_version,
-                );
+                ).await;
 
                 if owned_channel.server_mode {
                     if let Some(listen_addr_str) = owned_channel.local_listen_addr.clone() {
@@ -958,7 +989,8 @@ impl Tube {
                 ksm_config,
                 callback_token,
                 client_version,
-            );
+            )
+            .await;
 
             // Clone for release
             let data_channel_clone = data_channel.clone();
@@ -973,7 +1005,7 @@ impl Tube {
     }
 
     // Setup event handlers for a data channel
-    fn setup_data_channel_handlers(
+    async fn setup_data_channel_handlers(
         self: &Arc<Self>,
         data_channel: &WebRTCDataChannel,
         label: String,
@@ -1050,6 +1082,8 @@ impl Tube {
         });
 
         // FIX: Spawn a monitor task to catch panics from the main task
+        // The monitor task signals completion via channel (lock-free)
+        let spawned_task_tx = Arc::clone(&self.spawned_task_completion_tx);
         tokio::spawn(async move {
             match handle.await {
                 Ok(()) => {
@@ -1069,6 +1103,9 @@ impl Tube {
                     );
                 }
             }
+
+            // Signal completion (lock-free, non-blocking)
+            let _ = spawned_task_tx.send(());
         });
 
         let self_clone_for_close = Arc::clone(self);
@@ -2012,6 +2049,62 @@ impl Tube {
             );
         }
 
+        // CRITICAL: Wait for channel.run() tasks to complete and release buffers
+        // This prevents memory leaks when connections are created/closed rapidly (e.g., Ephemeral SSH)
+        // Channel tasks call deregister_channel() when they exit, removing themselves from active_channels
+        // Use lock-free atomic read to check count (RwLock read is released immediately)
+        let initial_active_count = {
+            let guard = self.active_channels.read().await;
+            guard.len()
+        }; // Lock released here
+
+        if initial_active_count > 0 {
+            let wait_start = std::time::Instant::now();
+            let completion_timeout = crate::config::channel_task_completion_timeout();
+            let poll_interval = Duration::from_millis(100); // Check every 100ms
+            let max_iterations =
+                (completion_timeout.as_millis() / poll_interval.as_millis()) as usize + 1;
+            let mut iterations = 0;
+
+            loop {
+                // Lock-free check: acquire read lock, check length, release immediately
+                let active_count = {
+                    let guard = self.active_channels.read().await;
+                    guard.len()
+                }; // Lock released here - no contention with deregister_channel()
+
+                if active_count == 0 {
+                    let wait_duration = wait_start.elapsed();
+                    debug!(
+                        "Tube {}: All {} channel tasks completed and buffers released ({:?} elapsed for task completion)",
+                        tube_id, initial_active_count, wait_duration
+                    );
+                    break;
+                }
+
+                // Safety: Prevent infinite loops even if timeout logic fails
+                iterations += 1;
+                if iterations >= max_iterations {
+                    warn!(
+                        "Tube {}: Channel task completion max iterations reached ({}) - {} channels still active (buffers may leak)",
+                        tube_id, max_iterations, active_count
+                    );
+                    break;
+                }
+
+                if wait_start.elapsed() >= completion_timeout {
+                    warn!(
+                        "Tube {}: Channel task completion timeout after {:?} - {} channels still active (buffers may leak)",
+                        tube_id, completion_timeout, active_count
+                    );
+                    break;
+                }
+
+                // Brief sleep before next check (allows channels to complete and deregister)
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+
         // 3. Send CloseConnection control messages to all channels BEFORE physically closing them
         // This ensures Vault receives the close reason (e.g., AI_CLOSED) before channels disconnect
         let channel_names: Vec<String> =
@@ -2182,9 +2275,89 @@ impl Tube {
             );
         }
 
-        // Drain thread-local buffer pools to release memory
-        let buffer_pool = BufferPool::default();
-        buffer_pool.drain_thread_local();
+        // Wait for all spawned tasks to complete before final cleanup (lock-free channel-based)
+        // This prevents task accumulation during rapid create/close cycles (e.g., Ephemeral SSH)
+        // Tasks signal completion via channel, avoiding deadlock from join_all()
+        //
+        // NOTE: If close() is called immediately after tube creation, tasks may still be spawning.
+        // The no_messages_initial_timeout (500ms) handles this case by assuming no tasks exist
+        // if no messages arrive within that window. This is safe because:
+        // 1. Tasks spawn quickly (<100ms typically)
+        // 2. If they spawn after close(), they'll complete independently
+        // 3. The timeout prevents indefinite waiting
+        let wait_start = std::time::Instant::now();
+        let completion_timeout = crate::config::spawned_task_completion_timeout();
+        let mut completed_count = 0;
+        let mut last_message_time = wait_start;
+        let no_message_timeout = Duration::from_millis(200); // If no messages for 200ms, assume done
+        let no_messages_initial_timeout = Duration::from_millis(500); // If no messages at all after 500ms, assume no tasks or early spawn
+
+        // Drain completion channel with timeout (lock-free!)
+        let mut rx_guard = self.spawned_task_completion_rx.lock().await;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), rx_guard.recv()).await {
+                Ok(Some(_)) => {
+                    completed_count += 1;
+                    last_message_time = std::time::Instant::now();
+                    // Continue receiving until channel is empty or timeout
+                }
+                Ok(None) => {
+                    // Channel closed (all tasks completed)
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - check if we should continue waiting
+                    let elapsed = wait_start.elapsed();
+                    let time_since_last_message = last_message_time.elapsed();
+
+                    // If we received messages but none recently, assume all completed
+                    if completed_count > 0 && time_since_last_message >= no_message_timeout {
+                        debug!(
+                            "Tube {}: No spawned task messages for {:?}, assuming all completed ({} tasks completed)",
+                            tube_id, time_since_last_message, completed_count
+                        );
+                        break;
+                    }
+
+                    // If no messages at all after initial timeout, assume no tasks or they completed early
+                    if completed_count == 0 && elapsed >= no_messages_initial_timeout {
+                        debug!(
+                            "Tube {}: No spawned task messages after {:?}, assuming no tasks or early completion",
+                            tube_id, no_messages_initial_timeout
+                        );
+                        break;
+                    }
+
+                    // Otherwise, check overall timeout
+                    if elapsed >= completion_timeout {
+                        warn!(
+                            "Tube {}: Spawned task completion timeout after {:?} - {} tasks completed",
+                            tube_id, completion_timeout, completed_count
+                        );
+                        break;
+                    }
+                    // Brief timeout allows checking elapsed time without blocking
+                }
+            }
+        }
+        drop(rx_guard); // Release lock
+
+        if completed_count > 0 {
+            let wait_duration = wait_start.elapsed();
+            debug!(
+                "Tube {}: {} spawned tasks completed ({:?} elapsed)",
+                tube_id, completed_count, wait_duration
+            );
+        }
+
+        // NOTE: We do NOT drain buffer pools here because:
+        // 1. Thread-local storage is shared across all BufferPool instances on this thread
+        //    - Draining it would affect other active tubes/channels, hurting their performance
+        //    - Thread-local buffers will be naturally reused by other tubes (intended behavior)
+        // 2. The tube's per-instance fallback pool has already been cleaned up via Drop
+        //    - Creating a new BufferPool instance here would only drain an empty fallback
+        //    - This would be a no-op with no benefit
+        // 3. Memory will be reclaimed when the thread exits or buffers are naturally cycled out
 
         info!(
             "Tube {} close() completed successfully (total time: {:?})",

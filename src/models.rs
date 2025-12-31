@@ -9,6 +9,7 @@ use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -24,6 +25,12 @@ pub(crate) enum ConnectionMessage {
     Data(Bytes),
     Eof,
 }
+
+// Connection state machine for lifecycle tracking
+// Prevents conn_no reuse race during cleanup window (600ms-2.7s)
+pub(crate) const CONN_STATE_ACTIVE: u8 = 0;
+pub(crate) const CONN_STATE_CLOSING: u8 = 1;
+pub(crate) const CONN_STATE_CLOSED: u8 = 2;
 
 // Trait for async read/write operations
 pub(crate) trait AsyncReadWrite:
@@ -101,6 +108,13 @@ pub(crate) struct Conn {
     pub(crate) to_webrtc: Option<JoinHandle<()>>,
     /// Cancellation token for backend read task - allows immediate exit on WebRTC closure
     pub(crate) cancel_read_task: tokio_util::sync::CancellationToken,
+    /// Generation counter - increments each time this conn_no is reused
+    /// Prevents confusion between old and new connections with same conn_no
+    #[allow(dead_code)] // Reserved for future debugging/logging
+    pub(crate) generation: u64,
+    /// Connection lifecycle state (ACTIVE, CLOSING, CLOSED)
+    /// Prevents conn_no reuse race during 600ms-2.7s cleanup window
+    pub(crate) state: Arc<AtomicU8>,
 }
 
 impl Conn {
@@ -110,6 +124,7 @@ impl Conn {
         outbound_task: JoinHandle<()>,
         conn_no: u32,
         channel_id: String,
+        generation: u64,
     ) -> Self {
         let (data_tx, data_rx) = mpsc::unbounded_channel::<ConnectionMessage>();
         let cancel_read_task = tokio_util::sync::CancellationToken::new();
@@ -134,6 +149,8 @@ impl Conn {
             backend_task: Some(backend_task), // Wrap in Option
             to_webrtc: Some(outbound_task),   // Wrap in Option
             cancel_read_task,
+            generation,
+            state: Arc::new(AtomicU8::new(CONN_STATE_ACTIVE)),
         }
     }
 
@@ -160,9 +177,39 @@ impl Conn {
         let old_tx = std::mem::replace(&mut self.data_tx, dummy_tx);
         drop(old_tx); // Dropping the sender signals the receiver to close
 
-        // Step 2: Abort to_webrtc immediately (read-only task, safe to kill)
+        // Step 2: Cancel to_webrtc read task and wait for graceful exit (releases buffers!)
+        // CRITICAL: Use cancellation token instead of abort() to allow buffer cleanup
+        // The task checks cancellation token in read loop and exits gracefully, releasing buffers
         if let Some(task) = self.to_webrtc.take() {
-            task.abort();
+            // Cancel the read task (signals it to exit via cancellation token)
+            self.cancel_read_task.cancel();
+
+            // Wait for task to exit gracefully (allows buffer cleanup)
+            // Timeout after 1 second - read cancellation check interval is 500ms, so 1s is safe
+            let task_handle = task.abort_handle(); // Get abort handle before consuming task
+            match tokio::time::timeout(Duration::from_secs(1), task).await {
+                Ok(Ok(())) => {
+                    debug!(
+                        "to_webrtc task completed gracefully with buffer cleanup (channel_id: {}, conn_no: {})",
+                        channel_id, conn_no
+                    );
+                }
+                Ok(Err(join_err)) => {
+                    warn!(
+                        "to_webrtc task panicked during shutdown: {:?} (channel_id: {}, conn_no: {})",
+                        join_err, channel_id, conn_no
+                    );
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "to_webrtc shutdown timeout (1s), aborting (channel_id: {}, conn_no: {})",
+                        channel_id, conn_no
+                    );
+                    // Abort the task if graceful shutdown timed out
+                    // This is a fallback - buffers may leak in this rare case
+                    task_handle.abort();
+                }
+            }
         }
 
         // Step 3: Await backend_task to complete TCP shutdown (with timeout)
@@ -203,6 +250,14 @@ impl Drop for Conn {
     fn drop(&mut self) {
         // Abort tasks only if not already consumed by graceful_shutdown()
         // This provides a safety net for cases where graceful_shutdown wasn't called
+
+        // For to_webrtc: Cancel token first to give it a chance to exit gracefully
+        // (though we can't wait in Drop, so we still abort immediately)
+        if self.to_webrtc.is_some() {
+            self.cancel_read_task.cancel();
+            // Note: We still abort immediately since Drop is synchronous and can't await
+            // But canceling the token first gives the task a chance if it's currently checking
+        }
 
         if let Some(task) = &self.backend_task {
             task.abort();

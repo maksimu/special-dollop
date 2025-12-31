@@ -115,6 +115,7 @@ pub struct ConnectAsSettings {
 pub struct Channel {
     pub(crate) webrtc: WebRTCDataChannel,
     pub(crate) conns: Arc<DashMap<u32, Conn>>,
+    pub(crate) conn_generations: Arc<DashMap<u32, std::sync::atomic::AtomicU64>>,
     pub(crate) rx_from_dc: mpsc::UnboundedReceiver<Bytes>,
     pub(crate) channel_id: String,
     pub(crate) timeouts: TunnelTimeouts,
@@ -532,6 +533,7 @@ impl Channel {
         let new_channel = Self {
             webrtc,
             conns: Arc::new(DashMap::new()),
+            conn_generations: Arc::new(DashMap::new()),
             rx_from_dc,
             channel_id,
             timeouts: timeouts.unwrap_or_default(),
@@ -680,12 +682,22 @@ impl Channel {
                             writer,
                         };
 
+                        // Get next generation for this conn_no - prevents reuse race during cleanup
+                        // Use Relaxed ordering since generation is per-conn_no and doesn't need synchronization
+                        // with other conn_no values
+                        let generation = self
+                            .conn_generations
+                            .entry(conn_no)
+                            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                         // Create a lock-free connection with a dedicated backend task
                         let conn = Conn::new_with_backend(
                             Box::new(stream_half),
                             task,
                             conn_no,
                             self.channel_id.clone(),
+                            generation,
                         ).await;
 
                         // Store in our lock-free registry
@@ -987,6 +999,18 @@ impl Channel {
         }
         let msg_data = buffer.freeze();
 
+        // Mark connection as CLOSING to prevent reuse during cleanup window
+        if let Some(conn_ref) = self.conns.get(&conn_no) {
+            conn_ref.state.store(
+                crate::models::CONN_STATE_CLOSING,
+                std::sync::atomic::Ordering::Release,
+            );
+            debug!(
+                "Marked connection {} as CLOSING (channel_id: {})",
+                conn_no, self.channel_id
+            );
+        }
+
         self.internal_handle_connection_close(conn_no, reason)
             .await?;
 
@@ -1268,6 +1292,18 @@ impl Channel {
 
         // For control connections or explicit cleanup, remove immediately
         let should_delay_removal = conn_no != 0 && reason != CloseConnectionReason::Normal;
+
+        // Mark connection as CLOSING to prevent reuse during cleanup window
+        if let Some(conn_ref) = self.conns.get(&conn_no) {
+            conn_ref.state.store(
+                crate::models::CONN_STATE_CLOSING,
+                std::sync::atomic::Ordering::Release,
+            );
+            debug!(
+                "Marked connection {} as CLOSING (no message) (channel_id: {})",
+                conn_no, self.channel_id
+            );
+        }
 
         // CRITICAL FIX: Send disconnect BEFORE internal_handle_connection_close
         // The WebRTC channel can close during internal_handle_connection_close, causing the

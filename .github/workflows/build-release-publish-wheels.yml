@@ -49,8 +49,32 @@ jobs:
 
       - name: Build wheel
         run: |
-          echo "Building for Linux x86_64"
-          docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin build --release --manylinux 2014
+          echo "Building for Linux x86_64 with manylinux_2_28"
+
+          # Pull the manylinux_2_28 image for x86_64
+          docker pull quay.io/pypa/manylinux_2_28_x86_64
+
+          # Build the wheel inside the container (same approach as ARM64)
+          docker run --rm -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_x86_64 bash -c "
+            # Install Rust
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+
+            # Install maturin
+            /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
+
+            # Build the wheel
+            cd /io
+            /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
+          
+            # Ensure wheels are in target/wheels
+            mkdir -p /io/target/wheels
+            for wheel in \$(find /io/target -name \"*.whl\" -type f); do
+              if [[ \"\$wheel\" != \"/io/target/wheels/\"* ]]; then
+                cp \"\$wheel\" /io/target/wheels/
+              fi
+            done
+          "
           
           # Debug - list the wheels that were built
           echo "Wheels built for Linux x86_64:"
@@ -115,13 +139,13 @@ jobs:
       # Use the prebuilt manylinux Docker image to build our wheel
       - name: Build wheel in manylinux container
         run: |
-          echo "Building for Linux ARM64 with manylinux 2014"
-          
-          # Pull the manylinux2014 image for ARM64
-          docker pull quay.io/pypa/manylinux2014_aarch64
-          
+          echo "Building for Linux ARM64 with manylinux_2_28"
+
+          # Pull the manylinux_2_28 image for ARM64
+          docker pull quay.io/pypa/manylinux_2_28_aarch64
+
           # Print container system info to verify glibc version
-          docker run --rm quay.io/pypa/manylinux2014_aarch64 bash -c "
+          docker run --rm quay.io/pypa/manylinux_2_28_aarch64 bash -c "
             echo 'Container system information:'
             uname -a
             echo 'Container glibc version:'
@@ -129,19 +153,19 @@ jobs:
             echo 'Container architecture:'
             arch
           "
-          
+
           # Build the wheel inside the container
-          docker run --rm -v "$(pwd)":/io quay.io/pypa/manylinux2014_aarch64 bash -c "
+          docker run --rm -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_aarch64 bash -c "
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source \$HOME/.cargo/env
-          
+
             # Install maturin
             /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
-          
+
             # Build the wheel
             cd /io
-            /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
+            /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
           
             # Print information about built wheels
             echo 'Information about built wheels:'
@@ -189,7 +213,7 @@ jobs:
           cd tests && python -m pytest -v
         shell: bash
 
-      # Verify the wheel compatibility with older glibc
+      # Verify the wheel compatibility with glibc 2.28
       - name: Verify wheel compatibility with glibc 2.28
         run: |
           # Find the built wheel
@@ -198,14 +222,14 @@ jobs:
             echo "No wheel found for verification!"
             exit 1
           fi
-          
+
           # Install pip packages for verification
           pip install auditwheel
-          
+
           # Show the dependencies of the wheel to verify glibc version
           auditwheel show $WHEEL
-          
-          echo "This wheel should be compatible with glibc 2.28 or earlier"
+
+          echo "This wheel is compatible with glibc 2.28 or later"
         shell: bash
 
       - uses: actions/upload-artifact@v4

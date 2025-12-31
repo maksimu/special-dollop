@@ -17,8 +17,27 @@ rm -rf target/wheels && mkdir -p target/wheels
 # Alternatively: if [ -d "target/wheels" ]; then rm -rf target/wheels/*; fi
 
 echo "Building wheel..."
-# Build the wheel with release configuration
-maturin build --release
+# Detect platform and build accordingly
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS build - skip manylinux checks (not applicable to macOS)
+    echo "Building for macOS (native platform)..."
+    maturin build --release --auditwheel skip
+elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    # Linux build - check if we want manylinux compliance
+    # Use explicit check to only enable when BUILD_MANYLINUX=1 (not just any non-empty value)
+    if [ "$BUILD_MANYLINUX" = "1" ]; then
+        echo "Building Linux wheel with manylinux_2_28 compliance (using Docker)..."
+        docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin:v1.8.1 build --release --manylinux 2_28
+    else
+        echo "Building Linux wheel without manylinux checks (for local testing only)..."
+        echo "Note: For manylinux-compliant wheels, use: BUILD_MANYLINUX=1 ./build_and_test.sh"
+        maturin build --release --auditwheel skip
+    fi
+else
+    # Other platforms (Windows, etc.)
+    echo "Building for $OSTYPE..."
+    maturin build --release --auditwheel skip
+fi
 
 # Find the newly built wheel
 WHEEL=$(find target/wheels -name "*.whl" | head -1)

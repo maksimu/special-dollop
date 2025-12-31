@@ -21,6 +21,10 @@ use crossbeam_queue::SegQueue;
 /// - Marginal CPU increase (~1-2% per connection) for dramatic latency improvement
 pub const STANDARD_BUFFER_THRESHOLD: u64 = 8 * 1024; // 8KB - balanced for latency + throughput
 
+// Error message constants to avoid repeated allocations in hot paths
+const QUEUE_FULL_ERROR: &str = "Queue full - backpressure required (loss-intolerant protocol)";
+const DATACHANNEL_CLOSED_ERROR: &str = "DataChannel closed";
+
 // Type alias for complex callback type - callbacks still need Mutex (can't be atomic)
 type BufferedAmountLowCallback =
     Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>>;
@@ -454,6 +458,65 @@ impl WebRTCDataChannel {
     }
 }
 
+/// Retry state for exponential backoff
+/// Uses atomic timestamp (nanoseconds since epoch) for lock-free access
+struct RetryState {
+    /// Number of retry attempts
+    attempts: AtomicUsize,
+    /// Timestamp of last retry attempt (nanoseconds since Unix epoch, 0 = None)
+    last_retry_ns: AtomicU64,
+}
+
+impl RetryState {
+    fn new() -> Self {
+        Self {
+            attempts: AtomicUsize::new(0),
+            last_retry_ns: AtomicU64::new(0), // 0 = None
+        }
+    }
+
+    // Note: get_backoff_delay() reserved for future use when implementing
+    // actual retry with backoff delays. Currently retries happen via queue.
+
+    /// Record a retry attempt (lock-free)
+    fn record_retry(&self) {
+        self.attempts.fetch_add(1, Ordering::Release);
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        self.last_retry_ns.store(now_ns, Ordering::Release);
+    }
+
+    /// Reset retry state on success (lock-free)
+    fn reset(&self) {
+        self.attempts.store(0, Ordering::Release);
+        self.last_retry_ns.store(0, Ordering::Release); // 0 = None
+    }
+
+    /// Get current attempt count (lock-free)
+    fn get_attempts(&self) -> usize {
+        self.attempts.load(Ordering::Acquire)
+    }
+
+    /// Get elapsed time since last retry (lock-free)
+    fn get_last_retry_elapsed(&self) -> Option<Duration> {
+        let last_ns = self.last_retry_ns.load(Ordering::Acquire);
+        if last_ns == 0 {
+            return None;
+        }
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if now_ns >= last_ns {
+            Some(Duration::from_nanos(now_ns - last_ns))
+        } else {
+            None // Clock went backwards
+        }
+    }
+}
+
 /// Event-driven sender that uses WebRTC native bufferedAmountLow events
 /// Eliminates polling and provides natural backpressure
 /// Uses lock-free SegQueue for zero-contention frame queueing
@@ -464,6 +527,15 @@ pub struct EventDrivenSender {
     can_send: Arc<AtomicBool>,
     threshold: u64,               // Backpressure threshold for monitoring
     queue_size: Arc<AtomicUsize>, // Lock-free queue depth counter
+
+    // Queue monitoring for alerts (lock-free atomics)
+    /// Timestamp when queue first exceeded 75% threshold (nanoseconds since Unix epoch, 0 = None)
+    high_queue_start_ns: Arc<AtomicU64>,
+    /// Count of frames that were blocked (queue full) - for metrics
+    frames_blocked: Arc<AtomicUsize>,
+
+    // Retry state for exponential backoff
+    retry_state: Arc<RetryState>,
 }
 
 impl EventDrivenSender {
@@ -475,6 +547,9 @@ impl EventDrivenSender {
             can_send: Arc::new(AtomicBool::new(true)),
             threshold,
             queue_size: Arc::new(AtomicUsize::new(0)),
+            high_queue_start_ns: Arc::new(AtomicU64::new(0)), // 0 = None
+            frames_blocked: Arc::new(AtomicUsize::new(0)),
+            retry_state: Arc::new(RetryState::new()),
         };
 
         // Set up WebRTC native event handling
@@ -524,6 +599,8 @@ impl EventDrivenSender {
             if !to_send.is_empty() {
                 let dc = dc_clone.clone();
                 let can_send_for_batch = can_send_clone.clone();
+                // Note: retry_state not accessible here (would need Arc in closure)
+                // Retry logic handled at send_with_natural_backpressure level
 
                 tokio::spawn(async move {
                     for frame in to_send {
@@ -545,7 +622,7 @@ impl EventDrivenSender {
 
     /// Send with zero-polling natural backpressure (lock-free!)
     /// Returns immediately - either sends or queues for later
-    pub async fn send_with_natural_backpressure(&self, frame: Bytes) -> Result<(), String> {
+    pub async fn send_with_natural_backpressure(&self, frame: Bytes) -> Result<(), &'static str> {
         let frame_len = frame.len(); // Capture for logging
 
         // Fast path: send immediately if buffer has space
@@ -570,14 +647,18 @@ impl EventDrivenSender {
                                 frame_len
                             );
                         }
-                        return Err(error_str);
+                        return Err(DATACHANNEL_CLOSED_ERROR);
                     }
 
                     // Temporary failure (buffer full, congestion) - queue for retry
+                    // Record retry attempt for exponential backoff tracking
+                    self.retry_state.record_retry();
+                    let attempts = self.retry_state.get_attempts();
+
                     if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
-                            "WebRTC send failed temporarily (frame_size: {} bytes), queueing for retry. Error: {}",
-                            frame_len, e
+                            "WebRTC send failed temporarily (frame_size: {} bytes, retry_attempt: {}), queueing for retry. Error: {}",
+                            frame_len, attempts, e
                         );
                     }
 
@@ -594,27 +675,77 @@ impl EventDrivenSender {
 
         // Prevent unbounded growth - increased from 1000 to 10000 frames
         // Check BEFORE incrementing counter to maintain accurate queue depth
+        // CRITICAL: Never drop frames for loss-intolerant protocols (RDP/SSH/SFTP)
+        // Return error to trigger backpressure instead (caller pauses reads)
         if current_queue_size >= 10000 {
-            log::error!(
-                "CRITICAL: EventDrivenSender queue overflow! Dropping frame (queue_size: {}, threshold: {}, dropped_bytes: {})",
+            // Track blocked frames for metrics
+            self.frames_blocked.fetch_add(1, Ordering::Relaxed);
+
+            warn!(
+                "EventDrivenSender queue FULL - backpressure required (queue_size: {}, threshold: {}, frame_bytes: {})",
                 current_queue_size,
                 self.threshold,
                 frame_len
             );
-            return Ok(()); // Still return Ok - frame was "handled" (dropped)
+            // Return error to trigger backpressure - caller will pause reads
+            // This prevents frame loss for loss-intolerant protocols
+            return Err(QUEUE_FULL_ERROR);
         }
 
-        // Log warnings at various thresholds (before incrementing)
-        if current_queue_size > 7500 {
-            // 75% of max capacity
-            warn!(
-                "EventDrivenSender queue critically high: {}/10000 frames ({:.1}% full) - approaching data loss",
-                current_queue_size,
-                (current_queue_size as f64 / 10000.0) * 100.0
+        // Queue monitoring: Track sustained high queue pressure for alerts (lock-free)
+        const HIGH_QUEUE_THRESHOLD: usize = 7500; // 75% of max capacity
+        const SUSTAINED_PRESSURE_DURATION: Duration = Duration::from_secs(30);
+
+        if current_queue_size > HIGH_QUEUE_THRESHOLD {
+            // Track when queue first exceeded threshold (lock-free compare-and-swap)
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+
+            // Only set if currently 0 (None) - lock-free initialization
+            let _ = self.high_queue_start_ns.compare_exchange(
+                0,
+                now_ns,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             );
-        } else if current_queue_size > 5000 && current_queue_size.is_multiple_of(500) {
-            // Log every 500 frames after 50%
-            if unlikely!(crate::logger::is_verbose_logging()) {
+
+            // Check if sustained pressure for alert threshold (lock-free read)
+            let start_ns = self.high_queue_start_ns.load(Ordering::Acquire);
+            if start_ns != 0 {
+                let elapsed = Duration::from_nanos(now_ns.saturating_sub(start_ns));
+                if elapsed >= SUSTAINED_PRESSURE_DURATION {
+                    warn!(
+                        "Sustained queue pressure detected: {}/10000 frames ({:.1}% full) for {:?} - network may be degraded",
+                        current_queue_size,
+                        (current_queue_size as f64 / 10000.0) * 100.0,
+                        elapsed
+                    );
+                    // Record metrics for sustained pressure (non-blocking)
+                    // Note: conversation_id not available here, will be tracked at channel level
+                }
+            }
+
+            // Log warning at 75% threshold
+            // Re-check queue size to avoid stale warnings if it dropped during processing
+            let final_queue_size = self.queue_size.load(Ordering::Acquire);
+            if final_queue_size > HIGH_QUEUE_THRESHOLD {
+                warn!(
+                    "EventDrivenSender queue critically high: {}/10000 frames ({:.1}% full) - backpressure active",
+                    final_queue_size,
+                    (final_queue_size as f64 / 10000.0) * 100.0
+                );
+            }
+        } else {
+            // Queue below threshold - reset tracking (lock-free)
+            self.high_queue_start_ns.store(0, Ordering::Release); // 0 = None
+
+            // Log at 50% threshold (every 500 frames for monitoring)
+            if current_queue_size > 5000
+                && current_queue_size.is_multiple_of(500)
+                && unlikely!(crate::logger::is_verbose_logging())
+            {
                 debug!(
                     "EventDrivenSender queue growing: {}/10000 frames ({:.1}% full)",
                     current_queue_size,
@@ -630,7 +761,18 @@ impl EventDrivenSender {
         // This ensures counter never exceeds actual queue size
         self.queue_size.fetch_add(1, Ordering::Release);
 
+        // Reset retry state on successful queue (frame will be sent when buffer drains)
+        self.retry_state.reset();
+
         Ok(()) // Queued successfully - no blocking!
+    }
+
+    /// Get retry statistics for monitoring (lock-free)
+    #[allow(dead_code)] // Reserved for future metrics API
+    pub fn get_retry_stats(&self) -> (usize, Option<Duration>) {
+        let attempts = self.retry_state.get_attempts();
+        let last_retry = self.retry_state.get_last_retry_elapsed();
+        (attempts, last_retry)
     }
 
     /// Get queue depth for monitoring (lock-free)
@@ -651,5 +793,29 @@ impl EventDrivenSender {
     /// Get the configured threshold for monitoring
     pub fn get_threshold(&self) -> u64 {
         self.threshold
+    }
+
+    /// Get count of frames that were blocked (queue full) - for metrics
+    #[allow(dead_code)] // Reserved for future metrics API
+    pub fn get_frames_blocked(&self) -> usize {
+        self.frames_blocked.load(Ordering::Acquire)
+    }
+
+    /// Check if queue has been high for sustained period (for alerts) - lock-free
+    #[allow(dead_code)] // Reserved for future metrics API
+    pub fn has_sustained_pressure(&self) -> bool {
+        let start_ns = self.high_queue_start_ns.load(Ordering::Acquire);
+        if start_ns == 0 {
+            return false;
+        }
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if now_ns >= start_ns {
+            Duration::from_nanos(now_ns - start_ns) >= Duration::from_secs(30)
+        } else {
+            false // Clock went backwards
+        }
     }
 }

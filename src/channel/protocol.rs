@@ -490,14 +490,73 @@ impl Channel {
             return Ok(());
         }
 
-        if self.conns.contains_key(&target_connection_no) {
-            debug!("Endpoint Connection {} already exists or is being processed. Sending ConnectionOpened. (channel_id: {})", target_connection_no, self.channel_id);
-            self.send_control_message(
-                ControlMessage::ConnectionOpened,
-                &target_connection_no.to_be_bytes(),
-            )
-            .await?;
-            return Ok(());
+        // Check if connection exists AND is in active state (prevents conn_no reuse race)
+        // NOTE: SOCKS5 protocol is not currently used and is not a focus of this project.
+        // The following check prevents a race condition where conn_no could be reused during
+        // the 600ms-2.7s cleanup window, which is primarily an issue for SOCKS5 proxy workloads.
+        //
+        // Memory ordering: Uses Acquire to pair with Release stores in handle_connection_close()
+        // and internal_handle_connection_close(). This ensures we see the CLOSING/CLOSED state
+        // after it's been set, preventing conn_no reuse during cleanup.
+        let conn_state = self
+            .conns
+            .get(&target_connection_no)
+            .map(|conn_ref| conn_ref.state.load(std::sync::atomic::Ordering::Acquire));
+
+        if let Some(state) = conn_state {
+            match state {
+                crate::models::CONN_STATE_ACTIVE => {
+                    // Connection is genuinely active - duplicate request
+                    debug!(
+                        "Active connection {} already exists. Sending ConnectionOpened. (channel_id: {})",
+                        target_connection_no, self.channel_id
+                    );
+                    self.send_control_message(
+                        ControlMessage::ConnectionOpened,
+                        &target_connection_no.to_be_bytes(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                crate::models::CONN_STATE_CLOSING | crate::models::CONN_STATE_CLOSED => {
+                    // Connection is in cleanup - reject reuse
+                    let error_str = format!(
+                        "Connection {} is closing (state: {}), cannot reuse conn_no during cleanup window",
+                        target_connection_no, state
+                    );
+                    error!(
+                        "Rejected conn_no reuse during cleanup (channel_id: {}, conn_no: {}, state: {})",
+                        self.channel_id, target_connection_no, state
+                    );
+
+                    // Send CloseConnection with ConnectionFailed reason
+                    let mut buffer = self.buffer_pool.acquire();
+                    buffer.clear();
+                    buffer.put_u32(target_connection_no);
+                    buffer.put_u8(CloseConnectionReason::ConnectionFailed as u8);
+                    let error_bytes = error_str.as_bytes();
+                    let error_len = error_bytes.len().min(1024) as u16;
+                    buffer.put_u16(error_len);
+                    buffer.extend_from_slice(&error_bytes[..error_len as usize]);
+
+                    if let Err(e) = self
+                        .send_control_message(ControlMessage::CloseConnection, &buffer)
+                        .await
+                    {
+                        error!("Failed to send CloseConnection for reuse rejection: {}", e);
+                    }
+                    self.buffer_pool.release(buffer);
+                    return Ok(());
+                }
+                _ => {
+                    warn!(
+                        "Unknown connection state: {} (channel_id: {}, conn_no: {})",
+                        state, self.channel_id, target_connection_no
+                    );
+                    // Treat as closing to be safe
+                    return Ok(());
+                }
+            }
         }
 
         // --- Actual Connection Opening Logic ---

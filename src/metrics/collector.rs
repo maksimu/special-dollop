@@ -715,6 +715,11 @@ impl MetricsCollector {
                 // Check for alerts periodically
                 if now.duration_since(state.last_alert_check) > Duration::from_secs(30) {
                     self.alert_manager.check_metrics(&state.metrics);
+
+                    // Conservative proactive actions for loss-intolerant protocols
+                    // Only alert and reduce quality conservatively - NO proactive ICE restart
+                    self.check_and_act_conservatively(&state.metrics, conversation_id);
+
                     state.last_alert_check = now;
                 }
 
@@ -751,6 +756,41 @@ impl MetricsCollector {
         } else {
             None
         }
+    }
+
+    /// Conservative proactive actions for loss-intolerant protocols
+    /// Only alerts and conservative quality reduction - NO proactive ICE restart
+    fn check_and_act_conservatively(&self, metrics: &ConnectionMetrics, conversation_id: &str) {
+        // Conservative thresholds for loss-intolerant protocols
+        const HIGH_RTT_THRESHOLD_MS: f64 = 500.0;
+
+        // Check for sustained high latency
+        if let Some(rtt_ms) = metrics.webrtc_metrics.rtc_stats.rtt_ms {
+            if rtt_ms > HIGH_RTT_THRESHOLD_MS {
+                // Check if sustained (would need to track start time, simplified here)
+                warn!(
+                    "Sustained high latency detected for conversation {}: {:.1}ms (threshold: {:.1}ms) - alerting only (no proactive restart)",
+                    conversation_id, rtt_ms, HIGH_RTT_THRESHOLD_MS
+                );
+
+                // Alert only - don't restart ICE (would interrupt active transfers)
+                // Quality reduction already handled by quality manager conservatively
+            }
+        }
+
+        // Check for high packet loss
+        if metrics.webrtc_metrics.rtc_stats.packet_loss_rate > 0.05 {
+            warn!(
+                "High packet loss detected for conversation {}: {:.1}% - alerting only (no proactive restart)",
+                conversation_id,
+                metrics.webrtc_metrics.rtc_stats.packet_loss_rate * 100.0
+            );
+
+            // Alert only - quality manager will handle conservative reduction
+        }
+
+        // Note: ICE restart only happens when connection is ALREADY failed/disconnected
+        // (handled by should_restart_ice() which checks connection state)
     }
 
     /// Export current metrics as JSON

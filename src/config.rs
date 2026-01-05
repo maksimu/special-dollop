@@ -170,6 +170,58 @@ pub fn peer_connection_close_timeout() -> Duration {
     )
 }
 
+/// Timeout for waiting for channel.run() tasks to complete during tube close.
+///
+/// **Default**: 2 seconds
+///
+/// **Rationale**: After signaling channels to shut down, we must wait for channel.run() tasks
+/// to exit gracefully and release their buffers. Channel tasks check shutdown notification
+/// every 500ms (READ_CANCELLATION_CHECK_INTERVAL), so 2s provides 4 check cycles.
+/// This prevents memory leaks when connections are created/closed rapidly.
+///
+/// **Tuning**:
+/// - Fast networks: 1-1.5s (faster cleanup)
+/// - Slow networks or high load: 3-4s (more buffer release time)
+///
+/// **Env**: `KEEPER_GATEWAY_CHANNEL_TASK_COMPLETION_TIMEOUT_SECS`
+pub fn channel_task_completion_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("KEEPER_GATEWAY_CHANNEL_TASK_COMPLETION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+    )
+}
+
+/// Timeout for waiting for spawned tasks (e.g., channel handler monitors) to complete during tube close.
+///
+/// **Default**: 2 seconds
+///
+/// **Rationale**: After closing channels, we wait for spawned monitor tasks to complete and signal
+/// via completion channel. These tasks should complete quickly (<500ms) once channels are closed.
+/// However, in production with slow networks or high load, they may take longer. The early exit
+/// logic (200ms after last message) handles fast cases, while this timeout handles edge cases.
+///
+/// **Impact if timeout expires**:
+/// - Non-critical: Tasks continue in background, no resources leaked
+/// - Warning logged for monitoring/debugging
+/// - Tube close continues normally
+///
+/// **Tuning**:
+/// - Normal operation: 2s (balanced - fast enough for tests, safe for production)
+/// - Fast cleanup needed: 1s (may see more warnings in production)
+/// - Debugging slow tasks: 3-5s (more time for investigation)
+///
+/// **Env**: `KEEPER_GATEWAY_SPAWNED_TASK_COMPLETION_TIMEOUT_SECS`
+pub fn spawned_task_completion_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("KEEPER_GATEWAY_SPAWNED_TASK_COMPLETION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+    )
+}
+
 /// Delay between disconnect message and EOF in Drop cleanup.
 ///
 /// **Default**: 100ms

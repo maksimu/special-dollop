@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2021"
 description = "Keeper PAM WebRTC for Python - A secure, stable, and high-performance Tube API for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations."
 license = "MIT"
@@ -20,7 +20,7 @@ disable_hot_path_logging = []   # Nuclear option: completely remove hot path log
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.100"
-arc-swap = "1.7.1"
+arc-swap = "1.8.0"
 base64 = "0.22.1"
 bitflags = "2.9"
 bytes = "1.11.0"
@@ -41,16 +41,16 @@ parking_lot = "0.12"
 pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py37"], optional = true }
 pyo3-log = { version = "0.13.2", optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-rustls = { version = "0.23.35", features = ["ring"], default-features = false }
+rustls = { version = "0.23.36", features = ["ring"], default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0.148"
 sha2 = "0.10.9"
 smallvec = "1.15.1"
 socket2 = "0.6.1"
 thiserror = "2.0.17"
-tokio = { version = "1.47.1", features = ["full", "rt-multi-thread"] }
-tokio-util = "0.7.17"
-tracing = { version = "0.1.41" }
+tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7.18"
+tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter", "json", "tracing-log"] }
 uuid = { version = "1.19", features = ["v4"] }
 webrtc = "0.14.0"

@@ -352,8 +352,8 @@ pub async fn setup_outbound_task(
                                 }
                             }
                             Err(e) => {
-                                if !e.to_string().contains("DataChannel is not opened")
-                                    && !e.to_string().contains("Channel is closing")
+                                if !e.contains("DataChannel is not opened")
+                                    && !e.contains("Channel is closing")
                                 {
                                     error!(
                                         "Fragment send failed (channel_id: {}, conn_no: {}, fragment: {}, error: {})",
@@ -926,11 +926,6 @@ pub async fn setup_outbound_task(
                                             break;
                                         }
                                         OpcodeAction::ServerSync => {
-                                            // GUACD KEEPALIVE AUTO-RESPONSE
-                                            // Guacd sends sync every ~5s as keepalive ping, client must respond within 15s
-                                            // When browser is backgrounded (throttled to 1 FPS), response is delayed 10-16s → timeout
-                                            // We intercept and respond immediately to prevent false "User is not responding" disconnects
-
                                             // Flush batch buffer BEFORE handling sync**
                                             // Bug (commit 196ba77): sync handler would continue without flushing batch,
                                             // causing keystroke echoes to wait ~1 second for next read/sync
@@ -1397,6 +1392,15 @@ pub async fn setup_outbound_task(
         }
     });
 
+    // Get next generation for this conn_no - prevents reuse race during cleanup (600ms-2.7s)
+    // Use Relaxed ordering since generation is per-conn_no and doesn't need synchronization
+    // with other conn_no values
+    let generation = channel
+        .conn_generations
+        .entry(conn_no)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+
     // Create connection struct with our pre-created backend task and data_tx channel
     // Note: outbound_handle is the to_webrtc task (guacd→client)
     let conn = Conn {
@@ -1404,6 +1408,10 @@ pub async fn setup_outbound_task(
         backend_task: Some(backend_task), // Task that writes client data to guacd
         to_webrtc: Some(outbound_handle), // Task that reads guacd data and sends to client
         cancel_read_task, // Cancellation token for immediate exit on WebRTC closure
+        generation, // Increments on each conn_no reuse
+        state: Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::models::CONN_STATE_ACTIVE,
+        )),
     };
 
     channel.conns.insert(conn_no, conn);

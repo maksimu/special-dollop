@@ -94,7 +94,7 @@ pub enum OpcodeAction {
     CloseConnection,
     /// Special instruction needing custom processing
     ProcessSpecial(SpecialOpcode),
-    /// Server sync keepalive - auto-respond immediately to prevent timeout when browser throttled
+    /// Server sync keepalive - forward to client who must respond within 15s per protocol
     ServerSync,
 }
 
@@ -691,7 +691,7 @@ impl GuacdParser {
         } else if opcode_str == SIZE_OPCODE {
             OpcodeAction::ProcessSpecial(SpecialOpcode::Size)
         } else if opcode_str == "sync" {
-            // Server sync keepalive - needs immediate response to prevent 15s timeout
+            // Server sync keepalive - forward to client for protocol-required response
             OpcodeAction::ServerSync
         } else if opcode_str == DISCONNECT_OPCODE {
             // Disconnect instruction from guacd - connection closing cleanly

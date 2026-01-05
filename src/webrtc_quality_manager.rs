@@ -965,15 +965,40 @@ impl AdaptiveQualityManager {
             *metrics
         };
 
-        // Check if quality is below target
-        if current_metrics.quality_score < self.config.target_quality_score {
-            warn!(
-                "Quality below target for tube {}: {} < {}",
-                self.tube_id, current_metrics.quality_score, self.config.target_quality_score
-            );
+        // Conservative quality thresholds for loss-intolerant protocols
+        // Only reduce quality when significantly degraded (not proactive)
+        const CONSERVATIVE_QUALITY_THRESHOLD: u8 = 50; // Lower threshold (was 80)
+        const CONSERVATIVE_PACKET_LOSS_THRESHOLD: f64 = 0.05; // 5% packet loss
+        const CONSERVATIVE_RTT_THRESHOLD_MS: f64 = 500.0; // 500ms RTT
 
-            // Trigger quality improvement actions
-            self.trigger_quality_improvement(&current_metrics).await?;
+        // Check if quality is significantly below target
+        if current_metrics.quality_score < CONSERVATIVE_QUALITY_THRESHOLD {
+            // Only act if packet loss or RTT is high (not just low quality score)
+            let should_reduce = current_metrics.packet_loss_rate
+                > CONSERVATIVE_PACKET_LOSS_THRESHOLD
+                || current_metrics.rtt_ms > CONSERVATIVE_RTT_THRESHOLD_MS;
+
+            if should_reduce {
+                warn!(
+                    "Quality significantly degraded for tube {}: score={}, packet_loss={:.1}%, rtt={:.1}ms - applying conservative reduction",
+                    self.tube_id,
+                    current_metrics.quality_score,
+                    current_metrics.packet_loss_rate * 100.0,
+                    current_metrics.rtt_ms
+                );
+
+                // Trigger conservative quality improvement (10-15% reduction max)
+                self.trigger_quality_improvement(&current_metrics).await?;
+            } else {
+                // Quality low but metrics OK - just log, don't reduce
+                debug!(
+                    "Quality score low but metrics OK for tube {}: score={}, packet_loss={:.1}%, rtt={:.1}ms - monitoring",
+                    self.tube_id,
+                    current_metrics.quality_score,
+                    current_metrics.packet_loss_rate * 100.0,
+                    current_metrics.rtt_ms
+                );
+            }
         }
 
         Ok(())
@@ -985,24 +1010,74 @@ impl AdaptiveQualityManager {
     ) -> WebRTCResult<()> {
         match metrics.congestion_level {
             CongestionLevel::High | CongestionLevel::Severe => {
-                // Reduce bitrate aggressively
-                let current_bitrate = self.bitrate_controller.get_current_bitrate_bps();
-                let reduced_bitrate = (current_bitrate as f64 * 0.7) as u64;
+                // Conservative reduction for loss-intolerant protocols (RDP/SSH/SFTP)
+                // Only reduce 15-20% max to keep bulk transfers viable
+                // Use compare_exchange loop to avoid TOCTOU race conditions
+                let mut observed_bitrate = self
+                    .bitrate_controller
+                    .current_bitrate_bps
+                    .load(Ordering::Relaxed);
+                let (current_bitrate, reduced_bitrate) = loop {
+                    let candidate_reduced =
+                        (observed_bitrate as f64 * 0.85) // 15% reduction
+                            .max(self.config.min_bitrate_bps as f64) as u64;
+                    match self
+                        .bitrate_controller
+                        .current_bitrate_bps
+                        .compare_exchange(
+                            observed_bitrate,
+                            candidate_reduced,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                        Ok(_) => break (observed_bitrate, candidate_reduced),
+                        Err(actual) => {
+                            // Another thread updated the bitrate; retry with the new value
+                            observed_bitrate = actual;
+                        }
+                    }
+                };
 
                 info!(
-                    "Triggering quality improvement for tube {}: reducing bitrate {} -> {} bps",
+                    "Triggering conservative quality improvement for tube {}: reducing bitrate {} -> {} bps (15% reduction, preserves bulk transfers)",
                     self.tube_id, current_bitrate, reduced_bitrate
                 );
             }
             CongestionLevel::Moderate => {
-                // Moderate reduction
+                // Very gentle reduction (10% max)
+                // Use compare_exchange loop to avoid TOCTOU race conditions
+                let mut observed_bitrate = self
+                    .bitrate_controller
+                    .current_bitrate_bps
+                    .load(Ordering::Relaxed);
+                let (current_bitrate, reduced_bitrate) = loop {
+                    let candidate_reduced =
+                        (observed_bitrate as f64 * 0.9) // 10% reduction
+                            .max(self.config.min_bitrate_bps as f64) as u64;
+                    match self
+                        .bitrate_controller
+                        .current_bitrate_bps
+                        .compare_exchange(
+                            observed_bitrate,
+                            candidate_reduced,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                        Ok(_) => break (observed_bitrate, candidate_reduced),
+                        Err(actual) => {
+                            // Another thread updated the bitrate; retry with the new value
+                            observed_bitrate = actual;
+                        }
+                    }
+                };
+
                 info!(
-                    "Moderate congestion detected for tube {}, applying gentle bitrate reduction",
-                    self.tube_id
+                    "Moderate congestion detected for tube {}, applying gentle bitrate reduction (10%): {} -> {} bps",
+                    self.tube_id, current_bitrate, reduced_bitrate
                 );
             }
             CongestionLevel::Low => {
-                // Quality issues might be due to other factors
+                // Quality issues might be due to other factors - just log
                 debug!(
                     "Quality issues without congestion for tube {}, investigating",
                     self.tube_id
@@ -1011,6 +1086,42 @@ impl AdaptiveQualityManager {
         }
 
         Ok(())
+    }
+
+    /// Conservative quality reduction - preserves bulk transfers
+    /// Reduces bitrate by 10-20% max, never below minimum
+    pub fn reduce_quality_conservatively(&self) {
+        // Use compare_exchange loop to avoid TOCTOU race conditions
+        let mut observed_bitrate = self
+            .bitrate_controller
+            .current_bitrate_bps
+            .load(Ordering::Relaxed);
+        let (current_bitrate, reduced_bitrate) = loop {
+            let candidate_reduced = (observed_bitrate as f64 * 0.85) // 15% reduction
+                .max(self.config.min_bitrate_bps as f64) as u64;
+            match self
+                .bitrate_controller
+                .current_bitrate_bps
+                .compare_exchange(
+                    observed_bitrate,
+                    candidate_reduced,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                Ok(_) => break (observed_bitrate, candidate_reduced),
+                Err(actual) => {
+                    // Another thread updated the bitrate; retry with the new value
+                    observed_bitrate = actual;
+                }
+            }
+        };
+
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Conservative quality reduction for tube {}: {} -> {} bps (preserves bulk transfers)",
+                self.tube_id, current_bitrate, reduced_bitrate
+            );
+        }
     }
 
     /// Get current quality metrics

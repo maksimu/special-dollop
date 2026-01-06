@@ -27,7 +27,7 @@ handlers-cef = ["guacr", "guacr/rbi-cef"]
 # rbi-chrome: requires Chrome/Chromium installed on system at runtime (no audio)
 # rbi-cef: requires CEF binaries at build time (has audio support)
 guacr = { git = "https://github.com/Keeper-Security/pam-guacr.git", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"], optional = true }
-# For local development:
+# For local development (rdp removed due to sspi dependency conflict):
 #guacr = { path = "../pam-guacr/crates/guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"], optional = true }
 
 # Core async

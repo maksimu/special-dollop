@@ -375,6 +375,18 @@ For deep dives into specific subsystems, see:
 5. **Performance check**: If touching hot paths, benchmark before/after
 6. **Verify no zombies**: Check that RAII cleanup still works correctly
 
+## Git Workflow Rules
+
+**CRITICAL**: Never commit code automatically. Always let the user review changes and commit manually.
+
+- ❌ **NEVER** run `git commit` commands
+- ❌ **NEVER** run `git add` commands
+- ❌ **NEVER** run `git push` commands
+- ✅ Make code changes using edit tools
+- ✅ Let user review with `git diff`
+- ✅ Let user decide when to commit
+- ✅ Let user write commit messages
+
 ## Understanding the "Always Fast" Philosophy
 
 This project follows an **"always fast"** design:

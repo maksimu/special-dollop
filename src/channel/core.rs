@@ -17,14 +17,15 @@ use bytes::Bytes;
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::task::{AbortHandle, JoinHandle};
 // Add this
 
 // Import from sibling modules
@@ -143,6 +144,14 @@ pub struct Channel {
     pub(crate) local_client_server_conn_rx:
         Option<mpsc::Receiver<(u32, OwnedWriteHalf, JoinHandle<()>)>>,
 
+    // Task tracking for proper resource management (not just RAII safety net)
+    /// Track server connection handler tasks for explicit cancellation on shutdown
+    pub(crate) server_connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    /// Track state monitoring tasks for explicit cancellation
+    pub(crate) state_monitoring_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    /// Track delayed cleanup tasks for explicit cancellation
+    pub(crate) cleanup_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+
     // Protocol handling integrated into Channel
     pub(crate) active_protocol: ActiveProtocol,
     pub(crate) protocol_state: ProtocolLogicState,
@@ -151,11 +160,11 @@ pub struct Channel {
     pub(crate) guacd_host: Option<String>,
     pub(crate) guacd_port: Option<u16>,
     pub(crate) connect_as_settings: ConnectAsSettings,
-    pub(crate) guacd_params: Arc<Mutex<HashMap<String, String>>>, // Kept for now for minimal diff
+    pub(crate) guacd_params: Arc<AsyncMutex<HashMap<String, String>>>, // Kept for now for minimal diff
     // Database proxy settings (for DatabaseProxy protocol)
     pub(crate) proxy_host: Option<String>,
     pub(crate) proxy_port: Option<u16>,
-    pub(crate) db_params: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) db_params: Arc<AsyncMutex<HashMap<String, String>>>,
 
     // Protocol handler registry and conversation type (for built-in handlers)
     #[cfg(feature = "handlers")]
@@ -165,22 +174,21 @@ pub struct Channel {
 
     // Handler senders for forwarding inbound messages to protocol handlers
     #[cfg(feature = "handlers")]
-    pub(crate) handler_senders:
-        Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+    pub(crate) handler_senders: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
     // Timestamp for the last channel-level ping sent (conn_no=0)
-    pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
+    pub(crate) channel_ping_sent_time: AsyncMutex<Option<u64>>,
 
     // For signaling connection task closures to the main Channel run loop
     pub(crate) conn_closed_tx: mpsc::UnboundedSender<(u32, String)>, // (conn_no, channel_id)
     conn_closed_rx: Option<mpsc::UnboundedReceiver<(u32, String)>>,
     // Stores the conn_no of the primary Guacd data connection
-    pub(crate) primary_guacd_conn_no: Arc<Mutex<Option<u32>>>,
+    pub(crate) primary_guacd_conn_no: Arc<AsyncMutex<Option<u32>>>,
 
     // Store the close reason when control connection closes
-    pub(crate) channel_close_reason: Arc<Mutex<Option<CloseConnectionReason>>>,
+    pub(crate) channel_close_reason: Arc<AsyncMutex<Option<CloseConnectionReason>>>,
     // Callback token for router communication
     pub(crate) callback_token: Option<String>,
     // KSM config for router communication
@@ -662,30 +670,36 @@ impl Channel {
             local_client_server_task: None,
             local_client_server_conn_tx: Some(server_conn_tx),
             local_client_server_conn_rx: Some(server_conn_rx),
+
+            // Initialize task tracking for proper resource management
+            server_connection_tasks: Arc::new(Mutex::new(Vec::new())),
+            state_monitoring_tasks: Arc::new(Mutex::new(Vec::new())),
+            cleanup_tasks: Arc::new(Mutex::new(Vec::new())),
+
             active_protocol: determined_protocol,
             protocol_state: initial_protocol_state,
 
             guacd_host: guacd_host_setting,
             guacd_port: guacd_port_setting,
             connect_as_settings: final_connect_as_settings,
-            guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
+            guacd_params: Arc::new(AsyncMutex::new(temp_initial_guacd_params_map)),
             proxy_host: proxy_host_setting,
             proxy_port: proxy_port_setting,
-            db_params: Arc::new(Mutex::new(temp_db_params_map)),
+            db_params: Arc::new(AsyncMutex::new(temp_db_params_map)),
 
             #[cfg(feature = "handlers")]
             handler_registry,
             conversation_type: stored_conversation_type,
 
             #[cfg(feature = "handlers")]
-            handler_senders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            handler_senders: Arc::new(DashMap::new()),
 
             buffer_pool,
-            channel_ping_sent_time: Mutex::new(None),
+            channel_ping_sent_time: AsyncMutex::new(None),
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
-            primary_guacd_conn_no: Arc::new(Mutex::new(None)),
-            channel_close_reason: Arc::new(Mutex::new(None)),
+            primary_guacd_conn_no: Arc::new(AsyncMutex::new(None)),
+            channel_close_reason: Arc::new(AsyncMutex::new(None)),
             callback_token,
             ksm_config,
             client_version,
@@ -1043,10 +1057,11 @@ impl Channel {
         // they only exist in handler_senders. Dropping their senders signals them to exit.
         #[cfg(feature = "handlers")]
         {
-            let handler_conn_nos: Vec<u32> = {
-                let senders = self.handler_senders.read().await;
-                senders.keys().copied().collect()
-            };
+            let handler_conn_nos: Vec<u32> = self
+                .handler_senders
+                .iter()
+                .map(|entry| *entry.key())
+                .collect();
 
             if !handler_conn_nos.is_empty() {
                 debug!(
@@ -1058,13 +1073,7 @@ impl Channel {
                 for conn_no in handler_conn_nos {
                     // Remove the sender to signal the handler to stop
                     // The handler's from_client.recv() will return None
-                    if self
-                        .handler_senders
-                        .write()
-                        .await
-                        .remove(&conn_no)
-                        .is_some()
-                    {
+                    if self.handler_senders.remove(&conn_no).is_some() {
                         debug!(
                             "Signaled handler to stop (channel_id: {}, conn_no: {})",
                             self.channel_id, conn_no
@@ -1272,27 +1281,42 @@ impl Channel {
             // Schedule delayed cleanup
             let conns_arc = Arc::clone(&self.conns);
             let channel_id_clone = self.channel_id.clone();
+            let cleanup_tasks = self.cleanup_tasks.clone();
+            let shutdown_notify = self.shutdown_notify.clone();
 
-            // Spawn a task to remove the connection after a grace period
-            tokio::spawn(async move {
-                // Wait a bit to allow in-flight messages to be processed
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Proper resource handling: Store AbortHandle and make cancellable
+            let handle = tokio::spawn(async move {
+                // Wait with cancellation support
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        debug!(
+                            "Grace period elapsed, removing connection from maps (channel_id: {})",
+                            channel_id_clone
+                        );
 
-                debug!(
-                    "Grace period elapsed, removing connection from maps (channel_id: {})",
-                    channel_id_clone
-                );
-
-                // Now remove from maps
-                if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
-                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
-                    conn.graceful_shutdown(conn_no, &channel_id_clone).await;
-                    debug!(
-                        "Connection {} removed with graceful TCP shutdown (channel_id: {})",
-                        conn_no, channel_id_clone
-                    );
+                        // Now remove from maps
+                        if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
+                            // Gracefully shutdown to ensure TCP cleanup completes
+                            conn.graceful_shutdown(conn_no, &channel_id_clone).await;
+                            debug!(
+                                "Connection {} removed with graceful TCP shutdown (channel_id: {})",
+                                conn_no, channel_id_clone
+                            );
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        // Channel shutting down, cancel delayed cleanup
+                        debug!(
+                            "Cleanup cancelled due to channel shutdown (channel_id: {}, conn_no: {})",
+                            channel_id_clone, conn_no
+                        );
+                    }
                 }
             });
+
+            // Store abort handle for explicit lifecycle management
+            let abort_handle = handle.abort_handle();
+            cleanup_tasks.lock().push(abort_handle);
         }
 
         if conn_no == 0 {
@@ -1549,27 +1573,42 @@ impl Channel {
             // Schedule delayed cleanup
             let conns_arc = Arc::clone(&self.conns);
             let channel_id_clone = self.channel_id.clone();
+            let cleanup_tasks = self.cleanup_tasks.clone();
+            let shutdown_notify = self.shutdown_notify.clone();
 
-            // Spawn a task to remove the connection after a grace period
-            tokio::spawn(async move {
-                // Wait a bit to allow in-flight messages to be processed
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Proper resource handling: Store AbortHandle and make cancellable
+            let handle = tokio::spawn(async move {
+                // Wait with cancellation support
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        debug!(
+                            "Grace period elapsed, removing connection from maps (channel_id: {})",
+                            channel_id_clone
+                        );
 
-                debug!(
-                    "Grace period elapsed, removing connection from maps (channel_id: {})",
-                    channel_id_clone
-                );
-
-                // Now remove from maps
-                if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
-                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
-                    conn.graceful_shutdown(conn_no, &channel_id_clone).await;
-                    debug!(
-                        "Connection {} removed with graceful TCP shutdown (channel_id: {})",
-                        conn_no, channel_id_clone
-                    );
+                        // Now remove from maps
+                        if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
+                            // Gracefully shutdown to ensure TCP cleanup completes
+                            conn.graceful_shutdown(conn_no, &channel_id_clone).await;
+                            debug!(
+                                "Connection {} removed with graceful TCP shutdown (channel_id: {})",
+                                conn_no, channel_id_clone
+                            );
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        // Channel shutting down, cancel delayed cleanup
+                        debug!(
+                            "Cleanup cancelled due to channel shutdown (channel_id: {}, conn_no: {})",
+                            channel_id_clone, conn_no
+                        );
+                    }
                 }
             });
+
+            // Store abort handle for explicit lifecycle management
+            let abort_handle = handle.abort_handle();
+            cleanup_tasks.lock().push(abort_handle);
         }
 
         if conn_no == 0 {
@@ -1642,13 +1681,7 @@ impl Channel {
         // for messages that will never come after WebRTC closes.
         #[cfg(feature = "handlers")]
         {
-            if self
-                .handler_senders
-                .write()
-                .await
-                .remove(&conn_no)
-                .is_some()
-            {
+            if self.handler_senders.remove(&conn_no).is_some() {
                 debug!(
                     "Removed handler sender for conn {} to signal handler shutdown (channel_id: {})",
                     conn_no, self.channel_id
@@ -1731,6 +1764,29 @@ impl Drop for Channel {
     fn drop(&mut self) {
         self.should_exit
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Proper resource handling: Abort all tracked tasks explicitly
+        // This provides graceful shutdown instead of relying solely on RAII safety net
+        // Using parking_lot::Mutex::lock() which blocks but never poisons
+        let mut tasks = self.server_connection_tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+        drop(tasks);
+
+        let mut tasks = self.state_monitoring_tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+        drop(tasks);
+
+        let mut tasks = self.cleanup_tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+        drop(tasks);
+
+        // Abort server task
         if let Some(task) = &self.local_client_server_task {
             task.abort();
         }

@@ -27,7 +27,7 @@ handlers-cef = ["guacr", "guacr/rbi-cef"]
 # rbi-chrome: requires Chrome/Chromium installed on system at runtime (no audio)
 # rbi-cef: requires CEF binaries at build time (has audio support)
 guacr = { git = "https://github.com/Keeper-Security/pam-guacr.git", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"], optional = true }
-# For local development, comment out the above and use (note: path is to crates/guacr within the workspace):
+# For local development:
 #guacr = { path = "../pam-guacr/crates/guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"], optional = true }
 
 # Core async
@@ -84,16 +84,6 @@ socket2 = "0.6.1"
 
 [dev-dependencies]
 ctor = "0.6.2"  # For test initialization (rustls crypto provider setup)
-
-# Patch for ironrdp - use miroberts fork with Update PDU workaround
-# Based on PR #1043 branch with additional Update PDU handling
-# See: https://github.com/miroberts/IronRDP/tree/feature/handle-update-pdu
-[patch.crates-io]
-ironrdp = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
-ironrdp-async = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
-ironrdp-tokio = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
-ironrdp-pdu = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
-ironrdp-session = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 
 [profile.release]
 opt-level = 3

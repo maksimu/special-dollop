@@ -34,9 +34,9 @@ pub fn create_handler_registry() -> Arc<ProtocolHandlerRegistry> {
     registry.register(guacr::database::OracleHandler::with_defaults());
     registry.register(guacr::database::MariaDbHandler::with_defaults());
 
-    // Additional handlers can be enabled via guacr features
-    // RDP, VNC, SFTP, Database, RBI handlers are available
-    // when guacr is built with those features enabled
+    // RBI (Remote Browser Isolation) - registers as "http" protocol
+    // Requires Chrome/Chromium to be installed at runtime
+    registry.register(guacr::rbi::RbiHandler::with_defaults());
 
     info!(
         "Protocol handler registry initialized with {} handlers",

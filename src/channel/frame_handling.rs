@@ -187,8 +187,12 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     // **HANDLER PATH**: Check if this connection is managed by a built-in protocol handler
     #[cfg(feature = "handlers")]
     {
-        // RwLock read is fast for concurrent access
-        if let Some(sender) = channel.handler_senders.read().await.get(&conn_no) {
+        // DashMap provides lock-free concurrent access
+        if let Some(sender_ref) = channel.handler_senders.get(&conn_no) {
+            // Clone sender and drop the DashMap reference before await
+            let sender = sender_ref.value().clone();
+            drop(sender_ref);
+
             // Forward to protocol handler instead of normal TCP connection
             if unlikely!(crate::logger::is_verbose_logging()) {
                 debug!(
@@ -205,8 +209,7 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
                         channel.channel_id, conn_no, e
                     );
                     // Remove dead sender
-                    drop(channel.handler_senders.read().await); // Drop read lock
-                    channel.handler_senders.write().await.remove(&conn_no);
+                    channel.handler_senders.remove(&conn_no);
                     return Err(anyhow!("Handler channel closed for connection {}", conn_no));
                 }
             }

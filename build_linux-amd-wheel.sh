@@ -38,7 +38,7 @@ if [ "$1" = "--handlers" ]; then
       -v "$PAM_GUACR_DIR":/pam-guacr \
       $CERT_MOUNT \
       $CERT_ENVS \
-      quay.io/pypa/manylinux2014_x86_64 bash -c '
+      quay.io/pypa/manylinux_2_28_x86_64 bash -c '
         set -e
         
         # Configure git SSL if certs available
@@ -46,9 +46,10 @@ if [ "$1" = "--handlers" ]; then
             git config --global http.sslCAInfo /tmp/combined_certs.pem
         fi
         
-        # Install OpenSSL development headers (required by openssl-sys crate)
+        # manylinux_2_28 is based on AlmaLinux 8 and has more packages available
+        # Install OpenSSL development headers (required by native-tls/openssl-sys)
         echo "Installing OpenSSL development packages..."
-        yum install -y openssl-devel perl-IPC-Cmd
+        dnf install -y openssl-devel
         
         # Install Rust
         echo "Installing Rust..."
@@ -74,9 +75,9 @@ EOF
         echo "Installing maturin..."
         /opt/python/cp311-cp311/bin/pip install "maturin>=1.8,<1.9"
         
-        # Build with handlers
+        # Build with handlers - use manylinux_2_28 for broader compatibility
         echo "Building wheel with handlers..."
-        cd /io && /opt/python/cp311-cp311/bin/maturin build --release --features handlers --manylinux 2014
+        cd /io && /opt/python/cp311-cp311/bin/maturin build --release --features handlers --manylinux 2_28
         
         echo "Build complete!"
         ls -la /io/target/wheels/

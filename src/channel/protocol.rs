@@ -49,6 +49,9 @@ impl Channel {
         let is_open_flag = webrtc.is_open.clone();
         let open_notify = webrtc.open_notify.clone();
 
+        // Clone task tracking for proper resource management
+        let state_tasks_for_open = self.state_monitoring_tasks.clone();
+
         data_channel.on_open(Box::new(move || {
             // Update the shared is_open flag and notify waiters
             // This ensures wait_for_channel_open() works even though we replaced the callback
@@ -57,7 +60,9 @@ impl Channel {
 
             let tx = state_tx_open.clone();
             let channel_id_log = channel_id_for_open.clone(); // Clone for async block
-            tokio::spawn(async move {
+
+            // Proper resource handling: Store AbortHandle for explicit lifecycle management
+            let handle = tokio::spawn(async move {
                 if let Err(e) = tx.send("Open".to_string()).await {
                     warn!(
                         "Failed to send open state notification (channel_id: {}, error: {})",
@@ -65,15 +70,24 @@ impl Channel {
                     );
                 }
             });
+
+            // Store abort handle synchronously - no race condition possible
+            let abort_handle = handle.abort_handle();
+            state_tasks_for_open.lock().push(abort_handle);
+
             Box::pin(async {})
         }));
 
         let state_tx_close = state_tx.clone();
         let channel_id_for_close = channel_id_base.clone(); // Clone for on_close
+        let state_tasks_for_close = self.state_monitoring_tasks.clone();
+
         data_channel.on_close(Box::new(move || {
             let tx = state_tx_close.clone();
             let channel_id_log = channel_id_for_close.clone(); // Clone for async block
-            tokio::spawn(async move {
+
+            // Proper resource handling: Store AbortHandle for explicit lifecycle management
+            let handle = tokio::spawn(async move {
                 if let Err(e) = tx.send("Closed".to_string()).await {
                     warn!(
                         "Failed to send close state notification (channel_id: {}, error: {})",
@@ -81,16 +95,25 @@ impl Channel {
                     );
                 }
             });
+
+            // Store abort handle synchronously - no race condition possible
+            let abort_handle = handle.abort_handle();
+            state_tasks_for_close.lock().push(abort_handle);
+
             Box::pin(async {})
         }));
 
         let state_tx_error = state_tx.clone();
         let channel_id_for_error = channel_id_base.clone(); // Clone for on_error
+        let state_tasks_for_error = self.state_monitoring_tasks.clone();
+
         data_channel.on_error(Box::new(move |err| {
             let tx = state_tx_error.clone();
             let err_str = format!("Error: {err}");
             let channel_id_log = channel_id_for_error.clone(); // Clone for async block
-            tokio::spawn(async move {
+
+            // Proper resource handling: Store AbortHandle for explicit lifecycle management
+            let handle = tokio::spawn(async move {
                 if let Err(e) = tx.send(err_str).await {
                     warn!(
                         "Failed to send error state notification (channel_id: {}, error: {})",
@@ -98,6 +121,11 @@ impl Channel {
                     );
                 }
             });
+
+            // Store abort handle synchronously - no race condition possible
+            let abort_handle = handle.abort_handle();
+            state_tasks_for_error.lock().push(abort_handle);
+
             Box::pin(async {})
         }));
 

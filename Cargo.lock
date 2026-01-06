@@ -8118,6 +8118,7 @@ checksum = "2959ca473aae96a14ecedf501d20b3608d2825ba280d5adb57d651721885b0c2"
 dependencies = [
  "zune-core 0.5.1",
 ]
+<<<<<<< HEAD
 
 [[patch.unused]]
 name = "ironrdp"
@@ -8143,3 +8144,5 @@ source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-u
 name = "ironrdp-tokio"
 version = "0.8.0"
 source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#7934f948822d2595e6fbe8b2e4242146de7e5a21"
+=======
+>>>>>>> 4ba2eec (Fix task tracking race conditions and optimize lock-free paths)

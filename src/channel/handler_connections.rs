@@ -371,11 +371,7 @@ pub async fn invoke_builtin_handler(
         let (webrtc_tx, from_client_rx) = mpsc::channel::<Bytes>(128);
 
         // Store sender so incoming frames can be forwarded to handler
-        channel
-            .handler_senders
-            .write()
-            .await
-            .insert(conn_no, webrtc_tx);
+        channel.handler_senders.insert(conn_no, webrtc_tx.clone());
 
         // Spawn handler task with event callback
         let protocol_for_task = protocol_name.clone();
@@ -407,7 +403,7 @@ pub async fn invoke_builtin_handler(
             }
 
             // Cleanup: Remove handler sender when task completes
-            handler_senders.write().await.remove(&conn_no);
+            handler_senders.remove(&conn_no);
 
             // Notify main Channel run loop that connection has closed
             // This triggers cleanup of backend connection and signals to WebRTC client
@@ -436,11 +432,7 @@ pub async fn invoke_builtin_handler(
     let (webrtc_tx, handler_from_webrtc) = mpsc::channel::<Bytes>(128);
 
     // Store sender so incoming frames can be forwarded to handler
-    channel
-        .handler_senders
-        .write()
-        .await
-        .insert(conn_no, webrtc_tx);
+    channel.handler_senders.insert(conn_no, webrtc_tx.clone());
 
     let protocol_for_handler = protocol_name.clone();
     let protocol_for_outbound = protocol_name.clone();
@@ -558,7 +550,7 @@ pub async fn invoke_builtin_handler(
         let _ = outbound_task.await;
 
         // Cleanup: Remove handler sender
-        handler_senders.write().await.remove(&conn_no);
+        handler_senders.remove(&conn_no);
 
         info!(
             "Channel-based handler session ended for protocol: {}",

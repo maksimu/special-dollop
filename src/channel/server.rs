@@ -92,6 +92,8 @@ impl Channel {
         let buffer_pool = self.buffer_pool.clone();
         let should_exit = self.should_exit.clone();
         let listener_clone = listener_arc;
+        // Clone task tracking for proper resource management
+        let server_connection_tasks = self.server_connection_tasks.clone();
 
         let server_task = tokio::spawn(async move {
             // Signal that we're ready to accept connections
@@ -190,7 +192,8 @@ impl Channel {
                                 let current_conn_no = next_conn_no;
                                 next_conn_no += 1;
 
-                                tokio::spawn(async move {
+                                // Proper resource handling: Store AbortHandle for explicit lifecycle management
+                                let handle = tokio::spawn(async move {
                                     if let Err(e) = socks5::handle_socks5_connection(
                                         stream,
                                         current_conn_no,
@@ -207,6 +210,10 @@ impl Channel {
                                         );
                                     }
                                 });
+
+                                // Store abort handle for explicit cancellation on shutdown
+                                let abort_handle = handle.abort_handle();
+                                server_connection_tasks.lock().push(abort_handle);
                             }
                             ActiveProtocol::PortForward
                             | ActiveProtocol::Guacd
@@ -219,7 +226,8 @@ impl Channel {
                                 let current_conn_no = next_conn_no;
                                 next_conn_no += 1;
 
-                                tokio::spawn(async move {
+                                // Proper resource handling: Store AbortHandle for explicit lifecycle management
+                                let handle = tokio::spawn(async move {
                                     if let Err(e) = handle_generic_server_connection(
                                         stream,
                                         current_conn_no,
@@ -234,6 +242,10 @@ impl Channel {
                                         error!("Channel({}): Generic server connection error for {:?}: {}", error_log_channel_id, active_protocol, e);
                                     }
                                 });
+
+                                // Store abort handle for explicit cancellation on shutdown
+                                let abort_handle = handle.abort_handle();
+                                server_connection_tasks.lock().push(abort_handle);
                             }
                             ActiveProtocol::PythonHandler => {
                                 // PythonHandler doesn't use the server mode for accepting connections

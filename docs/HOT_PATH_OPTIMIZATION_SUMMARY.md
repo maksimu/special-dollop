@@ -72,10 +72,6 @@ default = ["python"]
 python = ["pyo3", "pyo3-log"]          # Python bindings
 profiling = []                         # Performance monitoring instrumentation
 
-# **OPTIONAL LOGGING CONTROLS**
-production_debug = []                  # Enable debug logs in production
-disable_hot_path_logging = []          # Nuclear option: eliminate all hot path logging
-
 # **ALL OPTIMIZATIONS ALWAYS ENABLED:**
 # ✅ SIMD optimizations (auto-detected)
 # ✅ SIMD UTF-8 character counting (Guacamole protocol compliance)
@@ -93,12 +89,6 @@ disable_hot_path_logging = []          # Nuclear option: eliminate all hot path 
 ```bash
 # Standard build (all optimizations enabled by default)
 cargo build --release
-
-# Production with debug logging enabled
-cargo build --release --features production_debug
-
-# Maximum performance (disable hot path logging)
-cargo build --release --features disable_hot_path_logging
 
 # Development with profiling
 cargo build --features profiling

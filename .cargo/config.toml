@@ -1,0 +1,5 @@
+# Cargo configuration for git dependencies
+
+# Use git CLI for fetching (allows GITHUB_TOKEN to work in CI)
+[net]
+git-fetch-with-cli = true

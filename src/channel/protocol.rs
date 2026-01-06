@@ -558,9 +558,88 @@ impl Channel {
             }
         }
 
-        // --- Actual Connection Opening Logic ---
         let open_result = match self.active_protocol {
             super::types::ActiveProtocol::Guacd => {
+                // Check if we should use built-in handlers based on use_guacr parameter
+                #[cfg(feature = "handlers")]
+                {
+                    // Read use_guacr parameter from guacd_params
+                    let guacd_params = self.guacd_params.lock().await;
+                    let use_guacr = guacd_params
+                        .get("use_guacr")
+                        .and_then(|v| v.parse::<bool>().ok())
+                        .unwrap_or(false);
+                    drop(guacd_params); // Release lock
+
+                    error!(
+                        "DEBUG_HANDLER: use_guacr={}, registry={}, conv_type={:?}",
+                        use_guacr,
+                        self.handler_registry.is_some(),
+                        self.conversation_type
+                    );
+
+                    // Only use built-in handlers if use_guacr=true
+                    if use_guacr {
+                        if let (Some(registry), Some(conv_type)) =
+                            (&self.handler_registry, &self.conversation_type)
+                        {
+                            // Use built-in protocol handlers instead of external guacd
+                            error!(
+                                "DEBUG_HANDLER: INVOKING built-in handler for protocol: {:?}",
+                                conv_type
+                            );
+
+                            // Spawn handler and return result - will fall through to send ConnectionOpened
+                            return match super::handler_connections::invoke_builtin_handler(
+                                self,
+                                conv_type,
+                                registry,
+                                target_connection_no,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    debug!("Handler spawned successfully, sending ConnectionOpened (channel: {}, conn: {})",
+                                    self.channel_id, target_connection_no);
+                                    let mut payload = self.buffer_pool.acquire();
+                                    payload.put_u32(target_connection_no);
+                                    let result = self
+                                        .send_control_message(
+                                            ControlMessage::ConnectionOpened,
+                                            &payload,
+                                        )
+                                        .await;
+                                    self.buffer_pool.release(payload);
+                                    result
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Handler failed to start (channel: {}, conn: {}): {}",
+                                        self.channel_id, target_connection_no, e
+                                    );
+                                    let mut payload = self.buffer_pool.acquire();
+                                    payload.put_u32(target_connection_no);
+                                    payload.put_u8(CloseConnectionReason::ConnectionFailed as u8);
+                                    let result = self
+                                        .send_control_message(
+                                            ControlMessage::CloseConnection,
+                                            &payload,
+                                        )
+                                        .await;
+                                    self.buffer_pool.release(payload);
+                                    result.and(Err(e))
+                                }
+                            };
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "handlers"))]
+                {
+                    error!("DEBUG_HANDLER: Handlers feature NOT compiled in!");
+                }
+
+                // Original: Connect to external guacd server
                 if let (Some(host), Some(port)) =
                     (effective_guacd_host.as_deref(), effective_guacd_port)
                 {

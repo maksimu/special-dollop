@@ -9,6 +9,8 @@ mod buffer_pool;
 mod channel;
 mod config;
 mod error;
+#[cfg(feature = "handlers")]
+mod handler_integration;
 pub mod hot_path_macros;
 mod metrics;
 mod models;
@@ -34,5 +36,8 @@ pub use webrtc_quality_manager::{AdaptiveQualityManager, CongestionLevel, Qualit
 
 #[cfg(feature = "python")]
 pub use python::*;
+
+#[cfg(feature = "handlers")]
+pub use handler_integration::{create_handler_registry, invoke_handler};
 
 pub use logger::initialize_logger;

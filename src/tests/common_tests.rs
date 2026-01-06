@@ -1,5 +1,4 @@
 //! Common test utilities and setup
-#![cfg(test)]
 use crate::webrtc_core::format_ice_candidate;
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use log::debug;
@@ -316,6 +315,6 @@ pub async fn exchange_ice_candidates(peer1: Arc<RTCPeerConnection>, peer2: Arc<R
     }
 
     // Clean up handlers
-    let _ = handle1.abort();
-    let _ = handle2.abort();
+    handle1.abort();
+    handle2.abort();
 }

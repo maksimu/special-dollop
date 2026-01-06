@@ -1,7 +1,6 @@
 // src/channel/tests/guacd_handshake_tests.rs
 // Create a new file for Guacd handshake tests.
 
-#![cfg(test)]
 use bytes::{Buf, BytesMut};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,7 +68,7 @@ async fn parse_and_handle_connect_instruction(
 ) -> Result<bool, String> {
     loop {
         let advance_amount = {
-            let peek_result = GuacdParser::peek_instruction(&temp_parse_buffer);
+            let peek_result = GuacdParser::peek_instruction(temp_parse_buffer);
             match peek_result {
                 Ok(peeked) => {
                     if peeked.opcode == "connect" {
@@ -251,6 +250,8 @@ async fn test_guacd_handshake_successful() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel");
@@ -474,6 +475,8 @@ async fn test_guacd_handshake_join_existing_connection_readonly() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel for join test");
@@ -576,6 +579,8 @@ async fn test_guacd_handshake_join_existing_connection_not_readonly() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel for join_not_readonly test");
@@ -674,6 +679,8 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_args() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel for fail_args test");
@@ -764,6 +771,8 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel for fail_ready test");
@@ -938,8 +947,10 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
         "guacd_params".to_string(),
         serde_json::json!(guacd_params.clone()),
     );
-    let mut timeouts = TunnelTimeouts::default();
-    timeouts.guacd_handshake = Duration::from_millis(100);
+    let timeouts = TunnelTimeouts {
+        guacd_handshake: Duration::from_millis(100),
+        ..Default::default()
+    };
     let channel = Channel::new(crate::channel::core::ChannelParams {
         webrtc: mock_webrtc_dc_for_channel,
         rx_from_dc: dc_rx_for_channel,
@@ -953,6 +964,8 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel for timeout_args test");
@@ -1034,8 +1047,10 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
         "guacd_params".to_string(),
         serde_json::json!(guacd_params.clone()),
     );
-    let mut timeouts = TunnelTimeouts::default();
-    timeouts.guacd_handshake = Duration::from_millis(100);
+    let timeouts = TunnelTimeouts {
+        guacd_handshake: Duration::from_millis(100),
+        ..Default::default()
+    };
     let channel = Channel::new(crate::channel::core::ChannelParams {
         webrtc: mock_webrtc_dc_for_channel,
         rx_from_dc: dc_rx_for_channel,
@@ -1049,6 +1064,8 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await
     .expect("Failed to create channel for timeout_ready test");

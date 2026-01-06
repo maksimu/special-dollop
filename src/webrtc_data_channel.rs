@@ -303,9 +303,12 @@ impl WebRTCDataChannel {
         loop {
             let current_state = self.data_channel.ready_state();
 
-            // Check if already closed (error case)
+            // Check if already closed (expected during cleanup, not an error)
             if self.is_closing.load(Ordering::Acquire) {
-                warn!("wait_for_channel_open CLOSING: channel={}", label);
+                debug!(
+                    "wait_for_channel_open: channel closing (expected during cleanup): channel={}",
+                    label
+                );
                 return Err("Data channel is closing".to_string());
             }
 

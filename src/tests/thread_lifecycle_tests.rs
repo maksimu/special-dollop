@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Thread lifecycle tests for actor-based architecture
 //!
 //! Verifies that actor doesn't leak threads and cleanup is proper

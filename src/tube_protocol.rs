@@ -180,6 +180,8 @@ pub enum CloseConnectionReason {
     ProtocolError = 19,
     UpstreamClosed = 20,
     ProxyError = 21,
+    HandlerError = 22,
+    SecurityThreat = 23,
 }
 
 // Helper for CloseConnectionReason (assuming it might be defined elsewhere, adding a basic version)
@@ -208,6 +210,8 @@ impl CloseConnectionReason {
             19 => CloseConnectionReason::ProtocolError,
             20 => CloseConnectionReason::UpstreamClosed,
             21 => CloseConnectionReason::ProxyError,
+            22 => CloseConnectionReason::HandlerError,
+            23 => CloseConnectionReason::SecurityThreat,
             _ => CloseConnectionReason::Unknown,
         }
     }
@@ -262,6 +266,8 @@ impl CloseConnectionReason {
             CloseConnectionReason::ProtocolError => "protocol error".to_string(),
             CloseConnectionReason::UpstreamClosed => "upstream connection closed".to_string(),
             CloseConnectionReason::ProxyError => "database proxy error".to_string(),
+            CloseConnectionReason::HandlerError => "protocol handler error".to_string(),
+            CloseConnectionReason::SecurityThreat => "security threat detected".to_string(),
         }
     }
 }

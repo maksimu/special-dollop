@@ -24,6 +24,7 @@ impl RuntimeHandle {
     }
 
     /// Block on a future using this runtime
+    #[allow(dead_code)]
     pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
     }

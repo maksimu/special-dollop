@@ -36,12 +36,6 @@ cargo test test_name -- --nocapture
 ### Debug Builds and Logging
 
 ```bash
-# Production with debug logging enabled
-cargo build --release --features production_debug
-
-# Maximum performance (disable hot path logging)
-cargo build --release --features disable_hot_path_logging
-
 # Development with profiling instrumentation
 cargo build --features profiling
 ```
@@ -569,5 +563,8 @@ When adding **any** of these operations, test on Windows:
 - ❌ Assume "fast on Linux" means "fast everywhere"
 - ❌ Use verbose console logging on Windows
 - ❌ Use aggressive timeouts without testing on Windows DNS/network
+- ❌ Make .md summary files for everything. And don't try to use another format for this like .txt
+- ❌ Add or use EMOJIS in any code or documentation
+- ❌ Make speed/performance claims in comments without testing them
 
-**Remember**: The main use case is **100s of developers editing 4K videos over these connections**. A 10× slowdown on Windows is unacceptable.
+**Remember**: The main use case is **100s of developers editing 4K videos over these connections**.

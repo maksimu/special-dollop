@@ -157,6 +157,17 @@ pub struct Channel {
     pub(crate) proxy_port: Option<u16>,
     pub(crate) db_params: Arc<Mutex<HashMap<String, String>>>,
 
+    // Protocol handler registry and conversation type (for built-in handlers)
+    #[cfg(feature = "handlers")]
+    pub(crate) handler_registry: Option<std::sync::Arc<guacr::ProtocolHandlerRegistry>>,
+    #[allow(dead_code)]
+    pub(crate) conversation_type: Option<ConversationType>,
+
+    // Handler senders for forwarding inbound messages to protocol handlers
+    #[cfg(feature = "handlers")]
+    pub(crate) handler_senders:
+        Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
     // Timestamp for the last channel-level ping sent (conn_no=0)
@@ -207,6 +218,9 @@ pub struct ChannelParams {
     pub capabilities: crate::tube_protocol::Capabilities,
     /// Optional Python handler channel for PythonHandler protocol mode
     pub python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
+    // Protocol handler registry (optional)
+    #[cfg(feature = "handlers")]
+    pub handler_registry: Option<std::sync::Arc<guacr::ProtocolHandlerRegistry>>,
 }
 
 impl Channel {
@@ -224,6 +238,8 @@ impl Channel {
             client_version,
             capabilities,
             python_handler_tx,
+            #[cfg(feature = "handlers")]
+            handler_registry,
         } = params;
         debug!("Channel::new called (channel_id: {})", channel_id);
         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -249,6 +265,7 @@ impl Channel {
         let mut temp_initial_guacd_params_map = HashMap::new();
 
         let mut local_listen_addr_setting: Option<String> = None;
+        let mut stored_conversation_type: Option<ConversationType> = None;
 
         // Database proxy settings
         let mut proxy_host_setting: Option<String> = None;
@@ -338,6 +355,7 @@ impl Channel {
                                 warn!("DatabaseProxy: 'db_params' block not found in protocol_settings (channel_id: {})", channel_id);
                             }
                         } else if is_guacd_session(&parsed_conversation_type) {
+                            stored_conversation_type = Some(parsed_conversation_type.clone());
                             debug!("Configuring for GuacD protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                             determined_protocol = ActiveProtocol::Guacd;
                             initial_protocol_state =
@@ -397,18 +415,18 @@ impl Channel {
                                                 JsonValue::Array(arr) => {
                                                     let str_arr: Vec<String> = arr
                                                         .iter()
-                                                        .filter_map(|val| {
-                                                            val.as_str().map(String::from)
+                                                        .map(|val| match val {
+                                                            JsonValue::String(s) => s.clone(),
+                                                            JsonValue::Number(n) => n.to_string(),
+                                                            JsonValue::Bool(b) => b.to_string(),
+                                                            _ => serde_json::to_string(val)
+                                                                .unwrap_or_default(),
                                                         })
                                                         .collect();
                                                     if !str_arr.is_empty() {
                                                         Some((k.clone(), str_arr.join(",")))
                                                     } else {
-                                                        // For arrays not of strings, or empty string arrays, produce empty string or skip.
-                                                        // Guacamole usually expects comma-separated for multiple values like image/audio mimetypes.
-                                                        // If it's an array of other things, stringifying the whole array might be an option.
                                                         Some((k.clone(), "".to_string()))
-                                                        // Or None to skip
                                                     }
                                                 }
                                                 JsonValue::Null => None, // Omit null values by not adding them
@@ -655,6 +673,13 @@ impl Channel {
             proxy_port: proxy_port_setting,
             db_params: Arc::new(Mutex::new(temp_db_params_map)),
 
+            #[cfg(feature = "handlers")]
+            handler_registry,
+            conversation_type: stored_conversation_type,
+
+            #[cfg(feature = "handlers")]
+            handler_senders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+
             buffer_pool,
             channel_ping_sent_time: Mutex::new(None),
             conn_closed_tx,
@@ -734,6 +759,10 @@ impl Channel {
     }
 
     pub async fn run(mut self) -> Result<(), ChannelError> {
+        error!(
+            "DEBUG_CHANNEL_RUN: Channel.run() started (channel_id: {})",
+            self.channel_id
+        );
         self.setup_webrtc_state_monitoring();
 
         let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -1009,7 +1038,43 @@ impl Channel {
             }
         }
 
-        // Collect connection numbers from DashMap
+        // CRITICAL: Clean up handler-based connections first
+        // Handler-based connections (guacr) don't create Conn entries in the DashMap,
+        // they only exist in handler_senders. Dropping their senders signals them to exit.
+        #[cfg(feature = "handlers")]
+        {
+            let handler_conn_nos: Vec<u32> = {
+                let senders = self.handler_senders.read().await;
+                senders.keys().copied().collect()
+            };
+
+            if !handler_conn_nos.is_empty() {
+                debug!(
+                    "Cleaning up {} handler-based connections (channel_id: {})",
+                    handler_conn_nos.len(),
+                    self.channel_id
+                );
+
+                for conn_no in handler_conn_nos {
+                    // Remove the sender to signal the handler to stop
+                    // The handler's from_client.recv() will return None
+                    if self
+                        .handler_senders
+                        .write()
+                        .await
+                        .remove(&conn_no)
+                        .is_some()
+                    {
+                        debug!(
+                            "Signaled handler to stop (channel_id: {}, conn_no: {})",
+                            self.channel_id, conn_no
+                        );
+                    }
+                }
+            }
+        }
+
+        // Collect connection numbers from DashMap (TCP-based connections)
         let conn_keys = self.get_connection_ids();
         for conn_no in conn_keys {
             if conn_no != 0 {
@@ -1568,6 +1633,26 @@ impl Channel {
             ActiveProtocol::DatabaseProxy => {
                 // DatabaseProxy connections are similar to Guacd - TCP streams with handshake
                 // No special cleanup needed beyond what's done for Guacd
+            }
+        }
+
+        // CRITICAL: Clean up handler senders to signal built-in handlers to stop
+        // Dropping the sender causes from_client.recv() to return None in the handler,
+        // allowing it to exit gracefully. Without this, handlers block forever waiting
+        // for messages that will never come after WebRTC closes.
+        #[cfg(feature = "handlers")]
+        {
+            if self
+                .handler_senders
+                .write()
+                .await
+                .remove(&conn_no)
+                .is_some()
+            {
+                debug!(
+                    "Removed handler sender for conn {} to signal handler shutdown (channel_id: {})",
+                    conn_no, self.channel_id
+                );
             }
         }
 

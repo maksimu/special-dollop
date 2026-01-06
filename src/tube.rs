@@ -64,6 +64,10 @@ pub struct Tube {
     // Client version for authentication
     pub(crate) client_version: Arc<TokioRwLock<Option<String>>>,
 
+    // Protocol handler registry (for built-in guacr handlers)
+    #[cfg(feature = "handlers")]
+    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+
     // ============================================================================
     // RAII PATTERN: Lifecycle-bound resources owned by Tube
     // When Tube drops, these automatically cleanup via Drop trait
@@ -128,6 +132,7 @@ impl Tube {
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         custom_tube_id: Option<String>,
         capabilities: crate::tube_protocol::Capabilities,
+        #[cfg(feature = "handlers")] handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
     ) -> Result<Arc<Self>> {
         let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();
@@ -153,6 +158,8 @@ impl Tube {
             runtime,
             original_conversation_id: original_conversation_id.clone(),
             client_version: Arc::new(TokioRwLock::new(None)),
+            #[cfg(feature = "handlers")]
+            handler_registry,
 
             // RAII resources (owned by Tube):
             signal_sender,
@@ -694,6 +701,8 @@ impl Tube {
                     client_version,
                     tube.capabilities, // Pass tube's capabilities to channel
                     python_handler_tx, // For PythonHandler protocol mode
+                    #[cfg(feature = "handlers")]
+                    tube.handler_registry.clone(),
                 ).await;
 
                 let mut owned_channel = match channel_result {
@@ -797,9 +806,9 @@ impl Tube {
 
                     // Clone the Arc so we can access it after run() consumes the channel
                     let close_reason_arc = owned_channel.channel_close_reason.clone();
-                    info!("on_data_channel: About to call channel.run() (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
+                    debug!("on_data_channel: About to call channel.run() (tube_id: {}, channel_label: {})", tube_id_for_log, label_clone_for_run);
                     let run_result = owned_channel.run().await;
-                    info!("on_data_channel: channel.run() completed with result: {:?} (tube_id: {}, channel_label: {})", run_result.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)), tube_id_for_log, label_clone_for_run);
+                    debug!("on_data_channel: channel.run() completed with result: {:?} (tube_id: {}, channel_label: {})", run_result.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)), tube_id_for_log, label_clone_for_run);
                     // Get the close reason after run completes - use try_lock to avoid blocking
                     let close_reason = close_reason_arc.try_lock().ok().and_then(|guard| *guard);
                     debug!("on_data_channel: Retrieved close_reason: {:?} (tube_id: {}, channel_label: {})", close_reason, tube_id_for_log, label_clone_for_run);
@@ -1091,8 +1100,9 @@ impl Tube {
                     );
                 }
                 Err(e) => {
-                    warn!(
-                        "Error waiting for data channel '{}' to open: {} (tube_id: {})",
+                    // Expected during cleanup - channel closed before it could open
+                    debug!(
+                        "Data channel '{}' closed before opening (expected during cleanup): {} (tube_id: {})",
                         label_for_open, e, tube_id_for_open
                     );
                 }
@@ -1315,6 +1325,8 @@ impl Tube {
             client_version,
             self.capabilities, // Pass tube's capabilities to channel
             python_handler_tx,
+            #[cfg(feature = "handlers")]
+            self.handler_registry.clone(),
         )
         .await;
 

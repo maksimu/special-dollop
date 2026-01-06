@@ -10,7 +10,7 @@ import time
 import json
 import logging
 from unittest.mock import Mock, AsyncMock, MagicMock, patch
-from src.python.connection_manager import (
+from keeper_pam_webrtc_rs.connection_manager import (
     TunnelConnectionManager,
     ConnectionState,
     NetworkChangeType,

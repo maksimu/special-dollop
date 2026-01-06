@@ -6,7 +6,9 @@
 // - Performance benchmarks: See docs/HOT_PATH_OPTIMIZATION_SUMMARY.md
 //
 
-// Initialize rustls crypto provider for all tests
+// CRITICAL: Initialize rustls crypto provider for all tests
+// This is required for DTLS to work in WebRTC connections
+// Without this, tests will panic with "no process-level CryptoProvider available"
 #[cfg(test)]
 #[ctor::ctor]
 fn init_crypto_provider() {

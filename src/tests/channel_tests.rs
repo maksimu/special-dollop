@@ -1,5 +1,4 @@
 // Tests for the Channel module
-#![cfg(test)]
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::channel::Channel;
 use crate::tube_protocol::{ControlMessage, Frame};
@@ -102,6 +101,8 @@ async fn test_server_mode_data_flow() -> Result<()> {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await?;
 
@@ -290,6 +291,8 @@ async fn test_client_mode_data_flow() -> Result<()> {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
+        #[cfg(feature = "handlers")]
+        handler_registry: None,
     })
     .await?;
 

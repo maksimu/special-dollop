@@ -157,9 +157,6 @@ cargo build
 
 # Development with profiling enabled
 cargo build --features profiling
-
-# Development with debug logging
-cargo build --features production_debug
 ```
 
 ### **Production Builds**
@@ -167,11 +164,6 @@ cargo build --features production_debug
 # Standard production build (all optimizations enabled by default)
 cargo build --release
 
-# Production with debug logging enabled
-cargo build --release --features production_debug
-
-# Maximum performance (disable hot path logging)
-cargo build --release --features disable_hot_path_logging
 ```
 
 ## 📈 **Performance Monitoring**

@@ -88,9 +88,9 @@ impl From<InitializeLoggerError> for PyErr {
 /// * `logger_name` - Logger name (for debug messages only)
 /// * `verbose` - Enable verbose-gated debug logs (controls `is_verbose_logging()`)
 /// * `level` - Log level (Python int: 10=DEBUG, 20=INFO, etc.)
-///             **NOTE**: In Python mode, this is IGNORED. Rust always passes all logs
-///             to Python at TRACE level, and Python's logger config controls filtering.
-///             Only used in standalone Rust mode.
+///   **NOTE**: In Python mode, this is IGNORED. Rust always passes all logs
+///   to Python at TRACE level, and Python's logger config controls filtering.
+///   Only used in standalone Rust mode.
 ///
 /// # Python Integration
 /// When running in gateway (Python mode):
@@ -230,6 +230,7 @@ pub fn initialize_logger(
             .with_span_events(FmtSpan::CLOSE)
             .with_target(true)
             .with_level(true)
+            .with_ansi(false)
             .compact()
             .finish();
 

@@ -9,9 +9,9 @@ import logging
 import time
 import pytest
 from unittest.mock import Mock
-from src.python.connection_manager import (
+from keeper_pam_webrtc_rs.connection_manager import (
     TunnelConnectionManager,
-    ConnectionState, 
+    ConnectionState,
     NetworkChangeType,
     ICERestartPolicy,
     ConnectionMetrics,

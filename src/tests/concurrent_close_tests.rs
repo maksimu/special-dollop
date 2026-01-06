@@ -165,9 +165,8 @@ async fn test_atomic_closing_flag_prevents_double_close() {
     let tube = REGISTRY.get_tube_fast(&tube_id).expect("Tube should exist");
 
     // Verify initial state
-    assert_eq!(
-        tube.closing.load(Ordering::Relaxed),
-        false,
+    assert!(
+        !tube.closing.load(Ordering::Relaxed),
         "Tube should not be closing initially"
     );
 

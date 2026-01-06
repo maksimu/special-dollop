@@ -1,10 +1,15 @@
 /target
 /venv
 /.venv
-src/python/keeper_pam_webrtc_rs/
 src/python/__pycache__/
 tests/__pycache__/
 **/__pycache__/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 
 # macOS
 .DS_Store

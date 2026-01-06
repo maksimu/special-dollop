@@ -337,7 +337,7 @@ fn test_guacd_parser_missing_terminators() {
     match GuacdParser::peek_instruction(sliced_data) {
         Err(PeekError::InvalidFormat(msg)) => {
             assert!(
-                msg.len() > 0,
+                !msg.is_empty(),
                 "Error message was empty! Actual msg: {}",
                 msg
             );

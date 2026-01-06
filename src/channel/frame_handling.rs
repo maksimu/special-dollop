@@ -133,7 +133,9 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
 // Handle control frames (COLD PATH - infrequent)
 #[cold]
 pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
+    // ALWAYS log control messages with error!() to ensure visibility
     if unlikely(frame.payload.len() < CTRL_NO_LEN) {
+        error!("DEBUG_CONTROL_ENTRY: Malformed control frame - too short!");
         return Err(anyhow!("Malformed control frame"));
     }
 
@@ -179,6 +181,58 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     if channel.active_protocol == ActiveProtocol::PythonHandler {
         return forward_to_python_handler(channel, conn_no, payload).await;
     }
+
+    let payload_len = payload.len(); // Store length before moving
+
+    // **HANDLER PATH**: Check if this connection is managed by a built-in protocol handler
+    #[cfg(feature = "handlers")]
+    {
+        // RwLock read is fast for concurrent access
+        if let Some(sender) = channel.handler_senders.read().await.get(&conn_no) {
+            // Forward to protocol handler instead of normal TCP connection
+            if unlikely!(crate::logger::is_verbose_logging()) {
+                debug!(
+                    "Forwarding to protocol handler (channel_id: {}, conn_no: {}, payload_len: {})",
+                    channel.channel_id, conn_no, payload_len
+                );
+            }
+
+            match sender.send(payload).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    error!(
+                        "Failed to forward frame to handler, removing sender (channel_id: {}, conn_no: {}, error: {})",
+                        channel.channel_id, conn_no, e
+                    );
+                    // Remove dead sender
+                    drop(channel.handler_senders.read().await); // Drop read lock
+                    channel.handler_senders.write().await.remove(&conn_no);
+                    return Err(anyhow!("Handler channel closed for connection {}", conn_no));
+                }
+            }
+        }
+    }
+
+    // HOT PATH: Only log in verbose mode (suppress 1000s/sec spam with video workloads)
+    if unlikely!(crate::logger::is_verbose_logging()) {
+        debug!(
+            "Forwarding bytes via lock-free channel (channel_id: {}, conn_no: {}, payload_len: {})",
+            channel.channel_id, conn_no, payload_len
+        );
+
+        if payload_len > 0 && payload_len <= 100 {
+            debug!(
+                "Payload for backend (channel_id: {}, payload: {:?})",
+                channel.channel_id, payload
+            );
+        } else if payload_len > 100 {
+            let first_bytes = payload.slice(..std::cmp::min(50, payload_len));
+            debug!(
+                "Large payload first bytes (channel_id: {}, first_bytes: {:?})",
+                channel.channel_id, first_bytes
+            );
+        }
+    } // Close the is_verbose_logging() block
 
     // Skip inbound special instruction detection - user only wants outbound and handshake sizes
     // **COMPLETELY LOCK-FREE**: DashMap provides efficient concurrent access

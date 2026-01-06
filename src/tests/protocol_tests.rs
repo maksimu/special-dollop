@@ -38,9 +38,11 @@ fn test_protocol_frame_handling() {
         assert_eq!(encoded_slice[2], 0);
         assert_eq!(encoded_slice[3], 0);
 
-        // Test timestamp (skipping exact value)
+        // Test timestamp (8 bytes, skipping exact value)
+        // Bytes 4-11 are the timestamp
 
         // Test payload length (4 bytes)
+        // With 8-byte timestamp, payload length starts at byte 12
         let payload_len = (ping_frame.payload.len() as u32).to_be_bytes();
         assert_eq!(encoded_slice[12], payload_len[0]);
         assert_eq!(encoded_slice[13], payload_len[1]);

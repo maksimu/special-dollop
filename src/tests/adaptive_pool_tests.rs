@@ -93,15 +93,16 @@ fn test_pool_config_clone() {
 /// Test stats cloning preserves all fields
 #[test]
 fn test_pool_stats_clone() {
-    let mut original = PoolStats::default();
-    original.total_channels_created = 5;
-    original.total_channels_closed = 3;
-    original.overflow_events = 10;
-    original.active_overflow_count = 2;
-    original.primary_bytes_sent = 1_000_000;
-    original.overflow_bytes_sent = 500_000;
-    original.peak_overflow_count = 4;
-    original.total_overflow_time_ms = 5000;
+    let original = PoolStats {
+        total_channels_created: 5,
+        total_channels_closed: 3,
+        overflow_events: 10,
+        active_overflow_count: 2,
+        primary_bytes_sent: 1_000_000,
+        overflow_bytes_sent: 500_000,
+        peak_overflow_count: 4,
+        total_overflow_time_ms: 5000,
+    };
 
     let cloned = original.clone();
 

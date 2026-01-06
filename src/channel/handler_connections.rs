@@ -571,6 +571,6 @@ mod tests {
     #[test]
     fn test_module_compiles() {
         // Verify this module compiles with handlers feature
-        assert!(cfg!(feature = "handlers"));
+        const _: () = assert!(cfg!(feature = "handlers"));
     }
 }

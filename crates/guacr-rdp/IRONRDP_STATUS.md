@@ -1,67 +1,74 @@
 # IronRDP Integration Status
 
-## Current Status: ✅ WORKING (Dec 3, 2025)
+## Current Status: 🔄 IN PROGRESS (Jan 9, 2026)
 
-The RDP handler compiles and works using a **local IronRDP fork** with Update PDU handling.
+Restored IronRDP implementation after FreeRDP migration. Working through dependency conflicts.
 
-### Background
+## Why IronRDP?
 
-1. **PR #1043** (static dispatch for NetworkClient) was **merged to master** on Dec 3, 2025
-2. Our fork adds **Update PDU workaround** on top of master to prevent connection termination
+1. **Cloudflare uses it in production** - https://github.com/Devolutions/IronRDP
+   - Powers Cloudflare's RDP tunnel service
+   - Battle-tested at scale
+   
+2. **Pure Rust** - No FFI complexity, no system dependencies
+   - No bindgen build scripts
+   - No FreeRDP 3.x library hunting
+   - Simpler build process
 
-### The Update PDU Issue
+3. **Active Development** - Upstream has implemented Update PDU handling
+   - Graphics updates working (bitmap, orders, palette)
+   - Drawing order rendering implemented
+   - Slow-path updates routed to graphics processor
 
-RDP connections fail with "unhandled PDU: Update PDU" error when servers send graphics updates. The `ShareDataPdu::Update` variant is parsed but the session processor doesn't handle it.
+## Update PDU Status
 
-### Our Workaround
+✅ **FIXED UPSTREAM** - The Update PDU issue has been resolved!
 
-We added a temporary workaround in `ironrdp-session/src/x224/mod.rs` that:
-- Handles `ShareDataPdu::Update` to prevent connection termination
-- Parses and logs update type (Bitmap/Orders/Palette/Synchronize)
-- Logs hex preview of PDU data for debugging
+Upstream IronRDP now has proper Update PDU handling:
+- `ae66f7a5` - feat(session): implement drawing order rendering
+- `2a7a2f1a` - feat(session): route slow-path updates to graphics processor  
+- `a8896a4e` - feat(pdu): add slow-path server graphics update parsing
 
-### Current Cargo.toml Configuration
+**Our workaround is no longer needed!** The latest upstream master has full support.
 
-```toml
-# Patch for ironrdp - use local fork with Update PDU workaround
-# PR #1043 (static dispatch) is now merged to master
-# Our branch adds Update PDU handling on top of master
-# See: ~/Documents/IronRDP (feature/handle-update-pdu branch)
-[patch.crates-io]
-ironrdp = { path = "../IronRDP/crates/ironrdp" }
-ironrdp-async = { path = "../IronRDP/crates/ironrdp-async" }
-ironrdp-tokio = { path = "../IronRDP/crates/ironrdp-tokio" }
-ironrdp-pdu = { path = "../IronRDP/crates/ironrdp-pdu" }
-ironrdp-session = { path = "../IronRDP/crates/ironrdp-session" }
-```
+## Current Issue: Dependency Conflicts
 
-## Local IronRDP Fork
+The build fails due to `sspi` crate dependency conflicts:
+- `rand_core` version mismatch (0.6.4 vs 0.9.3)
+- `sspi` crate has non-exhaustive pattern matches
+
+This is a known issue in the IronRDP ecosystem that needs resolution.
+
+## IronRDP Fork
 
 Located at: `~/Documents/IronRDP`
-Branch: `feature/handle-update-pdu`
+Branch: `master` (updated from upstream)
 Remote: `miroberts/IronRDP` on GitHub
 
-### Commits on top of master
-
-1. `feat: Add temporary workaround for Update PDU with detailed logging`
-2. `feat: Make Update PDU logs visible at INFO level`
+Latest upstream commits:
+```
+87f8d073 chore(release): prepare for publishing (#1020)
+bd2aed76 feat(ironrdp-tls)!: return x509_cert::Certificate from upgrade() (#1054)
+b50b6483 build(deps): bump the patch group across 1 directory with 3 updates (#1055)
+```
 
 ## Next Steps
 
-1. **Test RDP connections** to see Update PDU logs and identify which types are sent
-2. **Implement proper Update PDU processing** if graphics rendering is needed
-3. **Submit PR to upstream** once implementation is complete
+1. **Resolve dependency conflicts** - Update sspi or pin versions
+2. **Test RDP connection** - Verify graphics updates work
+3. **Apply SSH handler patterns** - Scroll detection, dirty tracking
+4. **Document setup** - Update README with IronRDP instructions
 
 ## Verification
 
 ```bash
-# Build succeeds
-cargo check -p guacr-rdp
+# Build (currently failing due to sspi dependency conflict)
+cargo build -p guacr-rdp
 
-# All tests pass
+# Once fixed:
 cargo test -p guacr-rdp
 ```
 
 ---
 
-*Last updated: 2025-12-03*
+*Last updated: 2026-01-09*

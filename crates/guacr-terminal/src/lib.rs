@@ -53,7 +53,7 @@ pub use guacamole_input::{
 pub use input_handler::{RdpInputHandler, RdpKeyEvent, RdpPointerEvent};
 pub use keysym::{
     mouse_event_to_x11_sequence, x11_keysym_to_bytes, x11_keysym_to_bytes_with_backspace,
-    ModifierState,
+    x11_keysym_to_bytes_with_modes, ModifierState,
 };
 pub use recorder::{
     create_recording_transports, AsciicastHeader, AsciicastRecorder, AsyncDualFormatRecorder,

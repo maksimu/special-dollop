@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn test_column_side_ordering() {
         // Left comes before Right on same column
-        assert_eq!(ColumnSide::Left == ColumnSide::Right, false);
+        assert!(!(ColumnSide::Left == ColumnSide::Right));
     }
 
     #[test]
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_round_up() {
-        let terminal = create_test_terminal();
+        let _terminal = create_test_terminal();
 
         // Left side of column - stays at column
         let point = SelectionPoint {
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_round_down() {
-        let terminal = create_test_terminal();
+        let _terminal = create_test_terminal();
 
         // Right side of column - stays at column
         let point = SelectionPoint {

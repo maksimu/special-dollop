@@ -252,7 +252,7 @@ mod tests {
         for row in 0..height {
             let row_offset = (row * width * 4) as usize;
             // Use row number prominently in the pattern to make rows VERY distinct
-            let row_id = (row as u32).to_le_bytes();
+            let row_id = row.to_le_bytes();
             for pixel in 0..width {
                 let pixel_offset = row_offset + (pixel * 4) as usize;
                 // Encode row number in every pixel so rows are unmistakably unique

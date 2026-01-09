@@ -624,6 +624,13 @@ impl ProtocolHandler for TelnetHandler {
 
                                     debug!("Telnet: Selection complete, copying {} chars", selected_text.len());
 
+                                    // CRITICAL: Update local clipboard immediately to avoid race condition
+                                    // If user pastes immediately after selecting, they expect the selected text
+                                    // Without this, there's a race where the clipboard blob from client arrives
+                                    // after the user has already pressed Ctrl+Shift+V
+                                    stored_clipboard = selected_text.clone();
+                                    debug!("Telnet: Local clipboard updated immediately with {} chars", stored_clipboard.len());
+
                                     // Clear the overlay
                                     for instr in clear_instructions {
                                         to_client.send(Bytes::from(instr)).await

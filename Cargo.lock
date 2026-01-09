@@ -3575,6 +3575,7 @@ dependencies = [
 [[package]]
 name = "ironrdp"
 version = "0.14.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-connector",
@@ -3588,6 +3589,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-async"
 version = "0.8.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bytes",
  "ironrdp-connector",
@@ -3599,6 +3601,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.5.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bitflags 2.10.0",
  "ironrdp-core",
@@ -3610,6 +3613,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-connector"
 version = "0.8.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "ironrdp-core",
  "ironrdp-error",
@@ -3627,13 +3631,15 @@ dependencies = [
 [[package]]
 name = "ironrdp-core"
 version = "0.1.5"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "ironrdp-error",
 ]
 
 [[package]]
 name = "ironrdp-displaycontrol"
-version = "0.4.0"
+version = "0.5.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -3644,7 +3650,8 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-dvc"
-version = "0.4.1"
+version = "0.5.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
@@ -3656,10 +3663,12 @@ dependencies = [
 [[package]]
 name = "ironrdp-error"
 version = "0.1.3"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 
 [[package]]
 name = "ironrdp-graphics"
 version = "0.7.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bit_field",
  "bitflags 2.10.0",
@@ -3674,7 +3683,8 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-input"
-version = "0.4.0"
+version = "0.5.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bitvec",
  "ironrdp-pdu",
@@ -3683,7 +3693,8 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-pdu"
-version = "0.6.0"
+version = "0.7.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bit_field",
  "bitflags 2.10.0",
@@ -3706,6 +3717,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-session"
 version = "0.8.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "ironrdp-connector",
  "ironrdp-core",
@@ -3720,7 +3732,8 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-svc"
-version = "0.5.0"
+version = "0.6.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bitflags 2.10.0",
  "ironrdp-core",
@@ -3730,6 +3743,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-tokio"
 version = "0.8.0"
+source = "git+https://github.com/miroberts/IronRDP.git?branch=feature%2Fhandle-update-pdu#2eae12ddc6fc19c084eb5f1c6dc7401e04f76fbb"
 dependencies = [
  "bytes",
  "ironrdp-async",
@@ -8654,7 +8668,3 @@ checksum = "e35aee689668bf9bd6f6f3a6c60bb29ba1244b3b43adfd50edd554a371da37d5"
 dependencies = [
  "zune-core 0.5.0",
 ]
-
-[[patch.unused]]
-name = "ironrdp-tls"
-version = "0.2.0"

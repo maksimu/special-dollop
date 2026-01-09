@@ -74,8 +74,11 @@ impl TerminalConfig {
             }
         }
 
-        // Color scheme
-        if let Some(scheme) = params.get("color-scheme") {
+        // Color scheme (support both kebab-case and camelCase)
+        if let Some(scheme) = params
+            .get("color-scheme")
+            .or_else(|| params.get("colorScheme"))
+        {
             config.color_scheme = ColorScheme::from_name(scheme);
         }
 

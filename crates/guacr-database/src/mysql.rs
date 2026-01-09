@@ -241,9 +241,23 @@ impl ProtocolHandler for MySqlHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                // DON'T render yet - wait for client to send resize instruction
-                // This matches SSH behavior and ensures client is ready
-                debug!("MySQL: Connection success message prepared, waiting for client resize");
+                // Render the connection success screen
+                debug!("MySQL: Rendering initial screen with prompt");
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                debug!(
+                    "MySQL: Sending {} instructions to client",
+                    instructions.len()
+                );
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+                debug!("MySQL: Initial screen sent successfully");
             }
             Err(e) => {
                 let error_msg = format!("Connection failed: {}", e);
@@ -305,33 +319,10 @@ impl ProtocolHandler for MySqlHandler {
         }
 
         // Event loop - process queries
-        // Track if initial render has been done (after first client resize)
-        let mut initial_render_done = false;
-
+        // NOTE: Screen was already rendered above after connection success
         while let Some(msg) = from_client.recv().await {
             match executor.process_input(&msg).await {
                 Ok((needs_render, instructions, pending_query)) => {
-                    // On first resize, render the initial screen
-                    if !initial_render_done && needs_render {
-                        debug!("MySQL: First resize received, rendering initial screen");
-                        let (_, render_instructions) = executor
-                            .render_screen()
-                            .await
-                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                        debug!(
-                            "MySQL: Sending {} instructions to client",
-                            render_instructions.len()
-                        );
-                        for instr in render_instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                        }
-                        initial_render_done = true;
-                        debug!("MySQL: Initial screen sent successfully");
-                        continue; // Skip normal processing for this first resize
-                    }
                     if let Some(query) = pending_query {
                         info!("MySQL: Executing query: {}", query);
 

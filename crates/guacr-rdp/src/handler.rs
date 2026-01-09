@@ -599,15 +599,23 @@ impl IronRdpSession {
         self.scroll_detector.reset(self.width, self.height);
 
         // Send ready and size instructions to client (and record them)
-        let ready_instr = format!("5.ready,{}.{};", 8, "rdp-ready");
+        let ready_value = "rdp-ready";
+        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
         self.send_and_record(&ready_instr).await?;
 
+        // Format: size,<layer>,<width>,<height>;
+        let layer = 0;
+        let layer_str = layer.to_string();
+        let width_str = self.width.to_string();
+        let height_str = self.height.to_string();
         let size_instr = format!(
-            "4.size,1.0,{}.{},{}.{};",
-            self.width.to_string().len(),
-            self.width,
-            self.height.to_string().len(),
-            self.height
+            "4.size,{}.{},{}.{},{}.{};",
+            layer_str.len(),
+            layer_str,
+            width_str.len(),
+            width_str,
+            height_str.len(),
+            height_str
         );
         self.send_and_record(&size_instr).await?;
 
@@ -917,15 +925,15 @@ impl IronRdpSession {
                 ScrollDirection::Up => {
                     // Content moved up: copy existing content, render new bottom region
                     let copy_instr = guacr_protocol::format_transfer(
-                        0,                                  // src_layer
-                        0,                                  // src_x
-                        scroll_op.pixels,                   // src_y: from line N
-                        self.width,                         // width
-                        self.height - scroll_op.pixels,     // height: all except scrolled
-                        12,                                 // 12 = SRC function (simple copy)
-                        0,                                  // dst_layer
-                        0,                                  // dst_x
-                        0,                                  // dst_y: to top
+                        0,                              // src_layer
+                        0,                              // src_x
+                        scroll_op.pixels,               // src_y: from line N
+                        self.width,                     // width
+                        self.height - scroll_op.pixels, // height: all except scrolled
+                        12,                             // 12 = SRC function (simple copy)
+                        0,                              // dst_layer
+                        0,                              // dst_x
+                        0,                              // dst_y: to top
                     );
                     self.send_and_record(&copy_instr).await?;
 
@@ -1199,15 +1207,24 @@ impl IronRdpSession {
 
             // Format img instruction: img,<stream>,<mask>,<layer>,<mimetype>,<x>,<y>;
             // Then send blob instruction: blob,<stream>,<base64_data>;
+            // Every element needs LENGTH.VALUE format
             let stream_str = self.stream_id.to_string();
+            let mask = 7; // RGB channels (0x07)
+            let layer = 0; // Default layer
+            let mask_str = mask.to_string();
+            let layer_str = layer.to_string();
             let x_str = rect.x.to_string();
             let y_str = rect.y.to_string();
             let mimetype = "image/png";
 
             let img_instr = format!(
-                "3.img,{}.{},1.7,1.0,{}.{},{}.{},{}.{};",
+                "3.img,{}.{},{}.{},{}.{},{}.{},{}.{},{}.{};",
                 stream_str.len(),
                 stream_str,
+                mask_str.len(),
+                mask_str,
+                layer_str.len(),
+                layer_str,
                 mimetype.len(),
                 mimetype,
                 x_str.len(),
@@ -1227,6 +1244,10 @@ impl IronRdpSession {
             // Send and record instructions
             self.send_and_record(&img_instr).await?;
             self.send_and_record(&blob_instr).await?;
+
+            // Send end instruction to close the stream
+            let end_instr = guacr_protocol::format_end(self.stream_id);
+            self.send_and_record(&end_instr).await?;
         }
 
         self.framebuffer.clear_dirty();

@@ -82,6 +82,27 @@ pub fn x11_keysym_to_bytes_with_backspace(
     modifiers: Option<&ModifierState>,
     backspace_code: u8,
 ) -> Vec<u8> {
+    x11_keysym_to_bytes_with_modes(keysym, pressed, modifiers, backspace_code, false)
+}
+
+/// Convert X11 keysym to terminal input bytes with full mode support
+///
+/// Supports application cursor mode (DECCKM) for proper vim/less/tmux operation.
+///
+/// # Arguments
+///
+/// * `keysym` - X11 keysym value
+/// * `pressed` - Whether the key is pressed (true) or released (false)
+/// * `modifiers` - Optional modifier state for control character handling
+/// * `backspace_code` - Code to send for backspace key (127 = DEL, 8 = BS)
+/// * `application_cursor` - Whether terminal is in application cursor mode
+pub fn x11_keysym_to_bytes_with_modes(
+    keysym: u32,
+    pressed: bool,
+    modifiers: Option<&ModifierState>,
+    backspace_code: u8,
+    application_cursor: bool,
+) -> Vec<u8> {
     // Only handle key press events
     if !pressed {
         return Vec::new();
@@ -139,11 +160,41 @@ pub fn x11_keysym_to_bytes_with_backspace(
         // Escape
         0xFF1B => vec![0x1B],
 
-        // Arrow keys (VT100 sequences)
-        0xFF51 => vec![0x1B, b'[', b'D'], // Left
-        0xFF52 => vec![0x1B, b'[', b'A'], // Up
-        0xFF53 => vec![0x1B, b'[', b'C'], // Right
-        0xFF54 => vec![0x1B, b'[', b'B'], // Down
+        // Arrow keys - check application cursor mode (DECCKM)
+        // Normal mode: ESC[A/B/C/D
+        // Application mode: ESCOA/OB/OC/OD (used by vim, less, tmux)
+        0xFF51 => {
+            // Left
+            if application_cursor {
+                vec![0x1B, b'O', b'D']
+            } else {
+                vec![0x1B, b'[', b'D']
+            }
+        }
+        0xFF52 => {
+            // Up
+            if application_cursor {
+                vec![0x1B, b'O', b'A']
+            } else {
+                vec![0x1B, b'[', b'A']
+            }
+        }
+        0xFF53 => {
+            // Right
+            if application_cursor {
+                vec![0x1B, b'O', b'C']
+            } else {
+                vec![0x1B, b'[', b'C']
+            }
+        }
+        0xFF54 => {
+            // Down
+            if application_cursor {
+                vec![0x1B, b'O', b'B']
+            } else {
+                vec![0x1B, b'[', b'B']
+            }
+        }
 
         // Home/End
         0xFF50 => vec![0x1B, b'[', b'H'], // Home
@@ -272,6 +323,7 @@ mod tests {
 
     #[test]
     fn test_arrow_keys() {
+        // Normal mode (default)
         assert_eq!(
             x11_keysym_to_bytes(0xFF51, true, None),
             vec![0x1B, b'[', b'D']
@@ -288,6 +340,179 @@ mod tests {
             x11_keysym_to_bytes(0xFF54, true, None),
             vec![0x1B, b'[', b'B']
         ); // Down
+    }
+
+    #[test]
+    fn test_arrow_keys_application_cursor_mode() {
+        // Application cursor mode (used by vim, less, tmux)
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF51, true, None, 127, true),
+            vec![0x1B, b'O', b'D']
+        ); // Left
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF52, true, None, 127, true),
+            vec![0x1B, b'O', b'A']
+        ); // Up
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF53, true, None, 127, true),
+            vec![0x1B, b'O', b'C']
+        ); // Right
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF54, true, None, 127, true),
+            vec![0x1B, b'O', b'B']
+        ); // Down
+
+        // Normal mode (application_cursor = false) - MUST still work for bash!
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF51, true, None, 127, false),
+            vec![0x1B, b'[', b'D']
+        ); // Left
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF52, true, None, 127, false),
+            vec![0x1B, b'[', b'A']
+        ); // Up
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF53, true, None, 127, false),
+            vec![0x1B, b'[', b'C']
+        ); // Right
+        assert_eq!(
+            x11_keysym_to_bytes_with_modes(0xFF54, true, None, 127, false),
+            vec![0x1B, b'[', b'B']
+        ); // Down
+    }
+
+    #[test]
+    fn test_mode_switching_scenario() {
+        // Simulate the exact scenario: bash -> vim -> bash
+
+        // 1. In bash (normal mode = false), arrows should work
+        let bash_up = x11_keysym_to_bytes_with_modes(0xFF52, true, None, 127, false);
+        assert_eq!(
+            bash_up,
+            vec![0x1B, b'[', b'A'],
+            "Bash: Up arrow should be ESC[A"
+        );
+
+        // 2. Open vim (application mode = true), arrows should work differently
+        let vim_up = x11_keysym_to_bytes_with_modes(0xFF52, true, None, 127, true);
+        assert_eq!(
+            vim_up,
+            vec![0x1B, b'O', b'A'],
+            "Vim: Up arrow should be ESCOA"
+        );
+
+        // 3. Exit vim (back to normal mode = false), arrows should work again
+        let bash_up_again = x11_keysym_to_bytes_with_modes(0xFF52, true, None, 127, false);
+        assert_eq!(
+            bash_up_again,
+            vec![0x1B, b'[', b'A'],
+            "Bash again: Up arrow should be ESC[A"
+        );
+
+        // Verify they're different sequences
+        assert_ne!(
+            bash_up, vim_up,
+            "Bash and vim should send different sequences"
+        );
+        assert_eq!(bash_up, bash_up_again, "Bash should be consistent");
+    }
+
+    #[test]
+    fn test_multiple_mode_switches_all_arrows() {
+        // Test all arrow keys through multiple mode switches
+        // Simulates: bash -> vim -> bash -> less -> bash
+
+        let arrow_keys = [
+            (0xFF51, "Left", b'D'),
+            (0xFF52, "Up", b'A'),
+            (0xFF53, "Right", b'C'),
+            (0xFF54, "Down", b'B'),
+        ];
+
+        for (keysym, name, letter) in arrow_keys {
+            // Bash (normal mode)
+            let normal1 = x11_keysym_to_bytes_with_modes(keysym, true, None, 127, false);
+            assert_eq!(
+                normal1,
+                vec![0x1B, b'[', letter],
+                "{} in bash should be ESC[{}",
+                name,
+                letter as char
+            );
+
+            // Vim (application mode)
+            let app1 = x11_keysym_to_bytes_with_modes(keysym, true, None, 127, true);
+            assert_eq!(
+                app1,
+                vec![0x1B, b'O', letter],
+                "{} in vim should be ESCO{}",
+                name,
+                letter as char
+            );
+
+            // Back to bash
+            let normal2 = x11_keysym_to_bytes_with_modes(keysym, true, None, 127, false);
+            assert_eq!(
+                normal2,
+                vec![0x1B, b'[', letter],
+                "{} in bash again should be ESC[{}",
+                name,
+                letter as char
+            );
+
+            // Less (application mode)
+            let app2 = x11_keysym_to_bytes_with_modes(keysym, true, None, 127, true);
+            assert_eq!(
+                app2,
+                vec![0x1B, b'O', letter],
+                "{} in less should be ESCO{}",
+                name,
+                letter as char
+            );
+
+            // Back to bash again
+            let normal3 = x11_keysym_to_bytes_with_modes(keysym, true, None, 127, false);
+            assert_eq!(
+                normal3,
+                vec![0x1B, b'[', letter],
+                "{} in bash final should be ESC[{}",
+                name,
+                letter as char
+            );
+
+            // Verify consistency
+            assert_eq!(
+                normal1, normal2,
+                "{} normal mode should be consistent",
+                name
+            );
+            assert_eq!(
+                normal2, normal3,
+                "{} normal mode should be consistent",
+                name
+            );
+            assert_eq!(app1, app2, "{} application mode should be consistent", name);
+            assert_ne!(
+                normal1, app1,
+                "{} sequences should differ between modes",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_rapid_mode_switching() {
+        // Test rapid switching like opening/closing vim multiple times
+        for i in 0..10 {
+            let is_app_mode = i % 2 == 1; // Alternate between modes
+            let up = x11_keysym_to_bytes_with_modes(0xFF52, true, None, 127, is_app_mode);
+
+            if is_app_mode {
+                assert_eq!(up, vec![0x1B, b'O', b'A'], "Iteration {}: App mode", i);
+            } else {
+                assert_eq!(up, vec![0x1B, b'[', b'A'], "Iteration {}: Normal mode", i);
+            }
+        }
     }
 
     #[test]

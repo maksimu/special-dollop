@@ -45,24 +45,26 @@ log = "0.4.28"
 uuid = { version = "1.18.1", features = ["v4"] }
 base64 = "0.22.1"
 
-# Use local IronRDP fork with Update PDU handling + sspi 0.19.3
-# Your fork has graphics update support that's not yet in upstream master
+# Use GitHub IronRDP fork with Update PDU handling + sspi 0.18.6
+# Fork: https://github.com/miroberts/IronRDP
 # Branch: feature/handle-update-pdu
-# Updated sspi to 0.19.3 for rand_core 0.6.4 compatibility
+# - Graphics update support (bitmap, orders, palette)
+# - Updated sspi to 0.18.6 for rand_core compatibility
 [patch.crates-io]
-ironrdp = { path = "../IronRDP/crates/ironrdp" }
-ironrdp-async = { path = "../IronRDP/crates/ironrdp-async" }
-ironrdp-tokio = { path = "../IronRDP/crates/ironrdp-tokio" }
-ironrdp-pdu = { path = "../IronRDP/crates/ironrdp-pdu" }
-ironrdp-session = { path = "../IronRDP/crates/ironrdp-session" }
-ironrdp-core = { path = "../IronRDP/crates/ironrdp-core" }
-ironrdp-error = { path = "../IronRDP/crates/ironrdp-error" }
-ironrdp-connector = { path = "../IronRDP/crates/ironrdp-connector" }
-ironrdp-graphics = { path = "../IronRDP/crates/ironrdp-graphics" }
-ironrdp-input = { path = "../IronRDP/crates/ironrdp-input" }
-ironrdp-cliprdr = { path = "../IronRDP/crates/ironrdp-cliprdr" }
-ironrdp-svc = { path = "../IronRDP/crates/ironrdp-svc" }
-ironrdp-tls = { path = "../IronRDP/crates/ironrdp-tls" }
+ironrdp = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-async = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-tokio = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-pdu = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-session = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-core = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-error = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-connector = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-graphics = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-input = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-cliprdr = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-svc = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-displaycontrol = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-dvc = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 
 [profile.release]
 opt-level = 3

@@ -171,7 +171,7 @@ pub fn format_ack(stream: u32, message: &str) -> String {
 /// ```
 /// use guacr_protocol::format_error;
 /// let error_instr = format_error("Authentication failed", 769);
-/// assert_eq!(error_instr, "5.error,22.Authentication failed,3.769;");
+/// assert_eq!(error_instr, "5.error,21.Authentication failed,3.769;");
 /// ```
 pub fn format_error(message: &str, status_code: u32) -> String {
     let status_str = status_code.to_string();
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_format_error() {
         let instr = format_error("Authentication failed", 769);
-        assert_eq!(instr, "5.error,22.Authentication failed,3.769;");
+        assert_eq!(instr, "5.error,21.Authentication failed,3.769;");
 
         let instr2 = format_error("Connection timeout", 514);
         assert_eq!(instr2, "5.error,18.Connection timeout,3.514;");

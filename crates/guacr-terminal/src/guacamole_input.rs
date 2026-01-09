@@ -831,17 +831,15 @@ pub fn format_selection_overlay_instructions(
 
 /// Generate Guacamole instructions to clear selection overlay
 ///
+/// Uses the `dispose` instruction to properly destroy the overlay layer.
+/// This is the correct way to clear a layer in the Guacamole protocol.
+///
 /// # Returns
 /// Vec of Guacamole instructions to clear selection overlay
 pub fn format_clear_selection_instructions() -> Vec<String> {
-    let layer = "1"; // Selection overlay layer
-
-    vec![
-        // Draw a tiny 1x1 rectangle
-        format!("4.rect,{}.{},1.0,1.0,1.1,1.1;", layer.len(), layer),
-        // Fill with transparent (R=0, G=0, B=0, A=0)
-        format!("5.cfill,{}.{},1.0,1.0,1.0,1.0;", layer.len(), layer),
-    ]
+    // Use dispose instruction to properly clear the overlay layer
+    // Layer 1 is the selection overlay layer
+    vec![guacr_protocol::format_dispose(1)]
 }
 
 /// Format clipboard data as Guacamole protocol instructions

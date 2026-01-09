@@ -288,6 +288,19 @@ impl TerminalEmulator {
         self.sgr_mouse_mode
     }
 
+    /// Check if terminal is in application cursor mode (DECCKM)
+    ///
+    /// When enabled, arrow keys send different escape sequences:
+    /// - Normal mode: ESC[A (up), ESC[B (down), ESC[C (right), ESC[D (left)
+    /// - Application mode: ESCOA, ESCOB, ESCOC, ESCOD
+    ///
+    /// This mode is enabled by full-screen applications like vim, less, and tmux.
+    pub fn is_application_cursor_mode(&self) -> bool {
+        // Check if the vt100 parser has application cursor mode enabled
+        // The vt100 crate tracks this via the DECCKM mode (mode 1)
+        self.parser.screen().application_cursor()
+    }
+
     /// Detect mouse mode changes from escape sequences in the data
     ///
     /// Scans for DEC private mode set/reset sequences that control mouse tracking:
@@ -590,6 +603,211 @@ mod tests {
         let contents = screen.contents();
         assert!(contents.contains("Hello"));
         assert!(contents.contains("World"));
+    }
+
+    #[test]
+    fn test_application_cursor_mode_default() {
+        let term = TerminalEmulator::new(24, 80);
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_enable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // ESC [ ? 1 h - Enable application cursor mode (DECCKM)
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_disable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable then disable
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // ESC [ ? 1 l - Disable application cursor mode
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_multiple_switches() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Simulate: bash -> vim -> bash -> less -> bash
+
+        // Start in bash (normal mode)
+        assert!(!term.is_application_cursor_mode());
+
+        // Open vim (enables application mode)
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // Exit vim (back to normal mode)
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+
+        // Open less (enables application mode again)
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // Exit less (back to normal mode)
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_vim_simulation() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Simulate vim startup sequence
+        // Vim typically sends multiple mode changes
+        term.process(b"\x1b[?1h").unwrap(); // Enable application cursor
+        term.process(b"\x1b[?1h").unwrap(); // Redundant enable (should be idempotent)
+        assert!(term.is_application_cursor_mode());
+
+        // Vim exit sequence
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_in_mixed_data() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Application cursor mode sequence embedded in regular output
+        term.process(b"Hello \x1b[?1h World").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // More text with disable sequence
+        term.process(b"More text \x1b[?1l here").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_with_other_modes() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable multiple modes at once (like vim does)
+        term.process(b"\x1b[?1h\x1b[?1000h").unwrap(); // App cursor + mouse
+        assert!(term.is_application_cursor_mode());
+        assert!(term.is_mouse_enabled());
+
+        // Disable both
+        term.process(b"\x1b[?1l\x1b[?1000l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mouse_mode_and_text_selection_interaction() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // In bash: mouse mode disabled, text selection should work
+        assert!(!term.is_mouse_enabled());
+
+        // Open vim with mouse enabled
+        term.process(b"\x1b[?1000h").unwrap();
+        assert!(term.is_mouse_enabled());
+        // When mouse mode is enabled, mouse events go to terminal (not text selection)
+
+        // Exit vim
+        term.process(b"\x1b[?1000l").unwrap();
+        assert!(!term.is_mouse_enabled());
+        // Back to bash: text selection should work again
+    }
+
+    #[test]
+    fn test_vim_full_mode_sequence() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Vim startup: enables application cursor + mouse
+        term.process(b"\x1b[?1h\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+            .unwrap();
+
+        assert!(
+            term.is_application_cursor_mode(),
+            "Vim should enable app cursor"
+        );
+        assert!(term.is_mouse_enabled(), "Vim should enable mouse");
+        assert!(term.is_sgr_mouse_mode(), "Vim should enable SGR mouse");
+
+        // In vim:
+        // - Arrow keys send ESCOA/OB/OC/OD (application cursor mode)
+        // - Mouse events send X11 sequences (mouse mode enabled)
+        // - Text selection is disabled (mouse goes to vim)
+
+        // Vim exit: disables all modes
+        term.process(b"\x1b[?1l\x1b[?1000l\x1b[?1002l\x1b[?1006l")
+            .unwrap();
+
+        assert!(
+            !term.is_application_cursor_mode(),
+            "Should return to normal cursor"
+        );
+        assert!(!term.is_mouse_enabled(), "Should disable mouse");
+        assert!(!term.is_sgr_mouse_mode(), "Should disable SGR mouse");
+
+        // Back in bash:
+        // - Arrow keys send ESC[A/B/C/D (normal mode)
+        // - Mouse events trigger text selection
+        // - Highlighting/copy works
+    }
+
+    #[test]
+    fn test_less_mode_sequence() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Less typically enables application cursor but not mouse
+        term.process(b"\x1b[?1h").unwrap();
+
+        assert!(
+            term.is_application_cursor_mode(),
+            "Less should enable app cursor"
+        );
+        assert!(
+            !term.is_mouse_enabled(),
+            "Less typically doesn't enable mouse"
+        );
+
+        // In less:
+        // - Arrow keys send ESCOA/OB/OC/OD (application cursor mode)
+        // - Mouse events still trigger text selection (mouse mode disabled)
+        // - Highlighting/copy still works!
+
+        // Exit less
+        term.process(b"\x1b[?1l").unwrap();
+
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mode_combinations_bash_vim_bash() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Bash: Both modes disabled
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+        // Text selection: ✓ Works
+        // Arrow keys: ESC[A/B/C/D
+
+        // Open vim
+        term.process(b"\x1b[?1h\x1b[?1000h").unwrap();
+        assert!(term.is_application_cursor_mode());
+        assert!(term.is_mouse_enabled());
+        // Text selection: ✗ Disabled (mouse goes to vim)
+        // Arrow keys: ESCOA/OB/OC/OD
+
+        // Exit vim
+        term.process(b"\x1b[?1l\x1b[?1000l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+        // Text selection: ✓ Works again
+        // Arrow keys: ESC[A/B/C/D
     }
 
     #[test]

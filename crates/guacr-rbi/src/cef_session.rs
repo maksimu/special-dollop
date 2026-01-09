@@ -33,8 +33,7 @@
 // 3. Build: cargo build --features cef
 
 #[cfg(feature = "cef")]
-use log::warn;
-use log::{debug, info};
+use log::info;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 

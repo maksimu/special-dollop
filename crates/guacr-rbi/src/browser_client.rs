@@ -420,18 +420,18 @@ impl BrowserClient {
                             if let Some((delta_x, delta_y)) = scroll_detector.update(position) {
                                 // Scroll detected - boost FPS and capture immediately
                                 adaptive_fps.boost_fps();
-                                
+
                                 // Determine scroll significance
                                 let viewport_height = self.height as i32;
                                 let is_significant = scroll_detector.is_significant_scroll(delta_y, viewport_height);
                                 let is_page_scroll = scroll_detector.is_page_scroll(delta_y, viewport_height);
                                 let velocity = scroll_detector.velocity();
-                                
+
                                 debug!(
                                     "RBI: Scroll detected: delta=({}, {}), velocity={:.0}px/s, significant={}, page_scroll={}",
                                     delta_x, delta_y, velocity, is_significant, is_page_scroll
                                 );
-                                
+
                                 // Immediate frame capture for smooth scrolling
                                 if is_significant {
                                     match chrome_session.capture_screenshot().await {

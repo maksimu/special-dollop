@@ -8,8 +8,8 @@
 //!
 //! Connection details:
 //!   Host: localhost:3389
-//!   User: test_user
-//!   Password: test_password
+//!   User: linuxuser
+//!   Password: alpine
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -38,8 +38,8 @@ mod rdp_handler_tests {
 
     const HOST: &str = "127.0.0.1";
     const PORT: u16 = 3389;
-    const USERNAME: &str = "test_user";
-    const PASSWORD: &str = "test_password";
+    const USERNAME: &str = "linuxuser";
+    const PASSWORD: &str = "alpine";
 
     async fn skip_if_not_available() -> bool {
         if !port_is_open(HOST, PORT).await {
@@ -238,6 +238,143 @@ mod rdp_handler_tests {
         }
 
         println!("RDP resize: got_new_size={}", got_new_size);
+
+        drop(from_client_tx);
+        let _ = timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rdp_different_color_depths() {
+        if skip_if_not_available().await {
+            return;
+        }
+
+        for color_depth in &["8", "16", "24", "32"] {
+            let handler = RdpHandler::with_defaults();
+            let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(1024);
+            let (from_client_tx, from_client_rx) = mpsc::channel::<Bytes>(1024);
+
+            let mut params = HashMap::new();
+            params.insert("hostname".to_string(), HOST.to_string());
+            params.insert("port".to_string(), PORT.to_string());
+            params.insert("username".to_string(), USERNAME.to_string());
+            params.insert("password".to_string(), PASSWORD.to_string());
+            params.insert("security".to_string(), "rdp".to_string());
+            params.insert("ignore-cert".to_string(), "true".to_string());
+            params.insert("color-depth".to_string(), color_depth.to_string());
+
+            let handle =
+                tokio::spawn(
+                    async move { handler.connect(params, to_client_tx, from_client_rx).await },
+                );
+
+            // Wait for connection
+            let _ = timeout(CONNECT_TIMEOUT, to_client_rx.recv()).await;
+
+            println!("RDP: Tested with color depth {}", color_depth);
+
+            drop(from_client_tx);
+            let _ = timeout(Duration::from_secs(5), handle).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rdp_keyboard_input() {
+        if skip_if_not_available().await {
+            return;
+        }
+
+        let handler = RdpHandler::with_defaults();
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(1024);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Bytes>(1024);
+
+        let mut params = HashMap::new();
+        params.insert("hostname".to_string(), HOST.to_string());
+        params.insert("port".to_string(), PORT.to_string());
+        params.insert("username".to_string(), USERNAME.to_string());
+        params.insert("password".to_string(), PASSWORD.to_string());
+        params.insert("security".to_string(), "rdp".to_string());
+        params.insert("ignore-cert".to_string(), "true".to_string());
+
+        let handle =
+            tokio::spawn(
+                async move { handler.connect(params, to_client_tx, from_client_rx).await },
+            );
+
+        // Wait for connection
+        for _ in 0..10 {
+            if timeout(Duration::from_secs(1), to_client_rx.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        // Send key event (letter 'A')
+        let key_instr = "3.key,2.65,1.1;";
+        from_client_tx
+            .send(Bytes::from(key_instr))
+            .await
+            .expect("Send failed");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(from_client_tx);
+        let _ = timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rdp_mouse_input() {
+        if skip_if_not_available().await {
+            return;
+        }
+
+        let handler = RdpHandler::with_defaults();
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(1024);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Bytes>(1024);
+
+        let mut params = HashMap::new();
+        params.insert("hostname".to_string(), HOST.to_string());
+        params.insert("port".to_string(), PORT.to_string());
+        params.insert("username".to_string(), USERNAME.to_string());
+        params.insert("password".to_string(), PASSWORD.to_string());
+        params.insert("security".to_string(), "rdp".to_string());
+        params.insert("ignore-cert".to_string(), "true".to_string());
+
+        let handle =
+            tokio::spawn(
+                async move { handler.connect(params, to_client_tx, from_client_rx).await },
+            );
+
+        // Wait for connection
+        for _ in 0..10 {
+            if timeout(Duration::from_secs(1), to_client_rx.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        // Send mouse move
+        let mouse_instr = "5.mouse,3.100,3.100;";
+        from_client_tx
+            .send(Bytes::from(mouse_instr))
+            .await
+            .expect("Send failed");
+
+        // Send mouse click
+        let click_instr = "5.mouse,3.100,3.100,1.1;";
+        from_client_tx
+            .send(Bytes::from(click_instr))
+            .await
+            .expect("Send failed");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         drop(from_client_tx);
         let _ = timeout(Duration::from_secs(5), handle).await;

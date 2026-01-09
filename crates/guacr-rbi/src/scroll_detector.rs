@@ -123,7 +123,7 @@ impl ScrollDetector {
     /// Returns Some((delta_x, delta_y)) if position changed, None otherwise
     pub fn update(&mut self, position: ScrollPosition) -> Option<(i32, i32)> {
         let now = Instant::now();
-        
+
         if let Some(last) = self.last_position {
             let (delta_x, delta_y) = position.delta_from(&last);
 
@@ -363,20 +363,20 @@ mod tests {
     fn test_scroll_velocity() {
         use std::thread;
         use std::time::Duration;
-        
+
         let mut detector = ScrollDetector::new();
-        
+
         // First position
         let pos1 = ScrollPosition::new(0, 0, 1000, 2000);
         detector.update(pos1);
-        
+
         // Wait a bit
         thread::sleep(Duration::from_millis(100));
-        
+
         // Second position (scrolled 100 pixels)
         let pos2 = ScrollPosition::new(0, 100, 1000, 2000);
         detector.update(pos2);
-        
+
         // Velocity should be ~1000 px/s (100 pixels in 0.1 seconds)
         let velocity = detector.velocity();
         assert!(velocity > 500.0 && velocity < 1500.0);
@@ -385,16 +385,16 @@ mod tests {
     #[test]
     fn test_is_scrolling() {
         let mut detector = ScrollDetector::new();
-        
+
         // Not scrolling initially
         assert!(!detector.is_scrolling());
-        
+
         // Scroll
         let pos1 = ScrollPosition::new(0, 0, 1000, 2000);
         detector.update(pos1);
         let pos2 = ScrollPosition::new(0, 100, 1000, 2000);
         detector.update(pos2);
-        
+
         // Should be scrolling now
         assert!(detector.is_scrolling());
     }
@@ -402,16 +402,16 @@ mod tests {
     #[test]
     fn test_scroll_heuristics() {
         let detector = ScrollDetector::new();
-        
+
         // Small scroll (5 pixels in 1000px viewport = 0.5%)
         assert!(!detector.is_significant_scroll(5, 1000));
-        
+
         // Significant scroll (60 pixels in 1000px viewport = 6%)
         assert!(detector.is_significant_scroll(60, 1000));
-        
+
         // Page scroll (850 pixels in 1000px viewport = 85%)
         assert!(detector.is_page_scroll(850, 1000));
-        
+
         // Not a page scroll (500 pixels in 1000px viewport = 50%)
         assert!(!detector.is_page_scroll(500, 1000));
     }

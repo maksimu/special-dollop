@@ -29,13 +29,9 @@ use crate::handler::RbiConfig;
 use crate::input::RbiInputHandler;
 use bytes::Bytes;
 use guacr_handlers::{
-    format_error, KeepAliveManager, MultiFormatRecorder, RecordingConfig,
-    DEFAULT_KEEPALIVE_INTERVAL_SECS,
+    KeepAliveManager, MultiFormatRecorder, RecordingConfig, DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
-use guacr_protocol::{
-    BinaryEncoder, GuacamoleParser, STATUS_RESOURCE_CLOSED, STATUS_UPSTREAM_ERROR,
-    STATUS_UPSTREAM_TIMEOUT,
-};
+use guacr_protocol::{format_error, BinaryEncoder, GuacamoleParser, STATUS_UPSTREAM_ERROR};
 use log::{debug, error, info, trace, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -90,7 +86,7 @@ impl CefBrowserClient {
         error: String,
         status_code: u16,
     ) -> String {
-        let error_instr = format_error(&error, status_code);
+        let error_instr = format_error(&error, status_code as u32);
         let _ = to_client.send(Bytes::from(error_instr)).await;
         error
     }
@@ -163,9 +159,12 @@ impl CefBrowserClient {
         if let Err(e) = cef_session.launch(url, display_tx, audio_tx).await {
             let err_msg = format!("CEF launch failed: {}", e);
             error!("RBI/CEF: {}", err_msg);
-            return Err(
-                Self::send_error_and_return(&to_client, err_msg, STATUS_UPSTREAM_ERROR).await,
-            );
+            return Err(Self::send_error_and_return(
+                &to_client,
+                err_msg,
+                STATUS_UPSTREAM_ERROR as u16,
+            )
+            .await);
         }
 
         info!("RBI/CEF: Dedicated CEF process spawned (PID will be logged by CEF)");
@@ -174,7 +173,9 @@ impl CefBrowserClient {
         if let Err(e) = self.send_handshake(&to_client).await {
             error!("RBI/CEF: Handshake failed: {}", e);
             cef_session.close();
-            return Err(Self::send_error_and_return(&to_client, e, STATUS_UPSTREAM_ERROR).await);
+            return Err(
+                Self::send_error_and_return(&to_client, e, STATUS_UPSTREAM_ERROR as u16).await,
+            );
         }
 
         info!("RBI/CEF: Browser launched, starting event loop");

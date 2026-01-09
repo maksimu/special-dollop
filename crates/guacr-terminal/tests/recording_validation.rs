@@ -4,7 +4,6 @@
 use guacr_terminal::{AsciicastHeader, DualFormatRecorder};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use tempfile::TempDir;
 
 /// Test asciicast v2 format compliance
@@ -362,7 +361,7 @@ fn test_timing_accuracy() {
     if timestamps.len() >= 2 {
         let delay1 = timestamps[1] - timestamps[0];
         assert!(
-            delay1 >= 0.05 && delay1 <= 0.15,
+            (0.05..=0.15).contains(&delay1),
             "First delay should be ~100ms, got {:.3}s",
             delay1
         );

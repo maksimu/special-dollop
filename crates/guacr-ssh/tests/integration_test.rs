@@ -15,7 +15,7 @@
 //! Connection details:
 //!   Host: localhost:2222
 //!   User: root or test_user
-//!   Password: test_password
+//!   Password: alpine
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -47,8 +47,8 @@ mod ssh_handler_tests {
 
     const HOST: &str = "127.0.0.1";
     const PORT: u16 = 2222;
-    const USERNAME: &str = "test_user";
-    const PASSWORD: &str = "test_password";
+    const USERNAME: &str = "linuxuser";
+    const PASSWORD: &str = "alpine";
 
     async fn skip_if_not_available() -> bool {
         if !port_is_open(HOST, PORT).await {
@@ -130,15 +130,28 @@ mod ssh_handler_tests {
                 async move { handler.connect(params, to_client_tx, from_client_rx).await },
             );
 
-        // Collect initial instructions
+        // Collect initial instructions with longer timeout for first message
         let mut found_pipe = false;
         let mut found_ready = false;
         let mut found_size = false;
+        let mut received_messages = Vec::new();
 
-        for _ in 0..10 {
-            match timeout(Duration::from_secs(2), to_client_rx.recv()).await {
+        // Use CONNECT_TIMEOUT for first message (SSH connection can take time)
+        let first_timeout = CONNECT_TIMEOUT;
+        let subsequent_timeout = Duration::from_secs(3);
+
+        for i in 0..20 {
+            let timeout_duration = if i == 0 {
+                first_timeout
+            } else {
+                subsequent_timeout
+            };
+
+            match timeout(timeout_duration, to_client_rx.recv()).await {
                 Ok(Some(msg)) => {
                     let msg_str = String::from_utf8_lossy(&msg);
+                    eprintln!("Message {}: {}", i, msg_str); // Debug output
+                    received_messages.push(msg_str.to_string());
 
                     if msg_str.contains("pipe") && msg_str.contains("STDOUT") {
                         found_pipe = true;
@@ -158,9 +171,27 @@ mod ssh_handler_tests {
                     if msg_str.contains("size") {
                         found_size = true;
                     }
+
+                    // Break early if we found all three
+                    if found_pipe && found_ready && found_size {
+                        break;
+                    }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) => {
+                    eprintln!("Channel closed after {} messages", i);
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("Timeout after {} messages", i);
+                    break;
+                }
+            }
+        }
+
+        if !found_pipe {
+            eprintln!("Received {} messages total:", received_messages.len());
+            for (i, msg) in received_messages.iter().enumerate() {
+                eprintln!("  {}: {}", i, msg);
             }
         }
 

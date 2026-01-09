@@ -36,8 +36,8 @@ use guacr_protocol::{
 };
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, parse_clipboard_blob,
-    parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes_with_backspace,
-    DirtyTracker, ModifierState, MouseSelection, SelectionResult, TerminalConfig, TerminalEmulator,
+    parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes_with_modes, DirtyTracker,
+    ModifierState, MouseSelection, SelectionResult, TerminalConfig, TerminalEmulator,
     TerminalRenderer,
 };
 use log::{debug, error, info, trace, warn};
@@ -593,6 +593,10 @@ impl ProtocolHandler for SshHandler {
         // Track if we need to render banner after first resize
         let mut banner_needs_render = banner_collected;
 
+        // Track if we've received the first resize from client
+        // This prevents rendering the banner at the wrong size
+        let mut first_resize_received = false;
+
         // Make rows/cols mutable for dynamic resizing (guacd-style)
         let mut current_rows = rows;
         let mut current_cols = cols;
@@ -788,6 +792,13 @@ impl ProtocolHandler for SshHandler {
                 // IMPORTANT: This MUST come before input arms in biased select to ensure
                 // rendering has priority over input processing (prevents "one char behind")
                 _ = debounce.tick() => {
+                    // Don't render before first resize if banner was collected
+                    // This prevents rendering at the wrong size and losing banner content
+                    if !first_resize_received && banner_needs_render {
+                        trace!("SSH: Debounce tick skipped - waiting for first resize to render banner");
+                        continue;
+                    }
+
                     if terminal.is_dirty() {
                         // Find what changed (dirty region optimization like guacd)
                         let dirty_opt = dirty_tracker.find_dirty_region(terminal.screen());
@@ -1143,13 +1154,26 @@ impl ProtocolHandler for SshHandler {
                             continue;
                         }
 
-                        // Convert to terminal bytes with modifier state and configured backspace
+                        // Convert to terminal bytes with modifier state, backspace, and application cursor mode
                         // This enables Ctrl+C (0x03), Ctrl+D (0x04), etc.
-                        let bytes = x11_keysym_to_bytes_with_backspace(
+                        // Application cursor mode is needed for vim, less, tmux to work correctly
+                        let application_cursor = terminal.is_application_cursor_mode();
+
+                        // Log arrow keys to help debug mode switching
+                        if matches!(key_event.keysym, 0xFF51..=0xFF54) {
+                            trace!(
+                                "SSH: Arrow key 0x{:X} in {} mode",
+                                key_event.keysym,
+                                if application_cursor { "application" } else { "normal" }
+                            );
+                        }
+
+                        let bytes = x11_keysym_to_bytes_with_modes(
                             key_event.keysym,
                             key_event.pressed,
                             Some(&modifier_state),
                             backspace_code,
+                            application_cursor,
                         );
                         trace!("SSH: Key converted to {} bytes: {:?}", bytes.len(), bytes);
                         if !bytes.is_empty() {
@@ -1195,11 +1219,17 @@ impl ProtocolHandler for SshHandler {
                                             let new_cols = (new_width_px / char_width).clamp(20, 500) as u16;
                                             let new_rows = (new_height_px / char_height).clamp(10, 200) as u16;
 
-                                            // Skip resize if dimensions haven't changed
-                                            if new_rows == current_rows && new_cols == current_cols {
-                                                debug!("SSH: Ignoring resize - dimensions unchanged ({}x{} chars)", current_cols, current_rows);
-                                                continue;
-                                            }
+                            // Mark that we've received the first resize
+                            if !first_resize_received {
+                                first_resize_received = true;
+                                debug!("SSH: First resize received from client");
+                            }
+
+                            // Skip resize if dimensions haven't changed
+                            if new_rows == current_rows && new_cols == current_cols {
+                                debug!("SSH: Ignoring resize - dimensions unchanged ({}x{} chars)", current_cols, current_rows);
+                                continue;
+                            }
 
                                             // CRITICAL: Recalculate pixel dimensions to align with character grid
                                             let aligned_width = new_cols as u32 * char_width;
@@ -1339,6 +1369,13 @@ impl ProtocolHandler for SshHandler {
                                     }
 
                                     debug!("SSH: Selection complete, copying {} chars", selected_text.len());
+
+                                    // CRITICAL: Update local clipboard immediately to avoid race condition
+                                    // If user pastes immediately after selecting, they expect the selected text
+                                    // Without this, there's a race where the clipboard blob from client arrives
+                                    // after the user has already pressed Ctrl+Shift+V
+                                    stored_clipboard = selected_text.clone();
+                                    debug!("SSH: Local clipboard updated immediately with {} chars", stored_clipboard.len());
 
                                     // Clear the overlay
                                     for instr in clear_instructions {

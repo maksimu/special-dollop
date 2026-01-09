@@ -133,6 +133,29 @@ Use `proptest` or `quickcheck` for:
 
 ## Running Tests
 
+### Quick Commands (Makefile)
+
+```bash
+# Unit tests only (fast, no Docker)
+make test
+
+# Full integration tests (requires Docker)
+make test-full
+
+# Protocol-specific
+make test-ssh
+make test-rdp
+make test-vnc
+make test-db
+
+# Docker management
+make docker-up      # Start test servers
+make docker-down    # Stop test servers
+make docker-logs    # View logs
+```
+
+### Manual Commands
+
 ```bash
 # All tests
 cargo test --workspace
@@ -142,18 +165,52 @@ cargo test -p guacr-sftp
 cargo test -p guacr-telnet
 cargo test -p guacr-terminal
 
-# Recording validation tests
-cargo test -p guacr-terminal --test recording_validation
+# Integration tests (requires Docker servers)
+cargo test -p guacr-ssh --test integration_test -- --include-ignored
 
 # With output
 cargo test -- --nocapture
 
-# Integration tests only
-cargo test --test '*'
-
 # Coverage (requires cargo-tarpaulin)
 cargo install cargo-tarpaulin
 cargo tarpaulin --workspace
+```
+
+### Integration Tests with Docker
+
+Start test servers:
+```bash
+make docker-up
+```
+
+Test servers run on non-standard ports:
+- SSH: localhost:2222 (test_user/test_password)
+- RDP: localhost:3389 (test_user/test_password)
+- VNC: localhost:5901 (password: test_password)
+- Telnet: localhost:2323 (test_user/test_password)
+- MySQL: localhost:13306 (testuser/testpassword)
+- PostgreSQL: localhost:15432 (testuser/testpassword)
+- MongoDB: localhost:17017 (testuser/testpassword)
+- Redis: localhost:16379 (password: testpassword)
+
+Protocol-specific tests:
+```bash
+make test-ssh              # SSH integration tests
+make test-sftp             # SFTP integration tests (uses SSH server)
+make test-rdp              # RDP integration tests
+make test-vnc              # VNC integration tests
+make test-telnet           # Telnet integration tests
+make test-db               # Database integration tests
+make test-rbi              # RBI integration tests (requires Chrome)
+make test-threat-detection # Threat detection tests (mock BAML API)
+make test-performance      # Performance/load tests
+make test-security         # Security tests
+```
+
+Manual testing:
+```bash
+make dev-ssh    # Shows connection info
+ssh -p 2222 test_user@localhost
 ```
 
 ### Cross-Platform Testing

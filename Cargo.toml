@@ -45,15 +45,24 @@ log = "0.4.28"
 uuid = { version = "1.18.1", features = ["v4"] }
 base64 = "0.22.1"
 
-# Use local IronRDP fork with Update PDU handling
+# Use local IronRDP fork with Update PDU handling + sspi 0.19.3
 # Your fork has graphics update support that's not yet in upstream master
 # Branch: feature/handle-update-pdu
+# Updated sspi to 0.19.3 for rand_core 0.6.4 compatibility
 [patch.crates-io]
 ironrdp = { path = "../IronRDP/crates/ironrdp" }
 ironrdp-async = { path = "../IronRDP/crates/ironrdp-async" }
 ironrdp-tokio = { path = "../IronRDP/crates/ironrdp-tokio" }
 ironrdp-pdu = { path = "../IronRDP/crates/ironrdp-pdu" }
 ironrdp-session = { path = "../IronRDP/crates/ironrdp-session" }
+ironrdp-core = { path = "../IronRDP/crates/ironrdp-core" }
+ironrdp-error = { path = "../IronRDP/crates/ironrdp-error" }
+ironrdp-connector = { path = "../IronRDP/crates/ironrdp-connector" }
+ironrdp-graphics = { path = "../IronRDP/crates/ironrdp-graphics" }
+ironrdp-input = { path = "../IronRDP/crates/ironrdp-input" }
+ironrdp-cliprdr = { path = "../IronRDP/crates/ironrdp-cliprdr" }
+ironrdp-svc = { path = "../IronRDP/crates/ironrdp-svc" }
+ironrdp-tls = { path = "../IronRDP/crates/ironrdp-tls" }
 
 [profile.release]
 opt-level = 3

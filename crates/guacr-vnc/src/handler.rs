@@ -19,7 +19,8 @@ use guacr_handlers::{
     DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
 use guacr_protocol::{BinaryEncoder, GuacamoleParser};
-use guacr_terminal::FrameBuffer;
+use guacr_terminal::{FrameBuffer, ScrollDetector, ScrollDirection};
+use image::{ImageEncoder, RgbaImage};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,6 +52,14 @@ pub struct VncConfig {
     pub default_port: u16,
     pub default_width: u32,
     pub default_height: u32,
+    /// JPEG quality for image encoding (1-100, default 85)
+    /// Higher = better quality but larger files
+    /// 85 is optimal balance for RDP-like performance
+    pub jpeg_quality: u8,
+    /// Use JPEG encoding instead of PNG (default true for bandwidth savings)
+    pub use_jpeg: bool,
+    /// Frame rate limit in FPS (default 30)
+    pub frame_rate: u32,
 }
 
 impl Default for VncConfig {
@@ -59,6 +68,9 @@ impl Default for VncConfig {
             default_port: 5900,
             default_width: 1920,
             default_height: 1080,
+            jpeg_quality: 85,  // Same as RDP for consistency
+            use_jpeg: true,    // Enable by default for bandwidth savings
+            frame_rate: 30,    // 30 FPS default (can go up to 60)
         }
     }
 }
@@ -102,6 +114,9 @@ impl ProtocolHandler for VncHandler {
             settings.read_only,
             settings.security.clone(),
             settings.recording_config.clone(),
+            settings.jpeg_quality,
+            settings.use_jpeg,
+            settings.frame_rate,
             to_client,
             &params,
         );
@@ -177,6 +192,12 @@ pub struct VncSettings {
     pub security: HandlerSecuritySettings,
     /// Recording configuration
     pub recording_config: RecordingConfig,
+    /// JPEG quality (1-100)
+    pub jpeg_quality: u8,
+    /// Use JPEG encoding (vs PNG)
+    pub use_jpeg: bool,
+    /// Frame rate limit (FPS)
+    pub frame_rate: u32,
     #[cfg(feature = "sftp")]
     pub enable_sftp: bool,
     #[cfg(feature = "sftp")]
@@ -235,6 +256,29 @@ impl VncSettings {
                 recording_config.is_typescript_enabled()
             );
         }
+
+        // Parse image encoding settings
+        let jpeg_quality = params
+            .get("jpeg_quality")
+            .and_then(|q| q.parse().ok())
+            .unwrap_or(defaults.jpeg_quality)
+            .clamp(1, 100);
+        
+        let use_jpeg = params
+            .get("use_jpeg")
+            .map(|v| v == "true")
+            .unwrap_or(defaults.use_jpeg);
+        
+        let frame_rate = params
+            .get("frame_rate")
+            .and_then(|f| f.parse().ok())
+            .unwrap_or(defaults.frame_rate)
+            .clamp(1, 60);
+        
+        info!(
+            "VNC: Image encoding - use_jpeg={}, quality={}, frame_rate={} FPS",
+            use_jpeg, jpeg_quality, frame_rate
+        );
 
         #[cfg(feature = "sftp")]
         let (
@@ -309,6 +353,9 @@ impl VncSettings {
             read_only,
             security,
             recording_config,
+            jpeg_quality,
+            use_jpeg,
+            frame_rate,
             #[cfg(feature = "sftp")]
             enable_sftp,
             #[cfg(feature = "sftp")]
@@ -348,18 +395,31 @@ struct VncClient {
     /// Active recorder
     #[allow(dead_code)] // TODO: Use for .ses recording
     recorder: Option<MultiFormatRecorder>,
+    /// Scroll detector for bandwidth optimization (shared with RDP)
+    scroll_detector: ScrollDetector,
+    /// JPEG quality (1-100)
+    jpeg_quality: u8,
+    /// Use JPEG encoding (vs PNG)
+    use_jpeg: bool,
+    /// Frame rate limit (FPS) - currently unused for VNC (server controls rate)
+    #[allow(dead_code)]
+    frame_rate: u32,
     #[cfg(feature = "sftp")]
     sftp_session: Option<russh_sftp::client::SftpSession>,
     to_client: mpsc::Sender<Bytes>,
 }
 
 impl VncClient {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         width: u32,
         height: u32,
         read_only: bool,
         security: HandlerSecuritySettings,
         recording_config: RecordingConfig,
+        jpeg_quality: u8,
+        use_jpeg: bool,
+        frame_rate: u32,
         to_client: mpsc::Sender<Bytes>,
         params: &HashMap<String, String>,
     ) -> Self {
@@ -395,10 +455,83 @@ impl VncClient {
             security,
             recording_config,
             recorder,
+            scroll_detector: ScrollDetector::new(width, height),
+            jpeg_quality,
+            use_jpeg,
+            frame_rate,
             #[cfg(feature = "sftp")]
             sftp_session: None,
             to_client,
         }
+    }
+
+    /// Encode RGBA framebuffer data as JPEG
+    ///
+    /// Converts RGBA pixels to RGB and encodes as JPEG with specified quality.
+    /// This provides 5-10x bandwidth reduction compared to PNG encoding.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - RGBA pixel data (4 bytes per pixel)
+    /// * `width` - Image width in pixels
+    /// * `height` - Image height in pixels
+    /// * `quality` - JPEG quality (1-100, higher = better quality)
+    ///
+    /// # Returns
+    ///
+    /// JPEG-encoded image data
+    fn encode_jpeg(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        quality: u8,
+    ) -> Result<Vec<u8>, String> {
+        let img = RgbaImage::from_raw(width, height, data.to_vec())
+            .ok_or_else(|| "Invalid image dimensions".to_string())?;
+
+        let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
+
+        let mut jpeg_data = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, quality);
+        encoder
+            .write_image(&rgb_img, width, height, image::ExtendedColorType::Rgb8)
+            .map_err(|e| format!("JPEG encode failed: {}", e))?;
+
+        Ok(jpeg_data)
+    }
+
+    /// Encode a framebuffer region using configured encoding (JPEG or PNG)
+    ///
+    /// Uses JPEG by default for 5-10x bandwidth savings, with PNG fallback.
+    fn encode_region(&self, rect: guacr_terminal::FrameRect) -> Result<Vec<u8>, String> {
+        if self.use_jpeg {
+            // Extract region pixels
+            let region_pixels = self.framebuffer.get_region_pixels(rect);
+            
+            // Encode as JPEG
+            Self::encode_jpeg(&region_pixels, rect.width, rect.height, self.jpeg_quality)
+        } else {
+            // Fallback to PNG encoding
+            self.framebuffer.encode_region(rect)
+                .map_err(|e| format!("PNG encoding failed: {}", e))
+        }
+    }
+
+    /// Send sync instruction for frame timing
+    ///
+    /// Helps with session recording playback timing and client-side frame synchronization.
+    async fn send_sync(&self) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
+        
+        self.to_client
+            .send(Bytes::from(sync_instr))
+            .await
+            .map_err(|e| format!("Failed to send sync: {}", e))
     }
 
     async fn connect(
@@ -625,6 +758,12 @@ impl VncClient {
                             (width_str.parse::<u32>(), height_str.parse::<u32>())
                         {
                             info!("VNC: Resize requested: {}x{}", w, h);
+                            
+                            // Reset scroll detector for new dimensions
+                            self.scroll_detector.reset(w, h);
+                            self.width = w;
+                            self.height = h;
+                            
                             VncProtocol::send_framebuffer_update_request(
                                 stream, false, 0, 0, w as u16, h as u16,
                             )
@@ -696,29 +835,187 @@ impl VncClient {
             return Ok(());
         }
 
-        for dirty_rect in &dirty_rects {
-            let png_data = self
-                .framebuffer
-                .encode_region(*dirty_rect)
-                .map_err(|e| format!("Encoding failed: {}", e))?;
+        // Check for scroll operation (shared with RDP)
+        let framebuffer_pixels = self.framebuffer.get_all_pixels();
+        if let Some(scroll_op) = self.scroll_detector.detect_scroll(&framebuffer_pixels) {
+            trace!(
+                "VNC: Detected scroll {:?} by {} pixels",
+                scroll_op.direction,
+                scroll_op.pixels
+            );
 
-            let png_bytes = Bytes::from(png_data);
+            // Send copy instruction for scroll optimization
+            match scroll_op.direction {
+                ScrollDirection::Up => {
+                    // Content moved up: copy existing content, render new bottom region
+                    let copy_instr = guacr_protocol::format_transfer(
+                        0,                                           // src layer
+                        0,                                           // src x
+                        scroll_op.pixels,                           // src y (from line N)
+                        self.width,                                 // width
+                        self.height - scroll_op.pixels,             // height (all except scrolled)
+                        12,                                          // function: SRC (simple copy)
+                        0,                                           // dst layer
+                        0,                                           // dst x
+                        0,                                           // dst y (to top)
+                    );
+                    self.to_client
+                        .send(Bytes::from(copy_instr))
+                        .await
+                        .map_err(|e| format!("Failed to send copy instruction: {}", e))?;
+
+                    // Only render new content at bottom (bandwidth savings!)
+                    let new_region_y = self.height - scroll_op.pixels;
+                    let new_region_data = self.encode_region(guacr_terminal::FrameRect {
+                        x: 0,
+                        y: new_region_y,
+                        width: self.width,
+                        height: scroll_op.pixels,
+                    })?;
+
+                    let msg = self.binary_encoder.encode_image(
+                        self.stream_id,
+                        0,
+                        0,
+                        new_region_y as i32,
+                        self.width as u16,
+                        scroll_op.pixels as u16,
+                        0,
+                        Bytes::from(new_region_data),
+                    );
+
+                    self.to_client
+                        .send(msg)
+                        .await
+                        .map_err(|e| format!("Failed to send image: {}", e))?;
+                    
+                    // Send sync for frame timing
+                    self.send_sync().await?;
+                }
+                ScrollDirection::Down => {
+                    // Content moved down: copy existing content, render new top region
+                    let copy_instr = guacr_protocol::format_transfer(
+                        0,                                  // src layer
+                        0,                                  // src x
+                        0,                                  // src y (from top)
+                        self.width,                         // width
+                        self.height - scroll_op.pixels,    // height
+                        12,                                 // function: SRC
+                        0,                                  // dst layer
+                        0,                                  // dst x
+                        scroll_op.pixels,                  // dst y (move down by N)
+                    );
+                    self.to_client
+                        .send(Bytes::from(copy_instr))
+                        .await
+                        .map_err(|e| format!("Failed to send copy instruction: {}", e))?;
+
+                    // Only render new content at top
+                    let new_region_data = self.encode_region(guacr_terminal::FrameRect {
+                        x: 0,
+                        y: 0,
+                        width: self.width,
+                        height: scroll_op.pixels,
+                    })?;
+
+                    let msg = self.binary_encoder.encode_image(
+                        self.stream_id,
+                        0,
+                        0,
+                        0,
+                        self.width as u16,
+                        scroll_op.pixels as u16,
+                        0,
+                        Bytes::from(new_region_data),
+                    );
+
+                    self.to_client
+                        .send(msg)
+                        .await
+                        .map_err(|e| format!("Failed to send image: {}", e))?;
+                    
+                    // Send sync for frame timing
+                    self.send_sync().await?;
+                }
+            }
+
+            // Clear dirty rects since we handled the scroll
+            self.framebuffer.clear_dirty();
+            return Ok(());
+        }
+
+        // No scroll detected - use smart dirty region strategy
+        // Calculate total dirty area to decide rendering approach
+        let total_dirty_pixels: u32 = dirty_rects.iter()
+            .map(|r| r.width * r.height)
+            .sum();
+        let total_pixels = self.width * self.height;
+        let dirty_percent = (total_dirty_pixels * 100) / total_pixels;
+
+        if dirty_percent < 30 {
+            // Small changes (<30%): Render each dirty rect separately
+            // This is more efficient for small updates (cursor movements, text edits)
+            trace!("VNC: Small update ({}%), rendering {} dirty rects", dirty_percent, dirty_rects.len());
+            
+            for dirty_rect in &dirty_rects {
+                let encoded_data = self.encode_region(*dirty_rect)?;
+                let encoded_bytes = Bytes::from(encoded_data);
+
+                let msg = self.binary_encoder.encode_image(
+                    self.stream_id,
+                    0,
+                    dirty_rect.x as i32,
+                    dirty_rect.y as i32,
+                    dirty_rect.width as u16,
+                    dirty_rect.height as u16,
+                    0,
+                    encoded_bytes,
+                );
+
+                self.to_client
+                    .send(msg)
+                    .await
+                    .map_err(|e| format!("Failed to send image: {}", e))?;
+            }
+            
+            // Send sync after all dirty rects
+            self.send_sync().await?;
+        } else {
+            // Large changes (>=30%): Render full screen
+            // More efficient for large updates due to:
+            // 1. Better JPEG compression on larger images
+            // 2. Less protocol overhead (one image vs many)
+            // 3. Simpler client-side compositing
+            trace!("VNC: Large update ({}%), rendering full screen", dirty_percent);
+            
+            let full_screen = guacr_terminal::FrameRect {
+                x: 0,
+                y: 0,
+                width: self.width,
+                height: self.height,
+            };
+            
+            let encoded_data = self.encode_region(full_screen)?;
+            let encoded_bytes = Bytes::from(encoded_data);
 
             let msg = self.binary_encoder.encode_image(
                 self.stream_id,
                 0,
-                dirty_rect.x as i32,
-                dirty_rect.y as i32,
-                dirty_rect.width as u16,
-                dirty_rect.height as u16,
                 0,
-                png_bytes,
+                0,
+                self.width as u16,
+                self.height as u16,
+                0,
+                encoded_bytes,
             );
 
             self.to_client
                 .send(msg)
                 .await
                 .map_err(|e| format!("Failed to send image: {}", e))?;
+            
+            // Send sync after full screen
+            self.send_sync().await?;
         }
 
         self.framebuffer.clear_dirty();

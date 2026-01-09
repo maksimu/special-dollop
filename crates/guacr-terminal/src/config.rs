@@ -6,7 +6,9 @@
 // - Terminal type (terminal-type)
 // - Scrollback buffer size (scrollback)
 // - Backspace key handling (backspace)
+// - Clipboard buffer size (clipboard-buffer-size)
 
+use crate::clipboard::{CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
 use std::collections::HashMap;
 
 /// Terminal configuration matching guacd parameters
@@ -32,6 +34,10 @@ pub struct TerminalConfig {
     /// Backspace key code (guacd: backspace, default: 127)
     /// 127 = DEL (default), 8 = BS
     pub backspace_code: u8,
+
+    /// Clipboard buffer size in bytes (guacd: clipboard-buffer-size, default: 256KB)
+    /// Range: 256KB - 50MB (as per KCM patches)
+    pub clipboard_buffer_size: usize,
 }
 
 impl Default for TerminalConfig {
@@ -43,6 +49,7 @@ impl Default for TerminalConfig {
             terminal_type: "xterm-256color".to_string(),
             scrollback_size: 1000,
             backspace_code: 127, // DEL
+            clipboard_buffer_size: CLIPBOARD_DEFAULT_SIZE,
         }
     }
 }
@@ -94,6 +101,30 @@ impl TerminalConfig {
                 "8" | "BS" | "bs" => 8,
                 _ => 127, // Default to DEL
             };
+        }
+
+        // Clipboard buffer size (default: 256KB, range: 256KB - 50MB)
+        // Inspired by KCM-405 patch for configurable clipboard limits
+        if let Some(size_str) = params.get("clipboard-buffer-size") {
+            if let Ok(size) = size_str.parse::<usize>() {
+                if size < CLIPBOARD_MIN_SIZE {
+                    log::warn!(
+                        "Clipboard buffer size {} is below minimum {}, using minimum",
+                        size,
+                        CLIPBOARD_MIN_SIZE
+                    );
+                    config.clipboard_buffer_size = CLIPBOARD_MIN_SIZE;
+                } else if size > CLIPBOARD_MAX_SIZE {
+                    log::warn!(
+                        "Clipboard buffer size {} exceeds maximum {}, using maximum",
+                        size,
+                        CLIPBOARD_MAX_SIZE
+                    );
+                    config.clipboard_buffer_size = CLIPBOARD_MAX_SIZE;
+                } else {
+                    config.clipboard_buffer_size = size;
+                }
+            }
         }
 
         config

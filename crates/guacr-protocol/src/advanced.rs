@@ -1,8 +1,56 @@
 // Advanced instruction formatting for Guacamole protocol
 //
-// Supports: transfer, nest, pipe, ack
+// Supports: transfer, nest, pipe, ack, error
 
 use crate::format_instruction;
+
+// ============================================================================
+// Guacamole Protocol Status Codes
+// ============================================================================
+// These match the official Apache Guacamole protocol specification
+// and are used with the `error` instruction to communicate failures to clients.
+
+/// Internal server error (0x0100)
+pub const STATUS_SERVER_ERROR: u32 = 256;
+
+/// General upstream error (0x0200)
+pub const STATUS_UPSTREAM_ERROR: u32 = 512;
+
+/// Remote server unavailable (0x0201)
+pub const STATUS_UPSTREAM_UNAVAILABLE: u32 = 513;
+
+/// Remote server timeout (0x0202)
+pub const STATUS_UPSTREAM_TIMEOUT: u32 = 514;
+
+/// Resource not found on remote server (0x0203)
+pub const STATUS_UPSTREAM_NOT_FOUND: u32 = 515;
+
+/// Resource conflict (0x0204)
+pub const STATUS_RESOURCE_CONFLICT: u32 = 516;
+
+/// Resource closed - connection ended (0x0205)
+pub const STATUS_RESOURCE_CLOSED: u32 = 517;
+
+/// Bad request from client (0x0300)
+pub const STATUS_CLIENT_BAD_REQUEST: u32 = 768;
+
+/// Client unauthorized (0x0301)
+pub const STATUS_CLIENT_UNAUTHORIZED: u32 = 769;
+
+/// Client forbidden (0x0303)
+pub const STATUS_CLIENT_FORBIDDEN: u32 = 771;
+
+/// Client timeout (0x0304)
+pub const STATUS_CLIENT_TIMEOUT: u32 = 772;
+
+/// Client sent too much data (0x0305)
+pub const STATUS_CLIENT_OVERRUN: u32 = 773;
+
+/// Client sent bad type (0x0308)
+pub const STATUS_CLIENT_BAD_TYPE: u32 = 776;
+
+/// Too many clients (0x030D)
+pub const STATUS_CLIENT_TOO_MANY: u32 = 781;
 
 /// Format `transfer` instruction - Copy/transfer image data between layers
 ///
@@ -94,6 +142,42 @@ pub fn format_ack(stream: u32, message: &str) -> String {
     format_instruction("ack", &[&stream_str, message])
 }
 
+/// Format `error` instruction - Send error message to client
+///
+/// Format: `5.error,{message},{status_code};`
+///
+/// Guacamole protocol status codes:
+/// - 512 (0x0200): UPSTREAM_ERROR - Remote server error
+/// - 513 (0x0201): UPSTREAM_UNAVAILABLE - Remote server unavailable
+/// - 514 (0x0202): UPSTREAM_TIMEOUT - Remote server timeout
+/// - 515 (0x0203): UPSTREAM_NOT_FOUND - Resource not found
+/// - 516 (0x0204): RESOURCE_CONFLICT - Resource conflict
+/// - 517 (0x0205): RESOURCE_CLOSED - Resource closed
+/// - 768 (0x0300): CLIENT_BAD_REQUEST - Bad request
+/// - 769 (0x0301): CLIENT_UNAUTHORIZED - Unauthorized
+/// - 771 (0x0303): CLIENT_FORBIDDEN - Forbidden
+/// - 772 (0x0304): CLIENT_TIMEOUT - Client timeout
+/// - 773 (0x0305): CLIENT_OVERRUN - Too much data
+/// - 776 (0x0308): CLIENT_BAD_TYPE - Bad type
+/// - 781 (0x030D): CLIENT_TOO_MANY - Too many clients
+/// - 256 (0x0100): SERVER_ERROR - Internal server error
+/// - 512 (0x0200): UPSTREAM_ERROR - General upstream error
+///
+/// # Arguments
+/// - `message`: Error message to display to user
+/// - `status_code`: Guacamole protocol status code
+///
+/// # Example
+/// ```
+/// use guacr_protocol::format_error;
+/// let error_instr = format_error("Authentication failed", 769);
+/// assert_eq!(error_instr, "5.error,22.Authentication failed,3.769;");
+/// ```
+pub fn format_error(message: &str, status_code: u32) -> String {
+    let status_str = status_code.to_string();
+    format_instruction("error", &[message, &status_str])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +208,14 @@ mod tests {
     fn test_format_ack() {
         let instr = format_ack(1, "ok");
         assert_eq!(instr, "3.ack,1.1,2.ok;");
+    }
+
+    #[test]
+    fn test_format_error() {
+        let instr = format_error("Authentication failed", 769);
+        assert_eq!(instr, "5.error,22.Authentication failed,3.769;");
+
+        let instr2 = format_error("Connection timeout", 514);
+        assert_eq!(instr2, "5.error,18.Connection timeout,3.514;");
     }
 }

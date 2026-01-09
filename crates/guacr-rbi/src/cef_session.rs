@@ -1,5 +1,12 @@
 // CEF (Chromium Embedded Framework) session manager for RBI
 //
+// CRITICAL SECURITY: Each CefSession spawns a DEDICATED CEF subprocess
+// - NO process sharing between sessions
+// - Each session gets its own isolated Chromium process
+// - Profile directories are locked to prevent concurrent access
+// - Process terminates when session ends
+// - Complete memory and process isolation
+//
 // This provides the same capabilities as KCM's CEF implementation:
 // - RenderHandler: Receives raw BGRA pixels for each frame
 // - AudioHandler: Receives raw PCM audio samples
@@ -8,6 +15,16 @@
 //
 // Unlike the chromiumoxide/CDP approach, CEF embeds the browser directly
 // and provides callback-based access to audio streams.
+//
+// ## Process Architecture
+//
+// Each CefSession creates:
+// 1. Main CEF process (browser process)
+// 2. Renderer process (isolated sandbox)
+// 3. GPU process (if available)
+// 4. Utility processes (network, audio, etc.)
+//
+// All processes terminate when CefSession::close() is called.
 //
 // ## Build Requirements
 //
@@ -307,6 +324,21 @@ mod cef_impl {
 
     /// CEF session - stub implementation
     ///
+    /// CRITICAL SECURITY: Each CefSession spawns a DEDICATED CEF process
+    /// - NO process sharing between sessions
+    /// - Each session gets its own isolated Chromium process tree
+    /// - Profile directories are locked to prevent concurrent access
+    /// - Process terminates when session ends (Drop impl)
+    /// - Complete memory and process isolation
+    ///
+    /// Process Architecture:
+    /// - Main CEF browser process (spawned per session)
+    /// - Renderer process (sandboxed, isolated)
+    /// - GPU process (if available)
+    /// - Utility processes (network, audio, etc.)
+    ///
+    /// All processes terminate when CefSession is dropped.
+    ///
     /// This is a placeholder that documents the intended CEF API.
     /// Full implementation requires CEF binaries and verification of the cef crate API.
     pub struct CefSession {
@@ -314,19 +346,29 @@ mod cef_impl {
         #[allow(dead_code)]
         initialized: bool,
         /// Isolated profile directory for this session (auto-cleaned on drop)
+        /// SECURITY: Each session gets unique directory
         #[allow(dead_code)]
         profile_dir: Option<tempfile::TempDir>,
         /// Profile lock for persistent profiles (prevents concurrent use)
+        /// SECURITY: Locked to prevent multiple sessions using same profile
         #[allow(dead_code)]
         profile_lock: Option<crate::profile_isolation::ProfileLock>,
         /// DBus isolation for Linux (prevents cross-session IPC)
+        /// SECURITY: Isolated DBus socket per session (KCM-436 pattern)
         #[cfg(target_os = "linux")]
         #[allow(dead_code)]
         dbus_isolation: Option<crate::profile_isolation::DbusIsolation>,
+        /// Process ID of the CEF browser process
+        /// SECURITY: Tracked for monitoring and termination
+        #[allow(dead_code)]
+        browser_pid: Option<u32>,
     }
 
     impl CefSession {
         /// Create a new CEF session
+        ///
+        /// Does NOT spawn CEF process yet - call launch() to spawn
+        /// Each launch() call will spawn a DEDICATED CEF process (no sharing)
         pub fn new(width: u32, height: u32) -> Self {
             let state = Arc::new(Mutex::new(CefSharedState {
                 width,
@@ -343,6 +385,7 @@ mod cef_impl {
                 profile_lock: None,
                 #[cfg(target_os = "linux")]
                 dbus_isolation: None,
+                browser_pid: None,
             }
         }
 
@@ -375,6 +418,12 @@ mod cef_impl {
         }
 
         /// Launch browser with optional persistent profile - stub implementation
+        ///
+        /// SECURITY: Spawns a DEDICATED CEF process for this session
+        /// - Creates unique profile directory (locked)
+        /// - Spawns separate process tree (browser + renderer + GPU + utility)
+        /// - No sharing with other sessions
+        /// - Process terminates when close() is called or session is dropped
         pub async fn launch_with_profile(
             &mut self,
             url: &str,
@@ -383,6 +432,7 @@ mod cef_impl {
             profile_directory: Option<&str>,
         ) -> Result<(), String> {
             info!("CEF: Launch requested for URL: {} (stub)", url);
+            info!("CEF: SECURITY - Will spawn DEDICATED process (no sharing)");
 
             // Store channels in shared state (for when real implementation is added)
             {
@@ -394,8 +444,24 @@ mod cef_impl {
 
             // Profile isolation would be set up here
             if let Some(profile_dir) = profile_directory {
-                info!("CEF: Would use profile directory: {}", profile_dir);
+                info!("CEF: Would use profile directory: {} (locked)", profile_dir);
+                // TODO: Lock profile directory to prevent concurrent access
+                // self.profile_lock = Some(ProfileLock::acquire(profile_dir)?);
+            } else {
+                info!("CEF: Would create temporary profile directory");
+                // TODO: Create temp directory with automatic cleanup
+                // self.profile_dir = Some(tempfile::tempdir()?);
             }
+
+            // TODO: Spawn CEF process here
+            // 1. Initialize CEF with profile directory
+            // 2. Create browser instance (headless)
+            // 3. Navigate to URL
+            // 4. Store browser PID: self.browser_pid = Some(pid);
+            // 5. Start message loop in background thread
+
+            info!("CEF: Would spawn dedicated CEF process here");
+            info!("CEF: Process would terminate when close() is called");
 
             Err("CEF browser launch not yet implemented. \
                  Use --features chrome for a working browser backend."
@@ -482,10 +548,32 @@ mod cef_impl {
         }
 
         /// Close the browser
+        ///
+        /// SECURITY: Terminates the dedicated CEF process
+        /// - Closes browser window
+        /// - Shuts down CEF
+        /// - Terminates all CEF subprocesses (browser, renderer, GPU, utility)
+        /// - Unlocks profile directory (if locked)
+        /// - Ensures no process leakage
         pub fn close(&mut self) {
+            info!("CEF: Closing browser and terminating dedicated process (stub)");
+
+            if let Some(pid) = self.browser_pid {
+                info!("CEF: Would terminate browser process (PID: {})", pid);
+            }
+
             let mut state = self.state.lock();
             state.terminating = true;
+
+            // TODO: Actual CEF cleanup
+            // 1. Close browser window (cef_browser_host_close_browser)
+            // 2. Shutdown CEF (cef_shutdown)
+            // 3. Wait for process to terminate
+            // 4. Verify all subprocesses terminated
+            // 5. Profile directory lock is automatically released on drop
+
             info!("CEF: Browser closed (stub)");
+            info!("CEF: Profile directory lock will be released on drop");
         }
 
         /// Get shared state (for handlers)

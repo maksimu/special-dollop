@@ -3,7 +3,6 @@
 /// This module implements the selection point tracking system inspired by
 /// KCM's GUACAMOLE-2117 improvements. It tracks which side of a character
 /// the mouse is on (left vs right) to provide accurate selection boundaries.
-
 use crate::TerminalEmulator;
 
 /// Which side of a terminal column the selection point is on
@@ -80,12 +79,7 @@ impl SelectionPoint {
     /// Create a selection point directly from row/column/side
     ///
     /// This is useful for programmatic selection (e.g., double-click word selection)
-    pub fn new(
-        row: u16,
-        column: u16,
-        side: ColumnSide,
-        terminal: &TerminalEmulator,
-    ) -> Self {
+    pub fn new(row: u16, column: u16, side: ColumnSide, terminal: &TerminalEmulator) -> Self {
         let (char_starting_column, char_width) = find_char_at_position(terminal, row, column);
 
         SelectionPoint {
@@ -377,6 +371,6 @@ mod tests {
 
     // Helper function to create a test terminal
     fn create_test_terminal() -> TerminalEmulator {
-        TerminalEmulator::new(80, 24, 1000)
+        TerminalEmulator::new_with_scrollback(24, 80, 1000)
     }
 }

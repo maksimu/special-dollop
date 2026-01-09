@@ -279,6 +279,13 @@ impl TerminalRenderer {
             if c != ' ' && c != '\0' {
                 let fg = self.vt100_color_to_rgb(cell.fgcolor(), true);
 
+                // Check for Unicode box drawing characters (U+2500-U+257F)
+                // Render these manually for consistency and crispness
+                if Self::is_box_drawing_char(c) {
+                    self.render_box_drawing_char(img, c, x, y, fg)?;
+                    return Ok(());
+                }
+
                 // Check for Unicode block drawing characters (U+2580-U+259F)
                 // These are often missing from fonts, so render them manually
                 if let Some(block_region) = Self::get_block_character_region(c) {
@@ -390,6 +397,159 @@ impl TerminalRenderer {
                 let py = y + self.char_height - dy - 1;
                 if px < img.width() && py < img.height() {
                     img.put_pixel(px, py, cursor_color);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if character is a box drawing character (U+2500-U+257F)
+    fn is_box_drawing_char(c: char) -> bool {
+        matches!(c, '\u{2500}'..='\u{257F}')
+    }
+
+    /// Render box drawing character manually for consistency
+    /// Box drawing characters (U+2500-U+257F) are lines, corners, and intersections
+    fn render_box_drawing_char(
+        &self,
+        img: &mut RgbImage,
+        c: char,
+        x: u32,
+        y: u32,
+        color: Rgb<u8>,
+    ) -> Result<()> {
+        // Line thickness (1-2 pixels for crisp rendering)
+        let thick = 1;
+
+        // Calculate midpoints and edges
+        let mid_x = x + self.char_width / 2;
+        let mid_y = y + self.char_height / 2;
+        let left = x;
+        let right = x + self.char_width;
+        let top = y;
+        let bottom = y + self.char_height;
+
+        // Helper to draw horizontal line
+        let draw_h_line = |img: &mut RgbImage, y: u32, x1: u32, x2: u32| {
+            for py in y.saturating_sub(thick / 2)..=(y + thick / 2).min(img.height() - 1) {
+                for px in x1..x2.min(img.width()) {
+                    img.put_pixel(px, py, color);
+                }
+            }
+        };
+
+        // Helper to draw vertical line
+        let draw_v_line = |img: &mut RgbImage, x: u32, y1: u32, y2: u32| {
+            for px in x.saturating_sub(thick / 2)..=(x + thick / 2).min(img.width() - 1) {
+                for py in y1..y2.min(img.height()) {
+                    img.put_pixel(px, py, color);
+                }
+            }
+        };
+
+        match c {
+            // Horizontal lines
+            '\u{2500}' | '\u{2501}' => draw_h_line(img, mid_y, left, right), // ─ ━
+            // Vertical lines
+            '\u{2502}' | '\u{2503}' => draw_v_line(img, mid_x, top, bottom), // │ ┃
+
+            // Corners
+            '\u{250C}' | '\u{250D}' | '\u{250E}' | '\u{250F}' => {
+                // ┌ ┍ ┎ ┏
+                draw_h_line(img, mid_y, mid_x, right);
+                draw_v_line(img, mid_x, mid_y, bottom);
+            }
+            '\u{2510}' | '\u{2511}' | '\u{2512}' | '\u{2513}' => {
+                // ┐ ┑ ┒ ┓
+                draw_h_line(img, mid_y, left, mid_x);
+                draw_v_line(img, mid_x, mid_y, bottom);
+            }
+            '\u{2514}' | '\u{2515}' | '\u{2516}' | '\u{2517}' => {
+                // └ ┕ ┖ ┗
+                draw_h_line(img, mid_y, mid_x, right);
+                draw_v_line(img, mid_x, top, mid_y);
+            }
+            '\u{2518}' | '\u{2519}' | '\u{251A}' | '\u{251B}' => {
+                // ┘ ┙ ┚ ┛
+                draw_h_line(img, mid_y, left, mid_x);
+                draw_v_line(img, mid_x, top, mid_y);
+            }
+
+            // T-junctions
+            '\u{251C}' | '\u{251D}' | '\u{251E}' | '\u{251F}' | '\u{2520}' | '\u{2521}'
+            | '\u{2522}' | '\u{2523}' => {
+                // ├ ┝ ┞ ┟ ┠ ┡ ┢ ┣
+                draw_h_line(img, mid_y, mid_x, right);
+                draw_v_line(img, mid_x, top, bottom);
+            }
+            '\u{2524}' | '\u{2525}' | '\u{2526}' | '\u{2527}' | '\u{2528}' | '\u{2529}'
+            | '\u{252A}' | '\u{252B}' => {
+                // ┤ ┥ ┦ ┧ ┨ ┩ ┪ ┫
+                draw_h_line(img, mid_y, left, mid_x);
+                draw_v_line(img, mid_x, top, bottom);
+            }
+            '\u{252C}' | '\u{252D}' | '\u{252E}' | '\u{252F}' | '\u{2530}' | '\u{2531}'
+            | '\u{2532}' | '\u{2533}' => {
+                // ┬ ┭ ┮ ┯ ┰ ┱ ┲ ┳
+                draw_h_line(img, mid_y, left, right);
+                draw_v_line(img, mid_x, mid_y, bottom);
+            }
+            '\u{2534}' | '\u{2535}' | '\u{2536}' | '\u{2537}' | '\u{2538}' | '\u{2539}'
+            | '\u{253A}' | '\u{253B}' => {
+                // ┴ ┵ ┶ ┷ ┸ ┹ ┺ ┻
+                draw_h_line(img, mid_y, left, right);
+                draw_v_line(img, mid_x, top, mid_y);
+            }
+
+            // Cross
+            '\u{253C}' | '\u{253D}' | '\u{253E}' | '\u{253F}' | '\u{2540}' | '\u{2541}'
+            | '\u{2542}' | '\u{2543}' | '\u{2544}' | '\u{2545}' | '\u{2546}' | '\u{2547}'
+            | '\u{2548}' | '\u{2549}' | '\u{254A}' | '\u{254B}' => {
+                // ┼ and variants
+                draw_h_line(img, mid_y, left, right);
+                draw_v_line(img, mid_x, top, bottom);
+            }
+
+            // For other box drawing chars, fall back to font rendering
+            _ => {
+                // Try font rendering for less common box drawing chars
+                let font = self.get_font_for_char(c);
+                let (metrics, bitmap) = font.rasterize(c, self.font_size);
+                if !bitmap.is_empty() {
+                    // Render using font
+                    const BASELINE_RATIO: f32 = 0.75;
+                    let glyph_x =
+                        x + ((self.char_width as i32 - metrics.width as i32) / 2).max(0) as u32;
+                    let glyph_y = y + (self.char_height as f32 * BASELINE_RATIO) as u32;
+
+                    for (i, &alpha) in bitmap.iter().enumerate() {
+                        if alpha > 0 {
+                            let gx = i % metrics.width;
+                            let gy = i / metrics.width;
+                            let px = glyph_x + gx as u32;
+                            let py = glyph_y
+                                .saturating_sub(metrics.height as u32 - metrics.ymin as u32)
+                                + gy as u32;
+
+                            if px < img.width() && py < img.height() {
+                                let alpha_f = alpha as f32 / 255.0;
+                                let current = img.get_pixel(px, py);
+                                let blended = Rgb([
+                                    ((color.0[0] as f32 * alpha_f)
+                                        + (current.0[0] as f32 * (1.0 - alpha_f)))
+                                        as u8,
+                                    ((color.0[1] as f32 * alpha_f)
+                                        + (current.0[1] as f32 * (1.0 - alpha_f)))
+                                        as u8,
+                                    ((color.0[2] as f32 * alpha_f)
+                                        + (current.0[2] as f32 * (1.0 - alpha_f)))
+                                        as u8,
+                                ]);
+                                img.put_pixel(px, py, blended);
+                            }
+                        }
+                    }
                 }
             }
         }

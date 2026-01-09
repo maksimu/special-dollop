@@ -27,11 +27,12 @@ use guacr_handlers::{
     PIPE_NAME_STDIN,
     PIPE_STREAM_STDOUT,
 };
+use guacr_protocol::format_error;
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, mouse_event_to_x11_sequence,
     parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction,
     x11_keysym_to_bytes_with_backspace, DirtyTracker, ModifierState, MouseSelection,
-    TerminalConfig, TerminalEmulator, TerminalRenderer,
+    SelectionResult, TerminalConfig, TerminalEmulator, TerminalRenderer,
 };
 #[cfg(feature = "threat-detection")]
 use log::error;
@@ -328,9 +329,9 @@ impl ProtocolHandler for TelnetHandler {
         let mut modifier_state = ModifierState::new();
         let mut mouse_selection = MouseSelection::new();
 
-        // Clipboard state tracking
-        // Track if we've received the initial clipboard sync (to avoid auto-paste bug)
-        let mut first_clipboard_received = false;
+        // Clipboard storage
+        // Store clipboard data received from client (via clipboard stream)
+        // This data is pasted when user presses Ctrl+Shift+V
         let mut stored_clipboard = String::new();
 
         // Debounce timer for batching screen updates (16ms = 60fps)
@@ -361,6 +362,11 @@ impl ProtocolHandler for TelnetHandler {
                     match result {
                         Ok(0) => {
                             info!("Telnet connection closed");
+
+                            // Send error to client before breaking
+                            let error_instr = format_error("Telnet connection closed by server", 517); // RESOURCE_CLOSED
+                            let _ = to_client.send(Bytes::from(error_instr)).await;
+
                             break;
                         }
                         Ok(n) => {
@@ -415,6 +421,12 @@ impl ProtocolHandler for TelnetHandler {
                         }
                         Err(e) => {
                             warn!("Telnet read error: {}", e);
+
+                            // Send error to client before breaking
+                            let error_msg = format!("Telnet connection error: {}", e);
+                            let error_instr = format_error(&error_msg, 512); // UPSTREAM_ERROR
+                            let _ = to_client.send(Bytes::from(error_instr)).await;
+
                             break;
                         }
                     }
@@ -437,6 +449,62 @@ impl ProtocolHandler for TelnetHandler {
                             && !is_keyboard_event_allowed_readonly(key_event.keysym, modifier_state.control)
                         {
                             trace!("Telnet: Keyboard input blocked (read-only mode)");
+                            continue;
+                        }
+
+                        // Handle paste shortcuts (matching guacd's behavior):
+                        // - Ctrl+Shift+V (Linux/Windows): keysym 'V' (0x56) with ctrl+shift
+                        // - Cmd+V (Mac): keysym 'v' (0x76) with meta
+                        let is_paste = key_event.pressed && (
+                            (key_event.keysym == 0x56 && modifier_state.control && modifier_state.shift) ||
+                            (key_event.keysym == 0x76 && modifier_state.meta)
+                        );
+
+                        if is_paste {
+                            // Security: Check if paste is allowed
+                            if !security.is_paste_allowed() {
+                                debug!("Telnet: Paste blocked (disabled or read-only mode)");
+                                continue;
+                            }
+
+                            if stored_clipboard.is_empty() {
+                                debug!("Telnet: Paste shortcut pressed but clipboard is empty");
+                                continue;
+                            }
+
+                            // Check clipboard buffer size limit
+                            let max_size = security.clipboard_buffer_size;
+                            let paste_text = if stored_clipboard.len() > max_size {
+                                warn!("Telnet: Clipboard truncated from {} to {} bytes", stored_clipboard.len(), max_size);
+                                &stored_clipboard[..max_size]
+                            } else {
+                                &stored_clipboard
+                            };
+
+                            debug!("Telnet: Paste shortcut - Pasting {} chars from clipboard", paste_text.len());
+
+                            // Send using bracketed paste mode for safety
+                            let mut paste_data = Vec::new();
+                            paste_data.extend_from_slice(b"\x1b[200~"); // Start bracketed paste
+                            paste_data.extend_from_slice(paste_text.as_bytes());
+                            paste_data.extend_from_slice(b"\x1b[201~"); // End bracketed paste
+
+                            write_half.write_all(&paste_data[..]).await
+                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                            continue; // Don't send the 'V' key itself
+                        }
+
+                        // Handle copy shortcuts - ignore them since selection already copies
+                        // - Ctrl+Shift+C (Linux/Windows): keysym 'C' (0x43) with ctrl+shift
+                        // - Cmd+C (Mac): keysym 'c' (0x63) with meta
+                        let is_copy = key_event.pressed && (
+                            (key_event.keysym == 0x43 && modifier_state.control && modifier_state.shift) ||
+                            (key_event.keysym == 0x63 && modifier_state.meta)
+                        );
+
+                        if is_copy {
+                            debug!("Telnet: Copy shortcut pressed - ignoring (selection already copies)");
                             continue;
                         }
 
@@ -485,48 +553,12 @@ impl ProtocolHandler for TelnetHandler {
                         // between client and server. This does NOT mean the user wants to paste.
                         debug!("Telnet: Clipboard stream opened - syncing clipboard state (not pasting)");
                     } else if let Some(clipboard_text) = parse_clipboard_blob(&msg_str) {
-                        // FIXED: Clipboard blob can be either:
-                        // 1. Initial sync when connection opens (DON'T paste)
-                        // 2. Explicit paste request from user (DO paste)
-                        //
-                        // Solution: Track first clipboard message and skip it.
-                        // Subsequent clipboard updates are treated as paste requests.
-                        
-                        if !first_clipboard_received {
-                            // First clipboard sync - just store it, don't paste
-                            first_clipboard_received = true;
-                            stored_clipboard = clipboard_text.clone();
-                            debug!("Telnet: Initial clipboard sync - stored {} chars (not pasting)", clipboard_text.len());
-                        } else {
-                            // Subsequent clipboard update - this is a paste request!
-                            stored_clipboard = clipboard_text.clone();
-                            
-                            // Security: Check if paste is allowed
-                            if !security.is_paste_allowed() {
-                                debug!("Telnet: Paste blocked (disabled or read-only mode)");
-                                continue;
-                            }
+                        // Clipboard blob instruction: Store clipboard data from client
+                        // This is just synchronization - NOT a paste command!
+                        // The actual paste happens when user presses Ctrl+Shift+V (keysym 'V' with ctrl+shift)
 
-                            // Check clipboard buffer size limit
-                            let max_size = security.clipboard_buffer_size;
-                            let paste_text = if clipboard_text.len() > max_size {
-                                warn!("Telnet: Clipboard truncated from {} to {} bytes", clipboard_text.len(), max_size);
-                                &clipboard_text[..max_size]
-                            } else {
-                                &clipboard_text
-                            };
-
-                            debug!("Telnet: Pasting {} chars from clipboard", paste_text.len());
-
-                            // Send using bracketed paste mode for safety
-                            let mut paste_data = Vec::new();
-                            paste_data.extend_from_slice(b"\x1b[200~"); // Start bracketed paste
-                            paste_data.extend_from_slice(paste_text.as_bytes());
-                            paste_data.extend_from_slice(b"\x1b[201~"); // End bracketed paste
-
-                            write_half.write_all(&paste_data[..]).await
-                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                        }
+                        stored_clipboard = clipboard_text;
+                        debug!("Telnet: Clipboard updated - stored {} chars (waiting for Ctrl+Shift+V to paste)", stored_clipboard.len());
                     } else if let Some(mouse_event) = parse_mouse_instruction(&msg_str) {
                         // Security: Check read-only mode for mouse clicks
                         if security.read_only && !is_mouse_event_allowed_readonly(mouse_event.button_mask) {
@@ -535,38 +567,13 @@ impl ProtocolHandler for TelnetHandler {
                         }
 
                         // Handle mouse events intelligently:
-                        // 1. Left-click drag = text selection (copy to clipboard)
-                        // 2. Clicks/drags with buttons pressed = X11 sequences (for vim/tmux)
+                        // 1. If terminal has mouse mode enabled (vim/tmux) - send X11 sequences
+                        // 2. Otherwise, left-click drag = text selection (copy to clipboard)
                         // 3. Hover with no buttons = ignored (prevents garbage)
 
-                        // Try text selection first (left button drag)
-                        if let Some(selected_text) = handle_mouse_selection(
-                            mouse_event,
-                            &mut mouse_selection,
-                            &terminal,
-                            CHAR_W,
-                            CHAR_H,
-                            cols,
-                            rows,
-                        ) {
-                            // Security: Check if copy is allowed
-                            if !security.is_copy_allowed() {
-                                debug!("Telnet: Selection copy blocked (copy disabled)");
-                                continue;
-                            }
-
-                            debug!("Telnet: Selection complete, copying {} chars", selected_text.len());
-
-                            // Send to client as clipboard
-                            let clipboard_stream_id = 10;
-                            let clipboard_instructions = format_clipboard_instructions(&selected_text, clipboard_stream_id);
-
-                            for instr in clipboard_instructions {
-                                to_client.send(Bytes::from(instr)).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                            }
-                        } else if mouse_event.button_mask != 0 {
-                            // A button is pressed (but not a selection) - send to vim/tmux
+                        // Check if terminal has mouse mode enabled (vim :set mouse=a, tmux mouse mode)
+                        if terminal.is_mouse_enabled() && mouse_event.button_mask != 0 {
+                            // Terminal wants mouse events - send X11 sequences
                             let mouse_seq = mouse_event_to_x11_sequence(
                                 mouse_event.x_px,
                                 mouse_event.y_px,
@@ -582,7 +589,61 @@ impl ProtocolHandler for TelnetHandler {
                                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                             }
                         }
-                        // Else: no buttons pressed, just hovering - ignore to prevent garbage
+                        // Try text selection (only when mouse mode is disabled)
+                        else {
+                            match handle_mouse_selection(
+                                mouse_event,
+                                &mut mouse_selection,
+                                &terminal,
+                                CHAR_W,
+                                CHAR_H,
+                                cols,
+                                rows,
+                                modifier_state.shift, // Pass shift key state for extend selection
+                            ) {
+                                SelectionResult::InProgress(overlay_instructions) => {
+                                    // Send visual feedback (blue overlay) to client
+                                    trace!("Telnet: Selection in progress, sending {} overlay instructions", overlay_instructions.len());
+                                    for instr in overlay_instructions {
+                                        to_client.send(Bytes::from(instr)).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    }
+                                }
+                                SelectionResult::Complete { text: selected_text, clear_instructions } => {
+                                    // Security: Check if copy is allowed
+                                    if !security.is_copy_allowed() {
+                                        debug!("Telnet: Selection copy blocked (copy disabled)");
+
+                                        // Still clear the overlay even if copy is blocked
+                                        for instr in clear_instructions {
+                                            to_client.send(Bytes::from(instr)).await
+                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        }
+                                        continue;
+                                    }
+
+                                    debug!("Telnet: Selection complete, copying {} chars", selected_text.len());
+
+                                    // Clear the overlay
+                                    for instr in clear_instructions {
+                                        to_client.send(Bytes::from(instr)).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    }
+
+                                    // Send to client as clipboard
+                                    let clipboard_stream_id = 10;
+                                    let clipboard_instructions = format_clipboard_instructions(&selected_text, clipboard_stream_id);
+
+                                    for instr in clipboard_instructions {
+                                        to_client.send(Bytes::from(instr)).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    }
+                                }
+                                SelectionResult::None => {
+                                    // No selection action (hovering, etc.) - ignore
+                                }
+                            }
+                        }
                     } else if let Some(pipe_instr) = parse_pipe_instruction(&msg_str) {
                         // Handle incoming pipe stream (e.g., STDIN from client)
                         if pipe_instr.name == PIPE_NAME_STDIN {

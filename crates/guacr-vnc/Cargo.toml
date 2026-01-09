@@ -27,6 +27,9 @@ guacr-protocol = { path = "../guacr-protocol" }
 # Utilities
 base64.workspace = true
 
+# Image encoding (JPEG compression for bandwidth optimization)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 # SFTP integration (optional)
 guacr-sftp = { path = "../guacr-sftp", optional = true }
 russh = { version = "0.46", optional = true }

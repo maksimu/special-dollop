@@ -566,3 +566,56 @@ S3 transport uses the AWS SDK, which supports multiple credential sources:
 4. **SSO**: AWS SSO profiles
 
 The SDK automatically discovers credentials in this order.
+
+## Testing
+
+### Recording Validation Tests
+
+Comprehensive test suite at `crates/guacr-terminal/tests/recording_validation.rs`:
+
+```bash
+# Run all recording tests
+cargo test -p guacr-terminal --test recording_validation
+```
+
+**Test Coverage** (12 tests):
+- ✅ Asciicast v2 format compliance
+- ✅ Unicode handling (emoji, multi-byte characters)
+- ✅ Short session recording
+- ✅ Guacamole .ses format
+- ✅ Dual format recording
+- ✅ Terminal resize events
+- ✅ Input/output recording
+- ✅ Large output (1000+ lines)
+- ✅ Timing accuracy
+- ✅ Binary data handling
+- ✅ Empty sessions
+
+**Cross-Platform**: Tests use `tempfile` crate for portable temporary file handling, ensuring compatibility across:
+- Linux (production)
+- macOS (development)
+- Windows (via cross-compilation)
+- BSD (community tested)
+
+### Manual Testing
+
+Test recording with a real SSH session:
+
+```bash
+# Start pam-guacr with recording enabled
+RECORDING_PATH=/tmp/recordings cargo run
+
+# Connect via SSH and run commands
+# Check generated files:
+ls -lh /tmp/recordings/
+# Should see .cast and .ses files
+
+# Play back asciicast recording
+asciinema play /tmp/recordings/session-123.cast
+
+# Verify .ses format
+head -5 /tmp/recordings/session-123.ses
+# Should show: timestamp.direction.instruction format
+```
+
+See `docs/TESTING_GUIDE.md` for complete testing documentation.

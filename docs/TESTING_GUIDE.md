@@ -58,6 +58,25 @@ cargo fix --workspace --allow-dirty
 - ✅ Dirty region tracking integration
 - ✅ Threat detection integration
 
+#### Recording Validation Tests
+**Location**: `crates/guacr-terminal/tests/recording_validation.rs`
+
+**Tests Implemented** (12 tests, all passing):
+- ✅ Asciicast v2 format compliance (JSON validation)
+- ✅ Unicode handling (Chinese, Russian, Arabic, emoji)
+- ✅ Short session recording (single-line sessions)
+- ✅ Guacamole .ses format (protocol instructions)
+- ✅ Dual format recording (both .cast and .ses)
+- ✅ Terminal resize events
+- ✅ Input recording (keyboard events)
+- ✅ Multiple output events (sequential)
+- ✅ Large output (1000+ lines)
+- ✅ Timing accuracy (monotonic timestamps)
+- ✅ Binary data handling (non-UTF8)
+- ✅ Empty recording (zero-event sessions)
+
+**Cross-Platform**: Uses `tempfile` crate for portable temporary file handling (Windows, Linux, macOS, BSD)
+
 ### 2. Integration Tests (Medium Priority)
 
 #### SFTP Integration Tests
@@ -121,6 +140,10 @@ cargo test --workspace
 # Specific crate
 cargo test -p guacr-sftp
 cargo test -p guacr-telnet
+cargo test -p guacr-terminal
+
+# Recording validation tests
+cargo test -p guacr-terminal --test recording_validation
 
 # With output
 cargo test -- --nocapture
@@ -132,6 +155,19 @@ cargo test --test '*'
 cargo install cargo-tarpaulin
 cargo tarpaulin --workspace
 ```
+
+### Cross-Platform Testing
+
+All tests use cross-platform abstractions:
+- **Temporary files**: `tempfile` crate (works on Windows, Linux, macOS, BSD)
+- **Path handling**: `std::path::Path` with platform-agnostic separators
+- **File I/O**: Standard library with platform-specific implementations
+
+**Tested on**:
+- macOS (primary development)
+- Linux (CI/production)
+- Windows (via cross-compilation)
+- FreeBSD (community tested)
 
 ## Test Coverage Goals
 

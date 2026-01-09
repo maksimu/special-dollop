@@ -45,8 +45,15 @@ log = "0.4.28"
 uuid = { version = "1.18.1", features = ["v4"] }
 base64 = "0.22.1"
 
-# No [patch.crates-io] section needed - IronRDP removed from workspace
-# RDP support will be re-added using FreeRDP FFI (see docs/RDP_BACKEND_ANALYSIS.md)
+# Use local IronRDP fork with Update PDU handling
+# Your fork has graphics update support that's not yet in upstream master
+# Branch: feature/handle-update-pdu
+[patch.crates-io]
+ironrdp = { path = "../IronRDP/crates/ironrdp" }
+ironrdp-async = { path = "../IronRDP/crates/ironrdp-async" }
+ironrdp-tokio = { path = "../IronRDP/crates/ironrdp-tokio" }
+ironrdp-pdu = { path = "../IronRDP/crates/ironrdp-pdu" }
+ironrdp-session = { path = "../IronRDP/crates/ironrdp-session" }
 
 [profile.release]
 opt-level = 3

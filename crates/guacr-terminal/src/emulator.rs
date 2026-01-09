@@ -219,7 +219,9 @@ impl TerminalEmulator {
 
     /// Resize terminal
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser = Parser::new(rows, cols, 0);
+        // Use vt100's set_size() to preserve terminal content during resize
+        // This is critical - Parser::new() would wipe all content!
+        self.parser.set_size(rows, cols);
         self.rows = rows;
         self.cols = cols;
 

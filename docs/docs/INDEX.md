@@ -9,6 +9,7 @@ guacr/
 ├── README.md                          # Project overview & quick start
 ├── docs/
 │   ├── INDEX.md                       # This file
+│   ├── DATABASE_TERMINAL_FEATURES.md  # Database handler features (NEW)
 │   ├── context/                       # Guacr design docs
 │   │   ├── GUACR_EXECUTIVE_SUMMARY.md
 │   │   ├── GUACR_ARCHITECTURE_PLAN.md
@@ -65,6 +66,11 @@ guacr/
   - Database protocols (MySQL/PostgreSQL/SQL Server)
   - RBI/HTTP handler
   - Testing strategies
+- **[Database Terminal Features](DATABASE_TERMINAL_FEATURES.md)** - Rich terminal features (40KB)
+  - Command history and line editing
+  - Unified input handler (clipboard, mouse, resize)
+  - KCM-inspired improvements
+  - Implementation guide
 
 ### For Developers Getting Started
 - **[Quick Start Guide](context/GUACR_QUICKSTART_GUIDE.md)** - Step-by-step setup (28KB)

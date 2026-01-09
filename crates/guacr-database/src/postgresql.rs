@@ -114,36 +114,58 @@ impl ProtocolHandler for PostgreSqlHandler {
             username, hostname, port, database
         );
 
-        // Create query executor with PostgreSQL prompt
+        // Parse display size from parameters (like SSH does)
+        let size_params = params
+            .get("size")
+            .map(|s| s.as_str())
+            .unwrap_or("1024,768,96");
+        let size_parts: Vec<&str> = size_params.split(',').collect();
+        let width: u32 = size_parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let height: u32 = size_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        // Calculate terminal dimensions (9x18 pixels per character cell)
+        let cols = (width / 9).max(80) as u16;
+        let rows = (height / 18).max(24) as u16;
+
+        info!(
+            "PostgreSQL: Display size {}x{} px → {}x{} chars",
+            width, height, cols, rows
+        );
+
+        // Create query executor with PostgreSQL prompt and correct dimensions
         let prompt = if security.base.read_only {
             "postgres [RO]=# "
         } else {
             "postgres=# "
         };
-        let mut executor = QueryExecutor::new(prompt, "postgresql")
+        let mut executor = QueryExecutor::new_with_size(prompt, "postgresql", rows, cols)
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-        // Get terminal dimensions for recording
-        let (rows, cols) = executor.terminal.size();
 
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "PostgreSQL", cols, rows);
 
-        // Send initial screen
-        executor
-            .terminal
-            .write_line("Connecting to PostgreSQL server...")
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
+        // Send display initialization instructions (ready + size)
+        let (ready_instr, size_instr) =
+            QueryExecutor::create_display_init_instructions(width, height);
+        to_client
+            .send(ready_instr)
             .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(size_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+        debug!("PostgreSQL: Sent ready and size instructions");
+
+        // NOTE: Don't render initial screen yet - wait until after connection
+        // This matches SSH behavior and prevents rendering at wrong dimensions
 
         // Build PostgreSQL connection URL with proper URL encoding for special characters
         // This is critical for passwords containing: | & ? @ : / # %
@@ -211,6 +233,24 @@ impl ProtocolHandler for PostgreSqlHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+                // Render the connection success screen
+                debug!("PostgreSQL: Rendering initial screen with prompt");
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                debug!(
+                    "PostgreSQL: Sending {} instructions to client",
+                    instructions.len()
+                );
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+                debug!("PostgreSQL: Initial screen sent successfully");
+
                 pool
             }
             Err(e) => {
@@ -270,19 +310,8 @@ impl ProtocolHandler for PostgreSqlHandler {
             }
         };
 
-        // Send updated screen
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
-
         // Event loop
+        // NOTE: Screen was already rendered above after connection success
         while let Some(msg) = from_client.recv().await {
             match executor.process_input(&msg).await {
                 Ok((needs_render, instructions, pending_query)) => {

@@ -29,7 +29,7 @@ fn main() {
     for (password, description) in &test_passwords {
         let encoded = encode(password);
         let changed = password != &encoded.to_string();
-        
+
         println!(
             "{:<30} {:<25} {:<30} {}",
             description,
@@ -52,13 +52,13 @@ fn main() {
 
     for (username, password, host, port, database) in examples {
         println!("Credentials: {}:{}", username, password);
-        
+
         // Without encoding (BROKEN)
         let broken_url = format!(
             "mysql://{}:{}@{}:{}/{}",
             username, password, host, port, database
         );
-        
+
         // With encoding (FIXED)
         let encoded_username = encode(username);
         let encoded_password = encode(password);
@@ -67,7 +67,7 @@ fn main() {
             "mysql://{}:{}@{}:{}/{}",
             encoded_username, encoded_password, host, port, encoded_database
         );
-        
+
         println!("  ❌ Broken: {}", broken_url);
         println!("  ✅ Fixed:  {}", fixed_url);
         println!();

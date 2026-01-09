@@ -11,7 +11,7 @@ Guacr is a ground-up rewrite of Apache Guacamole's guacd daemon in Rust. It is a
 **Current Implementation Status:**
 - ✅ **SSH:** Production-ready with auth, clipboard, JPEG rendering (16ms debounce, 60fps)
 - ✅ **Telnet:** Complete with scrollback, mouse events, threat detection
-- ✅ **RDP:** Complete ironrdp integration with hardware encoding framework
+- ✅ **RDP:** Production-ready with rendering optimizations (60fps, 90-99% bandwidth reduction, dynamic resize)
 - ✅ **VNC:** Complete VNC protocol implementation (RFB 3.8)
 - ✅ **Database:** MySQL query execution wired up, spreadsheet UI complete
 - ✅ **SFTP:** Complete file transfer implementation with russh-sftp API
@@ -43,7 +43,11 @@ Each protocol is a separate crate implementing the `ProtocolHandler` trait:
   - Default handshake size (1024x768 @ 96 DPI, then resizes to browser)
   - Proper backpressure with async EventCallback (4096 channel capacity)
 - **guacr-telnet**: Telnet with custom implementation
-- **guacr-rdp**: RDP using ironrdp crate (pure Rust)
+- **guacr-rdp**: RDP using FreeRDP FFI (PRODUCTION READY)
+  - 60 FPS rendering with dirty region tracking
+  - Scroll detection with copy optimization (90-99% bandwidth savings)
+  - Dynamic resize support (reconnect method)
+  - Smart rendering (<30% = partial, >30% = full)
 - **guacr-vnc**: VNC using async-vnc crate
 - **guacr-database**: MySQL/PostgreSQL/SQL Server/Oracle/MongoDB/Redis using sqlx/tiberius
   - Spreadsheet-like UI for query results

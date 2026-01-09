@@ -2,12 +2,13 @@
 
 /// Modifier key state tracker
 ///
-/// Tracks which modifier keys are currently pressed (Control, Shift, Alt)
+/// Tracks which modifier keys are currently pressed (Control, Shift, Alt, Meta/Command)
 #[derive(Debug, Default, Clone)]
 pub struct ModifierState {
     pub control: bool,
     pub shift: bool,
     pub alt: bool,
+    pub meta: bool, // Command key on Mac, Windows key on PC
 }
 
 impl ModifierState {
@@ -33,6 +34,11 @@ impl ModifierState {
             // Alt keys
             0xFFE9 | 0xFFEA => {
                 self.alt = pressed;
+                true
+            }
+            // Meta/Command keys (0xFFE7 = left meta, 0xFFE8 = right meta)
+            0xFFE7 | 0xFFE8 => {
+                self.meta = pressed;
                 true
             }
             _ => false,

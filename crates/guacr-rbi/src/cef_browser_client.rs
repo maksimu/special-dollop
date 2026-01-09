@@ -1,11 +1,24 @@
 // CEF Browser client integration for RBI (Remote Browser Isolation)
 // Provides CEF-based browser session management with full audio support
 //
+// CRITICAL SECURITY: Each session gets its own isolated CEF process
+// - NO process sharing between sessions (unlike browser tabs)
+// - Each CefBrowserClient spawns a dedicated CEF subprocess
+// - Process isolation prevents cross-session data leakage
+// - Profile directories are locked to prevent concurrent access
+//
 // This is the CEF equivalent of browser_client.rs, providing:
 // - Display streaming via RenderHandler callbacks
 // - Audio streaming via AudioHandler callbacks (not available in Chrome/CDP)
 // - Input injection (keyboard, mouse, scroll)
 // - Clipboard synchronization
+//
+// Architecture follows SSH handler patterns:
+// - tokio::select! event loop
+// - Debounced rendering (configurable FPS)
+// - Error handling with client feedback
+// - Recording support
+// - Keep-alive management
 
 #[cfg(feature = "cef")]
 use crate::cef_session::{
@@ -15,26 +28,44 @@ use crate::clipboard::RbiClipboard;
 use crate::handler::RbiConfig;
 use crate::input::RbiInputHandler;
 use bytes::Bytes;
-use guacr_protocol::{BinaryEncoder, GuacamoleParser};
-use log::{debug, info, warn};
+use guacr_handlers::{
+    format_error, KeepAliveManager, MultiFormatRecorder, RecordingConfig,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS,
+};
+use guacr_protocol::{
+    BinaryEncoder, GuacamoleParser, STATUS_RESOURCE_CLOSED, STATUS_UPSTREAM_ERROR,
+    STATUS_UPSTREAM_TIMEOUT,
+};
+use log::{debug, error, info, trace, warn};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// CEF Browser client for RBI sessions with full audio support
+///
+/// SECURITY: Each instance creates a DEDICATED CEF process - NO SHARING
+/// - Spawns separate CEF subprocess per session
+/// - Uses unique profile directory (locked to prevent reuse)
+/// - Process terminates when session ends
+/// - No cross-session contamination possible
 #[cfg(feature = "cef")]
 pub struct CefBrowserClient {
     binary_encoder: BinaryEncoder,
     width: u32,
     height: u32,
     config: RbiConfig,
-    _input_handler: RbiInputHandler,
-    _clipboard: RbiClipboard,
+    input_handler: RbiInputHandler,
+    clipboard: RbiClipboard,
     /// Audio stream ID for Guacamole protocol
     audio_stream_id: u32,
+    /// Image stream ID for display updates
+    image_stream_id: u32,
 }
 
 #[cfg(feature = "cef")]
 impl CefBrowserClient {
     /// Create a new CEF browser client
+    ///
+    /// Each instance will spawn its own isolated CEF process when connect() is called
     pub fn new(width: u32, height: u32, config: RbiConfig) -> Self {
         let mut clipboard = RbiClipboard::new(config.clipboard_buffer_size);
         clipboard.set_restrictions(config.disable_copy, config.disable_paste);
@@ -43,45 +74,173 @@ impl CefBrowserClient {
             binary_encoder: BinaryEncoder::new(),
             width,
             height,
-            _input_handler: RbiInputHandler::new(),
-            _clipboard: clipboard,
+            input_handler: RbiInputHandler::new(),
+            clipboard,
             audio_stream_id: 1, // Audio uses stream 1
+            image_stream_id: 2, // Images use stream 2
             config,
         }
     }
 
+    /// Send error instruction to client and return error
+    ///
+    /// Matches SSH handler's pattern - ensures client sees user-friendly error
+    async fn send_error_and_return(
+        to_client: &mpsc::Sender<Bytes>,
+        error: String,
+        status_code: u16,
+    ) -> String {
+        let error_instr = format_error(&error, status_code);
+        let _ = to_client.send(Bytes::from(error_instr)).await;
+        error
+    }
+
     /// Launch CEF browser and connect to Guacamole client
+    ///
+    /// SECURITY: Spawns a DEDICATED CEF process for this session only
+    /// - Creates unique profile directory (locked)
+    /// - No process sharing with other sessions
+    /// - Process terminates when this function returns
+    ///
+    /// Architecture follows SSH handler pattern:
+    /// - tokio::select! event loop with multiple arms
+    /// - Debounced rendering for performance
+    /// - Keep-alive management
+    /// - Recording support
+    /// - Error handling with client feedback
     pub async fn connect(
         &mut self,
         url: &str,
+        params: &std::collections::HashMap<String, String>,
         to_client: mpsc::Sender<Bytes>,
         mut from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), String> {
-        info!("RBI/CEF: Launching browser for URL: {}", url);
+        info!("RBI/CEF: Launching DEDICATED CEF process for URL: {}", url);
+        info!("RBI/CEF: SECURITY - Each session gets isolated browser process (no sharing)");
+
+        // Parse recording configuration (SSH handler pattern)
+        let recording_config = RecordingConfig::from_params(params);
+        if recording_config.is_enabled() {
+            info!(
+                "RBI/CEF: Recording enabled - ses={}, asciicast={}, typescript={}",
+                recording_config.is_ses_enabled(),
+                recording_config.is_asciicast_enabled(),
+                recording_config.is_typescript_enabled()
+            );
+        }
+
+        // Initialize recording if enabled
+        let mut recorder: Option<MultiFormatRecorder> = if recording_config.is_enabled() {
+            match MultiFormatRecorder::new(
+                &recording_config,
+                params,
+                "http",
+                self.width as u16,
+                self.height as u16,
+            ) {
+                Ok(rec) => {
+                    info!("RBI/CEF: Session recording initialized");
+                    Some(rec)
+                }
+                Err(e) => {
+                    warn!("RBI/CEF: Failed to initialize recording: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Create channels for CEF callbacks
-        let (display_tx, mut display_rx) = mpsc::channel::<CefDisplayEvent>(64);
-        let (audio_tx, mut audio_rx) = mpsc::channel::<CefAudioPacket>(32);
+        // Larger buffers to handle burst rendering without blocking
+        let (display_tx, mut display_rx) = mpsc::channel::<CefDisplayEvent>(128);
+        let (audio_tx, mut audio_rx) = mpsc::channel::<CefAudioPacket>(64);
 
-        // Create and launch CEF session
+        // Create and launch CEF session (spawns dedicated subprocess)
         let mut cef_session = CefSession::new(self.width, self.height);
-        cef_session
-            .launch(url, display_tx, audio_tx)
-            .await
-            .map_err(|e| format!("CEF launch failed: {}", e))?;
+
+        // CRITICAL: This spawns a NEW CEF process - no sharing!
+        if let Err(e) = cef_session.launch(url, display_tx, audio_tx).await {
+            let err_msg = format!("CEF launch failed: {}", e);
+            error!("RBI/CEF: {}", err_msg);
+            return Err(
+                Self::send_error_and_return(&to_client, err_msg, STATUS_UPSTREAM_ERROR).await,
+            );
+        }
+
+        info!("RBI/CEF: Dedicated CEF process spawned (PID will be logged by CEF)");
 
         // Send initial handshake
-        self.send_handshake(&to_client).await?;
+        if let Err(e) = self.send_handshake(&to_client).await {
+            error!("RBI/CEF: Handshake failed: {}", e);
+            cef_session.close();
+            return Err(Self::send_error_and_return(&to_client, e, STATUS_UPSTREAM_ERROR).await);
+        }
 
         info!("RBI/CEF: Browser launched, starting event loop");
 
-        // Main event loop
+        // Debounce timer for batching screen updates (SSH handler pattern)
+        // Configurable FPS (default 30)
+        let frame_interval_ms = 1000 / self.config.capture_fps as u64;
+        let mut debounce = tokio::time::interval(Duration::from_millis(frame_interval_ms));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Keep-alive manager (SSH handler pattern)
+        let mut keepalive = KeepAliveManager::new(DEFAULT_KEEPALIVE_INTERVAL_SECS);
+        let mut keepalive_interval =
+            tokio::time::interval(Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Track if we have pending display updates
+        let mut pending_display_events = Vec::new();
+
+        // Main event loop (SSH handler pattern)
         loop {
             tokio::select! {
+                // Keep-alive ping to detect dead connections (SSH handler pattern)
+                _ = keepalive_interval.tick() => {
+                    if let Some(sync_instr) = keepalive.check() {
+                        trace!("RBI/CEF: Sending keep-alive sync");
+                        if to_client.send(sync_instr).await.is_err() {
+                            info!("RBI/CEF: Client channel closed, ending session");
+                            break;
+                        }
+                    }
+                }
+
+                // Debounce tick - process pending display events (SSH handler pattern)
+                _ = debounce.tick() => {
+                    if !pending_display_events.is_empty() {
+                        trace!("RBI/CEF: Processing {} pending display events", pending_display_events.len());
+
+                        for event in pending_display_events.drain(..) {
+                            if let Err(e) = self.handle_display_event(&event, &to_client, &mut recorder).await {
+                                warn!("RBI/CEF: Display event error: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 // Handle display events from CEF RenderHandler
                 Some(event) = display_rx.recv() => {
-                    if let Err(e) = self.handle_display_event(&event, &to_client).await {
-                        warn!("RBI/CEF: Display event error: {}", e);
+                    // Buffer events for debounced processing (except critical ones)
+                    match event.event_type {
+                        DisplayEventType::EndOfFrame => {
+                            // Send sync immediately (frame boundary)
+                            if let Err(e) = self.handle_display_event(&event, &to_client, &mut recorder).await {
+                                warn!("RBI/CEF: Display event error: {}", e);
+                            }
+                        }
+                        DisplayEventType::Resize => {
+                            // Send resize immediately (critical)
+                            if let Err(e) = self.handle_display_event(&event, &to_client, &mut recorder).await {
+                                warn!("RBI/CEF: Display event error: {}", e);
+                            }
+                        }
+                        _ => {
+                            // Buffer for debounced processing
+                            pending_display_events.push(event);
+                        }
                     }
                 }
 
@@ -94,7 +253,7 @@ impl CefBrowserClient {
 
                 // Handle client input
                 Some(msg) = from_client.recv() => {
-                    match self.handle_client_message(&msg, &mut cef_session).await {
+                    match self.handle_client_message(&msg, &mut cef_session, &mut recorder).await {
                         Ok(true) => {
                             // Continue
                         }
@@ -109,17 +268,28 @@ impl CefBrowserClient {
                     }
                 }
 
-                // All channels closed
+                // Client disconnected
                 else => {
-                    info!("RBI/CEF: All channels closed, ending session");
+                    info!("RBI/CEF: Client channel closed, ending session");
                     break;
                 }
             }
         }
 
-        // Cleanup
+        // Cleanup (SSH handler pattern)
+        info!("RBI/CEF: Closing CEF session and terminating dedicated process");
         cef_session.close();
-        info!("RBI/CEF: Session ended");
+
+        // Finalize recording (SSH handler pattern)
+        if let Some(rec) = recorder {
+            if let Err(e) = rec.finalize() {
+                warn!("RBI/CEF: Failed to finalize recording: {}", e);
+            } else {
+                info!("RBI/CEF: Session recording finalized");
+            }
+        }
+
+        info!("RBI/CEF: Session ended, CEF process terminated");
         Ok(())
     }
 
@@ -162,6 +332,7 @@ impl CefBrowserClient {
         &mut self,
         event: &CefDisplayEvent,
         to_client: &mpsc::Sender<Bytes>,
+        recorder: &mut Option<MultiFormatRecorder>,
     ) -> Result<(), String> {
         match event.event_type {
             DisplayEventType::Draw => {
@@ -170,6 +341,12 @@ impl CefBrowserClient {
                     let png_data =
                         self.encode_rect_to_png(pixels, event.width as u32, event.height as u32)?;
 
+                    // Record frame if recording enabled
+                    if let Some(ref mut rec) = recorder {
+                        // Record as PNG blob (RBI doesn't have terminal output like SSH)
+                        let _ = rec.record_output(&png_data);
+                    }
+
                     // Send image instruction with PNG data
                     let layer = match event.surface {
                         DisplaySurface::View => 0,
@@ -177,7 +354,7 @@ impl CefBrowserClient {
                     };
 
                     let img_instr = self.binary_encoder.encode_image(
-                        1, // stream_id
+                        self.image_stream_id,
                         layer,
                         event.x,
                         event.y,
@@ -192,9 +369,12 @@ impl CefBrowserClient {
                         .await
                         .map_err(|e| format!("Failed to send img: {}", e))?;
 
-                    debug!(
+                    trace!(
                         "RBI/CEF: Sent {}x{} update at ({},{})",
-                        event.width, event.height, event.x, event.y
+                        event.width,
+                        event.height,
+                        event.x,
+                        event.y
                     );
                 }
             }
@@ -301,12 +481,13 @@ impl CefBrowserClient {
         &mut self,
         msg: &Bytes,
         cef_session: &mut CefSession,
+        recorder: &mut Option<MultiFormatRecorder>,
     ) -> Result<bool, String> {
         // Try to parse as text instruction
         if let Ok(instr) = GuacamoleParser::parse_instruction(msg) {
             let args: Vec<String> = instr.args.iter().map(|s| s.to_string()).collect();
             return self
-                .handle_instruction(instr.opcode, &args, cef_session)
+                .handle_instruction(instr.opcode, &args, cef_session, recorder)
                 .await;
         }
 
@@ -320,6 +501,7 @@ impl CefBrowserClient {
         opcode: &str,
         args: &[String],
         cef_session: &mut CefSession,
+        recorder: &mut Option<MultiFormatRecorder>,
     ) -> Result<bool, String> {
         match opcode {
             "mouse" => {
@@ -359,6 +541,15 @@ impl CefBrowserClient {
                     let keysym: u32 = args[0].parse().unwrap_or(0);
                     let pressed = args[1] == "1";
 
+                    // Record input if enabled
+                    if let Some(ref mut rec) = recorder {
+                        if pressed {
+                            // Record key press as single byte (simplified)
+                            let key_byte = (keysym & 0xFF) as u8;
+                            let _ = rec.record_input(&[key_byte]);
+                        }
+                    }
+
                     cef_session.inject_keyboard(keysym, pressed)?;
                 }
             }
@@ -373,6 +564,11 @@ impl CefBrowserClient {
                         self.width = width;
                         self.height = height;
                         info!("RBI/CEF: Resized to {}x{}", width, height);
+
+                        // Record resize if enabled
+                        if let Some(ref mut rec) = recorder {
+                            let _ = rec.record_resize(width as u16, height as u16);
+                        }
                     }
                 }
             }

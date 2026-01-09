@@ -40,7 +40,11 @@ fn test_url_encode_passwords() {
             description,
             password,
             encoded,
-            if needs_encoding { "ENCODED" } else { "NO CHANGE" }
+            if needs_encoding {
+                "ENCODED"
+            } else {
+                "NO CHANGE"
+            }
         );
 
         // Verify encoding is reversible
@@ -127,8 +131,14 @@ fn test_postgres_url_construction() {
         );
 
         // Verify URL is well-formed
-        assert!(url.starts_with("postgres://"), "URL should start with postgres://");
-        assert!(url.contains(&encoded_password.to_string()), "URL should contain encoded password");
+        assert!(
+            url.starts_with("postgres://"),
+            "URL should start with postgres://"
+        );
+        assert!(
+            url.contains(&encoded_password.to_string()),
+            "URL should contain encoded password"
+        );
 
         println!("✓ PostgreSQL URL valid for: {}", description);
     }
@@ -159,8 +169,14 @@ fn test_mongodb_url_construction() {
         );
 
         // Verify URL is well-formed
-        assert!(url.starts_with("mongodb://"), "URL should start with mongodb://");
-        assert!(url.contains("authSource="), "URL should contain authSource parameter");
+        assert!(
+            url.starts_with("mongodb://"),
+            "URL should start with mongodb://"
+        );
+        assert!(
+            url.contains("authSource="),
+            "URL should contain authSource parameter"
+        );
 
         println!("✓ MongoDB URL valid for: {}", description);
     }
@@ -175,11 +191,20 @@ fn test_redis_url_construction() {
     for (password, description) in TEST_PASSWORDS {
         let encoded_password = encode(password);
 
-        let url = format!("redis://:{}@{}:{}/{}", encoded_password, hostname, port, database);
+        let url = format!(
+            "redis://:{}@{}:{}/{}",
+            encoded_password, hostname, port, database
+        );
 
         // Verify URL is well-formed
-        assert!(url.starts_with("redis://"), "URL should start with redis://");
-        assert!(url.contains(&encoded_password.to_string()), "URL should contain encoded password");
+        assert!(
+            url.starts_with("redis://"),
+            "URL should start with redis://"
+        );
+        assert!(
+            url.contains(&encoded_password.to_string()),
+            "URL should contain encoded password"
+        );
 
         println!("✓ Redis URL valid for: {}", description);
     }
@@ -206,12 +231,7 @@ fn test_special_char_encoding_correctness() {
 #[test]
 fn test_username_encoding() {
     // Usernames can also contain special characters
-    let special_usernames = vec![
-        "user@domain.com",
-        "user:name",
-        "user/name",
-        "user name",
-    ];
+    let special_usernames = vec!["user@domain.com", "user:name", "user/name", "user name"];
 
     for username in special_usernames {
         let encoded = encode(username);
@@ -226,12 +246,7 @@ fn test_username_encoding() {
 #[test]
 fn test_database_name_encoding() {
     // Database names might contain special characters
-    let special_databases = vec![
-        "test-db",
-        "test_db",
-        "test.db",
-        "test db",
-    ];
+    let special_databases = vec!["test-db", "test_db", "test.db", "test db"];
 
     for database in special_databases {
         let encoded = encode(database);
@@ -251,7 +266,10 @@ fn test_real_world_scenarios() {
     let password = "my|password";
     let encoded = encode(password);
     assert_eq!(encoded.to_string(), "my%7Cpassword");
-    println!("✓ Bug report password encoded correctly: {} -> {}", password, encoded);
+    println!(
+        "✓ Bug report password encoded correctly: {} -> {}",
+        password, encoded
+    );
 
     // Scenario 2: Generated password with special chars
     let password = "Xy7$mK9@pL2!";

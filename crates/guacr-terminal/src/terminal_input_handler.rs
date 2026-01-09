@@ -9,7 +9,7 @@
 //! Used by SSH, Telnet, and Database handlers for consistent UX.
 
 use crate::{
-    format_clipboard_instructions, format_clear_selection_instructions,
+    extract_selection_text, format_clear_selection_instructions, format_clipboard_instructions,
     format_selection_overlay_instructions, handle_mouse_selection, parse_clipboard_blob,
     parse_mouse_instruction, DirtyTracker, MouseEvent, MouseSelection, SelectionResult,
     TerminalEmulator,
@@ -80,7 +80,7 @@ impl TerminalInputHandler {
     /// Handle mouse event for selection
     ///
     /// Returns SelectionResult indicating what action to take.
-    /// 
+    ///
     /// Note: Requires character dimensions (9x18 pixels per char for databases)
     pub fn handle_mouse_event(
         &mut self,
@@ -120,7 +120,7 @@ impl TerminalInputHandler {
             self.cols = new_cols;
             terminal.resize(new_rows, new_cols);
             self.dirty = DirtyTracker::new(new_rows, new_cols);
-            
+
             // Clear selection on resize
             self.mouse_selection = MouseSelection::new();
         }
@@ -130,7 +130,11 @@ impl TerminalInputHandler {
     /// Get clipboard instructions for selected text
     ///
     /// Returns Guacamole clipboard instructions to send to client.
-    pub fn get_clipboard_instructions(&self, terminal: &TerminalEmulator, stream_id: u32) -> Vec<String> {
+    pub fn get_clipboard_instructions(
+        &self,
+        terminal: &TerminalEmulator,
+        stream_id: u32,
+    ) -> Vec<String> {
         // Check if we have a selection
         if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
             self.mouse_selection.selection_start_row,
@@ -140,11 +144,10 @@ impl TerminalInputHandler {
         ) {
             // Extract text using the shared function
             let text = extract_selection_text(
-                terminal.screen(),
-                start_row,
-                start_col,
-                end_row,
-                end_col,
+                terminal,
+                (start_row, start_col),
+                (end_row, end_col),
+                terminal.screen().size().1,
             );
 
             if !text.is_empty() {
@@ -158,9 +161,26 @@ impl TerminalInputHandler {
     /// Get selection overlay instructions
     ///
     /// Returns Guacamole instructions to draw selection highlight.
-    pub fn get_selection_overlay_instructions(&self) -> Vec<String> {
-        if self.mouse_selection.is_active() {
-            format_selection_overlay_instructions(&self.mouse_selection)
+    ///
+    /// Note: Requires character dimensions (9x18 pixels per char for databases)
+    pub fn get_selection_overlay_instructions(
+        &self,
+        char_width: u32,
+        char_height: u32,
+    ) -> Vec<String> {
+        if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+            self.mouse_selection.selection_start_row,
+            self.mouse_selection.selection_start_column,
+            self.mouse_selection.selection_end_row,
+            self.mouse_selection.selection_end_column,
+        ) {
+            format_selection_overlay_instructions(
+                (start_row, start_col),
+                (end_row, end_col),
+                char_width,
+                char_height,
+                self.cols,
+            )
         } else {
             vec![]
         }
@@ -173,7 +193,7 @@ impl TerminalInputHandler {
 
     /// Check if selection is active
     pub fn has_selection(&self) -> bool {
-        self.mouse_selection.is_active()
+        self.mouse_selection.start.is_some() && self.mouse_selection.end.is_some()
     }
 
     /// Clear current selection
@@ -250,8 +270,8 @@ mod tests {
     #[test]
     fn test_clipboard_instructions_empty() {
         let handler = TerminalInputHandler::new(24, 80);
-        let screen = vec![vec!['H', 'e', 'l', 'l', 'o']];
-        let instrs = handler.get_clipboard_instructions(&screen);
+        let terminal = TerminalEmulator::new(24, 80);
+        let instrs = handler.get_clipboard_instructions(&terminal, 1);
         assert!(instrs.is_empty()); // No selection
     }
 }

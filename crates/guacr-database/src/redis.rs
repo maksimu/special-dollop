@@ -138,12 +138,20 @@ impl ProtocolHandler for RedisHandler {
                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         }
 
-        // Build Redis connection URL
+        // Build Redis connection URL with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
         let connection_url = if let Some(pwd) = password {
+            let encoded_password = urlencoding::encode(pwd);
             if self.config.require_tls {
-                format!("rediss://:{}@{}:{}/{}", pwd, hostname, port, database)
+                format!(
+                    "rediss://:{}@{}:{}/{}",
+                    encoded_password, hostname, port, database
+                )
             } else {
-                format!("redis://:{}@{}:{}/{}", pwd, hostname, port, database)
+                format!(
+                    "redis://:{}@{}:{}/{}",
+                    encoded_password, hostname, port, database
+                )
             }
         } else if self.config.require_tls {
             format!("rediss://{}:{}/{}", hostname, port, database)
@@ -153,7 +161,12 @@ impl ProtocolHandler for RedisHandler {
 
         debug!(
             "Redis: Connection URL: {}",
-            connection_url.replace(password.unwrap_or(&"".to_string()), "***")
+            connection_url.replace(
+                &password
+                    .map(|p| urlencoding::encode(p).to_string())
+                    .unwrap_or_default(),
+                "***"
+            )
         );
 
         // Connect to Redis

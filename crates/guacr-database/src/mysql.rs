@@ -140,19 +140,26 @@ impl ProtocolHandler for MySqlHandler {
                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         }
 
-        // Build MySQL connection URL
+        // Build MySQL connection URL with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
+        let encoded_username = urlencoding::encode(username);
+        let encoded_password = urlencoding::encode(password);
         let connection_url = if database.is_empty() {
-            format!("mysql://{}:{}@{}:{}", username, password, hostname, port)
+            format!(
+                "mysql://{}:{}@{}:{}",
+                encoded_username, encoded_password, hostname, port
+            )
         } else {
+            let encoded_database = urlencoding::encode(database);
             format!(
                 "mysql://{}:{}@{}:{}/{}",
-                username, password, hostname, port, database
+                encoded_username, encoded_password, hostname, port, encoded_database
             )
         };
 
         debug!(
             "MySQL: Connection URL: {}",
-            connection_url.replace(password, "***")
+            connection_url.replace(&encoded_password.to_string(), "***")
         );
 
         // Connect to MySQL using mysql_async

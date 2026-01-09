@@ -44,85 +44,6 @@ use tokio::sync::mpsc;
 #[cfg(feature = "threat-detection")]
 use guacr_threat_detection::{ThreatDetector, ThreatDetectorConfig};
 
-/// Parse size parameter from connection params
-///
-/// Format: "width,height,dpi" (e.g., "2118,1536,192")
-/// Returns: (width_px, height_px, char_width, char_height, cols, rows, dpi_scale)
-///
-/// The dpi_scale is used to convert CSS pixels to device pixels for HiDPI displays.
-fn parse_size_parameter(size_str: &str) -> (u32, u32, u32, u32, u16, u16, f32) {
-    let parts: Vec<&str> = size_str.split(',').collect();
-
-    if parts.len() >= 2 {
-        if let (Ok(width), Ok(height)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-            // Parse DPI (default to 96 if not provided)
-            let dpi = if parts.len() >= 3 {
-                parts[2].parse::<u32>().unwrap_or(96)
-            } else {
-                96
-            };
-
-            // Calculate DPI scale factor (for converting CSS pixels to device pixels)
-            let dpi_scale = dpi as f32 / 96.0;
-
-            // Calculate character cell size based on DPI
-            let char_width = (9.0 * dpi_scale).round() as u32;
-            let char_height = (18.0 * dpi_scale).round() as u32;
-
-            // Calculate terminal dimensions
-            let cols = (width / char_width.max(1)).clamp(20, 500) as u16;
-            let rows = (height / char_height.max(1)).clamp(10, 200) as u16;
-
-            // Realign to character cell boundaries for crisp rendering
-            let aligned_width = cols as u32 * char_width;
-            let aligned_height = rows as u32 * char_height;
-
-            log::info!(
-                "Telnet: Parsed size {}x{} @ {} DPI (scale={:.1}x) → {}x{} chars @ {}x{} cell",
-                width,
-                height,
-                dpi,
-                dpi_scale,
-                cols,
-                rows,
-                char_width,
-                char_height
-            );
-
-            return (
-                aligned_width,
-                aligned_height,
-                char_width,
-                char_height,
-                cols,
-                rows,
-                dpi_scale,
-            );
-        }
-    }
-
-    // Fallback to defaults
-    log::warn!(
-        "Telnet: Failed to parse size '{}', using defaults",
-        size_str
-    );
-    let char_width = 19_u32;
-    let char_height = 38_u32;
-    let cols = 80_u16;
-    let rows = 24_u16;
-    let width_px = cols as u32 * char_width;
-    let height_px = rows as u32 * char_height;
-    (
-        width_px,
-        height_px,
-        char_width,
-        char_height,
-        cols,
-        rows,
-        1.0,
-    )
-}
-
 /// Telnet protocol handler
 ///
 /// Simpler than SSH - just TCP connection with terminal emulation.
@@ -228,36 +149,23 @@ impl ProtocolHandler for TelnetHandler {
             .and_then(|p| p.parse().ok())
             .unwrap_or(self.config.default_port);
 
-        // Parse size from connection parameters if available
-        // Format: "width,height,dpi" (e.g., "2118,1536,192")
-        // dpi_scale is used to convert CSS pixels to device pixels for HiDPI
-        let (width_px, height_px, char_width, char_height, cols, rows, dpi_scale) =
-            if let Some(size_str) = params.get("size") {
-                parse_size_parameter(size_str)
-            } else {
-                // Fallback to default size
-                info!("Telnet: No size parameter, using default (1024x768 @ 96 DPI)");
-                let char_width = 19_u32;
-                let char_height = 38_u32;
-                let cols = self.config.default_cols;
-                let rows = self.config.default_rows;
-                let width_px = cols as u32 * char_width;
-                let height_px = rows as u32 * char_height;
-                (
-                    width_px,
-                    height_px,
-                    char_width,
-                    char_height,
-                    cols,
-                    rows,
-                    1.0_f32,
-                )
-            };
+        // IMPORTANT: Always use DEFAULT size during initialization (like guacd does)
+        // The client will send a resize instruction with actual browser dimensions after handshake
+        // This matches guacd behavior and prevents "half screen" display issues
+        //
+        // Telnet uses fixed 19x38 cell dimensions (high DPI style)
+        // Default: 1024x768 @ 96 DPI equivalent → ~53x20 chars
+        const CHAR_W: u32 = 19;
+        const CHAR_H: u32 = 38;
 
         info!(
-            "Telnet: Initial size {}x{} px @ {}x{} cell → {}x{} chars (dpi_scale={:.1}x)",
-            width_px, height_px, char_width, char_height, cols, rows, dpi_scale
+            "Telnet: Using default handshake size (1024x768) - will resize after client connects"
         );
+        let rows = self.config.default_rows;
+        let cols = self.config.default_cols;
+        let width_px = cols as u32 * CHAR_W;
+        let height_px = rows as u32 * CHAR_H;
+        let (rows, cols, width_px, height_px) = (rows, cols, width_px, height_px);
 
         info!(
             "Connecting to {}:{} (timeout: {}s)",
@@ -278,10 +186,10 @@ impl ProtocolHandler for TelnetHandler {
             TerminalEmulator::new_with_scrollback(rows, cols, terminal_config.scrollback_size);
 
         // Calculate font size from cell height (70% fits well)
-        let font_size = (char_height as f32) * 0.70;
+        let font_size = (CHAR_H as f32) * 0.70;
         let renderer = TerminalRenderer::new_with_dimensions_and_scheme(
-            char_width,
-            char_height,
+            CHAR_W,
+            CHAR_H,
             font_size,
             terminal_config.color_scheme,
         )
@@ -420,9 +328,10 @@ impl ProtocolHandler for TelnetHandler {
         let mut modifier_state = ModifierState::new();
         let mut mouse_selection = MouseSelection::new();
 
-        // Clipboard buffer - stores clipboard data from client
-        // Data is stored here when received, then pasted when user presses Ctrl+V
-        let mut clipboard_buffer: Option<String> = None;
+        // Clipboard state tracking
+        // Track if we've received the initial clipboard sync (to avoid auto-paste bug)
+        let mut first_clipboard_received = false;
+        let mut stored_clipboard = String::new();
 
         // Debounce timer for batching screen updates (16ms = 60fps)
         let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
@@ -531,41 +440,6 @@ impl ProtocolHandler for TelnetHandler {
                             continue;
                         }
 
-                        // Check for Ctrl+V (paste) - keysym 'v' (0x76) with Ctrl modifier
-                        let is_ctrl_v = key_event.pressed
-                            && modifier_state.control
-                            && (key_event.keysym == 0x76 || key_event.keysym == 0x56); // 'v' or 'V'
-
-                        if is_ctrl_v {
-                            if !security.is_paste_allowed() {
-                                debug!("Telnet: Paste blocked (disabled or read-only mode)");
-                                continue;
-                            }
-
-                            if let Some(ref paste_text) = clipboard_buffer {
-                                debug!("Telnet: Pasting {} chars from clipboard buffer", paste_text.len());
-
-                                // Send using bracketed paste mode for safety
-                                let mut paste_data = Vec::new();
-                                paste_data.extend_from_slice(b"\x1b[200~"); // Start bracketed paste
-                                paste_data.extend_from_slice(paste_text.as_bytes());
-                                paste_data.extend_from_slice(b"\x1b[201~"); // End bracketed paste
-
-                                // Record paste if enabled
-                                if let Some(ref mut rec) = recorder {
-                                    if recording_config.recording_include_keys {
-                                        let _ = rec.record_input(&paste_data);
-                                    }
-                                }
-
-                                write_half.write_all(&paste_data[..]).await
-                                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            } else {
-                                debug!("Telnet: Ctrl+V pressed but clipboard buffer is empty");
-                            }
-                            continue; // Don't send Ctrl+V as a regular key
-                        }
-
                         // Convert to terminal bytes with current modifier state and configured backspace
                         let bytes = x11_keysym_to_bytes_with_backspace(
                             key_event.keysym,
@@ -606,22 +480,53 @@ impl ProtocolHandler for TelnetHandler {
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         }
                     } else if msg_str.contains(".clipboard,") {
-                        // Clipboard instruction received - the actual data comes in a blob message
-                        debug!("Telnet: Clipboard stream opened - data incoming");
+                        // Clipboard instruction received - this is just a SYNC, not a paste command!
+                        // The Guacamole protocol sends clipboard instructions to sync clipboard state
+                        // between client and server. This does NOT mean the user wants to paste.
+                        debug!("Telnet: Clipboard stream opened - syncing clipboard state (not pasting)");
                     } else if let Some(clipboard_text) = parse_clipboard_blob(&msg_str) {
-                        // Store clipboard data in buffer - DON'T paste immediately!
-                        // The browser sends clipboard data to sync, but the user hasn't
-                        // pressed Ctrl+V yet. We paste when Ctrl+V is detected.
-                        let max_size = security.clipboard_buffer_size;
-                        let stored_text = if clipboard_text.len() > max_size {
-                            warn!("Telnet: Clipboard truncated from {} to {} bytes", clipboard_text.len(), max_size);
-                            clipboard_text[..max_size].to_string()
+                        // FIXED: Clipboard blob can be either:
+                        // 1. Initial sync when connection opens (DON'T paste)
+                        // 2. Explicit paste request from user (DO paste)
+                        //
+                        // Solution: Track first clipboard message and skip it.
+                        // Subsequent clipboard updates are treated as paste requests.
+                        
+                        if !first_clipboard_received {
+                            // First clipboard sync - just store it, don't paste
+                            first_clipboard_received = true;
+                            stored_clipboard = clipboard_text.clone();
+                            debug!("Telnet: Initial clipboard sync - stored {} chars (not pasting)", clipboard_text.len());
                         } else {
-                            clipboard_text
-                        };
+                            // Subsequent clipboard update - this is a paste request!
+                            stored_clipboard = clipboard_text.clone();
+                            
+                            // Security: Check if paste is allowed
+                            if !security.is_paste_allowed() {
+                                debug!("Telnet: Paste blocked (disabled or read-only mode)");
+                                continue;
+                            }
 
-                        debug!("Telnet: Clipboard buffer updated ({} chars) - will paste on Ctrl+V", stored_text.len());
-                        clipboard_buffer = Some(stored_text);
+                            // Check clipboard buffer size limit
+                            let max_size = security.clipboard_buffer_size;
+                            let paste_text = if clipboard_text.len() > max_size {
+                                warn!("Telnet: Clipboard truncated from {} to {} bytes", clipboard_text.len(), max_size);
+                                &clipboard_text[..max_size]
+                            } else {
+                                &clipboard_text
+                            };
+
+                            debug!("Telnet: Pasting {} chars from clipboard", paste_text.len());
+
+                            // Send using bracketed paste mode for safety
+                            let mut paste_data = Vec::new();
+                            paste_data.extend_from_slice(b"\x1b[200~"); // Start bracketed paste
+                            paste_data.extend_from_slice(paste_text.as_bytes());
+                            paste_data.extend_from_slice(b"\x1b[201~"); // End bracketed paste
+
+                            write_half.write_all(&paste_data[..]).await
+                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        }
                     } else if let Some(mouse_event) = parse_mouse_instruction(&msg_str) {
                         // Security: Check read-only mode for mouse clicks
                         if security.read_only && !is_mouse_event_allowed_readonly(mouse_event.button_mask) {
@@ -639,8 +544,8 @@ impl ProtocolHandler for TelnetHandler {
                             mouse_event,
                             &mut mouse_selection,
                             &terminal,
-                            char_width,
-                            char_height,
+                            CHAR_W,
+                            CHAR_H,
                             cols,
                             rows,
                         ) {
@@ -660,29 +565,24 @@ impl ProtocolHandler for TelnetHandler {
                                 to_client.send(Bytes::from(instr)).await
                                     .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                             }
-                        } else if mouse_event.button_mask != 0 && terminal.is_mouse_enabled() {
-                            // A button is pressed AND mouse mode is enabled by the remote app
-                            // (e.g., vim :set mouse=a, tmux mouse mode, etc.)
-                            //
-                            // IMPORTANT: Only send X11 mouse sequences when mouse mode is enabled!
-                            // Without this check, the escape sequences appear as garbage characters
+                        } else if mouse_event.button_mask != 0 {
+                            // A button is pressed (but not a selection) - send to vim/tmux
                             let mouse_seq = mouse_event_to_x11_sequence(
                                 mouse_event.x_px,
                                 mouse_event.y_px,
                                 mouse_event.button_mask as u8,
-                                char_width,
-                                char_height
+                                CHAR_W,
+                                CHAR_H
                             );
 
                             if !mouse_seq.is_empty() {
-                                trace!("Telnet: Mouse X11 sequence (button={}, mode={:?}) at ({}, {})",
-                                    mouse_event.button_mask, terminal.mouse_mode(),
-                                    mouse_event.x_px, mouse_event.y_px);
+                                trace!("Telnet: Mouse X11 sequence (button={}) at ({}, {})",
+                                    mouse_event.button_mask, mouse_event.x_px, mouse_event.y_px);
                                 write_half.write_all(&mouse_seq).await
                                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                             }
                         }
-                        // Else: mouse mode disabled or no buttons - ignore to prevent garbage
+                        // Else: no buttons pressed, just hovering - ignore to prevent garbage
                     } else if let Some(pipe_instr) = parse_pipe_instruction(&msg_str) {
                         // Handle incoming pipe stream (e.g., STDIN from client)
                         if pipe_instr.name == PIPE_NAME_STDIN {
@@ -731,6 +631,10 @@ impl ProtocolHandler for TelnetHandler {
                                     // Scroll up: copy rows 1..N to rows 0..N-1, render new bottom line(s)
                                     trace!("Telnet: Scroll up {} lines (copy optimization)", scroll_lines);
 
+                                    // Get character dimensions from renderer
+                                    const CHAR_W: u32 = 19;
+                                    const CHAR_H: u32 = 38;
+
                                     let copy_instr = TerminalRenderer::format_copy_instruction(
                                         scroll_lines,  // src_row
                                         0,             // src_col
@@ -738,8 +642,8 @@ impl ProtocolHandler for TelnetHandler {
                                         rows - scroll_lines, // height_chars
                                         0,             // dst_row
                                         0,             // dst_col
-                                        char_width,    // char_width
-                                        char_height,   // char_height
+                                        CHAR_W,        // char_width
+                                        CHAR_H,        // char_height
                                         0,             // layer
                                     );
                                     to_client.send(Bytes::from(copy_instr)).await

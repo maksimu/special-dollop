@@ -141,7 +141,12 @@ impl ProtocolHandler for MongoDbHandler {
                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         }
 
-        // Build MongoDB connection URI
+        // Build MongoDB connection URI with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
+        let encoded_username = urlencoding::encode(username);
+        let encoded_password = urlencoding::encode(password);
+        let encoded_database = urlencoding::encode(database);
+        let encoded_auth_source = urlencoding::encode(auth_source);
         let tls_param = if self.config.require_tls {
             "&tls=true"
         } else {
@@ -149,12 +154,18 @@ impl ProtocolHandler for MongoDbHandler {
         };
         let connection_uri = format!(
             "mongodb://{}:{}@{}:{}/{}?authSource={}{}",
-            username, password, hostname, port, database, auth_source, tls_param
+            encoded_username,
+            encoded_password,
+            hostname,
+            port,
+            encoded_database,
+            encoded_auth_source,
+            tls_param
         );
 
         debug!(
             "MongoDB: Connection URI: {}",
-            connection_uri.replace(password, "***")
+            connection_uri.replace(&encoded_password.to_string(), "***")
         );
 
         // Connect to MongoDB

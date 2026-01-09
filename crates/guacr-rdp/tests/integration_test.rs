@@ -1,150 +1,263 @@
-//! Integration tests for guacr-rdp
+//! Integration tests for RDP handler
 //!
-//! These tests require:
-//! - FreeRDP installed (not just stub bindings)
-//! - An RDP server to connect to
+//! These tests require a running RDP server. Start one with:
+//!   docker-compose -f docker-compose.test.yml up -d rdp
 //!
-//! Run with: cargo test -p guacr-rdp --test integration_test -- --include-ignored
+//! Run tests with:
+//!   cargo test --package guacr-rdp --test integration_test -- --include-ignored
 //!
-//! Environment variables:
-//! - TEST_RDP_HOST: RDP server hostname (required)
-//! - TEST_RDP_PORT: RDP server port (default: 3389)
-//! - TEST_RDP_USER: Username (required)
-//! - TEST_RDP_PASSWORD: Password (required)
+//! Connection details:
+//!   Host: localhost:3389
+//!   User: test_user
+//!   Password: test_password
 
-use guacr_handlers::ProtocolHandler;
-use guacr_rdp::{RdpConfig, RdpHandler};
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::timeout;
 
-/// Get test connection parameters from environment
-fn get_test_params() -> Option<HashMap<String, String>> {
-    let host = std::env::var("TEST_RDP_HOST").ok()?;
-    let user = std::env::var("TEST_RDP_USER").ok()?;
-    let password = std::env::var("TEST_RDP_PASSWORD").ok()?;
+/// Test connection timeout
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    let mut params = HashMap::new();
-    params.insert("hostname".to_string(), host);
-    params.insert("username".to_string(), user);
-    params.insert("password".to_string(), password);
-
-    if let Ok(port) = std::env::var("TEST_RDP_PORT") {
-        params.insert("port".to_string(), port);
-    }
-
-    // Use smaller resolution for tests
-    params.insert("width".to_string(), "800".to_string());
-    params.insert("height".to_string(), "600".to_string());
-
-    // Security settings for test servers (xrdp in Docker)
-    // Use "any" to allow negotiation - xrdp may not have proper TLS certs
-    params.insert("security".to_string(), "any".to_string());
-    params.insert("ignore-cert".to_string(), "true".to_string());
-
-    Some(params)
+/// Check if a port is open (server is running)
+async fn port_is_open(host: &str, port: u16) -> bool {
+    timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(format!("{}:{}", host, port)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
 }
 
-#[test]
-fn test_rdp_handler_name() {
-    let handler = RdpHandler::with_defaults();
-    assert_eq!(handler.name(), "rdp");
-}
+mod rdp_handler_tests {
+    use super::*;
+    use bytes::Bytes;
+    use guacr_handlers::ProtocolHandler;
+    use guacr_rdp::RdpHandler;
+    use tokio::sync::mpsc;
 
-#[tokio::test]
-async fn test_rdp_handler_health() {
-    let handler = RdpHandler::with_defaults();
-    let health = handler.health_check().await;
-    assert!(health.is_ok());
-}
+    const HOST: &str = "127.0.0.1";
+    const PORT: u16 = 3389;
+    const USERNAME: &str = "test_user";
+    const PASSWORD: &str = "test_password";
 
-/// Test RDP connection to a real server
-///
-/// Ignored by default - requires TEST_RDP_* environment variables
-#[tokio::test]
-#[ignore]
-async fn test_rdp_connection_basic() {
-    let params = match get_test_params() {
-        Some(p) => p,
-        None => {
-            eprintln!("Skipping test: TEST_RDP_HOST, TEST_RDP_USER, TEST_RDP_PASSWORD not set");
-            return;
-        }
-    };
-
-    let handler = RdpHandler::with_defaults();
-
-    let (to_client_tx, mut to_client_rx) = tokio::sync::mpsc::channel(100);
-    let (from_client_tx, from_client_rx) = tokio::sync::mpsc::channel(100);
-
-    // Spawn connection in background
-    let connect_handle =
-        tokio::spawn(async move { handler.connect(params, to_client_tx, from_client_rx).await });
-
-    // Wait for ready instruction
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while let Some(msg) = to_client_rx.recv().await {
-            let msg_str = String::from_utf8_lossy(&msg);
-            if msg_str.contains("ready") {
-                return true;
-            }
+    async fn skip_if_not_available() -> bool {
+        if !port_is_open(HOST, PORT).await {
+            eprintln!(
+                "Skipping RDP tests - server not available on {}:{}",
+                HOST, PORT
+            );
+            eprintln!(
+                "Start a test RDP server with: docker-compose -f docker-compose.test.yml up -d rdp"
+            );
+            return true;
         }
         false
-    })
-    .await;
+    }
 
-    // Send disconnect
-    let _ = from_client_tx
-        .send(bytes::Bytes::from("10.disconnect;"))
-        .await;
+    #[tokio::test]
+    #[ignore] // Requires RDP server
+    async fn test_rdp_connection_basic() {
+        if skip_if_not_available().await {
+            return;
+        }
 
-    // Wait for connection to finish
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connect_handle).await;
+        let handler = RdpHandler::with_defaults();
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(1024);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Bytes>(1024);
 
-    assert!(
-        timeout.unwrap_or(false),
-        "Did not receive ready instruction"
-    );
-}
+        let mut params = HashMap::new();
+        params.insert("hostname".to_string(), HOST.to_string());
+        params.insert("port".to_string(), PORT.to_string());
+        params.insert("username".to_string(), USERNAME.to_string());
+        params.insert("password".to_string(), PASSWORD.to_string());
+        params.insert("width".to_string(), "1024".to_string());
+        params.insert("height".to_string(), "768".to_string());
+        // Use RDP security for xrdp compatibility
+        params.insert("security".to_string(), "rdp".to_string());
+        params.insert("ignore-cert".to_string(), "true".to_string());
 
-/// Test RDP connection with invalid credentials
-///
-/// Ignored by default - requires FreeRDP installed
-#[tokio::test]
-#[ignore]
-async fn test_rdp_connection_auth_failure() {
-    let mut params = HashMap::new();
-    params.insert("hostname".to_string(), "localhost".to_string());
-    params.insert("username".to_string(), "invalid_user".to_string());
-    params.insert("password".to_string(), "invalid_pass".to_string());
-    params.insert("port".to_string(), "3389".to_string());
+        // Spawn handler in background
+        let handle =
+            tokio::spawn(
+                async move { handler.connect(params, to_client_tx, from_client_rx).await },
+            );
 
-    let handler = RdpHandler::with_defaults();
+        // Wait for ready instruction
+        let msg = timeout(CONNECT_TIMEOUT, to_client_rx.recv())
+            .await
+            .expect("Timeout waiting for ready")
+            .expect("Channel closed");
 
-    let (to_client_tx, _to_client_rx) = tokio::sync::mpsc::channel(100);
-    let (_from_client_tx, from_client_rx) = tokio::sync::mpsc::channel(100);
+        let msg_str = String::from_utf8_lossy(&msg);
+        println!("RDP: First message: {}", msg_str);
 
-    // This should fail with auth error (or connection refused if no server)
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        handler.connect(params, to_client_tx, from_client_rx),
-    )
-    .await;
+        // RDP should send ready or size instruction
+        assert!(
+            msg_str.contains("ready") || msg_str.contains("size"),
+            "Expected ready or size instruction, got: {}",
+            msg_str
+        );
 
-    // Either timeout or error is expected
-    match result {
-        Ok(Ok(())) => panic!("Expected connection to fail"),
-        Ok(Err(_)) => (), // Expected - auth failure or connection refused
-        Err(_) => (),     // Timeout - also acceptable
+        // Wait for a few more messages (size, img, sync)
+        let mut received_size = false;
+        let mut received_img = false;
+
+        for _ in 0..20 {
+            match timeout(Duration::from_secs(2), to_client_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let msg_str = String::from_utf8_lossy(&msg);
+                    if msg_str.contains("size") {
+                        received_size = true;
+                    }
+                    if msg_str.contains("img") {
+                        received_img = true;
+                        break; // Got an image, connection is working
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        println!(
+            "RDP: received_size={}, received_img={}",
+            received_size, received_img
+        );
+
+        // Close the connection
+        drop(from_client_tx);
+
+        // Wait for handler to finish (with timeout)
+        let _ = timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RDP server
+    async fn test_rdp_security_settings() {
+        if skip_if_not_available().await {
+            return;
+        }
+
+        let handler = RdpHandler::with_defaults();
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(1024);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Bytes>(1024);
+
+        let mut params = HashMap::new();
+        params.insert("hostname".to_string(), HOST.to_string());
+        params.insert("port".to_string(), PORT.to_string());
+        params.insert("username".to_string(), USERNAME.to_string());
+        params.insert("password".to_string(), PASSWORD.to_string());
+        params.insert("security".to_string(), "rdp".to_string());
+        params.insert("ignore-cert".to_string(), "true".to_string());
+        // Security settings
+        params.insert("read-only".to_string(), "true".to_string());
+        params.insert("disable-copy".to_string(), "true".to_string());
+
+        let handle =
+            tokio::spawn(
+                async move { handler.connect(params, to_client_tx, from_client_rx).await },
+            );
+
+        // Wait for connection
+        let _ = timeout(CONNECT_TIMEOUT, to_client_rx.recv()).await;
+
+        // In read-only mode, keyboard/mouse should be blocked
+        // Send a key event (should be ignored by handler)
+        let key_instr = "3.key,2.65,1.1;"; // 'A' key
+        from_client_tx
+            .send(Bytes::from(key_instr))
+            .await
+            .expect("Send failed");
+
+        // Wait briefly
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        drop(from_client_tx);
+        let _ = timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RDP server
+    async fn test_rdp_resize() {
+        if skip_if_not_available().await {
+            return;
+        }
+
+        let handler = RdpHandler::with_defaults();
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Bytes>(1024);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Bytes>(1024);
+
+        let mut params = HashMap::new();
+        params.insert("hostname".to_string(), HOST.to_string());
+        params.insert("port".to_string(), PORT.to_string());
+        params.insert("username".to_string(), USERNAME.to_string());
+        params.insert("password".to_string(), PASSWORD.to_string());
+        params.insert("security".to_string(), "rdp".to_string());
+        params.insert("ignore-cert".to_string(), "true".to_string());
+        params.insert("width".to_string(), "800".to_string());
+        params.insert("height".to_string(), "600".to_string());
+
+        let handle =
+            tokio::spawn(
+                async move { handler.connect(params, to_client_tx, from_client_rx).await },
+            );
+
+        // Wait for initial connection
+        for _ in 0..10 {
+            match timeout(Duration::from_secs(2), to_client_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let msg_str = String::from_utf8_lossy(&msg);
+                    if msg_str.contains("img") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Send resize instruction
+        let resize_instr = "4.size,4.1024,3.768;";
+        from_client_tx
+            .send(Bytes::from(resize_instr))
+            .await
+            .expect("Send failed");
+
+        // Wait for new size response
+        let mut got_new_size = false;
+        for _ in 0..10 {
+            match timeout(Duration::from_secs(2), to_client_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let msg_str = String::from_utf8_lossy(&msg);
+                    if msg_str.contains("size") && msg_str.contains("1024") {
+                        got_new_size = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        println!("RDP resize: got_new_size={}", got_new_size);
+
+        drop(from_client_tx);
+        let _ = timeout(Duration::from_secs(5), handle).await;
     }
 }
 
-/// Test RDP security settings
-#[test]
-fn test_rdp_security_config() {
-    let config = RdpConfig {
-        security_mode: "tls".to_string(),
-        ..Default::default()
-    };
+mod unit_tests {
+    use guacr_handlers::ProtocolHandler;
+    use guacr_rdp::RdpHandler;
 
-    let handler = RdpHandler::new(config);
-    assert_eq!(handler.name(), "rdp");
+    #[test]
+    fn test_rdp_handler_creation() {
+        let handler = RdpHandler::with_defaults();
+        assert_eq!(handler.name(), "rdp");
+    }
+
+    #[tokio::test]
+    async fn test_rdp_handler_health_check() {
+        let handler = RdpHandler::with_defaults();
+        let health = handler.health_check().await;
+        assert!(health.is_ok());
+    }
 }

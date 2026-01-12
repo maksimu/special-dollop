@@ -754,6 +754,42 @@ impl Channel {
                 // Return Ok - no TCP backend needed for PythonHandler
                 Ok(())
             }
+            super::types::ActiveProtocol::DatabaseProxy => {
+                // Database proxy mode: route to proxy host/port instead of guacd
+                if let (Some(host), Some(port)) =
+                    (self.proxy_host.as_deref(), self.proxy_port)
+                {
+                    match tokio::net::lookup_host(format!("{host}:{port}")).await {
+                        Ok(mut addrs) => {
+                            if let Some(socket_addr) = addrs.next() {
+                                debug!("Channel({}): DatabaseProxy OpenConnection for target_conn_no {} to {}:{} (resolved to {}).",
+                                    self.channel_id, target_connection_no, host, port, socket_addr);
+                                super::connections::open_backend(
+                                    self,
+                                    target_connection_no,
+                                    socket_addr,
+                                    super::types::ActiveProtocol::DatabaseProxy,
+                                )
+                                .await
+                            } else {
+                                Err(anyhow!(
+                                    "Could not resolve DatabaseProxy host {}:{} to any SocketAddr",
+                                    host,
+                                    port
+                                ))
+                            }
+                        }
+                        Err(e) => Err(anyhow!(
+                            "DNS lookup failed for DatabaseProxy host {}:{}: {}",
+                            host,
+                            port,
+                            e
+                        )),
+                    }
+                } else {
+                    Err(anyhow!("DatabaseProxy host/port not configured for OpenConnection"))
+                }
+            }
         };
 
         // --- Post OpenConnection Attempt ---

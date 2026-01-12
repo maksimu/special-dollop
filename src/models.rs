@@ -645,8 +645,16 @@ pub fn is_guacd_session(conversation_type: &ConversationType) -> bool {
             | ConversationType::Telnet
             | ConversationType::Http
             | ConversationType::Kubernetes
-            | ConversationType::Mysql
-            | ConversationType::SqlServer
-            | ConversationType::Postgresql
+        // Note: Mysql, SqlServer, Postgresql now handled by is_database_session()
+    )
+}
+
+/// Check if the conversation type is a database session that should route to the database proxy.
+///
+/// Database sessions use a simplified handshake protocol without multimedia instructions.
+pub fn is_database_session(conversation_type: &ConversationType) -> bool {
+    matches!(
+        conversation_type,
+        ConversationType::Mysql | ConversationType::SqlServer | ConversationType::Postgresql
     )
 }

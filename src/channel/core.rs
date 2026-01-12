@@ -4,7 +4,8 @@ use super::types::ActiveProtocol;
 use crate::buffer_pool::{BufferPool, STANDARD_BUFFER_CONFIG};
 pub(crate) use crate::error::ChannelError;
 use crate::models::{
-    is_guacd_session, Conn, ConversationType, NetworkAccessChecker, StreamHalf, TunnelTimeouts,
+    is_database_session, is_guacd_session, Conn, ConversationType, NetworkAccessChecker,
+    StreamHalf, TunnelTimeouts,
 };
 use crate::runtime::get_runtime;
 use crate::tube_and_channel_helpers::parse_network_rules_from_settings;
@@ -84,12 +85,19 @@ pub(crate) struct ChannelPythonHandlerState {
     pub active_connections: std::collections::HashSet<u32>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ChannelDatabaseProxyState {
+    // Database proxy state - currently minimal as most params passed via guacd_params
+    // Can be expanded if needed for connection tracking
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ProtocolLogicState {
     Socks5(ChannelSocks5State),
     Guacd(ChannelGuacdState),
     PortForward(ChannelPortForwardState),
     PythonHandler(ChannelPythonHandlerState),
+    DatabaseProxy(ChannelDatabaseProxyState),
 }
 
 impl Default for ProtocolLogicState {
@@ -144,6 +152,10 @@ pub struct Channel {
     pub(crate) guacd_port: Option<u16>,
     pub(crate) connect_as_settings: ConnectAsSettings,
     pub(crate) guacd_params: Arc<Mutex<HashMap<String, String>>>, // Kept for now for minimal diff
+    // Database proxy settings (for DatabaseProxy protocol)
+    pub(crate) proxy_host: Option<String>,
+    pub(crate) proxy_port: Option<u16>,
+    pub(crate) db_params: Arc<Mutex<HashMap<String, String>>>,
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
@@ -238,11 +250,65 @@ impl Channel {
 
         let mut local_listen_addr_setting: Option<String> = None;
 
+        // Database proxy settings
+        let mut proxy_host_setting: Option<String> = None;
+        let mut proxy_port_setting: Option<u16> = None;
+        let mut temp_db_params_map: HashMap<String, String> = HashMap::new();
+
         if let Some(protocol_name_val) = protocol_settings.get("conversationType") {
             if let Some(protocol_name_str) = protocol_name_val.as_str() {
                 match protocol_name_str.parse::<ConversationType>() {
                     Ok(parsed_conversation_type) => {
-                        if is_guacd_session(&parsed_conversation_type) {
+                        // Check for database session FIRST (before guacd check)
+                        // Database sessions use DatabaseProxy protocol for routing to dynamic-db-proxy
+                        if is_database_session(&parsed_conversation_type) {
+                            debug!("Configuring for DatabaseProxy protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
+                            determined_protocol = ActiveProtocol::DatabaseProxy;
+                            initial_protocol_state =
+                                ProtocolLogicState::DatabaseProxy(ChannelDatabaseProxyState::default());
+
+                            // Extract proxy host/port from 'proxy' block in protocol_settings
+                            if let Some(proxy_settings_val) = protocol_settings.get("proxy") {
+                                if let JsonValue::Object(proxy_map) = proxy_settings_val {
+                                    proxy_host_setting = proxy_map
+                                        .get("proxy_host")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                    proxy_port_setting = proxy_map
+                                        .get("proxy_port")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|p| p as u16);
+                                    debug!("Parsed proxy settings: host={:?}, port={:?} (channel_id: {})",
+                                        proxy_host_setting, proxy_port_setting, channel_id);
+                                }
+                            }
+
+                            // Process db_params for database parameters
+                            if let Some(db_params_json_val) = protocol_settings.get("db_params") {
+                                if let JsonValue::Object(map) = db_params_json_val {
+                                    temp_db_params_map = map
+                                        .iter()
+                                        .filter_map(|(k, v)| {
+                                            match v {
+                                                JsonValue::String(s) => Some((k.clone(), s.clone())),
+                                                JsonValue::Bool(b) => Some((k.clone(), b.to_string())),
+                                                JsonValue::Number(n) => Some((k.clone(), n.to_string())),
+                                                JsonValue::Null => None,
+                                                _ => None,
+                                            }
+                                        })
+                                        .collect();
+                                    // Set protocol name for database type
+                                    let db_protocol_name = parsed_conversation_type.to_string();
+                                    temp_db_params_map
+                                        .insert("protocol".to_string(), db_protocol_name.clone());
+                                    debug!("Parsed db_params for DatabaseProxy (channel_id: {}, protocol: {})",
+                                        channel_id, db_protocol_name);
+                                }
+                            } else {
+                                warn!("DatabaseProxy: 'db_params' block not found in protocol_settings (channel_id: {})", channel_id);
+                            }
+                        } else if is_guacd_session(&parsed_conversation_type) {
                             debug!("Configuring for GuacD protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                             determined_protocol = ActiveProtocol::Guacd;
                             initial_protocol_state =
@@ -556,6 +622,9 @@ impl Channel {
             guacd_port: guacd_port_setting,
             connect_as_settings: final_connect_as_settings,
             guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
+            proxy_host: proxy_host_setting,
+            proxy_port: proxy_port_setting,
+            db_params: Arc::new(Mutex::new(temp_db_params_map)),
 
             buffer_pool,
             channel_ping_sent_time: Mutex::new(None),
@@ -1466,6 +1535,10 @@ impl Channel {
             }
             ActiveProtocol::PythonHandler => {
                 // PythonHandler connections send close events to Python, no special cleanup needed here
+            }
+            ActiveProtocol::DatabaseProxy => {
+                // DatabaseProxy connections are similar to Guacd - TCP streams with handshake
+                // No special cleanup needed beyond what's done for Guacd
             }
         }
 

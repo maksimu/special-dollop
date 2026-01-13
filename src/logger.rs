@@ -13,6 +13,12 @@ use tracing_subscriber::{fmt::format::FmtSpan, FmtSubscriber};
 #[cfg(feature = "python")]
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
+#[cfg(feature = "python")]
+use crate::python::channel_logger::create_channel_logger;
+
+#[cfg(feature = "python")]
+use crate::python::logger_task::spawn_logger_task;
+
 /// Global flag for verbose logging (gated detailed logs)
 /// Defaults to false for optimal performance - detailed logs only when explicitly enabled
 pub static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
@@ -55,15 +61,15 @@ fn set_webrtc_logging(enabled: bool) {
 // Custom error type for logger initialization
 #[derive(Debug)]
 pub enum InitializeLoggerError {
-    Pyo3LogError(String),
+    SetLoggerError(String),
     SetGlobalDefaultError(String),
 }
 
 impl fmt::Display for InitializeLoggerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InitializeLoggerError::Pyo3LogError(e) => {
-                write!(f, "Failed to initialize pyo3-log: {e}")
+            InitializeLoggerError::SetLoggerError(e) => {
+                write!(f, "Failed to set global logger: {e}")
             }
             InitializeLoggerError::SetGlobalDefaultError(e) => write!(
                 f,
@@ -136,57 +142,36 @@ pub fn initialize_logger(
             _ => log::LevelFilter::Trace,
         };
 
-        // Initialize pyo3_log with explicit filter
-        Python::attach(|py| -> Result<(), InitializeLoggerError> {
-            // Create the logger with global level filter
-            let mut logger = pyo3_log::Logger::new(py, pyo3_log::Caching::Loggers)
-                .map_err(|e| InitializeLoggerError::Pyo3LogError(e.to_string()))?
-                .filter(level_filter);
+        // Create channel-based logger and receiver
+        // This logger sends log records to an unbounded channel (NO GIL!)
+        // A background task receives them and forwards to Python's logging system
+        let (channel_logger, log_receiver) = create_channel_logger(level_filter);
 
-            // **CRITICAL: Suppress WebRTC ecosystem spam unless explicitly requested**
-            // WebRTC + dependencies have 1000+ debug/trace logs that fire constantly (per-packet!)
-            // TURN client dumps full packet data: "try_send data = [0, 1, 0, 88, ...]" (200 bytes/log!)
-            // Without suppression: 60 gateways * 40 packets/sec * 3 logs = 36GB+ in Docker logs
-            // With suppression: Only errors from these crates pass through
-            //
-            // NOTE: Controlled by KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS env var, NOT verbose flag
-            // This keeps WebRTC library debugging separate from application verbose logging
-            if !include_webrtc_logs {
-                logger = logger
-                    // WebRTC core library
-                    .filter_target("webrtc".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_ice".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_sctp".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_dtls".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_mdns".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_data".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_srtp".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_media".to_owned(), log::LevelFilter::Error)
-                    .filter_target("webrtc_util".to_owned(), log::LevelFilter::Error)
-                    // TURN/STUN libraries (MASSIVE spam - logs full packet data!)
-                    .filter_target("turn".to_owned(), log::LevelFilter::Off)
-                    .filter_target("stun".to_owned(), log::LevelFilter::Error)
-                    // RTP/RTCP libraries
-                    .filter_target("rtp".to_owned(), log::LevelFilter::Error)
-                    .filter_target("rtcp".to_owned(), log::LevelFilter::Error)
-                    // Turn off noisy websockets library logs
-                    .filter_target("websockets".to_owned(), log::LevelFilter::Off);
-            }
+        // Install as global logger
+        log::set_boxed_logger(Box::new(channel_logger))
+            .map_err(|e| InitializeLoggerError::SetLoggerError(e.to_string()))?;
 
-            // Install the configured logger
-            logger
-                .install()
-                .map_err(|e| InitializeLoggerError::SetGlobalDefaultError(e.to_string()))?;
+        log::set_max_level(level_filter);
 
-            Ok(()) // Explicitly return Ok(()) after discarding the ResetHandle
-        })?;
+        // Spawn background task to forward logs to Python
+        // This task acquires the GIL only when forwarding logs, not during Rust logging!
+        let runtime_handle = crate::runtime::get_runtime();
+        spawn_logger_task(log_receiver, runtime_handle);
 
         log::debug!(
-            "pyo3_log bridge initialized for '{}' with level {:?}, webrtc_* suppression: {}",
+            "Channel-based logger initialized for '{}' with level {:?}",
             logger_name,
-            level_filter,
-            !include_webrtc_logs
+            level_filter
         );
+
+        // **NOTE ON WEBRTC SPAM SUPPRESSION**:
+        // We intentionally removed per-target filtering from the Rust logger.
+        // Instead, Python's stdio_config.py handles this via logger configuration:
+        //   'webrtc_ice': LogInfo(logging.WARNING),
+        //   'webrtc_dtls': LogInfo(logging.WARNING),
+        //   etc.
+        // This approach is simpler and respects Python as the "owner" of logging.
+        // If performance becomes an issue, we can add per-target filtering back.
 
         set_verbose_logging(is_verbose);
         set_webrtc_logging(include_webrtc_logs);

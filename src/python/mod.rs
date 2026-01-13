@@ -1,6 +1,8 @@
+pub mod channel_logger;
 mod connectivity;
 mod enums;
 pub mod handler_task;
+pub mod logger_task;
 mod signal_handler;
 mod tube_registry_binding;
 mod utils;

@@ -46,7 +46,43 @@ docker run --rm --platform linux/amd64 \
     
     # Install Rust stable (latest) - maturin will handle manylinux compliance
     # The manylinux2014 container ensures glibc 2.17 compatibility
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    # If using custom certs, configure environment for rustup installer
+    if [ -f /tmp/combined_certs.pem ]; then
+        echo 'Configuring rustup to use custom CA bundle...'
+        # Point to the system CA bundle that includes our custom cert
+        export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt
+        export CURL_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+        # Increase timeout for slow VPN connections (30 seconds per download)
+        export RUSTUP_IO_THREADS=1
+        export RUSTUP_UNPACK_RAM=536870912
+        export RUSTUP_DIST_SERVER=https://static.rust-lang.org
+        
+        # Test if we can reach rust-lang.org
+        echo 'Testing connectivity to static.rust-lang.org...'
+        if curl --proto '=https' --tlsv1.2 -sSf --connect-timeout 10 --max-time 30 \
+            -I https://static.rust-lang.org/dist/channel-rust-stable.toml > /dev/null 2>&1; then
+            echo 'Connection test successful!'
+        else
+            echo 'WARNING: Cannot reach static.rust-lang.org - rustup installation may fail'
+            echo 'This could be due to firewall, proxy, or network issues'
+        fi
+        
+        # Download rustup-init using curl (which works with our certs)
+        echo 'Downloading rustup-init with curl (VPN-aware)...'
+        curl --proto '=https' --tlsv1.2 -sSf --connect-timeout 30 --max-time 300 \
+            -o /tmp/rustup-init.sh https://sh.rustup.rs
+        chmod +x /tmp/rustup-init.sh
+        
+        # Run rustup-init with environment variables explicitly set
+        # This ensures rustup uses our CA bundle for all downloads
+        SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt \
+        CURL_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
+        RUSTUP_IO_THREADS=1 \
+        /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+    else
+        # Standard installation without custom certs
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    fi
     source \$HOME/.cargo/env
     
     # Configure Cargo SSL (must be done AFTER Rust installation)

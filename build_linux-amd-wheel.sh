@@ -28,6 +28,8 @@ if [ "$1" = "--handlers" ]; then
         echo "Please uncomment the local path line and comment out the git line in Cargo.toml"
         exit 1
     fi
+    
+    echo "Note: IronRDP will be fetched from GitHub (https://github.com/miroberts/IronRDP.git)"
 fi
 
 # Optional: Check for combined_certs.pem (LOCAL DEVELOPMENT ONLY)
@@ -75,31 +77,92 @@ if [ -n "$HANDLERS_FLAG" ]; then
         
         # Install Rust BEFORE configuring cargo (needs ~/.cargo to exist)
         echo "Installing Rust..."
-        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source $HOME/.cargo/env
-        
-        # Configure Cargo SSL (must be done AFTER Rust installation)
+        # If using custom certs, configure environment for rustup installer
         if [ -f /tmp/combined_certs.pem ]; then
-            echo "Configuring Cargo SSL certificates..."
+            echo "Configuring rustup to use custom CA bundle..."
+            # Point to the system CA bundle that includes our custom cert
+            export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt
+            export CURL_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+            # Increase timeout for slow VPN connections (30 seconds per download)
+            export RUSTUP_IO_THREADS=1
+            export RUSTUP_UNPACK_RAM=536870912
+            export RUSTUP_DIST_SERVER=https://static.rust-lang.org
             
-            # Create cargo config directory if it does not exist
-            mkdir -p $HOME/.cargo
+            # Rustup reqwest backend does not respect SSL_CERT_FILE properly in containers
+            # Workaround: Use curl to pre-download Rust, then install offline
+            echo "Pre-downloading Rust toolchain with curl - VPN-aware..."
             
-            # Configure Cargo to use custom CA bundle
-            # This is critical for corporate VPNs that intercept HTTPS
-            cat >> $HOME/.cargo/config.toml <<EOF
-
-# Custom CA bundle for corporate VPN (SSL interception)
-[http]
-cainfo = "/tmp/combined_certs.pem"
-
-# Increase timeout for slow VPN connections
-[net]
-git-fetch-with-cli = true
-EOF
+            # Get the latest stable version info
+            echo "Fetching Rust version info..."
+            curl --proto "=https" --tlsv1.2 -sSf --connect-timeout 30 --max-time 60 \
+                -o /tmp/channel-rust-stable.toml \
+                https://static.rust-lang.org/dist/channel-rust-stable.toml
             
-            echo "Cargo SSL configuration complete."
+            # Extract version from TOML - get it from the actual URL, not the version field
+            # The version field is cargo'\''s version, but we need rustc'\''s version from the URL
+            RUST_VERSION=$(grep "url.*rustc.*x86_64-unknown-linux-gnu.tar" /tmp/channel-rust-stable.toml | head -1 | sed -E '\''s|.*rustc-([0-9]+\.[0-9]+\.[0-9]+)-.*|\1|'\'')
+            echo "Latest Rust version: $RUST_VERSION"
+            
+            # Download rustup-init
+            echo "Downloading rustup-init..."
+            curl --proto "=https" --tlsv1.2 -sSf --connect-timeout 30 --max-time 300 \
+                -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+            chmod +x /tmp/rustup-init
+            
+            # Install rustup without installing a toolchain
+            echo "Installing rustup without toolchain..."
+            /tmp/rustup-init -y --default-toolchain none --profile minimal
+            source $HOME/.cargo/env
+            
+            # Download Rust components with curl
+            RUST_DIST="https://static.rust-lang.org/dist"
+            RUST_TARGET="x86_64-unknown-linux-gnu"
+            RUST_DATE=$(grep "^date = " /tmp/channel-rust-stable.toml | head -1 | cut -d\" -f2)
+            
+            echo "Downloading Rust $RUST_VERSION components with curl..."
+            mkdir -p /tmp/rust-dist
+            
+            # Download cargo (with retry and HTTP/1.1 for stability)
+            echo "  - cargo..."
+            curl --proto "=https" --tlsv1.2 --http1.1 -sSfL --connect-timeout 30 --max-time 900 \
+                --retry 3 --retry-delay 5 --retry-max-time 1800 \
+                -o /tmp/rust-dist/cargo.tar.xz \
+                "$RUST_DIST/$RUST_DATE/cargo-$RUST_VERSION-$RUST_TARGET.tar.xz"
+            
+            # Download rustc
+            echo "  - rustc..."
+            curl --proto "=https" --tlsv1.2 --http1.1 -sSfL --connect-timeout 30 --max-time 900 \
+                --retry 3 --retry-delay 5 --retry-max-time 1800 \
+                -o /tmp/rust-dist/rustc.tar.xz \
+                "$RUST_DIST/$RUST_DATE/rustc-$RUST_VERSION-$RUST_TARGET.tar.xz"
+            
+            # Download rust-std
+            echo "  - rust-std..."
+            curl --proto "=https" --tlsv1.2 --http1.1 -sSfL --connect-timeout 30 --max-time 900 \
+                --retry 3 --retry-delay 5 --retry-max-time 1800 \
+                -o /tmp/rust-dist/rust-std.tar.xz \
+                "$RUST_DIST/$RUST_DATE/rust-std-$RUST_VERSION-$RUST_TARGET.tar.xz"
+            
+            # Extract and install components manually
+            echo "Installing Rust components..."
+            cd /tmp/rust-dist
+            
+            for component in cargo rustc rust-std; do
+                echo "  Installing $component..."
+                tar -xf $component.tar.xz
+                cd ${component}-*
+                ./install.sh --prefix=$HOME/.cargo
+                cd ..
+            done
+            
+            echo "Rust installation complete via offline method"
+            rustc --version
+            cargo --version
+        else
+            # Standard installation without custom certs
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         fi
+        source $HOME/.cargo/env
         
         # manylinux_2_28 is based on AlmaLinux 8
         # AlmaLinux 8 only has FreeRDP 2.x, so we build FreeRDP 3.x from source
@@ -153,14 +216,14 @@ EOF
         cmake --version || { echo "ERROR: cmake not found"; exit 1; }
         ninja --version || { echo "ERROR: ninja not found"; exit 1; }
         
-        # Try to install FFmpeg if available (optional for audio codecs)
-        echo "Attempting to install FFmpeg (optional for enhanced audio codecs)..."
+        # Try to install FFmpeg if available - optional for audio codecs
+        echo "Attempting to install FFmpeg - optional for enhanced audio codecs..."
         dnf install -y ffmpeg-free-devel || \
         dnf install -y ffmpeg-devel || \
         echo "FFmpeg not available - will build without FFmpeg codec support"
         
-        # Build FreeRDP 3.x from source (optimized for speed)
-        echo "Building FreeRDP 3.x from source (this takes ~5-10 minutes)..."
+        # Build FreeRDP 3.x from source - optimized for speed
+        echo "Building FreeRDP 3.x from source - this takes 5-10 minutes..."
         cd /tmp
         
         # Clone FreeRDP 3.x stable release
@@ -180,7 +243,7 @@ EOF
             echo "FFmpeg detected, enabling FFmpeg support"
             FFMPEG_OPTION=ON
         else
-            echo "FFmpeg not found, building without FFmpeg (ALSA/PulseAudio still enabled)"
+            echo "FFmpeg not found, building without FFmpeg - ALSA/PulseAudio still enabled"
         fi
         
         cmake .. \
@@ -212,8 +275,9 @@ EOF
         }
         
         # Build with all available cores
-        echo "Compiling FreeRDP 3.x (using $(nproc) cores)..."
-        ninja -j$(nproc) || {
+        NPROC=$(nproc)
+        echo "Compiling FreeRDP 3.x using $NPROC cores..."
+        ninja -j$NPROC || {
             echo "ERROR: FreeRDP build failed"
             exit 1
         }
@@ -233,7 +297,8 @@ EOF
         export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
         
         if pkg-config --exists freerdp3; then
-            echo "FreeRDP 3.x installed successfully! Version: $(pkg-config --modversion freerdp3)"
+            FREERDP_VER=$(pkg-config --modversion freerdp3)
+            echo "FreeRDP 3.x installed successfully! Version: $FREERDP_VER"
         else
             echo "ERROR: FreeRDP 3.x not found by pkg-config"
             echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
@@ -252,6 +317,8 @@ EOF
         
         echo "pam-guacr mounted successfully at /pam-guacr"
         ls -la /pam-guacr/crates/
+        
+        echo "IronRDP will be fetched from git during build from https://github.com/miroberts/IronRDP.git"
         
         # Install maturin
         echo "Installing maturin..."

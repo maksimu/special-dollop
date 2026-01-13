@@ -1847,36 +1847,42 @@ impl WebRTCPeerConnection {
         // Start periodic stats collection
         self.start_stats_collection().await?;
 
-        // Register ICE restart callback for network changes
-        // Note: This callback is ONLY called when trickle_ice=true (guarded in the state change handler above)
-        // It performs the actual ICE restart and sends the offer to the remote peer
-        let ice_restart_callback = {
-            let webrtc_conn = self.clone(); // Clone the entire WebRTCPeerConnection
-            let tube_id = self.tube_id.clone();
+        // Register ICE restart callback for network changes ONLY if trickle ICE is enabled
+        // ICE restart requires trickle ICE for proper signaling coordination
+        if self.trickle_ice {
+            let ice_restart_callback = {
+                let webrtc_conn = self.clone(); // Clone the entire WebRTCPeerConnection
+                let tube_id = self.tube_id.clone();
 
-            move || {
-                let conn = webrtc_conn.clone();
-                let id = tube_id.clone();
+                move || {
+                    let conn = webrtc_conn.clone();
+                    let id = tube_id.clone();
 
-                tokio::spawn(async move {
-                    info!(
-                        "Network change detected, triggering ICE restart for tube {} (trickle_ice enabled)",
-                        id
-                    );
-
-                    // Perform ICE restart with signaling
-                    if let Err(e) = conn.handle_ice_restart_with_signaling().await {
-                        warn!(
-                            "Failed to restart ICE due to network change (tube_id: {}, error: {:?})",
-                            id, e
+                    tokio::spawn(async move {
+                        info!(
+                            "Network change detected, triggering ICE restart for tube {}",
+                            id
                         );
-                    }
-                });
-            }
-        };
 
-        self.network_integration
-            .register_tube(self.tube_id.clone(), ice_restart_callback);
+                        // Perform ICE restart with signaling
+                        if let Err(e) = conn.handle_ice_restart_with_signaling().await {
+                            warn!(
+                                "Failed to restart ICE due to network change (tube_id: {}, error: {:?})",
+                                id, e
+                            );
+                        }
+                    });
+                }
+            };
+
+            self.network_integration
+                .register_tube(self.tube_id.clone(), ice_restart_callback);
+        } else {
+            debug!(
+                "Skipping network change ICE restart registration for tube {} (trickle_ice disabled)",
+                self.tube_id
+            );
+        }
 
         // Start network monitoring
         if let Err(e) = self.network_integration.start().await {

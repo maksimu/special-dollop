@@ -271,6 +271,63 @@ impl GuacdParser {
         Self::fallback_utf8_extract(slice, char_count)
     }
 
+    /// Fast character skipping without UTF-8 validation (for hot path opcode detection)
+    /// Returns byte count to skip, does NOT validate UTF-8 quality or create strings
+    /// This is used in streaming mode where we trust the data and just need to skip N characters
+    #[inline(always)]
+    fn skip_utf8_chars(slice: &[u8], char_count: usize) -> Result<usize, PeekError> {
+        let mut byte_pos = 0;
+        let mut chars_found = 0;
+
+        const UTF8_CHAR_LEN: [u8; 256] = {
+            let mut table = [0u8; 256];
+            let mut i = 0;
+            while i < 256 {
+                table[i] = if i < 0x80 {
+                    1 // ASCII
+                } else if i < 0xC0 {
+                    0 // Invalid start byte
+                } else if i < 0xE0 {
+                    2 // 2-byte UTF-8
+                } else if i < 0xF0 {
+                    3 // 3-byte UTF-8
+                } else if i < 0xF8 {
+                    4 // 4-byte UTF-8
+                } else {
+                    0 // Invalid
+                };
+                i += 1;
+            }
+            table
+        };
+
+        while byte_pos < slice.len() && chars_found < char_count {
+            let byte = slice[byte_pos];
+            let char_byte_len = UTF8_CHAR_LEN[byte as usize];
+
+            if char_byte_len == 0 {
+                return Err(PeekError::Utf8Error(format!(
+                    "Invalid UTF-8 start byte 0x{:02X} at position {}",
+                    byte, byte_pos
+                )));
+            }
+
+            if byte_pos + char_byte_len as usize > slice.len() {
+                return Err(PeekError::Incomplete);
+            }
+
+            // Hot path: Skip validation - just count bytes using lookup table
+            byte_pos += char_byte_len as usize;
+            chars_found += 1;
+        }
+
+        if chars_found < char_count {
+            return Err(PeekError::Incomplete);
+        }
+
+        Ok(byte_pos)
+    }
+
     /// Fallback UTF-8 character extraction (non-SIMD)
     #[inline(always)]
     fn fallback_utf8_extract(slice: &[u8], char_count: usize) -> Result<(&str, usize), PeekError> {
@@ -313,15 +370,16 @@ impl GuacdParser {
                 return Err(PeekError::Incomplete);
             }
 
-            // Minimal validation for multibyte characters
+            // Validate multi-byte sequences using from_utf8 (lenient but catches broken UTF-8)
+            // Single-byte (ASCII) chars skip validation for speed (hot path)
             if char_byte_len > 1 {
                 let end_pos = byte_pos + char_byte_len as usize;
-                for &cont_byte in &slice[byte_pos + 1..end_pos] {
-                    if !(0x80..0xC0).contains(&cont_byte) {
-                        return Err(PeekError::Utf8Error(
-                            "Invalid UTF-8 continuation byte".to_string(),
-                        ));
-                    }
+                // Use from_utf8 - more lenient than manual continuation byte checks
+                if str::from_utf8(&slice[byte_pos..end_pos]).is_err() {
+                    return Err(PeekError::Utf8Error(format!(
+                        "Invalid UTF-8 sequence at byte position {}",
+                        byte_pos
+                    )));
                 }
             }
 
@@ -333,6 +391,8 @@ impl GuacdParser {
             return Err(PeekError::Incomplete);
         }
 
+        // SAFETY: We've already validated all multi-byte UTF-8 sequences in the loop above
+        // ASCII bytes don't need validation (they're always valid UTF-8)
         let extracted_str = unsafe { str::from_utf8_unchecked(&slice[..byte_pos]) };
 
         Ok((extracted_str, byte_pos))
@@ -678,27 +738,30 @@ impl GuacdParser {
 
         pos += length_end + 1; // Skip past length and '.'
 
-        // Extract opcode using character count and check for special opcodes
-        let (opcode_str, opcode_byte_len) = if opcode_len == 0 {
-            ("", 0)
+        // Hot path optimization: Check for special ASCII opcodes first (no UTF-8 validation needed)
+        let action = if opcode_len > 0 && opcode_len <= 10 && pos + opcode_len <= buffer_slice.len() {
+            // Fast path: Direct byte comparison for ASCII opcodes (zero-copy, zero validation)
+            let opcode_bytes = &buffer_slice[pos..pos + opcode_len];
+            match opcode_bytes {
+                b"error" => OpcodeAction::CloseConnection,
+                b"disconnect" => OpcodeAction::CloseConnection,
+                b"size" => OpcodeAction::ProcessSpecial(SpecialOpcode::Size),
+                b"sync" => OpcodeAction::ServerSync,
+                _ => OpcodeAction::Normal,
+            }
         } else {
-            Self::extract_utf8_chars(buffer_slice, pos, opcode_len)?
+            OpcodeAction::Normal
         };
 
-        // Check for special opcodes using string comparison (more reliable for UTF-8)
-        let action = if opcode_str == ERROR_OPCODE {
-            OpcodeAction::CloseConnection
-        } else if opcode_str == SIZE_OPCODE {
-            OpcodeAction::ProcessSpecial(SpecialOpcode::Size)
-        } else if opcode_str == "sync" {
-            // Server sync keepalive - forward to client for protocol-required response
-            OpcodeAction::ServerSync
-        } else if opcode_str == DISCONNECT_OPCODE {
-            // Disconnect instruction from guacd - connection closing cleanly
-            OpcodeAction::CloseConnection
+        // Skip opcode bytes without validation (hot path - no UTF-8 checks)
+        let opcode_byte_len = if opcode_len == 0 {
+            0
+        } else if pos + opcode_len <= buffer_slice.len() && buffer_slice[pos..pos + opcode_len].is_ascii() {
+            // ASCII fast path: char_count == byte_count
+            opcode_len
         } else {
-            // Add more checks as needed
-            OpcodeAction::Normal
+            // Non-ASCII: Use fast skip (no validation)
+            Self::skip_utf8_chars(&buffer_slice[pos..], opcode_len)?
         };
 
         pos += opcode_byte_len;
@@ -724,8 +787,14 @@ impl GuacdParser {
 
             pos += arg_len_end + 1; // Skip past length and '.'
 
-            // Skip argument using character count to byte count conversion
-            let (_, arg_byte_len) = Self::extract_utf8_chars(buffer_slice, pos, arg_len)?;
+            // Hot path: Skip argument bytes without UTF-8 validation
+            let arg_byte_len = if pos + arg_len <= buffer_slice.len() && buffer_slice[pos..pos + arg_len].is_ascii() {
+                // ASCII fast path: char_count == byte_count (90%+ of arguments)
+                arg_len
+            } else {
+                // Non-ASCII: Use fast skip (no validation, just byte counting)
+                Self::skip_utf8_chars(&buffer_slice[pos..], arg_len)?
+            };
             pos += arg_byte_len;
         }
 

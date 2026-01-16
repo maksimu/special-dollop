@@ -271,22 +271,21 @@ pub async fn setup_outbound_task(
         }
     } else if active_protocol == ActiveProtocol::DatabaseProxy {
         // Database Proxy handshake - similar to Guacd but with simplified protocol
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Channel({}): Performing DatabaseProxy handshake for conn_no {}",
-                channel_id_for_task, conn_no
-            );
-        }
+        // ALWAYS log for debugging database proxy issues
+        info!(
+            "Channel({}): Performing DatabaseProxy handshake for conn_no {}",
+            channel_id_for_task, conn_no
+        );
 
         let channel_id_clone = channel_id_for_task.clone();
         let db_params_clone = channel.db_params.clone();
         let buffer_pool_clone = buffer_pool.clone();
         let handshake_timeout_duration = channel.timeouts.guacd_handshake; // Reuse guacd timeout
 
-        // Get the database type from params
+        // Get the database type from params, default to "auto" for proxy-side detection
         let db_type = {
             let params = db_params_clone.lock().await;
-            params.get("protocol").cloned().unwrap_or_else(|| "mysql".to_string())
+            params.get("protocol").cloned().unwrap_or_else(|| "auto".to_string())
         };
 
         match timeout(
@@ -1705,6 +1704,47 @@ where
             let mut temp_read_buf = [0u8; 1024];
             match reader.read(&mut temp_read_buf).await {
                 Ok(0) => {
+                    // EOF received - check if there's any remaining instruction in buffer
+                    // (especially an error instruction that arrived just before connection close)
+                    if *current_buffer_len > 0 {
+                        if let Ok(peeked) = GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]) {
+                            if peeked.total_length_in_buffer <= *current_buffer_len {
+                                // Try to parse the instruction
+                                let content_slice = &handshake_buffer[..peeked.total_length_in_buffer - 1];
+                                if let Ok(instruction) = GuacdParser::parse_instruction_content(content_slice) {
+                                    if instruction.opcode == "error" {
+                                        // Extract the actual error from guacd
+                                        let guacd_error_msg = instruction.args.first()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("Unknown guacd error");
+                                        let error_code = instruction.args.get(1)
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("");
+                                        error!("Guacd sent error during handshake (channel_id: {}, error_msg: {}, error_code: {})", channel_id, guacd_error_msg, error_code);
+
+                                        // Send CloseConnection to UI before returning error
+                                        let close_msg = format!("Guacd error: {} (code: {})", guacd_error_msg, error_code);
+                                        send_handshake_error_close(
+                                            dc,
+                                            conn_no,
+                                            CloseConnectionReason::GuacdError,
+                                            &close_msg,
+                                            buffer_pool,
+                                            channel_id,
+                                        )
+                                        .await;
+
+                                        return Err(anyhow::anyhow!(
+                                            "Guacd error: {} (code: {})",
+                                            guacd_error_msg,
+                                            error_code
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let error_msg = format!(
                         "Connection closed during handshake (expected: {}, buffer_len: {})",
                         expected_opcode, *current_buffer_len
@@ -2201,6 +2241,32 @@ where
             let mut temp_read_buf = [0u8; 1024];
             match reader.read(&mut temp_read_buf).await {
                 Ok(0) => {
+                    // EOF received - check if there's any remaining instruction in buffer
+                    // (especially an error instruction that arrived just before connection close)
+                    if *current_buffer_len > 0 {
+                        if let Ok(peeked) = GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]) {
+                            if peeked.total_length_in_buffer <= *current_buffer_len {
+                                // Try to parse the instruction
+                                let content_slice = &handshake_buffer[..peeked.total_length_in_buffer - 1];
+                                if let Ok(instruction) = GuacdParser::parse_instruction_content(content_slice) {
+                                    if instruction.opcode == "error" {
+                                        // Extract the actual error from proxy
+                                        let error_msg = instruction.args.first()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("Unknown proxy error");
+                                        let error_code = instruction.args.get(1)
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("");
+                                        return Err(anyhow::anyhow!(
+                                            "Proxy error: {} (code: {})",
+                                            error_msg,
+                                            error_code
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return Err(anyhow::anyhow!(
                         "EOF during DatabaseProxy handshake while waiting for '{}'",
                         expected_opcode
@@ -2225,16 +2291,23 @@ where
 
     // Step 1: Send select with database type
     let select_instruction = GuacdInstruction::new("select".to_string(), vec![db_type.to_string()]);
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "DatabaseProxy Handshake: Sending 'select' (channel_id: {}, db_type: {})",
-            channel_id, db_type
-        );
-    }
+    // ALWAYS log for debugging database proxy handshake
+    info!(
+        "DatabaseProxy Handshake: Sending 'select' (channel_id: {}, db_type: {})",
+        channel_id, db_type
+    );
+    let encoded_select = GuacdParser::guacd_encode_instruction(&select_instruction);
+    debug!(
+        "DatabaseProxy Handshake: Encoded select instruction ({} bytes): {:?}",
+        encoded_select.len(),
+        String::from_utf8_lossy(&encoded_select)
+    );
     writer
-        .write_all(&GuacdParser::guacd_encode_instruction(&select_instruction))
+        .write_all(&encoded_select)
         .await?;
+    info!("DatabaseProxy Handshake: write_all completed, calling flush");
     writer.flush().await?;
+    info!("DatabaseProxy Handshake: flush completed, waiting for 'args' response");
 
     // Step 2: Receive args from proxy
     let args_instruction = read_expected_instruction(

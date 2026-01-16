@@ -261,8 +261,36 @@ impl Channel {
                     Ok(parsed_conversation_type) => {
                         // Check for database session FIRST (before guacd check)
                         // Database sessions use DatabaseProxy protocol for routing to dynamic-db-proxy
-                        if is_database_session(&parsed_conversation_type) {
-                            debug!("Configuring for DatabaseProxy protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
+                        //
+                        // Two ways to detect a database session:
+                        // 1. tunnelType == "database" (new way - keeps conversationType as "tunnel" for client compatibility)
+                        // 2. conversationType is mysql/postgresql/sql-server (legacy way)
+                        let is_database_tunnel = protocol_settings
+                            .get("tunnelType")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s == "database")
+                            .unwrap_or(false);
+
+                        if is_database_tunnel || is_database_session(&parsed_conversation_type) {
+                            // Determine the database protocol name
+                            // If tunnelType == "database", get from databaseType field
+                            // Otherwise, use conversationType (legacy path)
+                            let db_protocol_name = if is_database_tunnel {
+                                protocol_settings
+                                    .get("databaseType")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("mysql")
+                                    .to_string()
+                            } else {
+                                parsed_conversation_type.to_string()
+                            };
+
+                            // ALWAYS log for debugging database proxy issues
+                            info!("Configuring for DatabaseProxy protocol (channel_id: {}, tunnelType: {}, databaseType: {}, conversationType: {})",
+                                channel_id,
+                                if is_database_tunnel { "database" } else { "none" },
+                                db_protocol_name,
+                                protocol_name_str);
                             determined_protocol = ActiveProtocol::DatabaseProxy;
                             initial_protocol_state =
                                 ProtocolLogicState::DatabaseProxy(ChannelDatabaseProxyState::default());
@@ -298,8 +326,7 @@ impl Channel {
                                             }
                                         })
                                         .collect();
-                                    // Set protocol name for database type
-                                    let db_protocol_name = parsed_conversation_type.to_string();
+                                    // Set protocol name for database type (from databaseType or conversationType)
                                     temp_db_params_map
                                         .insert("protocol".to_string(), db_protocol_name.clone());
                                     debug!("Parsed db_params for DatabaseProxy (channel_id: {}, protocol: {})",

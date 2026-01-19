@@ -4,14 +4,18 @@
 
 Before starting any work, read these files:
 
-1. **docs/CLAUDE.md** - Complete project overview, architecture, and development guidelines
-2. **COMMUNICATION_GUIDELINES.md** - How to interact with the user (no summary docs!)
-3. **docs/START_HERE.md** - Current implementation status and quick start
+1. **docs/README.md** - Documentation hub and navigation
+2. **docs/QUICKSTART.md** - Getting started guide
+3. **docs/CLAUDE.md** - Complete project overview and architecture
+4. **COMMUNICATION_GUIDELINES.md** - How to interact with the user
 
 ## Key Guidelines
 
 ### What NOT to do:
-- ❌ Do NOT create summary documents (*.md files in root)
+- ❌ Do NOT create new .md files unless explicitly requested by user
+- ❌ Do NOT create summary documents or exploration reports
+- ❌ Do NOT create planning documents or TODO.md files
+- ❌ ONLY update existing documentation files when needed
 - ❌ Do NOT commit changes unless explicitly requested
 - ❌ Do NOT use emojis in code/comments/commits
 - ❌ Do NOT use Mutex<Vec<T>> - use ArrayQueue
@@ -19,7 +23,8 @@ Before starting any work, read these files:
 - ❌ Do NOT copy pixel data - use bytes::Bytes
 
 ### What TO do:
-- ✅ Read docs/CLAUDE.md for architecture and patterns
+- ✅ Read existing docs before asking questions
+- ✅ Update existing .md files if information is outdated
 - ✅ Use lock-free concurrency (ArrayQueue, parking_lot::RwLock)
 - ✅ Use zero-copy techniques (bytes::Bytes, buffer pools)
 - ✅ Follow async patterns (tokio, no blocking)
@@ -61,12 +66,18 @@ cargo build --workspace
 
 ## Documentation Structure
 
-- `docs/` - All official documentation
-- `docs/CLAUDE.md` - **START HERE** - Complete guide
-- `docs/START_HERE.md` - Implementation status
-- `docs/development/` - Development guides
-- `docs/docs/context/` - Architecture deep dives
-- `docs/docs/reference/original-guacd/` - Original C implementation reference
+**NEW STRUCTURE** - Documentation has been reorganized:
+
+- `docs/README.md` - **START HERE** - Documentation hub
+- `docs/QUICKSTART.md` - Getting started guide
+- `docs/CLAUDE.md` - Complete architecture overview
+- `docs/crates/` - Per-crate documentation (guacr-ssh.md, guacr-rdp.md, etc.)
+- `docs/concepts/` - Core concepts (RECORDING.md, THREAT_DETECTION.md, ZERO_COPY.md)
+- `docs/guides/` - How-to guides (INTEGRATION.md, TESTING.md, PERFORMANCE.md)
+- `docs/reference/original-guacd/` - Original C implementation reference
+- `docs/archive/` - Archived/outdated documentation
+
+**IMPORTANT**: Do NOT create new .md files. Update existing ones only.
 
 ## Common Patterns
 

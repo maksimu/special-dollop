@@ -268,49 +268,53 @@ Environment variables:
 
 ## Documentation Structure
 
-### Core Documentation (`docs/`)
+**NEW ORGANIZED STRUCTURE** - Documentation has been reorganized for clarity:
 
-**Essential Reference**:
-- `CLAUDE.md` - This file - guidance for Claude Code
-- `START_HERE.md` - Quick start guide and current implementation status
+### Main Documentation (`docs/`)
+
+**Start Here**:
+- `README.md` - Documentation hub with navigation
+- `QUICKSTART.md` - Getting started in 5 minutes
+- `CLAUDE.md` - This file - complete architecture overview
 - `CONTRIBUTING.md` - Contribution guidelines
-- `README.md` - Documentation index
 
-**Protocol Implementation**:
-- `RDP_VNC_IMPLEMENTATION.md` - Complete RDP/VNC guide with SFTP integration
-- `RBI_IMPLEMENTATION.md` - Remote Browser Isolation implementation
-- `SFTP_CHANNEL_ADAPTER.md` - SFTP file transfer implementation
-- `THREAT_DETECTION.md` - Security threat detection system
-
-**Technical Guides**:
-- `INTEGRATION_GUIDE.md` - System integration patterns
-- `TESTING_GUIDE.md` - Testing procedures
-- `PERFORMANCE_OPTIMIZATIONS.md` - Performance techniques
-- `ZERO_COPY_INTEGRATION.md` - Zero-copy optimization guide
-- `WEBRTC_INTEGRATION_CHANGES.md` - WebRTC integration details
-- `WEBRTC_MULTI_CHANNEL_OPTIMIZATION.md` - Multi-channel optimization
-- `RECORDING_TRANSPORTS.md` - Session recording system
-
-**Protocol Specifications**:
+**Specifications**:
 - `BINARY_PROTOCOL_SPEC.md` - Binary protocol format
-- `GUACAMOLE_PROTOCOL_COVERAGE.md` - Guacamole protocol support
-- `CONTAINER_MANAGEMENT_PROTOCOL.md` - Kubernetes/Docker protocol design
+- `CONTAINER_MANAGEMENT_PROTOCOL.md` - Kubernetes/Docker protocol design (planned)
 
-**Security**:
-- `ADDITIONAL_PROTOCOLS_SECURITY.md` - Security considerations
-- `KEEPER_PAM_WEBRTC_RS_INTEGRATION.md` - Keeper integration
+### Per-Crate Documentation (`docs/crates/`)
 
-### Reference Documentation (`docs/docs/`)
+Protocol-specific implementation details:
+- `guacr-ssh.md` - SSH handler (production-ready)
+- `guacr-rdp.md` - RDP handler (production-ready)
+- `guacr-vnc.md` - VNC handler (production-ready)
+- `guacr-telnet.md` - Telnet handler
+- `guacr-database.md` - Database handlers
+- `guacr-sftp.md` - SFTP file transfer
+- `guacr-rbi.md` - Remote Browser Isolation
+- `guacr-threat-detection.md` - AI threat detection
+- `guacr-terminal.md` - Terminal emulation library
+- `guacr-protocol.md` - Guacamole protocol codec
 
-**Context** (`docs/docs/context/`):
-- `GUACR_ARCHITECTURE_PLAN.md` - Complete technical design
-- `GUACR_ZERO_COPY_OPTIMIZATION.md` - Performance techniques
-- `GUACR_PROTOCOL_HANDLERS_GUIDE.md` - Implementation patterns
-- `GUACR_QUICKSTART_GUIDE.md` - Getting started
-- `GUACR_EXECUTIVE_SUMMARY.md` - Business case
-- `GUACR_WEBRTC_INTEGRATION.md` - WebRTC integration
+### Core Concepts (`docs/concepts/`)
 
-**Original guacd Reference** (`docs/docs/reference/original-guacd/`):
+Deep dives into key architectural concepts:
+- `RECORDING.md` - Zero-copy session recording (consolidated)
+- `THREAT_DETECTION.md` - AI-powered security
+- `ZERO_COPY.md` - Performance optimization techniques
+- `GUACAMOLE_PROTOCOL.md` - Protocol coverage and instruction set
+
+### How-To Guides (`docs/guides/`)
+
+Practical guides for common tasks:
+- `INTEGRATION.md` - Integration patterns
+- `TESTING.md` - Testing procedures
+- `PERFORMANCE.md` - Performance tuning
+- `DEPLOYMENT.md` - Docker/Kubernetes deployment
+
+### Reference Documentation (`docs/reference/`)
+
+**Original guacd Reference** (`original-guacd/`):
 - Reference when implementing protocol handlers
 - Shows how original C implementation works
 - Includes database plugins and RBI analysis
@@ -342,14 +346,16 @@ Environment variables:
 ## Key Files to Reference
 
 When implementing protocol handlers:
-- `docs/context/GUACR_PROTOCOL_HANDLERS_GUIDE.md` - Implementation patterns
+- `docs/crates/guacr-ssh.md` - Reference implementation (production-ready)
 - `docs/reference/original-guacd/GUACD_ARCHITECTURE_DEEP_DIVE.md` - How original works
 
 When optimizing performance:
-- `docs/context/GUACR_ZERO_COPY_OPTIMIZATION.md` - Zero-copy techniques
+- `docs/concepts/ZERO_COPY.md` - Zero-copy techniques
+- `docs/guides/PERFORMANCE.md` - Performance tuning guide
 
 When understanding architecture:
-- `docs/context/GUACR_ARCHITECTURE_PLAN.md` - Complete design
+- `docs/QUICKSTART.md` - Quick overview
+- `docs/CLAUDE.md` - This file - complete design
 
 ## Common Pitfalls
 

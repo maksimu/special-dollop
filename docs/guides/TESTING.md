@@ -131,6 +131,28 @@ Use `proptest` or `quickcheck` for:
 - [ ] Test threat detection (malicious command should terminate)
 - [ ] Verify rendering performance (60fps)
 
+## Pre-Commit Checklist
+
+Before committing changes, ensure all quality checks pass:
+
+```bash
+# 1. Format code
+cargo fmt --all
+
+# 2. Run clippy with all targets (includes examples, tests, benches)
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run all tests
+cargo test --workspace
+```
+
+**CI Requirements**: The CI pipeline runs `cargo clippy --all-targets -- -D warnings`, which is stricter than `cargo clippy --workspace`. Always use `--all-targets` locally to catch issues before pushing.
+
+**Common Issues**:
+- Unused imports in examples: Remove or add `#[allow(unused_imports)]`
+- Dead code in examples: Add `#[allow(dead_code)]` for placeholder fields
+- Missing documentation: Add doc comments for public items
+
 ## Running Tests
 
 ### Quick Commands (Makefile)

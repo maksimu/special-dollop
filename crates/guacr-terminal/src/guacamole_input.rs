@@ -818,10 +818,11 @@ pub fn format_selection_overlay_instructions(
     }
 
     // Fill with blue semi-transparent color (matching guacd visibility)
-    // Blue: R=0, G=128 (0x80), B=255 (0xFF), A=160 (0xA0 = 62.7% opacity)
-    // Increased from 96 (37.6%) to 160 (62.7%) for better visibility
+    // Blue: R=0, G=128 (0x80), B=255 (0xFF), A=200 (0xC8 = 78% opacity)
+    // Increased from 160 (62.7%) to 200 (78%) for much better visibility
+    // This matches guacd's selection overlay which is quite visible
     instructions.push(format!(
-        "5.cfill,{}.{},1.0,3.128,3.255,3.160;",
+        "5.cfill,{}.{},1.0,3.128,3.255,3.200;",
         layer.len(),
         layer
     ));

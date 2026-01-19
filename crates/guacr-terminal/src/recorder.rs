@@ -455,8 +455,10 @@ impl ChannelRecordingTransport {
 #[async_trait]
 impl RecordingTransport for ChannelRecordingTransport {
     async fn write(&mut self, data: &[u8]) -> Result<()> {
+        // Zero-copy: Bytes::copy_from_slice uses Arc internally
+        // Once created, clones are zero-copy (just Arc::clone)
         self.sender
-            .send(Bytes::from(data.to_vec()))
+            .send(Bytes::copy_from_slice(data))
             .await
             .map_err(|e| {
                 crate::TerminalError::IoError(std::io::Error::new(

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "AI threat detection using BAML REST API"
 
+[features]
+default = []
+terminal-state = ["guacr-terminal"]
+
 [dependencies]
 # Workspace dependencies
 tokio.workspace = true
@@ -24,3 +28,10 @@ regex = "1.12"
 
 # Utilities
 uuid.workspace = true
+
+# Lock-free concurrency (following project patterns)
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# Terminal emulator for state extraction (optional)
+guacr-terminal = { path = "../guacr-terminal", optional = true }

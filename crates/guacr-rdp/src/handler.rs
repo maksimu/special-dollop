@@ -862,8 +862,10 @@ impl IronRdpSession {
                                             .await
                                             .map_err(|e| format!("Failed to write response: {}", e))?;
                                     }
-                                    ActiveStageOutput::GraphicsUpdate(_rect) => {
+                                    ActiveStageOutput::GraphicsUpdate(rect) => {
                                         // Send graphics update to client
+                                        debug!("RDP: GraphicsUpdate received - rect: {:?}, image size: {}x{}",
+                                            rect, image.width(), image.height());
                                         self.send_graphics_update(&image).await?;
                                     }
                                     ActiveStageOutput::Terminate(reason) => {
@@ -912,6 +914,12 @@ impl IronRdpSession {
     async fn send_graphics_update(&mut self, image: &DecodedImage) -> Result<(), String> {
         // Convert DecodedImage to our framebuffer format and send to client
         let image_data = image.data();
+
+        debug!(
+            "RDP: send_graphics_update called - image data len: {}, expected: {}",
+            image_data.len(),
+            self.width * self.height * 4
+        );
 
         // Check for scroll operation first (most bandwidth-efficient)
         if let Some(scroll_op) = self.scroll_detector.detect_scroll(image_data) {
@@ -981,6 +989,10 @@ impl IronRdpSession {
         }
 
         // No scroll detected - update framebuffer and use normal dirty region rendering
+        debug!(
+            "RDP: No scroll detected, updating full framebuffer {}x{}",
+            self.width, self.height
+        );
         self.framebuffer
             .update_region(0, 0, self.width, self.height, image_data);
 
@@ -1051,9 +1063,19 @@ impl IronRdpSession {
             }
             "mouse" => {
                 if instr.args.len() >= 3 {
-                    let mask: u8 = instr.args[0].parse().map_err(|_| "Invalid mouse mask")?;
-                    let x: i32 = instr.args[1].parse().map_err(|_| "Invalid x")?;
-                    let y: i32 = instr.args[2].parse().map_err(|_| "Invalid y")?;
+                    // Parse mask - might be float like "0.0" or integer like "0"
+                    let mask: u8 = instr.args[0]
+                        .parse::<f64>()
+                        .map_err(|e| format!("Invalid mouse mask '{}': {}", instr.args[0], e))?
+                        as u8;
+                    let x: i32 = instr.args[1]
+                        .parse::<f64>()
+                        .map_err(|e| format!("Invalid x '{}': {}", instr.args[1], e))?
+                        as i32;
+                    let y: i32 = instr.args[2]
+                        .parse::<f64>()
+                        .map_err(|e| format!("Invalid y '{}': {}", instr.args[2], e))?
+                        as i32;
 
                     // Security: Check read-only mode for mouse clicks
                     if self.read_only && !is_mouse_event_allowed_readonly(mask as u32) {
@@ -1158,15 +1180,27 @@ impl IronRdpSession {
         height: u32,
         pixels: &[u8],
     ) -> Result<(), String> {
-        let mut rgba_vec = vec![0u8; (width * height * 4) as usize];
-        guacr_terminal::convert_bgr_to_rgba_simd(pixels, &mut rgba_vec, width, height);
+        debug!(
+            "RDP: handle_graphics_update - region: {}x{} at ({}, {}), pixels len: {}",
+            width,
+            height,
+            x,
+            y,
+            pixels.len()
+        );
 
-        self.framebuffer
-            .update_region(x, y, width, height, &rgba_vec);
+        // IronRDP's DecodedImage is already in RGBA format (PixelFormat::RgbA32)
+        // No conversion needed - use pixels directly
+        self.framebuffer.update_region(x, y, width, height, pixels);
 
         self.framebuffer.optimize_dirty_rects();
         let dirty_rects: Vec<_> = self.framebuffer.dirty_rects().to_vec();
+        debug!(
+            "RDP: Dirty rects after optimization: {} rects",
+            dirty_rects.len()
+        );
         if dirty_rects.is_empty() {
+            warn!("RDP: No dirty rects after optimization - skipping render");
             return Ok(());
         }
 
@@ -1196,14 +1230,22 @@ impl IronRdpSession {
 
         // Use PNG encoding for all graphics updates
         for rect in &dirty_rects {
+            debug!(
+                "RDP: Encoding rect {}x{} at ({}, {})",
+                rect.width, rect.height, rect.x, rect.y
+            );
             let png_data = self
                 .framebuffer
                 .encode_region(*rect)
                 .map_err(|e| format!("Encoding failed: {}", e))?;
 
+            debug!("RDP: PNG encoded - {} bytes", png_data.len());
+
             // Encode PNG as base64 for text protocol
             let png_base64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
+
+            debug!("RDP: Base64 encoded - {} bytes", png_base64.len());
 
             // Format img instruction: img,<stream>,<mask>,<layer>,<mimetype>,<x>,<y>;
             // Then send blob instruction: blob,<stream>,<base64_data>;
@@ -1242,12 +1284,27 @@ impl IronRdpSession {
             );
 
             // Send and record instructions
+            info!(
+                "RDP: Sending img instruction for rect {}x{} at ({}, {})",
+                rect.width, rect.height, rect.x, rect.y
+            );
             self.send_and_record(&img_instr).await?;
+            info!(
+                "RDP: Sending blob instruction - {} bytes base64",
+                png_base64.len()
+            );
             self.send_and_record(&blob_instr).await?;
 
             // Send end instruction to close the stream
             let end_instr = guacr_protocol::format_end(self.stream_id);
             self.send_and_record(&end_instr).await?;
+            info!(
+                "RDP: Sent complete image update (stream {})",
+                self.stream_id
+            );
+
+            // Increment stream ID for next image (Guacamole protocol requires unique stream IDs)
+            self.stream_id += 1;
         }
 
         self.framebuffer.clear_dirty();

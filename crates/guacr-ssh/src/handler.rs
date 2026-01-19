@@ -36,9 +36,9 @@ use guacr_protocol::{
 };
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, parse_clipboard_blob,
-    parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes_with_modes, DirtyTracker,
-    ModifierState, MouseSelection, SelectionResult, TerminalConfig, TerminalEmulator,
-    TerminalRenderer,
+    parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes_with_modes,
+    x11_keysym_to_kitty_sequence, DirtyTracker, ModifierState, MouseSelection, SelectionResult,
+    TerminalConfig, TerminalEmulator, TerminalRenderer,
 };
 use log::{debug, error, info, trace, warn};
 use russh::client;
@@ -688,15 +688,42 @@ impl ProtocolHandler for SshHandler {
 
         debug!("SSH: Display initialized");
 
-        // IMPORTANT: Don't render banner immediately - wait for first resize from client
-        // This prevents the banner from being rendered at the default size (113x42) and then
-        // immediately resized to the actual browser size (e.g., 117x42), which causes the
-        // banner to scroll off or be repositioned.
-        //
-        // Instead, we'll render the banner after the first resize instruction from the client,
-        // which contains the actual browser dimensions. This matches guacd's behavior better.
+        // CRITICAL: Render banner immediately if collected
+        // The initial render timer will catch it at 300ms, but we should render it
+        // as soon as possible so the user sees the SSH banner/MOTD right away
         if banner_collected {
-            debug!("SSH: Banner collected, will render after first resize from client");
+            debug!("SSH: Banner collected, rendering immediately");
+
+            // Render the banner at the initial size
+            let jpeg = renderer
+                .render_screen(terminal.screen(), rows, cols)
+                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+            debug!("SSH: Banner render produced {} byte JPEG", jpeg.len());
+
+            #[allow(deprecated)]
+            let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
+            for instr in img_instructions {
+                to_client
+                    .send(Bytes::from(instr))
+                    .await
+                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            }
+
+            let sync_instr = renderer.format_sync_instruction(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+            to_client
+                .send(Bytes::from(sync_instr))
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+            terminal.clear_dirty();
+            banner_needs_render = false;
+            debug!("SSH: Banner rendered immediately at initial size");
         }
 
         // Debounce timer for batching screen updates
@@ -1159,22 +1186,39 @@ impl ProtocolHandler for SshHandler {
                         // Application cursor mode is needed for vim, less, tmux to work correctly
                         let application_cursor = terminal.is_application_cursor_mode();
 
+                        // Check if Kitty keyboard protocol is enabled
+                        let kitty_level = terminal.kitty_keyboard_level();
+
                         // Log arrow keys to help debug mode switching
                         if matches!(key_event.keysym, 0xFF51..=0xFF54) {
                             trace!(
-                                "SSH: Arrow key 0x{:X} in {} mode",
+                                "SSH: Arrow key 0x{:X} in {} mode, kitty_level={}",
                                 key_event.keysym,
-                                if application_cursor { "application" } else { "normal" }
+                                if application_cursor { "application" } else { "normal" },
+                                kitty_level
                             );
                         }
 
-                        let bytes = x11_keysym_to_bytes_with_modes(
-                            key_event.keysym,
-                            key_event.pressed,
-                            Some(&modifier_state),
-                            backspace_code,
-                            application_cursor,
-                        );
+                        // Use Kitty keyboard protocol if enabled, otherwise use legacy
+                        let bytes = if kitty_level > 0 {
+                            trace!("SSH: Using Kitty keyboard protocol level {}", kitty_level);
+                            x11_keysym_to_kitty_sequence(
+                                key_event.keysym,
+                                key_event.pressed,
+                                Some(&modifier_state),
+                                backspace_code,
+                                application_cursor,
+                                kitty_level,
+                            )
+                        } else {
+                            x11_keysym_to_bytes_with_modes(
+                                key_event.keysym,
+                                key_event.pressed,
+                                Some(&modifier_state),
+                                backspace_code,
+                                application_cursor,
+                            )
+                        };
                         trace!("SSH: Key converted to {} bytes: {:?}", bytes.len(), bytes);
                         if !bytes.is_empty() {
                             // Record input if enabled
@@ -1214,6 +1258,12 @@ impl ProtocolHandler for SshHandler {
                                     if let Some((_, height_str)) = height_part.split_once('.') {
                                         if let (Ok(new_width_px), Ok(new_height_px)) =
                                             (width_str.parse::<u32>(), height_str.parse::<u32>()) {
+
+                                            // CRITICAL: Validate dimensions to prevent black screen
+                                            if new_width_px == 0 || new_height_px == 0 {
+                                                warn!("SSH: Ignoring resize with zero dimensions ({}x{})", new_width_px, new_height_px);
+                                                continue;
+                                            }
 
                                             // Calculate new rows/cols using FIXED cell dimensions (guacd-style)
                                             let new_cols = (new_width_px / char_width).clamp(20, 500) as u16;
@@ -1301,6 +1351,10 @@ impl ProtocolHandler for SshHandler {
                             }
                         }
                     } else if let Some(mouse_event) = parse_mouse_instruction(&msg_str) {
+                        debug!("SSH: Mouse event - button={}, pos=({},{}), term_mouse={}",
+                            mouse_event.button_mask, mouse_event.x_px, mouse_event.y_px,
+                            terminal.is_mouse_enabled());
+
                         // Security: Check read-only mode for mouse clicks
                         if security.read_only && !is_mouse_event_allowed_readonly(mouse_event.button_mask) {
                             trace!("SSH: Mouse click blocked (read-only mode)");
@@ -1314,6 +1368,7 @@ impl ProtocolHandler for SshHandler {
 
                         // Check if terminal has mouse mode enabled (vim :set mouse=a, tmux mouse mode)
                         if terminal.is_mouse_enabled() && mouse_event.button_mask != 0 {
+                            debug!("SSH: Terminal mouse mode enabled - sending X11 sequences (no selection)");
                             // Terminal wants mouse events - send X11 sequences
                             use guacr_terminal::mouse_event_to_x11_sequence;
                             let mouse_seq = mouse_event_to_x11_sequence(
@@ -1333,6 +1388,7 @@ impl ProtocolHandler for SshHandler {
                         }
                         // Try text selection (only when mouse mode is disabled)
                         else {
+                            debug!("SSH: Terminal mouse mode disabled - handling text selection");
                             match handle_mouse_selection(
                                 mouse_event,
                                 &mut mouse_selection,
@@ -1345,9 +1401,9 @@ impl ProtocolHandler for SshHandler {
                             ) {
                                 SelectionResult::InProgress(overlay_instructions) => {
                                     // Send visual feedback (blue overlay) to client
-                                    debug!("SSH: Selection in progress, sending {} overlay instructions", overlay_instructions.len());
-                                    for instr in &overlay_instructions {
-                                        trace!("SSH: Overlay instruction: {}", instr);
+                                    info!("SSH: Selection in progress, sending {} overlay instructions", overlay_instructions.len());
+                                    for (i, instr) in overlay_instructions.iter().enumerate() {
+                                        debug!("SSH: Overlay [{}]: {}", i, instr);
                                     }
                                     for instr in overlay_instructions {
                                         to_client.send(Bytes::from(instr)).await
@@ -1356,9 +1412,11 @@ impl ProtocolHandler for SshHandler {
                                     debug!("SSH: Overlay instructions sent successfully");
                                 }
                                 SelectionResult::Complete { text: selected_text, clear_instructions } => {
+                                    info!("SSH: Selection complete - {} chars selected", selected_text.len());
+
                                     // Security: Check if copy is allowed
                                     if !security.is_copy_allowed() {
-                                        debug!("SSH: Selection copy blocked (copy disabled)");
+                                        warn!("SSH: Selection copy blocked (copy disabled)");
 
                                         // Still clear the overlay even if copy is blocked
                                         for instr in clear_instructions {
@@ -1368,7 +1426,7 @@ impl ProtocolHandler for SshHandler {
                                         continue;
                                     }
 
-                                    debug!("SSH: Selection complete, copying {} chars", selected_text.len());
+                                    debug!("SSH: Copying {} chars to clipboard", selected_text.len());
 
                                     // CRITICAL: Update local clipboard immediately to avoid race condition
                                     // If user pastes immediately after selecting, they expect the selected text

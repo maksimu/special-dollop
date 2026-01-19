@@ -4,7 +4,7 @@
 use crate::{DatabaseError, Result};
 use bytes::Bytes;
 use guacr_protocol::GuacamoleParser;
-use guacr_terminal::{DatabaseTerminal, QueryResult, TerminalInputHandler};
+use guacr_terminal::{DatabaseTerminal, QueryResult, TerminalInputHandler, TerminalRenderer};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -84,17 +84,12 @@ impl QueryExecutor {
     /// Generate Guacamole protocol display initialization instructions
     /// Returns (ready_instruction, size_instruction)
     pub fn create_display_init_instructions(width: u32, height: u32) -> (Bytes, Bytes) {
-        // Create ready instruction: "5.ready,1.0;"
-        let ready = Bytes::from("5.ready,1.0;");
+        // Create ready instruction with protocol name (matches SSH approach)
+        let ready = Bytes::from(TerminalRenderer::format_ready_instruction("database"));
 
-        // Create size instruction: "4.size,<width_len>.<width>,<height_len>.<height>;"
-        let size = Bytes::from(format!(
-            "4.size,{}.{},{}.{};",
-            width.to_string().len(),
-            width,
-            height.to_string().len(),
-            height
-        ));
+        // Create size instruction with layer 0 (matches SSH approach)
+        // This tells the client the dimensions of layer 0 where we'll render
+        let size = Bytes::from(TerminalRenderer::format_size_instruction(0, width, height));
 
         (ready, size)
     }

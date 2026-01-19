@@ -31,6 +31,7 @@ mod guacamole_input;
 mod input_handler;
 mod keysym;
 mod recorder;
+mod recording_pipeline;
 mod renderer;
 mod scroll_detector;
 mod selection_point;
@@ -53,13 +54,14 @@ pub use guacamole_input::{
 pub use input_handler::{RdpInputHandler, RdpKeyEvent, RdpPointerEvent};
 pub use keysym::{
     mouse_event_to_x11_sequence, x11_keysym_to_bytes, x11_keysym_to_bytes_with_backspace,
-    x11_keysym_to_bytes_with_modes, ModifierState,
+    x11_keysym_to_bytes_with_modes, x11_keysym_to_kitty_sequence, ModifierState,
 };
 pub use recorder::{
     create_recording_transports, AsciicastHeader, AsciicastRecorder, AsyncDualFormatRecorder,
     ChannelRecordingTransport, DualFormatRecorder, EventType, FileRecordingTransport,
     GuacamoleSessionRecorder, MultiTransportRecorder, RecordingTransport,
 };
+pub use recording_pipeline::{RecordingPipeline, RecordingTaskManager};
 pub use scroll_detector::{ScrollDetector, ScrollDirection, ScrollOperation};
 pub use selection_point::{points_enclose_text, ColumnSide, SelectionPoint};
 pub use simd::convert_bgr_to_rgba_simd;

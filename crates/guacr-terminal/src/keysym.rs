@@ -85,6 +85,144 @@ pub fn x11_keysym_to_bytes_with_backspace(
     x11_keysym_to_bytes_with_modes(keysym, pressed, modifiers, backspace_code, false)
 }
 
+/// Convert X11 keysym to Kitty keyboard protocol sequence
+///
+/// Generates CSI u sequences according to the Kitty keyboard protocol specification.
+/// Falls back to legacy sequences if kitty_level is 0.
+///
+/// # Kitty Protocol Levels
+///
+/// - Level 0: Disabled (uses legacy sequences)
+/// - Level 1: Disambiguate escape codes (Ctrl+I vs Tab, Ctrl+M vs Enter)
+/// - Level 2: Report event types (press=1, repeat=2, release=3)
+/// - Level 3: Report alternate keys (base key + shifted key)
+///
+/// # Format
+///
+/// `CSI <unicode> ; <modifiers> : <event> u`
+///
+/// Where:
+/// - unicode: Unicode codepoint of the key (decimal)
+/// - modifiers: Bitmask (1=Shift, 2=Alt, 4=Ctrl, 8=Meta)
+/// - event: 1=press, 2=repeat, 3=release (level 2+)
+///
+/// # Arguments
+///
+/// * `keysym` - X11 keysym value
+/// * `pressed` - Whether the key is pressed (true) or released (false)
+/// * `modifiers` - Optional modifier state for control character handling
+/// * `backspace_code` - Code to send for backspace key (127 = DEL, 8 = BS)
+/// * `application_cursor` - Whether terminal is in application cursor mode (for legacy fallback)
+/// * `kitty_level` - Kitty keyboard protocol level (0 = disabled, 1-3 = enabled)
+pub fn x11_keysym_to_kitty_sequence(
+    keysym: u32,
+    pressed: bool,
+    modifiers: Option<&ModifierState>,
+    backspace_code: u8,
+    application_cursor: bool,
+    kitty_level: u8,
+) -> Vec<u8> {
+    // Level 0 = disabled, use legacy sequences
+    if kitty_level == 0 {
+        return x11_keysym_to_bytes_with_modes(
+            keysym,
+            pressed,
+            modifiers,
+            backspace_code,
+            application_cursor,
+        );
+    }
+
+    // Convert keysym to Unicode codepoint
+    let unicode = match keysym {
+        // ASCII printable range
+        0x0020..=0x007E => keysym,
+
+        // Special keys - use their ASCII control codes or Unicode values
+        0xFF0D => 13,                    // Enter (CR)
+        0xFF08 => backspace_code as u32, // Backspace (DEL or BS)
+        0xFF09 => 9,                     // Tab
+        0xFF1B => 27,                    // Escape
+
+        // Arrow keys - use special Unicode values (Kitty spec uses shifted values)
+        0xFF51 => 57443, // Left
+        0xFF52 => 57444, // Up
+        0xFF53 => 57445, // Right
+        0xFF54 => 57446, // Down
+
+        // Navigation keys
+        0xFF50 => 57423, // Home
+        0xFF57 => 57424, // End
+        0xFF55 => 57425, // Page Up
+        0xFF56 => 57426, // Page Down
+        0xFF63 => 57427, // Insert
+        0xFFFF => 127,   // Delete
+
+        // Function keys F1-F12 (use Kitty spec values)
+        0xFFBE => 57376, // F1
+        0xFFBF => 57377, // F2
+        0xFFC0 => 57378, // F3
+        0xFFC1 => 57379, // F4
+        0xFFC2 => 57380, // F5
+        0xFFC3 => 57381, // F6
+        0xFFC4 => 57382, // F7
+        0xFFC5 => 57383, // F8
+        0xFFC6 => 57384, // F9
+        0xFFC7 => 57385, // F10
+        0xFFC8 => 57386, // F11
+        0xFFC9 => 57387, // F12
+
+        // Unsupported key - fall back to legacy
+        _ => {
+            return x11_keysym_to_bytes_with_modes(
+                keysym,
+                pressed,
+                modifiers,
+                backspace_code,
+                application_cursor,
+            )
+        }
+    };
+
+    // Build modifier bitmask
+    let mut mod_mask = 0u8;
+    if let Some(mods) = modifiers {
+        if mods.shift {
+            mod_mask |= 1;
+        }
+        if mods.alt {
+            mod_mask |= 2;
+        }
+        if mods.control {
+            mod_mask |= 4;
+        }
+        if mods.meta {
+            mod_mask |= 8;
+        }
+    }
+
+    // Generate CSI u sequence: ESC [ <unicode> ; <modifiers> : <event> u
+    let mut seq = vec![0x1B, b'[']; // ESC [
+
+    // Unicode codepoint
+    seq.extend_from_slice(unicode.to_string().as_bytes());
+
+    // Add modifiers if present or if level >= 2 (need event type)
+    if mod_mask > 0 || kitty_level >= 2 {
+        seq.push(b';');
+        seq.extend_from_slice(mod_mask.to_string().as_bytes());
+    }
+
+    // Level 2+: Add event type (1=press, 2=repeat, 3=release)
+    if kitty_level >= 2 {
+        seq.push(b':');
+        seq.push(if pressed { b'1' } else { b'3' });
+    }
+
+    seq.push(b'u');
+    seq
+}
+
 /// Convert X11 keysym to terminal input bytes with full mode support
 ///
 /// Supports application cursor mode (DECCKM) for proper vim/less/tmux operation.
@@ -713,5 +851,203 @@ mod tests {
         // Release Shift
         mods.update_modifier(0xFFE1, false);
         assert!(mods.control && !mods.shift && mods.alt);
+    }
+
+    // Kitty keyboard protocol tests
+
+    #[test]
+    fn test_kitty_protocol_disabled() {
+        // Level 0 should use legacy sequences
+        let seq = x11_keysym_to_kitty_sequence(0xFF52, true, None, 127, false, 0);
+        assert_eq!(seq, vec![0x1B, b'[', b'A']); // Legacy up arrow
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_basic() {
+        // Level 1: Basic key without modifiers
+        // 'a' should be CSI 97 u
+        let seq = x11_keysym_to_kitty_sequence(0x61, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[97u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_ctrl() {
+        // Level 1: Ctrl+C should be CSI 99 ; 4 u
+        let mut mods = ModifierState::new();
+        mods.control = true;
+        let seq = x11_keysym_to_kitty_sequence(0x63, true, Some(&mods), 127, false, 1);
+        assert_eq!(seq, b"\x1b[99;4u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_shift() {
+        // Level 1: Shift+A should be CSI 97 ; 1 u
+        let mut mods = ModifierState::new();
+        mods.shift = true;
+        let seq = x11_keysym_to_kitty_sequence(0x61, true, Some(&mods), 127, false, 1);
+        assert_eq!(seq, b"\x1b[97;1u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_ctrl_shift() {
+        // Level 1: Ctrl+Shift+C should be CSI 99 ; 5 u (4 + 1)
+        let mut mods = ModifierState::new();
+        mods.control = true;
+        mods.shift = true;
+        let seq = x11_keysym_to_kitty_sequence(0x63, true, Some(&mods), 127, false, 1);
+        assert_eq!(seq, b"\x1b[99;5u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_alt() {
+        // Level 1: Alt+Enter should be CSI 13 ; 2 u
+        let mut mods = ModifierState::new();
+        mods.alt = true;
+        let seq = x11_keysym_to_kitty_sequence(0xFF0D, true, Some(&mods), 127, false, 1);
+        assert_eq!(seq, b"\x1b[13;2u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_meta() {
+        // Level 1: Meta+A should be CSI 97 ; 8 u
+        let mut mods = ModifierState::new();
+        mods.meta = true;
+        let seq = x11_keysym_to_kitty_sequence(0x61, true, Some(&mods), 127, false, 1);
+        assert_eq!(seq, b"\x1b[97;8u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_1_all_modifiers() {
+        // Level 1: Ctrl+Alt+Shift+Meta+A should be CSI 97 ; 15 u (1+2+4+8)
+        let mut mods = ModifierState::new();
+        mods.shift = true;
+        mods.alt = true;
+        mods.control = true;
+        mods.meta = true;
+        let seq = x11_keysym_to_kitty_sequence(0x61, true, Some(&mods), 127, false, 1);
+        assert_eq!(seq, b"\x1b[97;15u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_2_press() {
+        // Level 2: Key press should include event type :1
+        // Shift+A press should be CSI 97 ; 1 : 1 u
+        let mut mods = ModifierState::new();
+        mods.shift = true;
+        let seq = x11_keysym_to_kitty_sequence(0x61, true, Some(&mods), 127, false, 2);
+        assert_eq!(seq, b"\x1b[97;1:1u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_2_release() {
+        // Level 2: Key release should include event type :3
+        // Shift+A release should be CSI 97 ; 1 : 3 u
+        let mut mods = ModifierState::new();
+        mods.shift = true;
+        let seq = x11_keysym_to_kitty_sequence(0x61, false, Some(&mods), 127, false, 2);
+        assert_eq!(seq, b"\x1b[97;1:3u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_level_2_no_modifiers() {
+        // Level 2: Even without modifiers, event type is included
+        // 'a' press should be CSI 97 ; 0 : 1 u
+        let seq = x11_keysym_to_kitty_sequence(0x61, true, None, 127, false, 2);
+        assert_eq!(seq, b"\x1b[97;0:1u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_special_keys() {
+        // Test special keys with Kitty protocol
+        // Enter
+        let seq = x11_keysym_to_kitty_sequence(0xFF0D, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[13u");
+
+        // Tab
+        let seq = x11_keysym_to_kitty_sequence(0xFF09, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[9u");
+
+        // Escape
+        let seq = x11_keysym_to_kitty_sequence(0xFF1B, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[27u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_arrow_keys() {
+        // Arrow keys use special Unicode values in Kitty protocol
+        // Up arrow
+        let seq = x11_keysym_to_kitty_sequence(0xFF52, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[57444u");
+
+        // Down arrow
+        let seq = x11_keysym_to_kitty_sequence(0xFF54, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[57446u");
+
+        // Left arrow
+        let seq = x11_keysym_to_kitty_sequence(0xFF51, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[57443u");
+
+        // Right arrow
+        let seq = x11_keysym_to_kitty_sequence(0xFF53, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[57445u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_function_keys() {
+        // F1
+        let seq = x11_keysym_to_kitty_sequence(0xFFBE, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[57376u");
+
+        // F12
+        let seq = x11_keysym_to_kitty_sequence(0xFFC9, true, None, 127, false, 1);
+        assert_eq!(seq, b"\x1b[57387u");
+    }
+
+    #[test]
+    fn test_kitty_protocol_disambiguate_ctrl_i_tab() {
+        // This is a key feature of Kitty protocol: disambiguate Ctrl+I from Tab
+        let mut mods = ModifierState::new();
+        mods.control = true;
+
+        // Ctrl+I should be CSI 105 ; 4 u
+        let ctrl_i = x11_keysym_to_kitty_sequence(0x69, true, Some(&mods), 127, false, 1);
+        assert_eq!(ctrl_i, b"\x1b[105;4u");
+
+        // Tab should be CSI 9 u
+        let tab = x11_keysym_to_kitty_sequence(0xFF09, true, None, 127, false, 1);
+        assert_eq!(tab, b"\x1b[9u");
+
+        // They should be different
+        assert_ne!(ctrl_i, tab);
+    }
+
+    #[test]
+    fn test_kitty_protocol_disambiguate_ctrl_m_enter() {
+        // Another key feature: disambiguate Ctrl+M from Enter
+        let mut mods = ModifierState::new();
+        mods.control = true;
+
+        // Ctrl+M should be CSI 109 ; 4 u
+        let ctrl_m = x11_keysym_to_kitty_sequence(0x6D, true, Some(&mods), 127, false, 1);
+        assert_eq!(ctrl_m, b"\x1b[109;4u");
+
+        // Enter should be CSI 13 u
+        let enter = x11_keysym_to_kitty_sequence(0xFF0D, true, None, 127, false, 1);
+        assert_eq!(enter, b"\x1b[13u");
+
+        // They should be different
+        assert_ne!(ctrl_m, enter);
+    }
+
+    #[test]
+    fn test_kitty_protocol_backspace_configurable() {
+        // Test that backspace code is respected
+        // Backspace with DEL (127)
+        let seq_del = x11_keysym_to_kitty_sequence(0xFF08, true, None, 127, false, 1);
+        assert_eq!(seq_del, b"\x1b[127u");
+
+        // Backspace with BS (8)
+        let seq_bs = x11_keysym_to_kitty_sequence(0xFF08, true, None, 8, false, 1);
+        assert_eq!(seq_bs, b"\x1b[8u");
     }
 }

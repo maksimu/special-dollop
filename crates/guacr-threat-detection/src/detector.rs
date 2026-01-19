@@ -2,9 +2,9 @@ use crate::baml_client::{BamlClient, CommandSummaryResponse};
 use crate::threat::{ThreatLevel, ThreatResult};
 use crate::{Result, ThreatDetectionError};
 use log::{debug, error, info, warn};
-use std::collections::{HashMap, VecDeque};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Threat detector configuration
 #[derive(Debug, Clone)]
@@ -29,6 +29,16 @@ pub struct ThreatDetectorConfig {
     pub allow_tags: HashMap<String, Vec<String>>, // level -> list of regex patterns
     /// Enable tag-based checking (immediate termination on deny tag match)
     pub enable_tag_checking: bool,
+    /// Enable proactive mode (AI approval before execution)
+    pub proactive_mode: bool,
+    /// Maximum time to wait for AI approval in proactive mode (milliseconds)
+    pub approval_timeout_ms: u64,
+    /// Fail-closed on AI errors (block commands if AI unavailable)
+    pub fail_closed_on_error: bool,
+    /// Show approval status to user (visual feedback)
+    pub show_approval_status: bool,
+    /// Auto-approve simple safe commands (ls, pwd, cd, etc.)
+    pub auto_approve_safe_commands: bool,
 }
 
 impl Default for ThreatDetectorConfig {
@@ -44,6 +54,11 @@ impl Default for ThreatDetectorConfig {
             deny_tags: HashMap::new(),
             allow_tags: HashMap::new(),
             enable_tag_checking: true,
+            proactive_mode: false,
+            approval_timeout_ms: 2000, // 2 seconds default
+            fail_closed_on_error: false,
+            show_approval_status: true,
+            auto_approve_safe_commands: true,
         }
     }
 }
@@ -52,11 +67,21 @@ impl Default for ThreatDetectorConfig {
 ///
 /// Monitors session activity and calls BAML REST API to detect threats.
 /// Can automatically terminate sessions on threat detection.
+///
+/// Uses lock-free patterns where possible:
+/// - parking_lot::RwLock (faster than std::sync::RwLock)
+/// - No nested locks
+/// - Short critical sections
+///
+/// **IMPORTANT**: Must call `cleanup_session()` when session ends to prevent memory leaks.
+/// The command history HashMap will grow unbounded if sessions aren't cleaned up.
 pub struct ThreatDetector {
     config: ThreatDetectorConfig,
     baml_client: BamlClient,
     /// Command history for context (per session)
-    command_history: Arc<RwLock<std::collections::HashMap<String, VecDeque<String>>>>,
+    /// Using parking_lot::RwLock (faster than std, no async)
+    /// **MUST be cleaned up** when session ends via cleanup_session()
+    command_history: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl ThreatDetector {
@@ -71,7 +96,7 @@ impl ThreatDetector {
                     config.baml_api_key.clone(),
                     Some(std::time::Duration::from_secs(config.timeout_seconds)),
                 ),
-                command_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                command_history: Arc::new(RwLock::new(HashMap::new())),
             });
         }
 
@@ -87,7 +112,7 @@ impl ThreatDetector {
                 config.baml_api_key.clone(),
                 Some(std::time::Duration::from_secs(config.timeout_seconds)),
             ),
-            command_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            command_history: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -189,14 +214,14 @@ impl ThreatDetector {
             .to_string();
 
         // Add to command history (store the actual command, not raw keystrokes)
+        // Using parking_lot::RwLock (non-async, faster than tokio::sync::RwLock)
         if !command.is_empty() {
-            let mut history = self.command_history.write().await;
-            let entry = history
-                .entry(session_id.to_string())
-                .or_insert_with(VecDeque::new);
-            entry.push_back(command.clone());
+            let mut history = self.command_history.write();
+            let entry = history.entry(session_id.to_string()).or_default();
+            entry.push(command.clone());
+            // Keep only last N commands (ring buffer behavior)
             if entry.len() > self.config.command_history_size {
-                entry.pop_front();
+                entry.remove(0);
             }
         }
 
@@ -392,13 +417,10 @@ impl ThreatDetector {
             ));
         }
 
-        // Get command history
+        // Get command history (short critical section)
         let command_sequence: Vec<String> = {
-            let history = self.command_history.read().await;
-            history
-                .get(session_id)
-                .map(|cmds| cmds.iter().cloned().collect())
-                .unwrap_or_default()
+            let history = self.command_history.read();
+            history.get(session_id).cloned().unwrap_or_default()
         };
 
         if command_sequence.is_empty() {
@@ -419,13 +441,42 @@ impl ThreatDetector {
     }
 
     /// Clean up command history for a session
-    pub async fn cleanup_session(&self, session_id: &str) {
-        let mut history = self.command_history.write().await;
-        history.remove(session_id);
-        debug!(
-            "Cleaned up threat detection history for session: {}",
-            session_id
-        );
+    ///
+    /// **CRITICAL**: Must be called when session ends to prevent memory leak.
+    /// The command history HashMap will grow unbounded if not cleaned up.
+    ///
+    /// Call this in protocol handler cleanup/disconnect logic:
+    /// ```rust,no_run
+    /// # use guacr_threat_detection::ThreatDetector;
+    /// # let threat_detector: Option<ThreatDetector> = None;
+    /// # let session_id = "test-session";
+    /// // In handler's main loop, when session ends:
+    /// if let Some(ref detector) = threat_detector {
+    ///     detector.cleanup_session(&session_id);
+    /// }
+    /// ```
+    pub fn cleanup_session(&self, session_id: &str) {
+        let mut history = self.command_history.write();
+        let removed = history.remove(session_id).is_some();
+        if removed {
+            debug!(
+                "Cleaned up threat detection history for session: {}",
+                session_id
+            );
+        } else {
+            debug!(
+                "No threat detection history found for session: {} (already cleaned or never created)",
+                session_id
+            );
+        }
+    }
+
+    /// Get the number of active sessions being tracked
+    ///
+    /// Useful for monitoring memory usage and detecting leaks.
+    /// If this number keeps growing, sessions aren't being cleaned up.
+    pub fn active_session_count(&self) -> usize {
+        self.command_history.read().len()
     }
 
     /// Health check - test BAML API connectivity
@@ -437,12 +488,9 @@ impl ThreatDetector {
     }
 
     /// Get all commands for a session (for summary generation)
-    pub async fn get_command_sequence(&self, session_id: &str) -> Vec<String> {
-        let history = self.command_history.read().await;
-        history
-            .get(session_id)
-            .map(|cmds| cmds.iter().cloned().collect())
-            .unwrap_or_default()
+    pub fn get_command_sequence(&self, session_id: &str) -> Vec<String> {
+        let history = self.command_history.read();
+        history.get(session_id).cloned().unwrap_or_default()
     }
 }
 

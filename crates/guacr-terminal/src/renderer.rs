@@ -223,6 +223,14 @@ impl TerminalRenderer {
         width_px: u32,
         height_px: u32,
     ) -> Result<Vec<u8>> {
+        // CRITICAL: Prevent rendering zero-size images (causes black screen)
+        if width_px == 0 || height_px == 0 || rows == 0 || cols == 0 {
+            return Err(crate::TerminalError::RenderError(format!(
+                "Invalid render dimensions: {}x{} px ({}x{} chars)",
+                width_px, height_px, cols, rows
+            )));
+        }
+
         let mut img = RgbImage::new(width_px, height_px);
 
         // Background (black)

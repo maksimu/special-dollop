@@ -31,8 +31,8 @@ use guacr_protocol::format_error;
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, mouse_event_to_x11_sequence,
     parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction,
-    x11_keysym_to_bytes_with_backspace, DirtyTracker, ModifierState, MouseSelection,
-    SelectionResult, TerminalConfig, TerminalEmulator, TerminalRenderer,
+    x11_keysym_to_bytes_with_backspace, x11_keysym_to_kitty_sequence, DirtyTracker, ModifierState,
+    MouseSelection, SelectionResult, TerminalConfig, TerminalEmulator, TerminalRenderer,
 };
 #[cfg(feature = "threat-detection")]
 use log::error;
@@ -508,13 +508,29 @@ impl ProtocolHandler for TelnetHandler {
                             continue;
                         }
 
+                        // Check if Kitty keyboard protocol is enabled
+                        let kitty_level = terminal.kitty_keyboard_level();
+
                         // Convert to terminal bytes with current modifier state and configured backspace
-                        let bytes = x11_keysym_to_bytes_with_backspace(
-                            key_event.keysym,
-                            key_event.pressed,
-                            Some(&modifier_state),
-                            backspace_code,
-                        );
+                        // Use Kitty keyboard protocol if enabled, otherwise use legacy
+                        let bytes = if kitty_level > 0 {
+                            trace!("Telnet: Using Kitty keyboard protocol level {}", kitty_level);
+                            x11_keysym_to_kitty_sequence(
+                                key_event.keysym,
+                                key_event.pressed,
+                                Some(&modifier_state),
+                                backspace_code,
+                                false, // Telnet doesn't use application cursor mode
+                                kitty_level,
+                            )
+                        } else {
+                            x11_keysym_to_bytes_with_backspace(
+                                key_event.keysym,
+                                key_event.pressed,
+                                Some(&modifier_state),
+                                backspace_code,
+                            )
+                        };
                         if !bytes.is_empty() {
                             // Threat detection: Analyze live keyboard input before sending to server
                             #[cfg(feature = "threat-detection")]

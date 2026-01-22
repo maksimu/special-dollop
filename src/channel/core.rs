@@ -292,8 +292,9 @@ impl Channel {
                                 db_protocol_name,
                                 protocol_name_str);
                             determined_protocol = ActiveProtocol::DatabaseProxy;
-                            initial_protocol_state =
-                                ProtocolLogicState::DatabaseProxy(ChannelDatabaseProxyState::default());
+                            initial_protocol_state = ProtocolLogicState::DatabaseProxy(
+                                ChannelDatabaseProxyState::default(),
+                            );
 
                             // Extract proxy host/port from 'proxy' block in protocol_settings
                             if let Some(proxy_settings_val) = protocol_settings.get("proxy") {
@@ -316,14 +317,14 @@ impl Channel {
                                 if let JsonValue::Object(map) = db_params_json_val {
                                     temp_db_params_map = map
                                         .iter()
-                                        .filter_map(|(k, v)| {
-                                            match v {
-                                                JsonValue::String(s) => Some((k.clone(), s.clone())),
-                                                JsonValue::Bool(b) => Some((k.clone(), b.to_string())),
-                                                JsonValue::Number(n) => Some((k.clone(), n.to_string())),
-                                                JsonValue::Null => None,
-                                                _ => None,
+                                        .filter_map(|(k, v)| match v {
+                                            JsonValue::String(s) => Some((k.clone(), s.clone())),
+                                            JsonValue::Bool(b) => Some((k.clone(), b.to_string())),
+                                            JsonValue::Number(n) => {
+                                                Some((k.clone(), n.to_string()))
                                             }
+                                            JsonValue::Null => None,
+                                            _ => None,
                                         })
                                         .collect();
                                     // Set protocol name for database type (from databaseType or conversationType)

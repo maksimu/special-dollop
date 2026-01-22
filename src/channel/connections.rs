@@ -285,7 +285,10 @@ pub async fn setup_outbound_task(
         // Get the database type from params, default to "auto" for proxy-side detection
         let db_type = {
             let params = db_params_clone.lock().await;
-            params.get("protocol").cloned().unwrap_or_else(|| "auto".to_string())
+            params
+                .get("protocol")
+                .cloned()
+                .unwrap_or_else(|| "auto".to_string())
         };
 
         match timeout(
@@ -341,8 +344,10 @@ pub async fn setup_outbound_task(
                         );
                     }
                     Err(_) => {
-                        crate::metrics::METRICS_COLLECTOR
-                            .record_error(&channel_id_clone, "db_proxy_handshake_error_send_failed");
+                        crate::metrics::METRICS_COLLECTOR.record_error(
+                            &channel_id_clone,
+                            "db_proxy_handshake_error_send_failed",
+                        );
                     }
                 }
                 return Err(e);
@@ -378,8 +383,10 @@ pub async fn setup_outbound_task(
                         );
                     }
                     Err(_) => {
-                        crate::metrics::METRICS_COLLECTOR
-                            .record_error(&channel_id_clone, "db_proxy_handshake_timeout_send_failed");
+                        crate::metrics::METRICS_COLLECTOR.record_error(
+                            &channel_id_clone,
+                            "db_proxy_handshake_timeout_send_failed",
+                        );
                     }
                 }
                 return Err(anyhow::anyhow!("DatabaseProxy handshake timed out"));
@@ -1707,23 +1714,35 @@ where
                     // EOF received - check if there's any remaining instruction in buffer
                     // (especially an error instruction that arrived just before connection close)
                     if *current_buffer_len > 0 {
-                        if let Ok(peeked) = GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]) {
+                        if let Ok(peeked) =
+                            GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len])
+                        {
                             if peeked.total_length_in_buffer <= *current_buffer_len {
                                 // Try to parse the instruction
-                                let content_slice = &handshake_buffer[..peeked.total_length_in_buffer - 1];
-                                if let Ok(instruction) = GuacdParser::parse_instruction_content(content_slice) {
+                                let content_slice =
+                                    &handshake_buffer[..peeked.total_length_in_buffer - 1];
+                                if let Ok(instruction) =
+                                    GuacdParser::parse_instruction_content(content_slice)
+                                {
                                     if instruction.opcode == "error" {
                                         // Extract the actual error from guacd
-                                        let guacd_error_msg = instruction.args.first()
+                                        let guacd_error_msg = instruction
+                                            .args
+                                            .first()
                                             .map(|s| s.as_str())
                                             .unwrap_or("Unknown guacd error");
-                                        let error_code = instruction.args.get(1)
+                                        let error_code = instruction
+                                            .args
+                                            .get(1)
                                             .map(|s| s.as_str())
                                             .unwrap_or("");
                                         error!("Guacd sent error during handshake (channel_id: {}, error_msg: {}, error_code: {})", channel_id, guacd_error_msg, error_code);
 
                                         // Send CloseConnection to UI before returning error
-                                        let close_msg = format!("Guacd error: {} (code: {})", guacd_error_msg, error_code);
+                                        let close_msg = format!(
+                                            "Guacd error: {} (code: {})",
+                                            guacd_error_msg, error_code
+                                        );
                                         send_handshake_error_close(
                                             dc,
                                             conn_no,
@@ -2186,7 +2205,8 @@ where
                 match peek_result {
                     Ok(peeked_instr) => {
                         let instruction_total_len = peeked_instr.total_length_in_buffer;
-                        if instruction_total_len == 0 || instruction_total_len > *current_buffer_len {
+                        if instruction_total_len == 0 || instruction_total_len > *current_buffer_len
+                        {
                             return Err(anyhow::anyhow!(
                                 "Peeked instruction length is invalid or exceeds buffer."
                             ));
@@ -2244,17 +2264,26 @@ where
                     // EOF received - check if there's any remaining instruction in buffer
                     // (especially an error instruction that arrived just before connection close)
                     if *current_buffer_len > 0 {
-                        if let Ok(peeked) = GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]) {
+                        if let Ok(peeked) =
+                            GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len])
+                        {
                             if peeked.total_length_in_buffer <= *current_buffer_len {
                                 // Try to parse the instruction
-                                let content_slice = &handshake_buffer[..peeked.total_length_in_buffer - 1];
-                                if let Ok(instruction) = GuacdParser::parse_instruction_content(content_slice) {
+                                let content_slice =
+                                    &handshake_buffer[..peeked.total_length_in_buffer - 1];
+                                if let Ok(instruction) =
+                                    GuacdParser::parse_instruction_content(content_slice)
+                                {
                                     if instruction.opcode == "error" {
                                         // Extract the actual error from proxy
-                                        let error_msg = instruction.args.first()
+                                        let error_msg = instruction
+                                            .args
+                                            .first()
                                             .map(|s| s.as_str())
                                             .unwrap_or("Unknown proxy error");
-                                        let error_code = instruction.args.get(1)
+                                        let error_code = instruction
+                                            .args
+                                            .get(1)
                                             .map(|s| s.as_str())
                                             .unwrap_or("");
                                         return Err(anyhow::anyhow!(
@@ -2274,7 +2303,8 @@ where
                 }
                 Ok(n_read) => {
                     if handshake_buffer.capacity() < *current_buffer_len + n_read {
-                        handshake_buffer.reserve(*current_buffer_len + n_read - handshake_buffer.capacity());
+                        handshake_buffer
+                            .reserve(*current_buffer_len + n_read - handshake_buffer.capacity());
                     }
                     handshake_buffer.put_slice(&temp_read_buf[..n_read]);
                     *current_buffer_len += n_read;
@@ -2302,9 +2332,7 @@ where
         encoded_select.len(),
         String::from_utf8_lossy(&encoded_select)
     );
-    writer
-        .write_all(&encoded_select)
-        .await?;
+    writer.write_all(&encoded_select).await?;
     info!("DatabaseProxy Handshake: write_all completed, calling flush");
     writer.flush().await?;
     info!("DatabaseProxy Handshake: flush completed, waiting for 'args' response");
@@ -2342,9 +2370,18 @@ where
                 .or_else(|| db_params_locked.get("target_port"))
                 .cloned()
                 .unwrap_or_default(),
-            "username" => db_params_locked.get("username").cloned().unwrap_or_default(),
-            "password" => db_params_locked.get("password").cloned().unwrap_or_default(),
-            "database" => db_params_locked.get("database").cloned().unwrap_or_default(),
+            "username" => db_params_locked
+                .get("username")
+                .cloned()
+                .unwrap_or_default(),
+            "password" => db_params_locked
+                .get("password")
+                .cloned()
+                .unwrap_or_default(),
+            "database" => db_params_locked
+                .get("database")
+                .cloned()
+                .unwrap_or_default(),
             "session_uid" => db_params_locked
                 .get("conversation_id")
                 .or_else(|| db_params_locked.get("session_uid"))

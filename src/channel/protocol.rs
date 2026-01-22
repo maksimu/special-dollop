@@ -761,9 +761,7 @@ impl Channel {
                     "Channel({}): DatabaseProxy OpenConnection requested, proxy_host={:?}, proxy_port={:?}",
                     self.channel_id, self.proxy_host, self.proxy_port
                 );
-                if let (Some(host), Some(port)) =
-                    (self.proxy_host.as_deref(), self.proxy_port)
-                {
+                if let (Some(host), Some(port)) = (self.proxy_host.as_deref(), self.proxy_port) {
                     match tokio::net::lookup_host(format!("{host}:{port}")).await {
                         Ok(mut addrs) => {
                             if let Some(socket_addr) = addrs.next() {
@@ -792,7 +790,9 @@ impl Channel {
                         )),
                     }
                 } else {
-                    Err(anyhow!("DatabaseProxy host/port not configured for OpenConnection"))
+                    Err(anyhow!(
+                        "DatabaseProxy host/port not configured for OpenConnection"
+                    ))
                 }
             }
         };

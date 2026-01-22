@@ -644,8 +644,7 @@ pub fn is_guacd_session(conversation_type: &ConversationType) -> bool {
             | ConversationType::Ssh
             | ConversationType::Telnet
             | ConversationType::Http
-            | ConversationType::Kubernetes
-        // Note: Mysql, SqlServer, Postgresql now handled by is_database_session()
+            | ConversationType::Kubernetes // Note: Mysql, SqlServer, Postgresql now handled by is_database_session()
     )
 }
 

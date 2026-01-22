@@ -297,19 +297,21 @@ impl Channel {
                             );
 
                             // Extract proxy host/port from 'proxy' block in protocol_settings
-                            if let Some(proxy_settings_val) = protocol_settings.get("proxy") {
-                                if let JsonValue::Object(proxy_map) = proxy_settings_val {
-                                    proxy_host_setting = proxy_map
-                                        .get("proxy_host")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from);
-                                    proxy_port_setting = proxy_map
-                                        .get("proxy_port")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|p| p as u16);
-                                    debug!("Parsed proxy settings: host={:?}, port={:?} (channel_id: {})",
-                                        proxy_host_setting, proxy_port_setting, channel_id);
-                                }
+                            if let Some(JsonValue::Object(proxy_map)) =
+                                protocol_settings.get("proxy")
+                            {
+                                proxy_host_setting = proxy_map
+                                    .get("proxy_host")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+                                proxy_port_setting = proxy_map
+                                    .get("proxy_port")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|p| p as u16);
+                                debug!(
+                                    "Parsed proxy settings: host={:?}, port={:?} (channel_id: {})",
+                                    proxy_host_setting, proxy_port_setting, channel_id
+                                );
                             }
 
                             // Process db_params for database parameters

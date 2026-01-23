@@ -271,11 +271,12 @@ pub async fn setup_outbound_task(
         }
     } else if active_protocol == ActiveProtocol::DatabaseProxy {
         // Database Proxy handshake - similar to Guacd but with simplified protocol
-        // ALWAYS log for debugging database proxy issues
-        info!(
-            "Channel({}): Performing DatabaseProxy handshake for conn_no {}",
-            channel_id_for_task, conn_no
-        );
+        if unlikely!(should_log_connection(false)) {
+            debug!(
+                "Channel({}): Performing DatabaseProxy handshake for conn_no {}",
+                channel_id_for_task, conn_no
+            );
+        }
 
         let channel_id_clone = channel_id_for_task.clone();
         let db_params_clone = channel.db_params.clone();
@@ -2321,21 +2322,15 @@ where
 
     // Step 1: Send select with database type
     let select_instruction = GuacdInstruction::new("select".to_string(), vec![db_type.to_string()]);
-    // ALWAYS log for debugging database proxy handshake
-    info!(
-        "DatabaseProxy Handshake: Sending 'select' (channel_id: {}, db_type: {})",
-        channel_id, db_type
-    );
+    if unlikely!(should_log_connection(false)) {
+        debug!(
+            "DatabaseProxy Handshake: Sending 'select' (channel_id: {}, db_type: {})",
+            channel_id, db_type
+        );
+    }
     let encoded_select = GuacdParser::guacd_encode_instruction(&select_instruction);
-    debug!(
-        "DatabaseProxy Handshake: Encoded select instruction ({} bytes): {:?}",
-        encoded_select.len(),
-        String::from_utf8_lossy(&encoded_select)
-    );
     writer.write_all(&encoded_select).await?;
-    info!("DatabaseProxy Handshake: write_all completed, calling flush");
     writer.flush().await?;
-    info!("DatabaseProxy Handshake: flush completed, waiting for 'args' response");
 
     // Step 2: Receive args from proxy
     let args_instruction = read_expected_instruction(

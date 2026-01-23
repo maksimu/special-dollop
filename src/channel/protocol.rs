@@ -755,17 +755,20 @@ impl Channel {
             }
             super::types::ActiveProtocol::DatabaseProxy => {
                 // Database proxy mode: route to proxy host/port instead of guacd
-                // ALWAYS log for debugging database proxy issues
-                info!(
-                    "Channel({}): DatabaseProxy OpenConnection requested, proxy_host={:?}, proxy_port={:?}",
-                    self.channel_id, self.proxy_host, self.proxy_port
-                );
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Channel({}): DatabaseProxy OpenConnection requested, proxy_host={:?}, proxy_port={:?}",
+                        self.channel_id, self.proxy_host, self.proxy_port
+                    );
+                }
                 if let (Some(host), Some(port)) = (self.proxy_host.as_deref(), self.proxy_port) {
                     match tokio::net::lookup_host(format!("{host}:{port}")).await {
                         Ok(mut addrs) => {
                             if let Some(socket_addr) = addrs.next() {
-                                info!("Channel({}): DatabaseProxy OpenConnection for target_conn_no {} to {}:{} (resolved to {}).",
-                                    self.channel_id, target_connection_no, host, port, socket_addr);
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!("Channel({}): DatabaseProxy OpenConnection for target_conn_no {} to {}:{} (resolved to {}).",
+                                        self.channel_id, target_connection_no, host, port, socket_addr);
+                                }
                                 super::connections::open_backend(
                                     self,
                                     target_connection_no,

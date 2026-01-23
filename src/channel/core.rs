@@ -285,8 +285,7 @@ impl Channel {
                                 parsed_conversation_type.to_string()
                             };
 
-                            // ALWAYS log for debugging database proxy issues
-                            info!("Configuring for DatabaseProxy protocol (channel_id: {}, tunnelType: {}, databaseType: {}, conversationType: {})",
+                            debug!("Configuring for DatabaseProxy protocol (channel_id: {}, tunnelType: {}, databaseType: {}, conversationType: {})",
                                 channel_id,
                                 if is_database_tunnel { "database" } else { "none" },
                                 db_protocol_name,

@@ -179,6 +179,7 @@ pub enum CloseConnectionReason {
     ConfigurationError = 18,
     ProtocolError = 19,
     UpstreamClosed = 20,
+    ProxyError = 21,
 }
 
 // Helper for CloseConnectionReason (assuming it might be defined elsewhere, adding a basic version)
@@ -206,6 +207,7 @@ impl CloseConnectionReason {
             18 => CloseConnectionReason::ConfigurationError,
             19 => CloseConnectionReason::ProtocolError,
             20 => CloseConnectionReason::UpstreamClosed,
+            21 => CloseConnectionReason::ProxyError,
             _ => CloseConnectionReason::Unknown,
         }
     }
@@ -218,6 +220,7 @@ impl CloseConnectionReason {
                 | CloseConnectionReason::ConfigurationError
                 | CloseConnectionReason::ProtocolError
                 | CloseConnectionReason::GuacdError
+                | CloseConnectionReason::ProxyError
                 | CloseConnectionReason::ErrorRecording
         )
     }
@@ -258,6 +261,7 @@ impl CloseConnectionReason {
             CloseConnectionReason::ConfigurationError => "configuration error".to_string(),
             CloseConnectionReason::ProtocolError => "protocol error".to_string(),
             CloseConnectionReason::UpstreamClosed => "upstream connection closed".to_string(),
+            CloseConnectionReason::ProxyError => "database proxy error".to_string(),
         }
     }
 }
@@ -287,6 +291,7 @@ impl TryFrom<u16> for CloseConnectionReason {
             18 => Ok(CloseConnectionReason::ConfigurationError),
             19 => Ok(CloseConnectionReason::ProtocolError),
             20 => Ok(CloseConnectionReason::UpstreamClosed),
+            21 => Ok(CloseConnectionReason::ProxyError),
             0xFFFF => Ok(CloseConnectionReason::Unknown),
             _ => Err(anyhow::anyhow!(
                 "Invalid u16 value for CloseConnectionReason: {}",

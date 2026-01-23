@@ -317,154 +317,153 @@ impl Channel {
         if self.active_protocol == super::types::ActiveProtocol::Guacd
             && (self.connect_as_settings.allow_supply_user
                 || self.connect_as_settings.allow_supply_host)
-            && self.connect_as_settings.gateway_private_key.is_some()
         {
-            debug!(
-                "Channel({}): Attempting ConnectAs for Guacd target_conn_no {}",
-                self.channel_id, target_connection_no
-            );
+            if let Some(ref gateway_private_key_pem) = self.connect_as_settings.gateway_private_key
+            {
+                debug!(
+                    "Channel({}): Attempting ConnectAs for Guacd target_conn_no {}",
+                    self.channel_id, target_connection_no
+                );
 
-            if cursor.remaining() >= CONNECT_AS_DETAILS_LEN_FIELD_BYTES {
-                let connect_as_payload_len = cursor.get_u32() as usize; // Consumes 4 bytes
-                let required_crypto_block_len =
-                    CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES + connect_as_payload_len;
+                if cursor.remaining() >= CONNECT_AS_DETAILS_LEN_FIELD_BYTES {
+                    let connect_as_payload_len = cursor.get_u32() as usize; // Consumes 4 bytes
+                    let required_crypto_block_len = CONNECT_AS_PUBLIC_KEY_BYTES
+                        + CONNECT_AS_NONCE_BYTES
+                        + connect_as_payload_len;
 
-                if cursor.remaining() >= required_crypto_block_len {
-                    let mut crypto_buffer = self.buffer_pool.acquire();
-                    crypto_buffer.clear();
-                    crypto_buffer.resize(required_crypto_block_len, 0);
+                    if cursor.remaining() >= required_crypto_block_len {
+                        let mut crypto_buffer = self.buffer_pool.acquire();
+                        crypto_buffer.clear();
+                        crypto_buffer.resize(required_crypto_block_len, 0);
 
-                    cursor.copy_to_slice(&mut crypto_buffer[..]); // Consumes required_crypto_block_len bytes
+                        cursor.copy_to_slice(&mut crypto_buffer[..]); // Consumes required_crypto_block_len bytes
 
-                    let client_public_key_bytes = &crypto_buffer[..CONNECT_AS_PUBLIC_KEY_BYTES];
-                    let nonce_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES
-                        ..CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES];
-                    let encrypted_data_bytes =
-                        &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES..];
+                        let client_public_key_bytes = &crypto_buffer[..CONNECT_AS_PUBLIC_KEY_BYTES];
+                        let nonce_bytes = &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES
+                            ..CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES];
+                        let encrypted_data_bytes =
+                            &crypto_buffer[CONNECT_AS_PUBLIC_KEY_BYTES + CONNECT_AS_NONCE_BYTES..];
 
-                    let gateway_private_key_pem = self
-                        .connect_as_settings
-                        .gateway_private_key
-                        .as_ref()
-                        .unwrap();
-
-                    // 1. Parse PKCS#8 PEM to P256SecretKey
-                    let p256_secret_key = P256SecretKey::from_pkcs8_pem(gateway_private_key_pem)
+                        // 1. Parse PKCS#8 PEM to P256SecretKey
+                        let p256_secret_key = P256SecretKey::from_pkcs8_pem(gateway_private_key_pem)
                         .map_err(|e| {
                             error!("Channel({}): Failed to parse gateway private key PKCS#8 PEM: {}. PEM was: '{}'", self.channel_id, e, gateway_private_key_pem);
                             anyhow!("Failed to parse gateway private key PKCS#8 PEM: {}", e)
                         })?;
 
-                    // 2. Get the raw scalar bytes of the P256SecretKey
-                    let secret_key_scalar_bytes = p256_secret_key.to_bytes(); // This returns FieldBytes<NistP256>
+                        // 2. Get the raw scalar bytes of the P256SecretKey
+                        let secret_key_scalar_bytes = p256_secret_key.to_bytes(); // This returns FieldBytes<NistP256>
 
-                    // 3. Convert raw scalar bytes to hex string
-                    // FieldBytes<C> (which is GenericArray<u8, C::FieldSize>) implements AsRef<[u8]>,
-                    // so it can be passed directly to hex::encode.
-                    let gateway_private_key_hex = hex::encode(secret_key_scalar_bytes);
+                        // 3. Convert raw scalar bytes to hex string
+                        // FieldBytes<C> (which is GenericArray<u8, C::FieldSize>) implements AsRef<[u8]>,
+                        // so it can be passed directly to hex::encode.
+                        let gateway_private_key_hex = hex::encode(secret_key_scalar_bytes);
 
-                    match decrypt_connect_as_payload(
-                        &gateway_private_key_hex, // Use the hex string of raw scalar bytes
-                        client_public_key_bytes,
-                        nonce_bytes,
-                        encrypted_data_bytes,
-                    ) {
-                        Ok(decrypted_payload) => {
-                            info!("Channel({}): Successfully decrypted ConnectAs payload for target_conn_no {}", self.channel_id, target_connection_no);
-                            let mut guacd_params_locked = self.guacd_params.lock().await;
+                        match decrypt_connect_as_payload(
+                            &gateway_private_key_hex, // Use the hex string of raw scalar bytes
+                            client_public_key_bytes,
+                            nonce_bytes,
+                            encrypted_data_bytes,
+                        ) {
+                            Ok(decrypted_payload) => {
+                                info!("Channel({}): Successfully decrypted ConnectAs payload for target_conn_no {}", self.channel_id, target_connection_no);
+                                let mut guacd_params_locked = self.guacd_params.lock().await;
 
-                            // Apply user credentials if EITHER allow_supply_user OR allow_supply_host is true (matches Python logic)
-                            if self.connect_as_settings.allow_supply_user
-                                || self.connect_as_settings.allow_supply_host
-                            {
-                                if let Some(user_details) = decrypted_payload.user {
-                                    debug!(
-                                        "Channel({}): Applying ConnectAs user details",
-                                        self.channel_id
-                                    );
+                                // Apply user credentials if EITHER allow_supply_user OR allow_supply_host is true (matches Python logic)
+                                if self.connect_as_settings.allow_supply_user
+                                    || self.connect_as_settings.allow_supply_host
+                                {
+                                    if let Some(user_details) = decrypted_payload.user {
+                                        debug!(
+                                            "Channel({}): Applying ConnectAs user details",
+                                            self.channel_id
+                                        );
 
-                                    if let Some(val) = user_details.username {
-                                        guacd_params_locked.insert("username".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.password {
-                                        guacd_params_locked.insert("password".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.private_key {
-                                        guacd_params_locked.insert("privatekey".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.private_key_passphrase {
-                                        guacd_params_locked
-                                            .insert("privatekeypassphrase".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.passphrase {
-                                        guacd_params_locked.insert("passphrase".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.domain {
-                                        guacd_params_locked.insert("domain".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.connect_database {
-                                        guacd_params_locked
-                                            .insert("connectdatabase".to_string(), val);
-                                    }
-                                    if let Some(val) = user_details.distinguished_name {
-                                        guacd_params_locked
-                                            .insert("distinguishedname".to_string(), val);
+                                        if let Some(val) = user_details.username {
+                                            guacd_params_locked.insert("username".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.password {
+                                            guacd_params_locked.insert("password".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.private_key {
+                                            guacd_params_locked
+                                                .insert("privatekey".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.private_key_passphrase {
+                                            guacd_params_locked
+                                                .insert("privatekeypassphrase".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.passphrase {
+                                            guacd_params_locked
+                                                .insert("passphrase".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.domain {
+                                            guacd_params_locked.insert("domain".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.connect_database {
+                                            guacd_params_locked
+                                                .insert("connectdatabase".to_string(), val);
+                                        }
+                                        if let Some(val) = user_details.distinguished_name {
+                                            guacd_params_locked
+                                                .insert("distinguishedname".to_string(), val);
+                                        }
                                     }
                                 }
+                                if self.connect_as_settings.allow_supply_host {
+                                    if let Some(host) = decrypted_payload.host {
+                                        debug!(
+                                            "Channel({}): ConnectAs supplied host: {}",
+                                            self.channel_id, host
+                                        );
+                                        effective_guacd_host = Some(host);
+                                    }
+                                    if let Some(port) = decrypted_payload.port {
+                                        debug!(
+                                            "Channel({}): ConnectAs supplied port: {}",
+                                            self.channel_id, port
+                                        );
+                                        effective_guacd_port = Some(port);
+                                    }
+                                }
+                                // Guacd params are updated, effective_guacd_host/port is set.
                             }
-                            if self.connect_as_settings.allow_supply_host {
-                                if let Some(host) = decrypted_payload.host {
-                                    debug!(
-                                        "Channel({}): ConnectAs supplied host: {}",
-                                        self.channel_id, host
-                                    );
-                                    effective_guacd_host = Some(host);
-                                }
-                                if let Some(port) = decrypted_payload.port {
-                                    debug!(
-                                        "Channel({}): ConnectAs supplied port: {}",
-                                        self.channel_id, port
-                                    );
-                                    effective_guacd_port = Some(port);
-                                }
+                            Err(e) => {
+                                error!("Channel({}): Failed to decrypt or parse ConnectAs payload for target_conn_no {}: {}", self.channel_id, target_connection_no, e);
+                                self.buffer_pool.release(crypto_buffer);
+                                // Unlike original connections.rs, we might not want to immediately return Err here.
+                                // Consider if connection should proceed with default Guacd params if ConnectAs fails.
+                                // For now, maintaining strict behavior: if ConnectAs is attempted and fails, the connection attempt fails.
+                                return Err(anyhow!("ConnectAs decryption/parsing failed: {}", e));
                             }
-                            // Guacd params are updated, effective_guacd_host/port is set.
                         }
-                        Err(e) => {
-                            error!("Channel({}): Failed to decrypt or parse ConnectAs payload for target_conn_no {}: {}", self.channel_id, target_connection_no, e);
-                            self.buffer_pool.release(crypto_buffer);
-                            // Unlike original connections.rs, we might not want to immediately return Err here.
-                            // Consider if connection should proceed with default Guacd params if ConnectAs fails.
-                            // For now, maintaining strict behavior: if ConnectAs is attempted and fails, the connection attempt fails.
-                            return Err(anyhow!("ConnectAs decryption/parsing failed: {}", e));
-                        }
-                    }
-                    self.buffer_pool.release(crypto_buffer);
-                } else {
-                    warn!("Channel({}): ConnectAs payload too short for PK, Nonce, and encrypted data (expected {}, got {}) for target_conn_no {}",
+                        self.buffer_pool.release(crypto_buffer);
+                    } else {
+                        warn!("Channel({}): ConnectAs payload too short for PK, Nonce, and encrypted data (expected {}, got {}) for target_conn_no {}",
                           self.channel_id, required_crypto_block_len, cursor.remaining(), target_connection_no);
-                    return Err(anyhow!(
-                        "ConnectAs payload too short for PK, Nonce, and encrypted data"
-                    ));
-                }
-            } else {
-                warn!("Channel({}): ConnectAs payload too short for connect_as_payload_len field (expected {} bytes, got {}) for target_conn_no {}",
+                        return Err(anyhow!(
+                            "ConnectAs payload too short for PK, Nonce, and encrypted data"
+                        ));
+                    }
+                } else {
+                    warn!("Channel({}): ConnectAs payload too short for connect_as_payload_len field (expected {} bytes, got {}) for target_conn_no {}",
                       self.channel_id, CONNECT_AS_DETAILS_LEN_FIELD_BYTES, cursor.remaining(), target_connection_no);
-                // If ConnectAs was expected but the payload is too short even for its length, it's an error.
-                // If ConnectAs was optional and this path is reached, it implies no ConnectAs data was provided.
-                // The original connections.rs returned Err. Here, we might just log and proceed if ConnectAs is not mandatory.
-                // For now, assuming if ConnectAs is configured, its presence is expected if data follows conn_no.
-                // However, the cursor.remaining() might be 0 if only conn_no was sent.
-                // This needs careful consideration of whether ConnectAs data is mandatory or optional if settings allow it.
-                // The original logic in connections.rs would bail out. Let's stick to that for now if ConnectAs settings are enabled.
-                if cursor.remaining() > 0 {
-                    // If there was some data beyond conn_no but not enough for ConnectAs header
-                    return Err(anyhow!(
-                        "ConnectAs payload present but too short for its own length field"
-                    ));
+                    // If ConnectAs was expected but the payload is too short even for its length, it's an error.
+                    // If ConnectAs was optional and this path is reached, it implies no ConnectAs data was provided.
+                    // The original connections.rs returned Err. Here, we might just log and proceed if ConnectAs is not mandatory.
+                    // For now, assuming if ConnectAs is configured, its presence is expected if data follows conn_no.
+                    // However, the cursor.remaining() might be 0 if only conn_no was sent.
+                    // This needs careful consideration of whether ConnectAs data is mandatory or optional if settings allow it.
+                    // The original logic in connections.rs would bail out. Let's stick to that for now if ConnectAs settings are enabled.
+                    if cursor.remaining() > 0 {
+                        // If there was some data beyond conn_no but not enough for ConnectAs header
+                        return Err(anyhow!(
+                            "ConnectAs payload present but too short for its own length field"
+                        ));
+                    }
+                    // If cursor.remaining() is 0, it means no ConnectAs payload was sent, proceed without it.
+                    debug!("Channel({}): No additional payload for ConnectAs provided after target_conn_no {}.", self.channel_id, target_connection_no);
                 }
-                // If cursor.remaining() is 0, it means no ConnectAs payload was sent, proceed without it.
-                debug!("Channel({}): No additional payload for ConnectAs provided after target_conn_no {}.", self.channel_id, target_connection_no);
             }
         }
         // --- End of ConnectAs Logic ---
@@ -753,6 +752,50 @@ impl Channel {
 
                 // Return Ok - no TCP backend needed for PythonHandler
                 Ok(())
+            }
+            super::types::ActiveProtocol::DatabaseProxy => {
+                // Database proxy mode: route to proxy host/port instead of guacd
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!(
+                        "Channel({}): DatabaseProxy OpenConnection requested, proxy_host={:?}, proxy_port={:?}",
+                        self.channel_id, self.proxy_host, self.proxy_port
+                    );
+                }
+                if let (Some(host), Some(port)) = (self.proxy_host.as_deref(), self.proxy_port) {
+                    match tokio::net::lookup_host(format!("{host}:{port}")).await {
+                        Ok(mut addrs) => {
+                            if let Some(socket_addr) = addrs.next() {
+                                if unlikely!(crate::logger::is_verbose_logging()) {
+                                    debug!("Channel({}): DatabaseProxy OpenConnection for target_conn_no {} to {}:{} (resolved to {}).",
+                                        self.channel_id, target_connection_no, host, port, socket_addr);
+                                }
+                                super::connections::open_backend(
+                                    self,
+                                    target_connection_no,
+                                    socket_addr,
+                                    super::types::ActiveProtocol::DatabaseProxy,
+                                )
+                                .await
+                            } else {
+                                Err(anyhow!(
+                                    "Could not resolve DatabaseProxy host {}:{} to any SocketAddr",
+                                    host,
+                                    port
+                                ))
+                            }
+                        }
+                        Err(e) => Err(anyhow!(
+                            "DNS lookup failed for DatabaseProxy host {}:{}: {}",
+                            host,
+                            port,
+                            e
+                        )),
+                    }
+                } else {
+                    Err(anyhow!(
+                        "DatabaseProxy host/port not configured for OpenConnection"
+                    ))
+                }
             }
         };
 

@@ -4,4 +4,5 @@ pub enum ActiveProtocol {
     Guacd,
     PortForward,
     PythonHandler,
+    DatabaseProxy,
 }

@@ -289,6 +289,11 @@ impl Tube {
                         is_closing_for_handler.store(true, std::sync::atomic::Ordering::Release);
                         debug!("Connection failed (tube_id: {}, state: {})", tube_id_log, state_str);
 
+                        // Send connection state changed signal to Python BEFORE closing
+                        // This allows Python to perform cleanup (e.g., release database proxy locks)
+                        debug!("Sending 'failed' signal to Python (tube_id: {})", tube_id_log);
+                        connection_for_signals.send_connection_state_changed("failed");
+
                         // Report connection failure for adaptive learning
                         let connection_error = crate::webrtc_errors::WebRTCError::IceConnectionFailed {
                             tube_id: tube_id_log.clone(),
@@ -371,6 +376,11 @@ impl Tube {
                     RTCPeerConnectionState::Disconnected => {
                         debug!("Connection disconnected (tube_id: {}, state: {})", tube_id_log, state_str);
 
+                        // Send connection state changed signal to Python BEFORE closing
+                        // This allows Python to perform cleanup (e.g., release database proxy locks)
+                        debug!("Sending 'disconnected' signal to Python (tube_id: {})", tube_id_log);
+                        connection_for_signals.send_connection_state_changed("disconnected");
+
                         // Tube lifecycle management
                         let current_status = *status_clone.read().await;
                         if current_status != TubeStatus::Closing &&
@@ -413,9 +423,11 @@ impl Tube {
         // Set up ICE connection state monitoring with TURN detection
         let tube_id_for_ice = self.id.clone();
         let pc_for_analysis = Arc::clone(&connection_arc.peer_connection);
+        let connection_arc_for_ice_signals = Arc::clone(&connection_arc); // Clone for ICE state signaling
         connection_arc.peer_connection.on_ice_connection_state_change(Box::new(move |state| {
             let tube_id_for_ice_log = tube_id_for_ice.clone();
             let pc_for_candidate_analysis = Arc::clone(&pc_for_analysis);
+            let connection_for_ice_signals = Arc::clone(&connection_arc_for_ice_signals);
 
             Box::pin(async move {
                 debug!("ICE connection state changed (tube_id: {}, state: {:?})", tube_id_for_ice_log, state);
@@ -481,9 +493,15 @@ impl Tube {
                     },
                     webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Failed => {
                         warn!("ICE connection failed (tube_id: {})", tube_id_for_ice_log);
+                        // Signal Python to release database proxy locks - ICE failures may not trigger
+                        // peer connection state changes, so we need to signal here
+                        connection_for_ice_signals.send_connection_state_changed("failed");
                     },
                     webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Disconnected => {
                         info!("ICE connection disconnected (tube_id: {})", tube_id_for_ice_log);
+                        // Signal Python to release database proxy locks - ICE disconnects may not trigger
+                        // peer connection state changes, so we need to signal here
+                        connection_for_ice_signals.send_connection_state_changed("disconnected");
                     },
                     _ => {}
                 }

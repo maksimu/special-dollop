@@ -208,7 +208,9 @@ impl Channel {
                                     }
                                 });
                             }
-                            ActiveProtocol::PortForward | ActiveProtocol::Guacd => {
+                            ActiveProtocol::PortForward
+                            | ActiveProtocol::Guacd
+                            | ActiveProtocol::DatabaseProxy => {
                                 let conn_tx_clone = connection_tx.clone();
                                 let webrtc_clone = webrtc.clone();
                                 let buffer_pool_clone = buffer_pool.clone();

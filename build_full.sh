@@ -12,14 +12,7 @@ echo "COMPREHENSIVE BUILD AND TEST PIPELINE"
 echo "========================================"
 echo ""
 
-# Parse command line arguments
-HANDLERS_FLAG=""
-if [ "$1" = "--handlers" ]; then
-    HANDLERS_FLAG="--handlers"
-    echo "Building with protocol handlers enabled (SSH, Telnet, VNC, etc)..."
-else
-    echo "Building without handlers (default)..."
-fi
+echo "Building with protocol handlers (SSH, Telnet, VNC, RDP, etc) - always included"
 echo ""
 
 # ============================================================================
@@ -71,11 +64,7 @@ cargo clean
 rm -rf target/wheels && mkdir -p target/wheels
 
 echo "Building macOS wheel..."
-if [ -n "$HANDLERS_FLAG" ]; then
-    maturin build --release --features handlers
-else
-    maturin build --release
-fi
+maturin build --release
 
 # Find the newly built wheel
 WHEEL=$(find target/wheels -name "*.whl" | head -1)
@@ -110,12 +99,7 @@ if [ ! -f "build_linux-amd-wheel.sh" ]; then
     exit 1
 fi
 
-# Pass the handlers flag through to the Linux build script
-if [ -n "$HANDLERS_FLAG" ]; then
-    ./build_linux-amd-wheel.sh --handlers
-else
-    ./build_linux-amd-wheel.sh
-fi
+./build_linux-amd-wheel.sh
 echo "✓ Linux AMD64 wheel build completed"
 echo ""
 

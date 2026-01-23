@@ -167,14 +167,12 @@ pub struct Channel {
     pub(crate) db_params: Arc<AsyncMutex<HashMap<String, String>>>,
 
     // Protocol handler registry and conversation type (for built-in handlers)
-    #[cfg(feature = "handlers")]
-    pub(crate) handler_registry: Option<std::sync::Arc<guacr::ProtocolHandlerRegistry>>,
+    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
     #[allow(dead_code)]
     pub(crate) conversation_type: Option<ConversationType>,
 
     // Handler senders for forwarding inbound messages to protocol handlers
-    #[cfg(feature = "handlers")]
-    pub(crate) handler_senders: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    pub(crate) handler_senders: Arc<DashMap<u32, mpsc::Sender<Bytes>>>,
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
@@ -196,7 +194,7 @@ pub struct Channel {
     // Client version for router communication
     pub(crate) client_version: String,
     /// Capabilities enabled for this channel
-    pub(crate) capabilities: crate::tube_protocol::Capabilities,
+    pub(crate) capabilities: Capabilities,
     /// Multi-channel assembler (created when FRAGMENTATION capability is enabled)
     #[allow(dead_code)] // Used at runtime when FRAGMENTATION enabled
     pub(crate) assembler: Option<super::assembler::Assembler>,
@@ -205,6 +203,10 @@ pub struct Channel {
     pub(crate) pending_fragments: DashMap<u32, FragmentBuffer>,
     // Python handler channel for PythonHandler protocol mode
     pub(crate) python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
+
+    // Task completion tracking (passed from Tube for handler task monitoring)
+    // Handler tasks signal completion via this channel to ensure proper cleanup
+    pub(crate) spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 // NOTE: Channel is intentionally NOT Clone because it contains a single-consumer receiver
@@ -223,12 +225,12 @@ pub struct ChannelParams {
     pub ksm_config: Option<String>,
     pub client_version: String,
     /// Capabilities enabled for this channel (e.g., FRAGMENTATION for multi-channel)
-    pub capabilities: crate::tube_protocol::Capabilities,
+    pub capabilities: Capabilities,
     /// Optional Python handler channel for PythonHandler protocol mode
     pub python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
-    // Protocol handler registry (optional)
-    #[cfg(feature = "handlers")]
-    pub handler_registry: Option<std::sync::Arc<guacr::ProtocolHandlerRegistry>>,
+    pub handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    /// Task completion tracking from Tube (for handler task monitoring)
+    pub spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl Channel {
@@ -246,8 +248,8 @@ impl Channel {
             client_version,
             capabilities,
             python_handler_tx,
-            #[cfg(feature = "handlers")]
             handler_registry,
+            spawned_task_completion_tx,
         } = params;
         debug!("Channel::new called (channel_id: {})", channel_id);
         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -687,11 +689,9 @@ impl Channel {
             proxy_port: proxy_port_setting,
             db_params: Arc::new(AsyncMutex::new(temp_db_params_map)),
 
-            #[cfg(feature = "handlers")]
             handler_registry,
             conversation_type: stored_conversation_type,
 
-            #[cfg(feature = "handlers")]
             handler_senders: Arc::new(DashMap::new()),
 
             buffer_pool,
@@ -707,6 +707,7 @@ impl Channel {
             assembler: None, // Will be created below if FRAGMENTATION enabled
             pending_fragments: DashMap::new(),
             python_handler_tx,
+            spawned_task_completion_tx,
         };
 
         debug!(
@@ -1055,7 +1056,6 @@ impl Channel {
         // CRITICAL: Clean up handler-based connections first
         // Handler-based connections (guacr) don't create Conn entries in the DashMap,
         // they only exist in handler_senders. Dropping their senders signals them to exit.
-        #[cfg(feature = "handlers")]
         {
             let handler_conn_nos: Vec<u32> = self
                 .handler_senders
@@ -1679,7 +1679,6 @@ impl Channel {
         // Dropping the sender causes from_client.recv() to return None in the handler,
         // allowing it to exit gracefully. Without this, handlers block forever waiting
         // for messages that will never come after WebRTC closes.
-        #[cfg(feature = "handlers")]
         {
             if self.handler_senders.remove(&conn_no).is_some() {
                 debug!(

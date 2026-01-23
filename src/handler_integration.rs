@@ -3,13 +3,12 @@
 // This module provides the glue between keeper-webrtc Channel and guacr protocol handlers,
 // allowing direct handler invocation instead of connecting to external guacd server.
 
-#[cfg(feature = "handlers")]
 use guacr::{handle_guacd_with_handlers, ProtocolHandlerRegistry};
 
 use crate::models::ConversationType;
 use anyhow::Result;
 use bytes::Bytes;
-use log::{debug, info};
+use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -17,7 +16,6 @@ use tokio::sync::mpsc;
 /// Initialize the global protocol handler registry
 ///
 /// This should be called once at application startup to register all available handlers.
-#[cfg(feature = "handlers")]
 pub fn create_handler_registry() -> Arc<ProtocolHandlerRegistry> {
     let registry = Arc::new(ProtocolHandlerRegistry::new());
 
@@ -38,11 +36,8 @@ pub fn create_handler_registry() -> Arc<ProtocolHandlerRegistry> {
     // Requires Chrome/Chromium to be installed at runtime
     registry.register(guacr::rbi::RbiHandler::with_defaults());
 
-    info!(
-        "Protocol handler registry initialized with {} handlers",
-        registry.count()
-    );
-    debug!("Registered handlers: {:?}", registry.list());
+    // Handler registry initialized silently - handlers remain dormant until use_guacr=true
+    // Logs will only appear when handlers are actually invoked
 
     registry
 }
@@ -59,7 +54,6 @@ pub fn create_handler_registry() -> Arc<ProtocolHandlerRegistry> {
 /// * `registry` - The protocol handler registry
 /// * `to_webrtc` - Channel to send messages to WebRTC client
 /// * `from_webrtc` - Channel to receive messages from WebRTC client
-#[cfg(feature = "handlers")]
 pub async fn invoke_handler(
     conversation_type: &ConversationType,
     params: HashMap<String, String>,
@@ -78,16 +72,10 @@ pub async fn invoke_handler(
     Ok(())
 }
 
-#[cfg(not(feature = "handlers"))]
-pub fn create_handler_registry() -> Option<()> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "handlers")]
     #[test]
     fn test_create_handler_registry() {
         let registry = create_handler_registry();

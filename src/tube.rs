@@ -65,7 +65,6 @@ pub struct Tube {
     pub(crate) client_version: Arc<TokioRwLock<Option<String>>>,
 
     // Protocol handler registry (for built-in guacr handlers)
-    #[cfg(feature = "handlers")]
     pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
 
     // ============================================================================
@@ -132,7 +131,7 @@ impl Tube {
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         custom_tube_id: Option<String>,
         capabilities: crate::tube_protocol::Capabilities,
-        #[cfg(feature = "handlers")] handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
     ) -> Result<Arc<Self>> {
         let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();
@@ -158,7 +157,6 @@ impl Tube {
             runtime,
             original_conversation_id: original_conversation_id.clone(),
             client_version: Arc::new(TokioRwLock::new(None)),
-            #[cfg(feature = "handlers")]
             handler_registry,
 
             // RAII resources (owned by Tube):
@@ -701,8 +699,8 @@ impl Tube {
                     client_version,
                     tube.capabilities, // Pass tube's capabilities to channel
                     python_handler_tx, // For PythonHandler protocol mode
-                    #[cfg(feature = "handlers")]
                     tube.handler_registry.clone(),
+                    Arc::clone(&tube.spawned_task_completion_tx), // For handler task tracking
                 ).await;
 
                 let mut owned_channel = match channel_result {
@@ -1325,8 +1323,8 @@ impl Tube {
             client_version,
             self.capabilities, // Pass tube's capabilities to channel
             python_handler_tx,
-            #[cfg(feature = "handlers")]
             self.handler_registry.clone(),
+            Arc::clone(&self.spawned_task_completion_tx), // For handler task tracking
         )
         .await;
 

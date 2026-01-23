@@ -7,7 +7,6 @@ mod connect_as;
 pub(crate) mod connections;
 pub(crate) mod core;
 pub(crate) mod frame_handling; // Logic to be merged into core.rs
-#[cfg(feature = "handlers")]
 pub(crate) mod handler_connections;
 mod server;
 pub mod types; // Added new types module

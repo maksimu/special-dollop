@@ -88,6 +88,8 @@ async fn test_server_mode_data_flow() -> Result<()> {
     let mut settings = HashMap::new();
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
+    let (spawned_task_completion_tx, _spawned_task_completion_rx) =
+        tokio::sync::mpsc::unbounded_channel();
     let mut channel = Channel::new(crate::channel::core::ChannelParams {
         webrtc: webrtc.clone(),
         rx_from_dc,
@@ -101,8 +103,8 @@ async fn test_server_mode_data_flow() -> Result<()> {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
-        #[cfg(feature = "handlers")]
         handler_registry: None,
+        spawned_task_completion_tx: Arc::new(spawned_task_completion_tx),
     })
     .await?;
 
@@ -278,6 +280,8 @@ async fn test_client_mode_data_flow() -> Result<()> {
     );
     settings.insert("conversationType".to_string(), serde_json::json!("tunnel"));
 
+    let (spawned_task_completion_tx, _spawned_task_completion_rx) =
+        tokio::sync::mpsc::unbounded_channel();
     let channel = Channel::new(crate::channel::core::ChannelParams {
         webrtc: webrtc.clone(),
         rx_from_dc,
@@ -291,8 +295,8 @@ async fn test_client_mode_data_flow() -> Result<()> {
         client_version: "ms16.5.0".to_string(),
         capabilities: crate::tube_protocol::Capabilities::NONE,
         python_handler_tx: None,
-        #[cfg(feature = "handlers")]
         handler_registry: None,
+        spawned_task_completion_tx: Arc::new(spawned_task_completion_tx),
     })
     .await?;
 

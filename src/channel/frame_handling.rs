@@ -185,7 +185,6 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
     let payload_len = payload.len(); // Store length before moving
 
     // **HANDLER PATH**: Check if this connection is managed by a built-in protocol handler
-    #[cfg(feature = "handlers")]
     {
         // DashMap provides lock-free concurrent access
         if let Some(sender_ref) = channel.handler_senders.get(&conn_no) {
@@ -201,8 +200,8 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
                 );
             }
 
-            match sender.send(payload).await {
-                Ok(_) => return Ok(()),
+            return match sender.send(payload).await {
+                Ok(_) => Ok(()),
                 Err(e) => {
                     error!(
                         "Failed to forward frame to handler, removing sender (channel_id: {}, conn_no: {}, error: {})",
@@ -210,9 +209,9 @@ async fn forward_to_protocol(channel: &mut Channel, conn_no: u32, payload: Bytes
                     );
                     // Remove dead sender
                     channel.handler_senders.remove(&conn_no);
-                    return Err(anyhow!("Handler channel closed for connection {}", conn_no));
+                    Err(anyhow!("Handler channel closed for connection {}", conn_no))
                 }
-            }
+            };
         }
     }
 

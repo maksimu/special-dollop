@@ -3,6 +3,7 @@ use crate::unlikely;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
 use log::{debug, error, info, warn};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::core::Channel;
@@ -346,7 +347,8 @@ impl Channel {
             && (self.connect_as_settings.allow_supply_user
                 || self.connect_as_settings.allow_supply_host)
         {
-            if let Some(ref gateway_private_key_pem) = self.connect_as_settings.gateway_private_key
+            if let Some(gateway_private_key_pem) =
+                self.connect_as_settings.gateway_private_key.as_ref()
             {
                 debug!(
                     "Channel({}): Attempting ConnectAs for Guacd target_conn_no {}",
@@ -468,14 +470,14 @@ impl Channel {
                         self.buffer_pool.release(crypto_buffer);
                     } else {
                         warn!("Channel({}): ConnectAs payload too short for PK, Nonce, and encrypted data (expected {}, got {}) for target_conn_no {}",
-                          self.channel_id, required_crypto_block_len, cursor.remaining(), target_connection_no);
+                              self.channel_id, required_crypto_block_len, cursor.remaining(), target_connection_no);
                         return Err(anyhow!(
                             "ConnectAs payload too short for PK, Nonce, and encrypted data"
                         ));
                     }
                 } else {
                     warn!("Channel({}): ConnectAs payload too short for connect_as_payload_len field (expected {} bytes, got {}) for target_conn_no {}",
-                      self.channel_id, CONNECT_AS_DETAILS_LEN_FIELD_BYTES, cursor.remaining(), target_connection_no);
+                          self.channel_id, CONNECT_AS_DETAILS_LEN_FIELD_BYTES, cursor.remaining(), target_connection_no);
                     // If ConnectAs was expected but the payload is too short even for its length, it's an error.
                     // If ConnectAs was optional and this path is reached, it implies no ConnectAs data was provided.
                     // The original connections.rs returned Err. Here, we might just log and proceed if ConnectAs is not mandatory.
@@ -589,7 +591,6 @@ impl Channel {
         let open_result = match self.active_protocol {
             super::types::ActiveProtocol::Guacd => {
                 // Check if we should use built-in handlers based on use_guacr parameter
-                #[cfg(feature = "handlers")]
                 {
                     // Read use_guacr parameter from guacd_params
                     let guacd_params = self.guacd_params.lock().await;
@@ -599,23 +600,12 @@ impl Channel {
                         .unwrap_or(false);
                     drop(guacd_params); // Release lock
 
-                    error!(
-                        "DEBUG_HANDLER: use_guacr={}, registry={}, conv_type={:?}",
-                        use_guacr,
-                        self.handler_registry.is_some(),
-                        self.conversation_type
-                    );
-
                     // Only use built-in handlers if use_guacr=true
                     if use_guacr {
                         if let (Some(registry), Some(conv_type)) =
                             (&self.handler_registry, &self.conversation_type)
                         {
                             // Use built-in protocol handlers instead of external guacd
-                            error!(
-                                "DEBUG_HANDLER: INVOKING built-in handler for protocol: {:?}",
-                                conv_type
-                            );
 
                             // Spawn handler and return result - will fall through to send ConnectionOpened
                             return match super::handler_connections::invoke_builtin_handler(
@@ -623,6 +613,7 @@ impl Channel {
                                 conv_type,
                                 registry,
                                 target_connection_no,
+                                Arc::clone(&self.spawned_task_completion_tx),
                             )
                             .await
                             {
@@ -660,11 +651,6 @@ impl Channel {
                             };
                         }
                     }
-                }
-
-                #[cfg(not(feature = "handlers"))]
-                {
-                    error!("DEBUG_HANDLER: Handlers feature NOT compiled in!");
                 }
 
                 // Original: Connect to external guacd server

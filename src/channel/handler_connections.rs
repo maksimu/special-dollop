@@ -4,12 +4,12 @@
 // the EventCallback pattern. Falls back to channel-based interface for backwards
 // compatibility if handlers don't support EventBasedHandler trait yet.
 
-#[cfg(feature = "handlers")]
 use guacr::{async_trait, EventCallback, HandlerError, HandlerEvent, ProtocolHandlerRegistry};
 
 use crate::channel::core::Channel;
 use crate::models::ConversationType;
 use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame};
+use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::WebRTCDataChannel;
 use anyhow::{anyhow, Result};
 use bytes::{BufMut, Bytes};
@@ -32,7 +32,6 @@ fn now_ms() -> u64 {
 /// additional processing.
 ///
 /// Zero-copy event callback for built-in protocol handlers
-#[cfg(feature = "handlers")]
 struct WebRtcEventCallback {
     /// WebRTC data channel for sending instructions
     webrtc: WebRTCDataChannel,
@@ -50,7 +49,6 @@ struct WebRtcEventCallback {
     send_queue_tx: mpsc::Sender<Bytes>,
 }
 
-#[cfg(feature = "handlers")]
 #[async_trait]
 impl EventCallback for WebRtcEventCallback {
     /// Handle critical events from protocol handler
@@ -267,12 +265,12 @@ impl EventCallback for WebRtcEventCallback {
 /// - All tasks are spawned with proper cleanup
 /// - handler_senders are removed on completion
 /// - No resource leaks (compiler enforced)
-#[cfg(feature = "handlers")]
 pub async fn invoke_builtin_handler(
     channel: &Channel,
     conversation_type: &ConversationType,
     registry: &Arc<ProtocolHandlerRegistry>,
     conn_no: u32,
+    spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> Result<()> {
     let protocol_name = conversation_type.to_string();
 
@@ -321,7 +319,7 @@ pub async fn invoke_builtin_handler(
         let channel_id_for_sender = channel.channel_id.clone();
         let conn_no_for_sender = conn_no;
 
-        tokio::spawn(async move {
+        let sender_handle = tokio::spawn(async move {
             debug!(
                 "Dedicated sender task started (channel: {}, conn: {})",
                 channel_id_for_sender, conn_no_for_sender
@@ -355,6 +353,22 @@ pub async fn invoke_builtin_handler(
             );
         });
 
+        // Spawn monitor task to track sender task completion
+        let sender_completion_tx = Arc::clone(&spawned_task_completion_tx);
+        tokio::spawn(async move {
+            match sender_handle.await {
+                Ok(()) => {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("Handler sender task completed normally");
+                    }
+                }
+                Err(e) => {
+                    error!("Handler sender task panicked or was cancelled: {}", e);
+                }
+            }
+            let _ = sender_completion_tx.send(());
+        });
+
         // Create event callback for zero-copy integration
         let callback = Arc::new(WebRtcEventCallback {
             webrtc: channel.webrtc.clone(),
@@ -378,7 +392,7 @@ pub async fn invoke_builtin_handler(
         let handler_senders = channel.handler_senders.clone();
         let conn_closed_tx_clone = channel.conn_closed_tx.clone();
         let channel_id_clone = channel.channel_id.clone();
-        tokio::spawn(async move {
+        let handler_handle = tokio::spawn(async move {
             debug!(
                 "Event-based handler task started for protocol: {}",
                 protocol_for_task
@@ -413,6 +427,22 @@ pub async fn invoke_builtin_handler(
                 "Event-based handler session ended for protocol: {}",
                 protocol_for_task
             );
+        });
+
+        // Spawn monitor task to track event-based handler task completion
+        let handler_completion_tx = Arc::clone(&spawned_task_completion_tx);
+        tokio::spawn(async move {
+            match handler_handle.await {
+                Ok(()) => {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!("Event-based handler task completed normally");
+                    }
+                }
+                Err(e) => {
+                    error!("Event-based handler task panicked or was cancelled: {}", e);
+                }
+            }
+            let _ = handler_completion_tx.send(());
         });
 
         return Ok(());
@@ -544,7 +574,7 @@ pub async fn invoke_builtin_handler(
     // Spawn cleanup task that waits for handler completion (RAII)
     let protocol_for_cleanup = protocol_name.clone();
     let handler_senders = channel.handler_senders.clone();
-    tokio::spawn(async move {
+    let cleanup_handle = tokio::spawn(async move {
         // Wait for handler to complete
         let _ = handler_task.await;
         let _ = outbound_task.await;
@@ -558,19 +588,30 @@ pub async fn invoke_builtin_handler(
         );
     });
 
+    // Spawn monitor task to track channel-based handler cleanup task completion
+    // This ensures both handler_task and outbound_task are tracked
+    let cleanup_completion_tx = Arc::clone(&spawned_task_completion_tx);
+    tokio::spawn(async move {
+        match cleanup_handle.await {
+            Ok(()) => {
+                if unlikely!(crate::logger::is_verbose_logging()) {
+                    debug!("Channel-based handler cleanup task completed normally");
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Channel-based handler cleanup task panicked or was cancelled: {}",
+                    e
+                );
+            }
+        }
+        let _ = cleanup_completion_tx.send(());
+    });
+
     // Return immediately to allow ConnectionOpened to be sent
     debug!(
         "Handler spawned successfully for protocol: {}, conn_no: {}",
         protocol_name, conn_no
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_module_compiles() {
-        // Verify this module compiles with handlers feature
-        const _: () = assert!(cfg!(feature = "handlers"));
-    }
 }

@@ -124,7 +124,6 @@ struct RegistryActor {
     stale_tubes_removed: Arc<AtomicUsize>,
     close_timeouts: Arc<AtomicUsize>,
     /// Protocol handler registry (for built-in guacr handlers)
-    #[cfg(feature = "handlers")]
     handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
 }
 
@@ -344,7 +343,7 @@ impl RegistryActor {
     fn new(
         command_rx: mpsc::UnboundedReceiver<RegistryCommand>,
         max_concurrent: usize,
-        #[cfg(feature = "handlers")] handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
     ) -> Self {
         Self {
             tubes: Arc::new(DashMap::new()),
@@ -358,7 +357,6 @@ impl RegistryActor {
             create_times: Vec::with_capacity(100),
             stale_tubes_removed: Arc::new(AtomicUsize::new(0)),
             close_timeouts: Arc::new(AtomicUsize::new(0)),
-            #[cfg(feature = "handlers")]
             handler_registry,
         }
     }
@@ -627,7 +625,6 @@ impl RegistryActor {
             Some(req.signal_sender.clone()),
             tube_id_opt,
             req.capabilities,
-            #[cfg(feature = "handlers")]
             self.handler_registry.clone(),
         )?;
         let tube_id = tube_arc.id();
@@ -976,7 +973,6 @@ pub struct RegistryHandle {
     /// Direct access to conversations
     conversations: Arc<DashMap<String, String>>,
     /// Protocol handler registry (for built-in guacr handlers)
-    #[cfg(feature = "handlers")]
     #[allow(dead_code)] // Used by Tube through RegistryActor
     pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
 }
@@ -986,13 +982,12 @@ impl RegistryHandle {
         command_tx: mpsc::UnboundedSender<RegistryCommand>,
         tubes: Arc<DashMap<String, Arc<Tube>>>,
         conversations: Arc<DashMap<String, String>>,
-        #[cfg(feature = "handlers")] handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
     ) -> Self {
         Self {
             command_tx,
             tubes,
             conversations,
-            #[cfg(feature = "handlers")]
             handler_registry,
         }
     }
@@ -1249,19 +1244,10 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
         max_concurrent
     );
 
-    // Initialize protocol handler registry (if handlers feature enabled)
-    #[cfg(feature = "handlers")]
-    let handler_registry = {
-        info!("Initializing protocol handler registry with built-in SSH and Telnet handlers");
-        Some(crate::handler_integration::create_handler_registry())
-    };
+    // Initialize protocol handler registry (handlers remain dormant until use_guacr=true)
+    let handler_registry = Some(crate::handler_integration::create_handler_registry());
 
-    let actor = RegistryActor::new(
-        command_rx,
-        max_concurrent,
-        #[cfg(feature = "handlers")]
-        handler_registry.clone(),
-    );
+    let actor = RegistryActor::new(command_rx, max_concurrent, handler_registry.clone());
     let tubes = Arc::clone(&actor.tubes);
     let conversations = Arc::clone(&actor.conversations);
 
@@ -1277,11 +1263,5 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
         });
     });
 
-    RegistryHandle::new(
-        command_tx,
-        tubes,
-        conversations,
-        #[cfg(feature = "handlers")]
-        handler_registry,
-    )
+    RegistryHandle::new(command_tx, tubes, conversations, handler_registry)
 });

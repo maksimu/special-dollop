@@ -739,7 +739,8 @@ impl GuacdParser {
         pos += length_end + 1; // Skip past length and '.'
 
         // Hot path optimization: Check for special ASCII opcodes first (no UTF-8 validation needed)
-        let action = if opcode_len > 0 && opcode_len <= 10 && pos + opcode_len <= buffer_slice.len() {
+        let action = if opcode_len > 0 && opcode_len <= 10 && pos + opcode_len <= buffer_slice.len()
+        {
             // Fast path: Direct byte comparison for ASCII opcodes (zero-copy, zero validation)
             let opcode_bytes = &buffer_slice[pos..pos + opcode_len];
             match opcode_bytes {
@@ -756,7 +757,9 @@ impl GuacdParser {
         // Skip opcode bytes without validation (hot path - no UTF-8 checks)
         let opcode_byte_len = if opcode_len == 0 {
             0
-        } else if pos + opcode_len <= buffer_slice.len() && buffer_slice[pos..pos + opcode_len].is_ascii() {
+        } else if pos + opcode_len <= buffer_slice.len()
+            && buffer_slice[pos..pos + opcode_len].is_ascii()
+        {
             // ASCII fast path: char_count == byte_count
             opcode_len
         } else {
@@ -788,7 +791,9 @@ impl GuacdParser {
             pos += arg_len_end + 1; // Skip past length and '.'
 
             // Hot path: Skip argument bytes without UTF-8 validation
-            let arg_byte_len = if pos + arg_len <= buffer_slice.len() && buffer_slice[pos..pos + arg_len].is_ascii() {
+            let arg_byte_len = if pos + arg_len <= buffer_slice.len()
+                && buffer_slice[pos..pos + arg_len].is_ascii()
+            {
                 // ASCII fast path: char_count == byte_count (90%+ of arguments)
                 arg_len
             } else {

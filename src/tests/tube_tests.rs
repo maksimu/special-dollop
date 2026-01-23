@@ -34,7 +34,6 @@ fn test_tube_creation() {
             None,
             None,
             crate::tube_protocol::Capabilities::NONE,
-            #[cfg(feature = "handlers")]
             None,
         )
         .expect("Failed to create tube");
@@ -142,7 +141,7 @@ fn test_tube_channel_creation() {
     println!("Starting test_tube_channel_creation");
     let runtime = get_runtime();
     runtime.block_on(async {
-        let tube = Tube::new(false, None, None, None, crate::tube_protocol::Capabilities::NONE, #[cfg(feature = "handlers")] None).expect("Failed to create tube");
+        let tube = Tube::new(false, None, None, None, crate::tube_protocol::Capabilities::NONE, None).expect("Failed to create tube");
         let tube_id = tube.id();
         let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
         let mut settings = HashMap::new();
@@ -211,7 +210,6 @@ async fn test_tube_create_with_pc() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )
     .expect("Failed to create tube");
@@ -244,7 +242,6 @@ async fn test_tube_webrtc_connection() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )
     .expect("Failed to create tube");
@@ -281,7 +278,6 @@ async fn test_tube_create_channel() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )
     .expect("Failed to create tube");
@@ -662,7 +658,6 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )?;
     let tube2 = Tube::new(
@@ -671,7 +666,6 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )?;
     println!(
@@ -965,7 +959,6 @@ async fn test_turn_allocation_cleanup_on_close() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )
     .expect("Failed to create tube");
@@ -1051,7 +1044,6 @@ async fn test_drop_without_close_warns() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
-        #[cfg(feature = "handlers")]
         None,
     )
     .expect("Failed to create tube");

@@ -191,7 +191,7 @@ pub fn initialize_logger(
                 if include_webrtc_logs_standalone {
                     EnvFilter::new("trace")
                 } else {
-                    EnvFilter::new("trace,webrtc=error,webrtc_ice=error,webrtc_mdns=error,webrtc_dtls=error,webrtc_sctp=error,turn=error,stun=error")
+                    EnvFilter::new("trace,webrtc=error,webrtc_ice=error,webrtc_mdns=error,webrtc_dtls=error,webrtc_sctp=error,turn=error,stun=error,ironrdp_session=debug,ironrdp_pdu=debug,ironrdp_graphics=debug")
                 }
             } else {
                 // Suppress webrtc dependency spam while allowing keeper_pam_webrtc_rs
@@ -204,7 +204,10 @@ pub fn initialize_logger(
                     webrtc_dtls=error,\
                     webrtc_sctp=error,\
                     turn=error,\
-                    stun=error"
+                    stun=error,\
+                    ironrdp_session=error,\
+                    ironrdp_pdu=error,\
+                    ironrdp_graphics=error"
                 );
                 EnvFilter::new(&filter_str)
             }

@@ -210,7 +210,7 @@ jobs:
             # Build the wheel
             cd /io
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
-          
+
             # Print information about built wheels
             echo 'Information about built wheels:'
             for wheel in \$(find /io/target -name \"*.whl\" -type f); do

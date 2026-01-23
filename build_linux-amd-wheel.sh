@@ -3,34 +3,39 @@ set -e
 
 # Build Linux AMD64 wheel via Docker with maturin
 #
+# This script ALWAYS builds with protocol handlers (SSH, Telnet, VNC, RDP, etc.)
+# Requirements:
+# - pam-guacr repo checked out at ../pam-guacr
+# - Cargo.toml must use path dependency for guacr
+#
 # This script handles:
 # - Mounting local pam-guacr to avoid GitHub auth issues in Docker
+# - Building FreeRDP 3.x from source for RDP support
 # - SSL certificates for VPN environments
 # - Cargo patch to redirect git dependency to local mount
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAM_GUACR_DIR="$SCRIPT_DIR/../pam-guacr"
 
-# Parse command line arguments for handler support
-HANDLERS_FLAG=""
-if [ "$1" = "--handlers" ]; then
-    HANDLERS_FLAG="--handlers"
-    # Check if pam-guacr exists when building with handlers
-    if [ ! -d "$PAM_GUACR_DIR" ]; then
-        echo "ERROR: pam-guacr not found at $PAM_GUACR_DIR"
-        echo "Clone it with: git clone git@github.com:Keeper-Security/pam-guacr.git ../pam-guacr"
-        exit 1
-    fi
-    
-    # Verify Cargo.toml is using local path
-    if ! grep -q 'guacr = { path = "../pam-guacr/crates/guacr"' "$SCRIPT_DIR/Cargo.toml"; then
-        echo "ERROR: Cargo.toml must use local path for guacr dependency"
-        echo "Please uncomment the local path line and comment out the git line in Cargo.toml"
-        exit 1
-    fi
-    
-    echo "Note: IronRDP will be fetched from GitHub (https://github.com/miroberts/IronRDP.git)"
+# Check if pam-guacr exists (REQUIRED for handler builds)
+if [ ! -d "$PAM_GUACR_DIR" ]; then
+    echo "ERROR: pam-guacr not found at $PAM_GUACR_DIR"
+    echo "Clone it with: git clone git@github.com:Keeper-Security/pam-guacr.git ../pam-guacr"
+    echo ""
+    echo "This build ALWAYS includes protocol handlers (RDP, SSH, VNC, Telnet, etc.)"
+    echo "The handlers feature can be controlled at runtime via KEEPER_GATEWAY_USE_GUACR flag."
+    exit 1
 fi
+
+# Verify Cargo.toml is using local path
+if ! grep -q 'guacr = { path = "../pam-guacr/crates/guacr"' "$SCRIPT_DIR/Cargo.toml"; then
+    echo "ERROR: Cargo.toml must use local path for guacr dependency"
+    echo "Please uncomment the local path line and comment out the git line in Cargo.toml"
+    exit 1
+fi
+
+echo "Building with protocol handlers (SSH, Telnet, VNC, RDP, etc.)..."
+echo "Note: IronRDP will be fetched from GitHub (https://github.com/miroberts/IronRDP.git)"
 
 # Optional: Check for combined_certs.pem (LOCAL DEVELOPMENT ONLY)
 # This is for developers behind corporate VPNs that intercept SSL.
@@ -44,17 +49,13 @@ if [ -f "$SCRIPT_DIR/combined_certs.pem" ]; then
     CERT_ENVS="-e REQUESTS_CA_BUNDLE=/tmp/combined_certs.pem -e SSL_CERT_FILE=/tmp/combined_certs.pem -e CURL_CA_BUNDLE=/tmp/combined_certs.pem -e GIT_SSL_CAINFO=/tmp/combined_certs.pem"
 fi
 
-if [ -n "$HANDLERS_FLAG" ]; then
-    echo "Building with protocol handlers (SSH, Telnet, etc)..."
-    
-    # For handlers, we need a shell to set up cargo config patches
-    # Use manylinux_2_28 (AlmaLinux 8) for better compatibility
-    docker run --rm --platform linux/amd64 \
-      -v "$SCRIPT_DIR":/io \
-      -v "$PAM_GUACR_DIR":/pam-guacr:ro \
-      $CERT_MOUNT \
-      $CERT_ENVS \
-      quay.io/pypa/manylinux_2_28_x86_64 bash -c '
+# Build with handlers using manylinux_2_28 (AlmaLinux 8) for better compatibility
+docker run --rm --platform linux/amd64 \
+  -v "$SCRIPT_DIR":/io \
+  -v "$PAM_GUACR_DIR":/pam-guacr:ro \
+  $CERT_MOUNT \
+  $CERT_ENVS \
+  quay.io/pypa/manylinux_2_28_x86_64 bash -c '
         set -e
         
         # Configure SSL certificates for all tools if available
@@ -330,18 +331,10 @@ if [ -n "$HANDLERS_FLAG" ]; then
         # Ensure PKG_CONFIG_PATH is set for cargo to find FreeRDP 3.x
         export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
         
-        cd /io && /opt/python/cp311-cp311/bin/maturin build --release --features handlers --manylinux 2_28
+        cd /io && /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
         
         echo "Build complete!"
         ls -la /io/target/wheels/
       '
-else
-    echo "Building without handlers (default)..."
-    docker run --rm --platform linux/amd64 \
-      -v "$SCRIPT_DIR":/io \
-      $CERT_MOUNT \
-      $CERT_ENVS \
-      ghcr.io/pyo3/maturin build --release --manylinux 2014
-fi
 
 echo "Build complete! Wheels are in target/wheels/"

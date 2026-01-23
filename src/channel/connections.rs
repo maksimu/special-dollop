@@ -322,7 +322,7 @@ pub async fn setup_outbound_task(
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
-                reusable_control_buf.put_u8(CloseConnectionReason::GuacdError as u8);
+                reusable_control_buf.put_u8(CloseConnectionReason::ProxyError as u8);
                 let error_bytes = error_str.as_bytes();
                 let error_len = error_bytes.len().min(1024) as u16;
                 reusable_control_buf.put_u16(error_len);
@@ -361,7 +361,7 @@ pub async fn setup_outbound_task(
                 let mut reusable_control_buf = buffer_pool.acquire();
                 reusable_control_buf.clear();
                 reusable_control_buf.extend_from_slice(&conn_no.to_be_bytes());
-                reusable_control_buf.put_u8(CloseConnectionReason::GuacdError as u8);
+                reusable_control_buf.put_u8(CloseConnectionReason::ProxyError as u8);
                 let error_bytes = error_str.as_bytes();
                 let error_len = error_bytes.len().min(1024) as u16;
                 reusable_control_buf.put_u16(error_len);
@@ -2383,8 +2383,9 @@ where
                 .cloned()
                 .unwrap_or_default(),
             "session_uid" => db_params_locked
-                .get("conversation_id")
-                .or_else(|| db_params_locked.get("session_uid"))
+                .get("session_uid")
+                .or_else(|| db_params_locked.get("sessionUid"))
+                .or_else(|| db_params_locked.get("conversation_id"))
                 .cloned()
                 .unwrap_or_default(),
             _ => {

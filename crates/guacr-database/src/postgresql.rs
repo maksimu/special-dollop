@@ -81,6 +81,9 @@ impl ProtocolHandler for PostgreSqlHandler {
     ) -> guacr_handlers::Result<()> {
         info!("PostgreSQL handler starting");
 
+        // Initialize rustls crypto provider (required for rustls 0.23+)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Parse security settings
         let security = DatabaseSecuritySettings::from_params(&params);
         if security.base.read_only {
@@ -312,9 +315,40 @@ impl ProtocolHandler for PostgreSqlHandler {
 
         // Event loop
         // NOTE: Screen was already rendered above after connection success
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal or input changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("PostgreSQL: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("PostgreSQL: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
                     if let Some(query) = pending_query {
                         info!("PostgreSQL: Executing query: {}", query);
 
@@ -451,6 +485,7 @@ impl ProtocolHandler for PostgreSqlHandler {
                     }
 
                     if needs_render {
+                        // Render immediately for special cases (Enter, Escape, etc.)
                         for instr in instructions {
                             to_client
                                 .send(instr)
@@ -458,9 +493,17 @@ impl ProtocolHandler for PostgreSqlHandler {
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
                     }
+                    // For regular keystrokes, debounce timer will handle rendering
+                        }
+                        Err(e) => {
+                            warn!("PostgreSQL: Input processing error: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("PostgreSQL: Input processing error: {}", e);
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

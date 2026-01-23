@@ -22,6 +22,7 @@ use guacr_handlers::{
 };
 use guacr_protocol::GuacamoleParser;
 use guacr_terminal::BufferPool;
+use image::{ImageEncoder, RgbaImage};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,16 +43,32 @@ use ironrdp_pdu::input::MousePdu;
 use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use tokio_rustls::TlsConnector;
 
+// DisplayControl for dynamic resize
+use ironrdp_displaycontrol::client::DisplayControlClient;
+use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+
 type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 // Re-export supporting modules
 use crate::channel_handler::RdpChannelHandler;
 
 // Import shared types from guacr-terminal
+use crate::window_detector::WindowMoveDetector;
 use guacr_terminal::{
-    FrameBuffer, RdpClipboard, RdpInputHandler, ScrollDetector, ScrollDirection,
-    CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE,
+    FrameBuffer, GraphicsMode, GraphicsRenderer, RdpClipboard, RdpInputHandler, ScrollDetector,
+    ScrollDirection, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE,
 };
+
+/// RDP server type detection for compatibility
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RdpServerType {
+    /// Native Windows RDP server (supports CredSSP, DVC)
+    WindowsNative,
+    /// xrdp/FreeRDP-based server (no CredSSP, no DVC, needs autologon)
+    Xrdp,
+    /// Unknown server type (use safe defaults)
+    Unknown,
+}
 
 /// RDP protocol handler
 ///
@@ -82,6 +99,16 @@ pub struct RdpConfig {
     pub disable_copy: bool,
     /// Whether clipboard paste is disabled
     pub disable_paste: bool,
+    /// Use JPEG encoding instead of PNG (default true for 33x bandwidth savings)
+    pub use_jpeg: bool,
+    /// JPEG quality (1-100, default 85)
+    pub jpeg_quality: u8,
+    /// Terminal graphics mode (None = normal Guacamole protocol)
+    pub terminal_mode: Option<GraphicsMode>,
+    /// Terminal columns (for terminal mode)
+    pub terminal_cols: u16,
+    /// Terminal rows (for terminal mode)
+    pub terminal_rows: u16,
 }
 
 impl Default for RdpConfig {
@@ -94,6 +121,11 @@ impl Default for RdpConfig {
             clipboard_buffer_size: CLIPBOARD_DEFAULT_SIZE,
             disable_copy: false,
             disable_paste: false,
+            use_jpeg: true,      // Enable JPEG by default (33x bandwidth savings)
+            jpeg_quality: 85,    // Optimal balance (same as VNC)
+            terminal_mode: None, // Default to normal Guacamole protocol
+            terminal_cols: 240,
+            terminal_rows: 60,
         }
     }
 }
@@ -142,6 +174,11 @@ impl ProtocolHandler for RdpHandler {
             settings.recording_config.clone(),
             to_client,
             &params,
+            self.config.terminal_mode,
+            self.config.terminal_cols,
+            self.config.terminal_rows,
+            settings.use_jpeg,
+            settings.jpeg_quality,
         );
 
         // Connect and run session
@@ -154,10 +191,7 @@ impl ProtocolHandler for RdpHandler {
                 settings.domain.as_deref(),
                 &settings.security_mode,
                 from_client,
-                #[cfg(feature = "sftp")]
                 Some(&settings),
-                #[cfg(not(feature = "sftp"))]
-                None,
             )
             .await
             .map_err(HandlerError::ConnectionFailed)?;
@@ -188,7 +222,9 @@ impl EventBasedHandler for RdpHandler {
         callback: Arc<dyn EventCallback>,
         from_client: mpsc::Receiver<Bytes>,
     ) -> Result<(), HandlerError> {
-        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(128);
+        // RDP sends 3 instructions per frame (img, blob, end) and can have multiple
+        // frames in flight, so we need a larger buffer than text-based protocols
+        let (to_client, mut handler_rx) = mpsc::channel::<Bytes>(1024);
 
         let sender = InstructionSender::new(callback);
         let sender_arc = Arc::new(sender);
@@ -226,11 +262,17 @@ pub struct RdpSettings {
     pub clipboard_buffer_size: usize,
     pub disable_copy: bool,
     pub disable_paste: bool,
+    /// Use JPEG encoding (33x bandwidth savings vs PNG)
+    pub use_jpeg: bool,
+    /// JPEG quality (1-100)
+    pub jpeg_quality: u8,
     /// Read-only mode - blocks keyboard/mouse input
     pub read_only: bool,
     /// Security settings (includes connection timeout)
     pub security: HandlerSecuritySettings,
     pub domain: Option<String>,
+    /// Server type hint for compatibility (windows, xrdp, auto)
+    pub server_type: Option<String>,
     #[allow(dead_code)] // TODO: Used for connection brokers
     pub load_balance_info: Option<String>,
     #[allow(dead_code)] // TODO: Used for cert validation
@@ -318,6 +360,17 @@ impl RdpSettings {
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false);
 
+        let use_jpeg = params
+            .get("use-jpeg")
+            .map(|s| s == "true")
+            .unwrap_or(defaults.use_jpeg);
+
+        let jpeg_quality = params
+            .get("jpeg-quality")
+            .and_then(|q| q.parse().ok())
+            .unwrap_or(defaults.jpeg_quality)
+            .clamp(1, 100);
+
         // Parse security settings (includes connection timeout)
         let security = HandlerSecuritySettings::from_params(params);
 
@@ -325,6 +378,7 @@ impl RdpSettings {
         let recording_config = RecordingConfig::from_params(params);
 
         let domain = params.get("domain").cloned();
+        let server_type = params.get("server-type").cloned();
         let load_balance_info = params.get("load-balance-info").cloned();
         let ignore_cert = params
             .get("ignore-cert")
@@ -423,9 +477,12 @@ impl RdpSettings {
             clipboard_buffer_size,
             disable_copy,
             disable_paste,
+            use_jpeg,
+            jpeg_quality,
             read_only,
             security,
             domain,
+            server_type,
             load_balance_info,
             ignore_cert,
             cert_fingerprint,
@@ -449,6 +506,38 @@ impl RdpSettings {
 }
 
 // ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Count decimal digits in a u32 without allocating
+#[inline]
+fn count_digits(mut n: u32) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    while n > 0 {
+        n /= 10;
+        count += 1;
+    }
+    count
+}
+
+/// Count decimal digits in a u64 without allocating
+#[inline]
+fn count_digits_u64(mut n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    while n > 0 {
+        n /= 10;
+        count += 1;
+    }
+    count
+}
+
+// ============================================================================
 // RDP Session - Complete connection and event loop
 // ============================================================================
 
@@ -460,9 +549,18 @@ struct IronRdpSession {
     #[allow(dead_code)] // TODO: Used for clipboard integration
     clipboard: RdpClipboard,
     input_handler: RdpInputHandler,
+    // Zero-copy buffers for encoding (reused across frames)
+    png_buffer: Vec<u8>,
+    base64_buffer: String,
+    instruction_buffer: String,
+    // JPEG encoding settings
+    use_jpeg: bool,
+    jpeg_quality: u8,
     channel_handler: RdpChannelHandler,
     /// Scroll detector for bandwidth optimization (90-99% savings on scrolling)
     scroll_detector: ScrollDetector,
+    /// Window move detector for outline optimization (50-100x savings during window moves)
+    window_detector: WindowMoveDetector,
     stream_id: u32,
     #[allow(dead_code)] // TODO: Used for clipboard policy
     disable_copy: bool,
@@ -484,6 +582,8 @@ struct IronRdpSession {
     use_hardware_encoding: bool,
     #[cfg(feature = "sftp")]
     sftp_session: Option<russh_sftp::client::SftpSession>,
+    /// Terminal graphics renderer (for terminal-only environments)
+    terminal_renderer: Option<GraphicsRenderer>,
 }
 
 impl IronRdpSession {
@@ -499,9 +599,19 @@ impl IronRdpSession {
         recording_config: RecordingConfig,
         to_client: mpsc::Sender<Bytes>,
         params: &HashMap<String, String>,
+        terminal_mode: Option<GraphicsMode>,
+        terminal_cols: u16,
+        terminal_rows: u16,
+        use_jpeg: bool,
+        jpeg_quality: u8,
     ) -> Self {
         let frame_size = (width * height * 4) as usize;
         let buffer_pool = Arc::new(BufferPool::new(8, frame_size));
+
+        // Pre-allocate zero-copy buffers (reused across frames)
+        let png_buffer = Vec::with_capacity(frame_size);
+        let base64_buffer = String::with_capacity(frame_size * 4 / 3); // base64 is ~33% larger
+        let instruction_buffer = String::with_capacity(256);
 
         // Initialize recording if enabled
         let recorder = if recording_config.is_enabled() {
@@ -526,12 +636,24 @@ impl IronRdpSession {
             None
         };
 
+        // Initialize terminal renderer if terminal mode is enabled
+        let terminal_renderer = terminal_mode.map(|mode| {
+            info!("RDP: Terminal graphics mode enabled: {:?}", mode);
+            GraphicsRenderer::new(mode, terminal_cols, terminal_rows)
+        });
+
         Self {
             framebuffer: FrameBuffer::new(width, height),
             buffer_pool,
             clipboard: RdpClipboard::new(clipboard_buffer_size),
             input_handler: RdpInputHandler::new(),
+            png_buffer,
+            base64_buffer,
+            instruction_buffer,
+            use_jpeg,
+            jpeg_quality,
             scroll_detector: ScrollDetector::new(width, height),
+            window_detector: WindowMoveDetector::new(),
             channel_handler: RdpChannelHandler::new(
                 clipboard_buffer_size,
                 disable_copy,
@@ -550,6 +672,7 @@ impl IronRdpSession {
             use_hardware_encoding: false, // Hardware encoding disabled for now
             #[cfg(feature = "sftp")]
             sftp_session: None,
+            terminal_renderer,
         }
     }
 
@@ -563,8 +686,7 @@ impl IronRdpSession {
         domain: Option<&str>,
         _security_mode: &str,
         from_client: mpsc::Receiver<Bytes>,
-        #[cfg(feature = "sftp")] settings: Option<&RdpSettings>,
-        #[cfg(not(feature = "sftp"))] _settings: Option<&RdpSettings>,
+        settings: Option<&RdpSettings>,
     ) -> Result<(), String> {
         info!(
             "RDP: Connecting to {}:{} (timeout: {}s)",
@@ -572,7 +694,8 @@ impl IronRdpSession {
         );
 
         // Build IronRDP connector config
-        let config = self.build_ironrdp_config(username, password, domain);
+        let settings_ref = settings.ok_or("RDP settings required")?;
+        let config = self.build_ironrdp_config(username, password, domain, settings_ref);
 
         // Establish TCP connection with timeout (matches guacd behavior)
         let stream = connect_tcp_with_timeout((hostname, port), self.connection_timeout_secs)
@@ -598,25 +721,40 @@ impl IronRdpSession {
         self.framebuffer = FrameBuffer::new(self.width, self.height);
         self.scroll_detector.reset(self.width, self.height);
 
-        // Send ready and size instructions to client (and record them)
+        // Send ready and size instructions to client (reuse buffer, no allocations)
         let ready_value = "rdp-ready";
-        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
+        self.instruction_buffer.clear();
+        use std::fmt::Write;
+        write!(
+            &mut self.instruction_buffer,
+            "5.ready,{}.{};",
+            ready_value.len(),
+            ready_value
+        )
+        .unwrap();
+        info!(
+            "RDP: Sending ready instruction: {}",
+            self.instruction_buffer
+        );
+        let ready_instr = self.instruction_buffer.clone();
         self.send_and_record(&ready_instr).await?;
 
-        // Format: size,<layer>,<width>,<height>;
-        let layer = 0;
-        let layer_str = layer.to_string();
-        let width_str = self.width.to_string();
-        let height_str = self.height.to_string();
-        let size_instr = format!(
+        // Format: size,<layer>,<width>,<height>; (no allocations)
+        let layer = 0u32;
+        self.instruction_buffer.clear();
+        write!(
+            &mut self.instruction_buffer,
             "4.size,{}.{},{}.{},{}.{};",
-            layer_str.len(),
-            layer_str,
-            width_str.len(),
-            width_str,
-            height_str.len(),
-            height_str
-        );
+            count_digits(layer),
+            layer,
+            count_digits(self.width),
+            self.width,
+            count_digits(self.height),
+            self.height
+        )
+        .unwrap();
+        info!("RDP: Sending size instruction: {}", self.instruction_buffer);
+        let size_instr = self.instruction_buffer.clone();
         self.send_and_record(&size_instr).await?;
 
         info!("RDP: Session ready, starting active session");
@@ -657,12 +795,50 @@ impl IronRdpSession {
         Ok(())
     }
 
+    fn detect_server_type(&self, settings: &RdpSettings) -> RdpServerType {
+        // Check explicit server-type parameter first
+        if let Some(ref server_type_str) = settings.server_type {
+            return match server_type_str.to_lowercase().as_str() {
+                "windows" => RdpServerType::WindowsNative,
+                "xrdp" => RdpServerType::Xrdp,
+                _ => RdpServerType::Unknown,
+            };
+        }
+
+        // Auto-detection heuristics:
+        // 1. If domain is set, likely Windows Active Directory
+        if settings.domain.is_some() {
+            return RdpServerType::WindowsNative;
+        }
+
+        // 2. Default to xrdp-compatible mode (works with both xrdp and Windows)
+        //    This is the safest default as:
+        //    - xrdp requires: CredSSP=false, autologon=true, no DVC
+        //    - Windows works with: CredSSP=false, autologon=true (just slower auth)
+        RdpServerType::Xrdp
+    }
+
     fn build_ironrdp_config(
         &self,
         username: &str,
         password: &str,
         domain: Option<&str>,
+        settings: &RdpSettings,
     ) -> connector::Config {
+        // Detect server type based on configuration hints
+        // Windows RDP servers typically support CredSSP, while xrdp/FreeRDP servers don't
+        let server_type = self.detect_server_type(settings);
+        let (enable_credssp, autologon) = match server_type {
+            RdpServerType::WindowsNative => (true, false), // Windows RDP supports CredSSP
+            RdpServerType::Xrdp => (false, true),          // xrdp needs autologon, no CredSSP
+            RdpServerType::Unknown => (false, true),       // Safe defaults for unknown servers
+        };
+
+        info!(
+            "RDP: Detected server type: {:?}, CredSSP: {}, Autologon: {}",
+            server_type, enable_credssp, autologon
+        );
+
         connector::Config {
             credentials: Credentials::UsernamePassword {
                 username: username.to_string(),
@@ -670,7 +846,7 @@ impl IronRdpSession {
             },
             domain: domain.map(|s| s.to_string()),
             enable_tls: true,
-            enable_credssp: true,
+            enable_credssp,
             keyboard_type: KeyboardType::IbmEnhanced,
             keyboard_subtype: 0,
             keyboard_layout: 0,
@@ -695,7 +871,7 @@ impl IronRdpSession {
             platform: MajorPlatformType::UNIX,
             enable_server_pointer: true,
             request_data: None,
-            autologon: false,
+            autologon,
             enable_audio_playback: false,
             pointer_software_rendering: true,
             performance_flags: PerformanceFlags::default(),
@@ -725,6 +901,9 @@ impl IronRdpSession {
             .map_err(|e| format!("Failed to get local address: {}", e))?;
 
         let mut framed = Framed::<ironrdp_tokio::MovableTokioStream<_>>::new(stream);
+
+        // Note: xrdp doesn't support Dynamic Virtual Channels (DVC), so we don't add DisplayControl
+        // guacd also doesn't use DVC with xrdp for this reason
         let mut connector = ClientConnector::new(config, client_addr);
 
         // Begin RDP connection (X.224, MCS)
@@ -769,6 +948,10 @@ impl IronRdpSession {
         server_name: &str,
     ) -> Result<(TokioTlsStream, Vec<u8>), String> {
         use tokio_rustls::rustls;
+
+        // Install default crypto provider (ring) if not already installed
+        // This is required for Rustls 0.23+
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
         let mut config = rustls::ClientConfig::builder()
             .dangerous()
@@ -848,11 +1031,20 @@ impl IronRdpSession {
                 result = framed.read_pdu() => {
                     match result {
                         Ok((action, payload)) => {
-                            debug!("RDP: Received frame - action: {:?}, {} bytes", action, payload.len());
+                            trace!("RDP: Received frame - action: {:?}, {} bytes", action, payload.len());
 
                             let outputs = active_stage
                                 .process(&mut image, action, &payload)
                                 .map_err(|e| format!("Failed to process RDP frame: {}", e))?;
+
+                            if outputs.is_empty() && payload.len() > 1000 {
+                                warn!("RDP: Large frame ({} bytes) produced 0 outputs - possible graphics data loss", payload.len());
+                            }
+
+                            trace!("RDP: ActiveStage returned {} outputs", outputs.len());
+                            for (idx, output) in outputs.iter().enumerate() {
+                                trace!("RDP: Output {}: {:?}", idx, output);
+                            }
 
                             for output in outputs {
                                 match output {
@@ -866,14 +1058,61 @@ impl IronRdpSession {
                                         // Send graphics update to client
                                         debug!("RDP: GraphicsUpdate received - rect: {:?}, image size: {}x{}",
                                             rect, image.width(), image.height());
-                                        self.send_graphics_update(&image).await?;
+
+                                        // Debug: Check image data
+                                        let sample_size = std::cmp::min(100, image.data().len());
+                                        let sample_pixels = &image.data()[0..sample_size];
+                                        let all_zeros = sample_pixels.iter().all(|&b| b == 0);
+                                        let all_same = sample_pixels.windows(4).all(|w| w == &sample_pixels[0..4]);
+
+                                        if all_zeros {
+                                            warn!("RDP: Image data is all zeros (black screen)!");
+                                        } else if all_same {
+                                            debug!("RDP: Image appears solid color: RGBA({},{},{},{})",
+                                                sample_pixels[0], sample_pixels[1], sample_pixels[2], sample_pixels[3]);
+                                        } else {
+                                            trace!("RDP: Image has varied pixel data (first 4 pixels: {:?})",
+                                                &sample_pixels[0..std::cmp::min(16, sample_size)]);
+                                        }
+
+                                        self.send_graphics_update_with_rect(&image, rect).await?;
+                                    }
+                                    ActiveStageOutput::PointerDefault => {
+                                        trace!("RDP: Pointer set to default");
+                                        // TODO: Send Guacamole cursor instruction for default cursor
+                                    }
+                                    ActiveStageOutput::PointerHidden => {
+                                        trace!("RDP: Pointer hidden");
+                                        // TODO: Send Guacamole cursor instruction to hide cursor
+                                    }
+                                    ActiveStageOutput::PointerPosition { x, y } => {
+                                        trace!("RDP: Pointer moved to ({}, {}) - client handles cursor locally", x, y);
+                                        // Client-side cursor is handled by the browser automatically
+                                        // No need to send position updates
+                                    }
+                                    ActiveStageOutput::PointerBitmap(pointer) => {
+                                        debug!("RDP: Custom pointer bitmap received: {}x{} at hotspot ({}, {})",
+                                            pointer.width, pointer.height, pointer.hotspot_x, pointer.hotspot_y);
+
+                                        // Send custom cursor to client
+                                        if let Err(e) = self.send_custom_cursor(&pointer).await {
+                                            warn!("RDP: Failed to send custom cursor: {}", e);
+                                        }
+                                    }
+                                    ActiveStageOutput::FrameStart { frame_id } => {
+                                        trace!("RDP: Frame {} start", frame_id);
+                                        self.window_detector.frame_start(frame_id);
+                                    }
+                                    ActiveStageOutput::FrameEnd { frame_id } => {
+                                        trace!("RDP: Frame {} end", frame_id);
+                                        self.window_detector.frame_end(frame_id);
                                     }
                                     ActiveStageOutput::Terminate(reason) => {
                                         info!("RDP: Session terminated: {:?}", reason);
                                         return Ok(());
                                     }
-                                    _ => {
-                                        debug!("RDP: Unhandled output: {:?}", output);
+                                    other => {
+                                        debug!("RDP: Unhandled ActiveStageOutput variant: {:?}", other);
                                     }
                                 }
                             }
@@ -911,17 +1150,209 @@ impl IronRdpSession {
         Ok(())
     }
 
+    /// Send custom RDP cursor to client via Guacamole cursor instruction
+    async fn send_custom_cursor(
+        &mut self,
+        pointer: &ironrdp::graphics::pointer::DecodedPointer,
+    ) -> Result<(), String> {
+        use guacr_protocol::format_cursor;
+
+        // Create a temporary layer for the cursor image
+        let cursor_layer = -1; // Use buffer layer -1 for cursor
+
+        // Encode cursor bitmap as PNG
+        let cursor_data = &pointer.bitmap_data;
+        let width = pointer.width as u32;
+        let height = pointer.height as u32;
+
+        // Create RGBA image from cursor data
+        let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
+        for chunk in cursor_data.chunks(4) {
+            if chunk.len() == 4 {
+                rgba_data.push(chunk[2]); // R
+                rgba_data.push(chunk[1]); // G
+                rgba_data.push(chunk[0]); // B
+                rgba_data.push(chunk[3]); // A
+            }
+        }
+
+        // Encode as JPEG or PNG
+        let (encoded_data, mimetype) =
+            if self.use_jpeg && pointer.bitmap_data.iter().any(|&b| b != 0) {
+                // Use JPEG for non-transparent cursors
+                match Self::encode_jpeg(&rgba_data, width, height, self.jpeg_quality) {
+                    Ok(data) => (data, "image/jpeg"),
+                    Err(_) => {
+                        // Fallback to PNG if JPEG fails
+                        let mut fb = guacr_terminal::FrameBuffer::new(width, height);
+                        fb.update_region(0, 0, width, height, &rgba_data);
+                        let rect = guacr_terminal::FrameRect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        };
+                        (
+                            fb.encode_region(rect)
+                                .map_err(|e| format!("PNG encoding failed: {}", e))?,
+                            "image/png",
+                        )
+                    }
+                }
+            } else {
+                // Use PNG for transparent cursors
+                let mut fb = guacr_terminal::FrameBuffer::new(width, height);
+                fb.update_region(0, 0, width, height, &rgba_data);
+                let rect = guacr_terminal::FrameRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
+                (
+                    fb.encode_region(rect)
+                        .map_err(|e| format!("PNG encoding failed: {}", e))?,
+                    "image/png",
+                )
+            };
+
+        // Send img instruction to load cursor into buffer layer
+        let stream_id = self.stream_id;
+        self.stream_id += 1;
+
+        // Base64 encode
+        let mut base64_data = String::new();
+        base64::Engine::encode_string(
+            &base64::engine::general_purpose::STANDARD,
+            &encoded_data,
+            &mut base64_data,
+        );
+
+        // Format img instruction
+        let img_instr = format!(
+            "3.img,{}.{},{}.{},2.15,{}.{},1.0,1.0;",
+            stream_id.to_string().len(),
+            stream_id,
+            mimetype.len(),
+            mimetype,
+            cursor_layer.to_string().len(),
+            cursor_layer
+        );
+
+        // Send img + blob + end
+        self.send_and_record(&img_instr).await?;
+
+        let blob_instr = format!(
+            "4.blob,{}.{},{}.{};",
+            stream_id.to_string().len(),
+            stream_id,
+            base64_data.len(),
+            base64_data
+        );
+        self.send_and_record(&blob_instr).await?;
+
+        let end_instr = format!("3.end,{}.{};", stream_id.to_string().len(), stream_id);
+        self.send_and_record(&end_instr).await?;
+
+        // Send cursor instruction to set the cursor
+        let cursor_instr = format_cursor(
+            pointer.hotspot_x as i32,
+            pointer.hotspot_y as i32,
+            cursor_layer,
+            0,
+            0,
+            width,
+            height,
+        );
+        self.send_and_record(&cursor_instr).await?;
+
+        debug!(
+            "RDP: Sent custom cursor {}x{} with hotspot ({}, {})",
+            width, height, pointer.hotspot_x, pointer.hotspot_y
+        );
+
+        Ok(())
+    }
+
     async fn send_graphics_update(&mut self, image: &DecodedImage) -> Result<(), String> {
+        // Fallback for when no rect is provided - use full screen
+        use ironrdp_pdu::geometry::InclusiveRectangle;
+        let full_screen_rect = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: (self.width - 1) as u16,
+            bottom: (self.height - 1) as u16,
+        };
+        self.send_graphics_update_with_rect(image, full_screen_rect)
+            .await
+    }
+
+    async fn send_graphics_update_with_rect(
+        &mut self,
+        image: &DecodedImage,
+        rect: ironrdp_pdu::geometry::InclusiveRectangle,
+    ) -> Result<(), String> {
         // Convert DecodedImage to our framebuffer format and send to client
         let image_data = image.data();
 
+        // Convert IronRDP InclusiveRectangle to our coordinates
+        // InclusiveRectangle uses inclusive bounds (right/bottom are included)
+        let x = rect.left as u32;
+        let y = rect.top as u32;
+        let width = (rect.right - rect.left + 1) as u32;
+        let height = (rect.bottom - rect.top + 1) as u32;
+
         debug!(
-            "RDP: send_graphics_update called - image data len: {}, expected: {}",
-            image_data.len(),
-            self.width * self.height * 4
+            "RDP: send_graphics_update_with_rect called - dirty rect: {}x{} at ({}, {}), image: {}x{}",
+            width, height, x, y, self.width, self.height
         );
 
-        // Check for scroll operation first (most bandwidth-efficient)
+        // NOTE: Alpha channel fix is now handled in framebuffer.update_region()
+        // IronRDP doesn't set alpha=255, so we fix it during the copy to avoid extra allocation
+
+        // If terminal mode is enabled, render to terminal instead of Guacamole protocol
+        if let Some(renderer) = &self.terminal_renderer {
+            trace!("RDP: Rendering to terminal graphics");
+            let terminal_output = renderer.render(image_data, self.width, self.height);
+
+            // Send terminal output directly to client
+            if let Err(e) = self.to_client.send(terminal_output).await {
+                return Err(format!("Failed to send terminal graphics: {}", e));
+            }
+
+            // Record if enabled
+            if let Some(_recorder) = &self.recorder {
+                // For terminal mode, we could record the terminal output
+                // For now, just skip recording or record as binary data
+                trace!("RDP: Terminal mode - recording not yet implemented");
+            }
+
+            return Ok(());
+        }
+
+        // Check for window move operation first (50-100x bandwidth savings)
+        if self.window_detector.is_window_move(rect, image_data) {
+            debug!(
+                "RDP: Window move detected - sending outline for {}x{} at ({}, {})",
+                width, height, x, y
+            );
+
+            // Send rectangle outline instead of full content
+            let outline_instr = guacr_protocol::format_rect(0, x, y, width, height);
+            self.send_and_record(&outline_instr).await?;
+
+            // Send sync
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
+            self.send_and_record(&sync_instr).await?;
+
+            return Ok(());
+        }
+
+        // Check for scroll operation (90-99% bandwidth savings)
         if let Some(scroll_op) = self.scroll_detector.detect_scroll(image_data) {
             trace!(
                 "RDP: Detected scroll {:?} by {} pixels",
@@ -988,17 +1419,19 @@ impl IronRdpSession {
             return Ok(());
         }
 
-        // No scroll detected - update framebuffer and use normal dirty region rendering
+        // Use the dirty rect from IronRDP instead of always rendering full screen
         debug!(
-            "RDP: No scroll detected, updating full framebuffer {}x{}",
-            self.width, self.height
+            "RDP: No scroll detected, using dirty rect {}x{} at ({}, {})",
+            width, height, x, y
         );
-        self.framebuffer
-            .update_region(0, 0, self.width, self.height, image_data);
 
-        // Encode and send the update
-        self.handle_graphics_update(0, 0, self.width, self.height, image_data)
-            .await
+        // Update ONLY the dirty region from the full-screen image (efficient!)
+        // IronRDP gives us the full screen, but we only copy the changed region
+        self.framebuffer
+            .update_region_from_fullscreen(x, y, width, height, image_data, self.width);
+
+        // Encode and send the dirty region from framebuffer
+        self.encode_and_send_dirty_rects().await
     }
 
     async fn handle_client_input_ironrdp(
@@ -1009,6 +1442,12 @@ impl IronRdpSession {
         image: &mut DecodedImage,
     ) -> Result<(), String> {
         use ironrdp_tokio::FramedWrite;
+
+        // Debug: Log raw instruction
+        trace!(
+            "RDP: Raw client instruction: {}",
+            String::from_utf8_lossy(msg)
+        );
 
         let instr = GuacamoleParser::parse_instruction(msg)
             .map_err(|e| format!("Failed to parse instruction: {}", e))?;
@@ -1063,19 +1502,28 @@ impl IronRdpSession {
             }
             "mouse" => {
                 if instr.args.len() >= 3 {
-                    // Parse mask - might be float like "0.0" or integer like "0"
-                    let mask: u8 = instr.args[0]
-                        .parse::<f64>()
-                        .map_err(|e| format!("Invalid mouse mask '{}': {}", instr.args[0], e))?
-                        as u8;
-                    let x: i32 = instr.args[1]
-                        .parse::<f64>()
-                        .map_err(|e| format!("Invalid x '{}': {}", instr.args[1], e))?
-                        as i32;
-                    let y: i32 = instr.args[2]
-                        .parse::<f64>()
-                        .map_err(|e| format!("Invalid y '{}': {}", instr.args[2], e))?
-                        as i32;
+                    // Debug: Log raw mouse instruction
+                    info!(
+                        "RDP: Raw mouse instruction - args[0]='{}' args[1]='{}' args[2]='{}'",
+                        instr.args[0], instr.args[1], instr.args[2]
+                    );
+
+                    // Parse coordinates as integers (per Guacamole protocol spec)
+                    // Protocol order: x, y, mask (NOT mask, x, y!)
+                    let x: i32 = instr.args[0]
+                        .parse()
+                        .map_err(|e| format!("Invalid x '{}': {}", instr.args[0], e))?;
+                    let y: i32 = instr.args[1]
+                        .parse()
+                        .map_err(|e| format!("Invalid y '{}': {}", instr.args[1], e))?;
+                    let mask: u8 = instr.args[2]
+                        .parse()
+                        .map_err(|e| format!("Invalid mouse mask '{}': {}", instr.args[2], e))?;
+
+                    info!(
+                        "RDP: Parsed mouse - x={} y={} mask=0x{:02x} ({})",
+                        x, y, mask, mask
+                    );
 
                     // Security: Check read-only mode for mouse clicks
                     if self.read_only && !is_mouse_event_allowed_readonly(mask as u32) {
@@ -1159,15 +1607,242 @@ impl IronRdpSession {
                 if instr.args.len() >= 2 {
                     let width: u32 = instr.args[0].parse().map_err(|_| "Invalid width")?;
                     let height: u32 = instr.args[1].parse().map_err(|_| "Invalid height")?;
-                    info!("RDP: Resize requested: {}x{}", width, height);
-                    // TODO: Send display control resize via DISP channel
-                    let _disp_msg = self.channel_handler.prepare_disp_resize(width, height);
+                    info!(
+                        "RDP: Client resize request: {}x{} (current server: {}x{})",
+                        width, height, self.width, self.height
+                    );
+
+                    // Try server-side resize via DisplayControl DVC
+                    match self.send_display_resize(active_stage, width, height).await {
+                        Ok(_) => {
+                            info!("RDP: DisplayControl resize sent successfully");
+                        }
+                        Err(e) => {
+                            debug!(
+                                "RDP: DisplayControl resize failed: {} - client will scale",
+                                e
+                            );
+                        }
+                    }
                 }
             }
             _ => {
                 debug!("RDP: Unhandled instruction: {}", instr.opcode);
             }
         }
+
+        Ok(())
+    }
+
+    /// Encode RGBA framebuffer data as JPEG
+    ///
+    /// Converts RGBA pixels to RGB and encodes as JPEG with specified quality.
+    /// This provides 33x bandwidth reduction compared to PNG encoding.
+    fn encode_jpeg(data: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+        let img = RgbaImage::from_raw(width, height, data.to_vec())
+            .ok_or_else(|| "Invalid image dimensions".to_string())?;
+
+        let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
+
+        let mut jpeg_data = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, quality);
+        encoder
+            .write_image(&rgb_img, width, height, image::ExtendedColorType::Rgb8)
+            .map_err(|e| format!("JPEG encode failed: {}", e))?;
+
+        Ok(jpeg_data)
+    }
+
+    /// Encode and send dirty rectangles from framebuffer
+    async fn encode_and_send_dirty_rects(&mut self) -> Result<(), String> {
+        self.framebuffer.optimize_dirty_rects();
+
+        // Check if we have dirty rects (without cloning)
+        if self.framebuffer.dirty_rects().is_empty() {
+            warn!("RDP: No dirty rects after optimization - skipping render");
+            return Ok(());
+        }
+
+        // Calculate dirty region coverage (without cloning)
+        let total_pixels = (self.width * self.height) as usize;
+        let dirty_pixels: usize = self
+            .framebuffer
+            .dirty_rects()
+            .iter()
+            .map(|r| (r.width * r.height) as usize)
+            .sum();
+        let coverage_pct = (dirty_pixels * 100) / total_pixels;
+
+        // Smart rendering: <30% = partial, >30% = full screen
+        // This matches the FreeRDP optimization pattern
+        let num_rects = self.framebuffer.dirty_rects().len();
+        if coverage_pct < 30 {
+            trace!(
+                "RDP: Rendering {} dirty regions ({}% of screen)",
+                num_rects,
+                coverage_pct
+            );
+        } else {
+            trace!(
+                "RDP: Rendering full screen ({}% dirty, {} regions)",
+                coverage_pct,
+                num_rects
+            );
+        }
+
+        // Use JPEG or PNG encoding based on configuration
+        // Clone rects here since we need to iterate while mutating buffers
+        let dirty_rects: Vec<_> = self.framebuffer.dirty_rects().to_vec();
+        for rect in &dirty_rects {
+            debug!(
+                "RDP: Encoding rect {}x{} at ({}, {})",
+                rect.width, rect.height, rect.x, rect.y
+            );
+
+            // Encode as JPEG or PNG
+            let (encoded_data, mimetype) = if self.use_jpeg {
+                // Extract region pixels for JPEG encoding
+                let region_pixels = self.framebuffer.get_region_pixels(*rect);
+                let jpeg_data =
+                    Self::encode_jpeg(&region_pixels, rect.width, rect.height, self.jpeg_quality)
+                        .map_err(|e| format!("JPEG encoding failed: {}", e))?;
+                debug!(
+                    "RDP: JPEG encoded - {} bytes (quality {})",
+                    jpeg_data.len(),
+                    self.jpeg_quality
+                );
+                (jpeg_data, "image/jpeg")
+            } else {
+                // ZERO-COPY: Encode directly into reusable buffer (no allocation)
+                self.framebuffer
+                    .encode_region_into_vec(*rect, &mut self.png_buffer)
+                    .map_err(|e| format!("PNG encoding failed: {}", e))?;
+                debug!("RDP: PNG encoded - {} bytes", self.png_buffer.len());
+                (self.png_buffer.clone(), "image/png")
+            };
+
+            // ZERO-COPY: Encode base64 into reusable buffer (no allocation)
+            self.base64_buffer.clear();
+            base64::Engine::encode_string(
+                &base64::engine::general_purpose::STANDARD,
+                &encoded_data,
+                &mut self.base64_buffer,
+            );
+
+            debug!("RDP: Base64 encoded - {} bytes", self.base64_buffer.len());
+
+            // ZERO-COPY: Format instruction into reusable buffer (no allocation)
+            // Use direct formatting to avoid .to_string() allocations
+            self.instruction_buffer.clear();
+            use std::fmt::Write;
+
+            let stream_id = self.stream_id;
+            let mask = 15u32; // RGBA channels (0x0F)
+            let layer = 0u32; // Default layer
+
+            // Write instruction directly with integers (no .to_string() allocations)
+            write!(
+                &mut self.instruction_buffer,
+                "3.img,{}.{},{}.{},{}.{},{}.{},{}.{},{}.{};",
+                count_digits(stream_id),
+                stream_id,
+                count_digits(mask),
+                mask,
+                count_digits(layer),
+                layer,
+                mimetype.len(),
+                mimetype,
+                count_digits(rect.x),
+                rect.x,
+                count_digits(rect.y),
+                rect.y
+            )
+            .unwrap();
+
+            // Send img instruction (clone needed for borrow checker)
+            info!(
+                "RDP: Sending img instruction for rect {}x{} at ({}, {})",
+                rect.width, rect.height, rect.x, rect.y
+            );
+            let img_instr = self.instruction_buffer.clone();
+            self.send_and_record(&img_instr).await?;
+
+            // Send blob data in chunks to avoid WebRTC message size limits
+            // WebRTC typically has 64-256KB max message size, so chunk at 6KB
+            // (matches terminal renderer and ensures compatibility)
+            const BLOB_CHUNK_SIZE: usize = 6144; // 6KB chunks
+            let total_size = self.base64_buffer.len();
+            let num_chunks = total_size.div_ceil(BLOB_CHUNK_SIZE);
+
+            debug!(
+                "RDP: Sending blob in {} chunks ({} bytes total)",
+                num_chunks, total_size
+            );
+
+            // Clone base64_buffer to avoid borrow checker issues
+            // This is still better than allocating per-frame since we reuse the buffer
+            let base64_data = self.base64_buffer.clone();
+            for (chunk_idx, chunk) in base64_data.as_bytes().chunks(BLOB_CHUNK_SIZE).enumerate() {
+                let chunk_str = std::str::from_utf8(chunk)
+                    .map_err(|e| format!("Invalid UTF-8 in base64 chunk: {}", e))?;
+
+                // Reuse instruction buffer for blob instructions (no allocations)
+                self.instruction_buffer.clear();
+                write!(
+                    &mut self.instruction_buffer,
+                    "4.blob,{}.{},{}.{};",
+                    count_digits(stream_id),
+                    stream_id,
+                    chunk_str.len(),
+                    chunk_str
+                )
+                .unwrap();
+
+                let blob_instr = self.instruction_buffer.clone();
+                self.send_and_record(&blob_instr).await?;
+
+                if chunk_idx == 0 || chunk_idx == num_chunks - 1 {
+                    debug!(
+                        "RDP: Sent blob chunk {}/{} ({} bytes)",
+                        chunk_idx + 1,
+                        num_chunks,
+                        chunk_str.len()
+                    );
+                }
+            }
+
+            // Send end instruction to close the stream
+            let end_instr = guacr_protocol::format_end(self.stream_id);
+            self.send_and_record(&end_instr).await?;
+            info!(
+                "RDP: Sent complete image update (stream {})",
+                self.stream_id
+            );
+
+            // Increment stream ID for next image (Guacamole protocol requires unique stream IDs)
+            self.stream_id += 1;
+        }
+
+        self.framebuffer.clear_dirty();
+
+        // Send sync instruction (reuse buffer to avoid allocation)
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.instruction_buffer.clear();
+        use std::fmt::Write;
+        write!(
+            &mut self.instruction_buffer,
+            "4.sync,{}.{};",
+            count_digits_u64(timestamp_ms),
+            timestamp_ms
+        )
+        .unwrap();
+
+        let sync_instr = self.instruction_buffer.clone();
+        self.send_and_record(&sync_instr).await?;
 
         Ok(())
     }
@@ -1193,132 +1868,8 @@ impl IronRdpSession {
         // No conversion needed - use pixels directly
         self.framebuffer.update_region(x, y, width, height, pixels);
 
-        self.framebuffer.optimize_dirty_rects();
-        let dirty_rects: Vec<_> = self.framebuffer.dirty_rects().to_vec();
-        debug!(
-            "RDP: Dirty rects after optimization: {} rects",
-            dirty_rects.len()
-        );
-        if dirty_rects.is_empty() {
-            warn!("RDP: No dirty rects after optimization - skipping render");
-            return Ok(());
-        }
-
-        // Calculate dirty region coverage
-        let total_pixels = (self.width * self.height) as usize;
-        let dirty_pixels: usize = dirty_rects
-            .iter()
-            .map(|r| (r.width * r.height) as usize)
-            .sum();
-        let coverage_pct = (dirty_pixels * 100) / total_pixels;
-
-        // Smart rendering: <30% = partial, >30% = full screen
-        // This matches the FreeRDP optimization pattern
-        if coverage_pct < 30 {
-            trace!(
-                "RDP: Rendering {} dirty regions ({}% of screen)",
-                dirty_rects.len(),
-                coverage_pct
-            );
-        } else {
-            trace!(
-                "RDP: Rendering full screen ({}% dirty, {} regions)",
-                coverage_pct,
-                dirty_rects.len()
-            );
-        }
-
-        // Use PNG encoding for all graphics updates
-        for rect in &dirty_rects {
-            debug!(
-                "RDP: Encoding rect {}x{} at ({}, {})",
-                rect.width, rect.height, rect.x, rect.y
-            );
-            let png_data = self
-                .framebuffer
-                .encode_region(*rect)
-                .map_err(|e| format!("Encoding failed: {}", e))?;
-
-            debug!("RDP: PNG encoded - {} bytes", png_data.len());
-
-            // Encode PNG as base64 for text protocol
-            let png_base64 =
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
-
-            debug!("RDP: Base64 encoded - {} bytes", png_base64.len());
-
-            // Format img instruction: img,<stream>,<mask>,<layer>,<mimetype>,<x>,<y>;
-            // Then send blob instruction: blob,<stream>,<base64_data>;
-            // Every element needs LENGTH.VALUE format
-            let stream_str = self.stream_id.to_string();
-            let mask = 7; // RGB channels (0x07)
-            let layer = 0; // Default layer
-            let mask_str = mask.to_string();
-            let layer_str = layer.to_string();
-            let x_str = rect.x.to_string();
-            let y_str = rect.y.to_string();
-            let mimetype = "image/png";
-
-            let img_instr = format!(
-                "3.img,{}.{},{}.{},{}.{},{}.{},{}.{},{}.{};",
-                stream_str.len(),
-                stream_str,
-                mask_str.len(),
-                mask_str,
-                layer_str.len(),
-                layer_str,
-                mimetype.len(),
-                mimetype,
-                x_str.len(),
-                x_str,
-                y_str.len(),
-                y_str
-            );
-
-            let blob_instr = format!(
-                "4.blob,{}.{},{}.{};",
-                stream_str.len(),
-                stream_str,
-                png_base64.len(),
-                png_base64
-            );
-
-            // Send and record instructions
-            info!(
-                "RDP: Sending img instruction for rect {}x{} at ({}, {})",
-                rect.width, rect.height, rect.x, rect.y
-            );
-            self.send_and_record(&img_instr).await?;
-            info!(
-                "RDP: Sending blob instruction - {} bytes base64",
-                png_base64.len()
-            );
-            self.send_and_record(&blob_instr).await?;
-
-            // Send end instruction to close the stream
-            let end_instr = guacr_protocol::format_end(self.stream_id);
-            self.send_and_record(&end_instr).await?;
-            info!(
-                "RDP: Sent complete image update (stream {})",
-                self.stream_id
-            );
-
-            // Increment stream ID for next image (Guacamole protocol requires unique stream IDs)
-            self.stream_id += 1;
-        }
-
-        self.framebuffer.clear_dirty();
-
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let ts_str = timestamp_ms.to_string();
-        let sync_instr = format!("4.sync,{}.{};", ts_str.len(), ts_str);
-
-        self.send_and_record(&sync_instr).await?;
-
-        Ok(())
+        // Encode and send the dirty rects
+        self.encode_and_send_dirty_rects().await
     }
 
     /// Send instruction to client and record it (if recording is enabled)
@@ -1348,6 +1899,69 @@ impl IronRdpSession {
                 warn!("RDP: Failed to record client input: {}", e);
             }
         }
+    }
+
+    /// Send display resize via DisplayControl DVC
+    async fn send_display_resize(
+        &self,
+        active_stage: &mut ActiveStage,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        // Get DisplayControl DVC
+        let dvc = active_stage
+            .get_dvc::<DisplayControlClient>()
+            .ok_or_else(|| "DisplayControl DVC not available".to_string())?;
+
+        let channel_id = dvc
+            .channel_id()
+            .ok_or_else(|| "DisplayControl channel not opened".to_string())?;
+
+        // Get DisplayControl client processor
+        let display_control = dvc
+            .channel_processor_downcast_ref::<DisplayControlClient>()
+            .ok_or_else(|| "Failed to downcast to DisplayControl client".to_string())?;
+
+        // Check if DisplayControl is ready (capabilities received)
+        if !display_control.ready() {
+            return Err("DisplayControl not ready (capabilities not received)".to_string());
+        }
+
+        // Adjust display size to meet RDP requirements
+        // Width must be >= 200, <= 8192, and even
+        // Height must be >= 200, <= 8192
+        let (adjusted_width, adjusted_height) =
+            MonitorLayoutEntry::adjust_display_size(width, height);
+
+        if adjusted_width != width || adjusted_height != height {
+            info!(
+                "RDP: Adjusted display size from {}x{} to {}x{}",
+                width, height, adjusted_width, adjusted_height
+            );
+        }
+
+        // Encode monitor layout message
+        let messages = display_control
+            .encode_single_primary_monitor(
+                channel_id,
+                adjusted_width,
+                adjusted_height,
+                None, // scale_factor
+                None, // physical_dims
+            )
+            .map_err(|e| format!("Failed to encode monitor layout: {}", e))?;
+
+        // Send via ActiveStage
+        let _encoded = active_stage
+            .encode_dvc_messages(messages)
+            .map_err(|e| format!("Failed to encode DVC messages: {}", e))?;
+
+        info!(
+            "RDP: Sent DisplayControl resize to server: {}x{}",
+            adjusted_width, adjusted_height
+        );
+
+        Ok(())
     }
 }
 

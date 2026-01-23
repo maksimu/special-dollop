@@ -13,17 +13,17 @@ guacr-handlers = { path = "../guacr-handlers" }
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
 # RDP client - using ironrdp (pure Rust) - GitHub fork with Update PDU support
-ironrdp = { version = "0.14.0", features = ["connector", "session", "graphics", "input", "cliprdr"] }
-ironrdp-async = "0.8.0"
-ironrdp-tokio = "0.8.0"
-ironrdp-pdu = "0.7.0"
+ironrdp = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu", features = ["connector", "session", "graphics", "input", "cliprdr"] }
+ironrdp-async = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-tokio = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-pdu = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-displaycontrol = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 x509-cert = "0.2"
 
 # Image processing
@@ -35,7 +35,6 @@ base64.workspace = true
 # Zero-copy optimizations
 guacr-terminal = { path = "../guacr-terminal" }
 guacr-protocol = { path = "../guacr-protocol" }
-crossbeam-queue = "0.3"
 
 # Hardware encoding support comes from guacr-terminal (shared across protocols)
 # SFTP integration support

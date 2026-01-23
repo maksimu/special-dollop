@@ -372,9 +372,40 @@ impl ProtocolHandler for MongoDbHandler {
 
         // Event loop
         // NOTE: Screen was already rendered above after connection success
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal or input changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("MongoDB: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("MongoDB: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
                     if let Some(command) = pending_query {
                         info!("MongoDB: Executing command: {}", command);
 
@@ -498,8 +529,15 @@ impl ProtocolHandler for MongoDbHandler {
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("MongoDB: Input processing error: {}", e);
+                        Err(e) => {
+                            warn!("MongoDB: Input processing error: {}", e);
+                        }
+                    }
+                }
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

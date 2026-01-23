@@ -296,8 +296,9 @@ impl CefBrowserClient {
 
     /// Send initial Guacamole handshake
     async fn send_handshake(&mut self, to_client: &mpsc::Sender<Bytes>) -> Result<(), String> {
-        // Send ready instruction
-        let ready_instr = "5.ready,9.cef-ready;";
+        // Send ready instruction with proper LENGTH.VALUE format
+        let ready_value = "cef-ready";
+        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
         to_client
             .send(Bytes::from(ready_instr))
             .await

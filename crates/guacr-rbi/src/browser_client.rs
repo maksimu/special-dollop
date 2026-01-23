@@ -147,8 +147,9 @@ impl BrowserClient {
             }
         }
 
-        // Send ready instruction
-        let ready_instr = format!("5.ready,{}.{};", 9, "rbi-ready");
+        // Send ready instruction with proper LENGTH.VALUE format
+        let ready_value = "rbi-ready";
+        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
         to_client
             .send(Bytes::from(ready_instr))
             .await
@@ -819,8 +820,9 @@ impl BrowserClient {
 
         for pattern in &self.config.allowed_url_patterns {
             if let Some(suffix) = pattern.strip_prefix('*') {
-                // Wildcard pattern
-                if url.contains(suffix) {
+                // Wildcard pattern - must match as domain suffix
+                // e.g., "*.example.com" should match "sub.example.com" but not "malicious-example.com"
+                if url.ends_with(suffix) || url.contains(&format!("/{}", suffix)) {
                     return true;
                 }
             } else if url.contains(pattern) {

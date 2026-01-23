@@ -4,7 +4,9 @@
 use crate::{DatabaseError, Result};
 use bytes::Bytes;
 use guacr_protocol::GuacamoleParser;
-use guacr_terminal::{DatabaseTerminal, QueryResult, TerminalInputHandler, TerminalRenderer};
+use guacr_terminal::{
+    DatabaseTerminal, DirtyTracker, QueryResult, TerminalInputHandler, TerminalRenderer,
+};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -40,6 +42,12 @@ pub struct QueryExecutor {
 
     // Unified input handler for clipboard, mouse, resize
     input_handler: TerminalInputHandler,
+
+    // Track if input line needs redrawing (for debounce optimization)
+    input_dirty: bool,
+
+    // Dirty region tracker for optimized rendering (only send changed portions)
+    dirty_tracker: DirtyTracker,
 }
 
 impl QueryExecutor {
@@ -73,6 +81,8 @@ impl QueryExecutor {
             current_database: None,
             prompt_template: prompt.to_string(),
             input_handler: TerminalInputHandler::new_with_scrollback(rows, cols, 1000),
+            input_dirty: false,
+            dirty_tracker: DirtyTracker::new(rows, cols),
         })
     }
 
@@ -157,6 +167,15 @@ impl QueryExecutor {
             self.cursor_position += clipboard_text.len();
             self.redraw_input_line()?;
 
+            // CRITICAL: Force dirty tracker reset after large paste
+            // Large pastes can cause dirty region tracking to fail, resulting in
+            // partial screen rendering (black screen with only small region visible)
+            // Reset forces next render to be full screen
+            if clipboard_text.len() > 100 {
+                let (rows, cols) = self.terminal.size();
+                self.dirty_tracker = DirtyTracker::new(rows, cols);
+            }
+
             let (_, instructions) = self.render_screen().await?;
             Ok((true, instructions, None))
         } else {
@@ -181,6 +200,9 @@ impl QueryExecutor {
             self.input_handler
                 .handle_resize(rows, cols, self.terminal.emulator_mut())
                 .map_err(|e| DatabaseError::QueryError(format!("Resize error: {}", e)))?;
+
+            // Recreate dirty tracker for new dimensions
+            self.dirty_tracker = DirtyTracker::new(rows, cols);
 
             // Re-render at new size
             let (_, instructions) = self.render_screen().await?;
@@ -386,9 +408,13 @@ impl QueryExecutor {
             _ => {
                 if let Some(c) = char::from_u32(keysym) {
                     if c.is_ascii() && !c.is_control() {
-                        self.insert_char(c)?;
-                        let (_, instructions) = self.render_screen().await?;
-                        return Ok((true, instructions, None));
+                        // Insert character WITHOUT redrawing - just update buffer
+                        // The debounce timer will batch updates and render periodically
+                        self.input_buffer.insert(self.cursor_position, c);
+                        self.cursor_position += 1;
+                        self.input_dirty = true; // Mark input as needing redraw
+                                                 // Don't render - let debounce timer handle it
+                        return Ok((false, vec![], None));
                     }
                 }
             }
@@ -411,23 +437,80 @@ impl QueryExecutor {
         Ok(())
     }
 
+    /// Check if terminal or input needs rendering
+    pub fn is_dirty(&self) -> bool {
+        self.terminal.is_dirty() || self.input_dirty
+    }
+
     /// Render terminal screen and return Guacamole instructions
     pub async fn render_screen(&mut self) -> Result<(bool, Vec<Bytes>)> {
-        let jpeg = self.terminal.render_jpeg()?;
-        let img_instructions = self.terminal.format_img_instructions(&jpeg, self.stream_id);
+        // If input line changed, redraw it before rendering
+        if self.input_dirty {
+            self.redraw_input_line()?;
+            self.input_dirty = false;
+        }
 
-        // Convert image instructions to Bytes
-        let mut instructions: Vec<Bytes> = img_instructions.into_iter().map(Bytes::from).collect();
+        // Use dirty region optimization (like SSH handler)
+        // Only render the changed portions of the screen
+        let dirty_opt = self.dirty_tracker.find_dirty_region(self.terminal.screen());
 
-        // Add sync instruction (CRITICAL: tells client to display the buffered instructions)
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let sync_instr = self.terminal.format_sync_instruction(timestamp_ms);
-        instructions.push(Bytes::from(sync_instr));
+        let instructions: Vec<Bytes> = if let Some(dirty) = dirty_opt {
+            let (rows, cols) = self.terminal.size();
+            let total_cells = (rows as usize) * (cols as usize);
+            let dirty_cells = dirty.cell_count();
+            let dirty_pct = (dirty_cells * 100) / total_cells;
 
-        Ok((true, instructions))
+            // For small changes (< 30%), render only the dirty region
+            // For large changes (>= 30%), render the full screen (more efficient)
+            if dirty_pct < 30 {
+                // Partial render - only changed region
+                let (jpeg_data, x_px, y_px, _width_px, _height_px) = self
+                    .terminal
+                    .renderer()
+                    .render_region(
+                        self.terminal.screen(),
+                        dirty.min_row,
+                        dirty.max_row,
+                        dirty.min_col,
+                        dirty.max_col,
+                    )
+                    .map_err(|e| DatabaseError::QueryError(format!("Render error: {}", e)))?;
+
+                let img_instructions = self.terminal.renderer().format_img_instructions(
+                    &jpeg_data,
+                    self.stream_id,
+                    0,
+                    x_px as i32,
+                    y_px as i32,
+                );
+                img_instructions.into_iter().map(Bytes::from).collect()
+            } else {
+                // Full render - most of screen changed
+                let jpeg = self.terminal.render_jpeg()?;
+                let img_instructions = self.terminal.format_img_instructions(&jpeg, self.stream_id);
+                img_instructions.into_iter().map(Bytes::from).collect()
+            }
+        } else {
+            // No changes detected
+            vec![]
+        };
+
+        // Add sync instruction if we sent any image data
+        let mut all_instructions = instructions;
+        if !all_instructions.is_empty() {
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let sync_instr = self.terminal.format_sync_instruction(timestamp_ms);
+            all_instructions.push(Bytes::from(sync_instr));
+
+            // Clear dirty flag after successful render
+            // This prevents infinite debounce loop where we keep rendering the same content
+            self.terminal.clear_dirty();
+        }
+
+        Ok((true, all_instructions))
     }
 
     /// Get current input buffer contents
@@ -538,8 +621,10 @@ impl QueryExecutor {
 
     /// Redraw the current input line
     fn redraw_input_line(&mut self) -> Result<()> {
-        // Move to beginning of line and clear
-        self.terminal.write_line("\r")?;
+        // Move to beginning of line and clear (use \r without newline)
+        self.terminal.process(b"\r")?;
+        // Clear to end of line
+        self.terminal.process(b"\x1B[K")?;
 
         // Write prompt
         if self.in_continuation {
@@ -561,14 +646,6 @@ impl QueryExecutor {
             }
         }
 
-        Ok(())
-    }
-
-    /// Insert character at cursor position
-    fn insert_char(&mut self, c: char) -> Result<()> {
-        self.input_buffer.insert(self.cursor_position, c);
-        self.cursor_position += 1;
-        self.redraw_input_line()?;
         Ok(())
     }
 
@@ -846,8 +923,11 @@ mod tests {
         executor.input_buffer = "SELECT FROM users".to_string();
         executor.cursor_position = 7; // After "SELECT "
 
-        executor.insert_char('*').unwrap();
-        executor.insert_char(' ').unwrap();
+        // Manually insert characters (simulating what process_input does)
+        executor.input_buffer.insert(executor.cursor_position, '*');
+        executor.cursor_position += 1;
+        executor.input_buffer.insert(executor.cursor_position, ' ');
+        executor.cursor_position += 1;
 
         assert_eq!(executor.input_buffer, "SELECT * FROM users");
         assert_eq!(executor.cursor_position, 9);

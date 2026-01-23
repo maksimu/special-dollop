@@ -27,6 +27,7 @@ mod database_renderer;
 mod dirty_tracker;
 mod emulator;
 mod framebuffer;
+mod graphics_protocol;
 mod guacamole_input;
 mod input_handler;
 mod keysym;
@@ -45,6 +46,7 @@ pub use database_renderer::{DatabaseTerminal, QueryResult, SpreadsheetRenderer};
 pub use dirty_tracker::{DirtyRect, DirtyTracker};
 pub use emulator::{Rect, ScrollbackLine, TerminalEmulator};
 pub use framebuffer::{FrameBuffer, FrameRect};
+pub use graphics_protocol::{GraphicsMode, GraphicsRenderer};
 pub use guacamole_input::{
     extract_selection_text, format_clear_selection_instructions, format_clipboard_instructions,
     format_selection_overlay_instructions, handle_mouse_selection, parse_clipboard_blob,

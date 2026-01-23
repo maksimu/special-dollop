@@ -293,16 +293,18 @@ impl ProtocolHandler for SshHandler {
         // The client will send a resize instruction with actual browser dimensions after handshake
         // This prevents the "half screen" issue where we use browser size too early
         //
-        // Match guacd's handshake behavior: start with 1024x768 @ 96 DPI
-        // DPI 96 → 9x18 char cells → 113x42 terminal → 1017x756 aligned
-        // The resize handler (lines 681-723) will adjust to actual browser size
-        info!("SSH: Using default handshake size (1024x768 @ 96 DPI) - will resize after client connects");
+        // CRITICAL: Use a TALLER initial terminal to capture full SSH banner
+        // Many SSH servers send large MOTD/banner screens (50+ lines)
+        // Using 1024x768 @ 96 DPI gives only 42 rows, which truncates banners
+        // Instead, use 80x60 terminal (standard VT100 size with extra rows for banners)
+        // This ensures we capture the full banner before the client resize
+        info!("SSH: Using default handshake size (80x60 terminal) - will resize after client connects");
         let char_width = 9_u32;
         let char_height = 18_u32;
-        let cols = (1024 / char_width).clamp(20, 500) as u16; // 113 cols
-        let rows = (768 / char_height).clamp(10, 200) as u16; // 42 rows
-        let width_px = cols as u32 * char_width; // 1017 px (aligned)
-        let height_px = rows as u32 * char_height; // 756 px (aligned)
+        let cols = 80_u16; // Standard terminal width
+        let rows = 60_u16; // Taller to capture full banners
+        let width_px = cols as u32 * char_width; // 720 px (aligned)
+        let height_px = rows as u32 * char_height; // 1080 px (aligned)
         let (rows, cols, width_px, height_px, char_width, char_height) =
             (rows, cols, width_px, height_px, char_width, char_height);
 
@@ -555,6 +557,7 @@ impl ProtocolHandler for SshHandler {
         let banner_screen_content = if banner_collected {
             let screen = terminal.screen();
             let mut content_preview = String::new();
+
             // Get first 3 lines of banner for debugging
             for row in 0..3.min(rows) {
                 for col in 0..80.min(cols) {
@@ -588,14 +591,11 @@ impl ProtocolHandler for SshHandler {
                 "SSH: Banner preview (first 3 lines):\n{}",
                 banner_screen_content
             );
+            info!(
+                "SSH: Banner collected with {} bytes - colors should be rendered in JPEG",
+                banner_bytes_total
+            );
         }
-
-        // Track if we need to render banner after first resize
-        let mut banner_needs_render = banner_collected;
-
-        // Track if we've received the first resize from client
-        // This prevents rendering the banner at the wrong size
-        let mut first_resize_received = false;
 
         // Make rows/cols mutable for dynamic resizing (guacd-style)
         let mut current_rows = rows;
@@ -722,14 +722,13 @@ impl ProtocolHandler for SshHandler {
                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
             terminal.clear_dirty();
-            banner_needs_render = false;
             debug!("SSH: Banner rendered immediately at initial size");
         }
 
-        // Debounce timer for batching screen updates
-        // 16ms = 60fps for smooth interactive feel (was 100ms)
-        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
-        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Backup render timer - only fires if immediate render somehow missed an update
+        // This is a safety net, not the primary rendering mechanism
+        let mut backup_render = tokio::time::interval(std::time::Duration::from_millis(100));
+        backup_render.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Force initial render after 300ms to catch SSH prompt
         // SSH servers often send prompt immediately, but it might arrive after we initialize
@@ -815,17 +814,8 @@ impl ProtocolHandler for SshHandler {
                     }
                 }
 
-                // Debounce tick - render if screen changed
-                // IMPORTANT: This MUST come before input arms in biased select to ensure
-                // rendering has priority over input processing (prevents "one char behind")
-                _ = debounce.tick() => {
-                    // Don't render before first resize if banner was collected
-                    // This prevents rendering at the wrong size and losing banner content
-                    if !first_resize_received && banner_needs_render {
-                        trace!("SSH: Debounce tick skipped - waiting for first resize to render banner");
-                        continue;
-                    }
-
+                // Backup render - safety net in case immediate render missed something
+                _ = backup_render.tick() => {
                     if terminal.is_dirty() {
                         // Find what changed (dirty region optimization like guacd)
                         let dirty_opt = dirty_tracker.find_dirty_region(terminal.screen());
@@ -910,8 +900,23 @@ impl ProtocolHandler for SshHandler {
                                 }
                             } else {
                                 // Not a scroll - use normal dirty region rendering
-                                if dirty_pct < 30 {
-                                    trace!("SSH: Dirty region: {}x{} cells ({}%)", dirty.width(), dirty.height(), dirty_pct);
+
+                                // OPTIMIZATION: For very small updates (< 1%), use even more aggressive optimization
+                                // This handles cursor movement, single character edits, etc.
+                                if dirty_pct == 0 {
+                                    // Edge case: dirty region is empty (shouldn't happen but be safe)
+                                    trace!("SSH: Empty dirty region (0%), skipping render");
+                                } else if dirty_pct < 30 {
+                                    // Small region - render only changed area
+                                    if dirty_pct < 5 {
+                                        trace!("SSH: Micro update: {}x{} cells ({}%) at row {}-{}, col {}-{}",
+                                            dirty.width(), dirty.height(), dirty_pct,
+                                            dirty.min_row, dirty.max_row, dirty.min_col, dirty.max_col);
+                                    } else {
+                                        trace!("SSH: Dirty region: {}x{} cells ({}%) at row {}-{}, col {}-{}",
+                                            dirty.width(), dirty.height(), dirty_pct,
+                                            dirty.min_row, dirty.max_row, dirty.min_col, dirty.max_col);
+                                    }
 
                                     let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region(
                                         terminal.screen(),
@@ -929,6 +934,7 @@ impl ProtocolHandler for SshHandler {
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
                                 } else {
+                                    // Large region - render full screen
                                     trace!("SSH: Full screen ({}% dirty)", dirty_pct);
 
                                     let jpeg = renderer.render_screen(
@@ -1063,7 +1069,69 @@ impl ProtocolHandler for SshHandler {
                                 }
                             }
 
-                            // Don't render immediately - let debounce batch updates
+                            // Render immediately for responsive feedback
+                            // The dirty region optimization ensures we only send changed portions
+                            if terminal.is_dirty() {
+                                let dirty_opt = dirty_tracker.find_dirty_region(terminal.screen());
+
+                                if let Some(dirty) = dirty_opt {
+                                    // Render only the changed region
+                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region(
+                                        terminal.screen(),
+                                        dirty.min_row,
+                                        dirty.max_row,
+                                        dirty.min_col,
+                                        dirty.max_col,
+                                    ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                                    #[allow(deprecated)]
+                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, x_px as i32, y_px as i32);
+
+                                    for instr in img_instructions {
+                                        to_client.send(Bytes::from(instr)).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    }
+
+                                    let sync_instr = renderer.format_sync_instruction(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as u64
+                                    );
+                                    to_client.send(Bytes::from(sync_instr)).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    terminal.clear_dirty();
+                                } else {
+                                    // Dirty tracker returned None - fallback to full screen render
+                                    debug!("SSH: Dirty tracker returned None, rendering full screen");
+
+                                    let jpeg = renderer.render_screen(
+                                        terminal.screen(),
+                                        terminal.size().0,
+                                        terminal.size().1,
+                                    ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                                    #[allow(deprecated)]
+                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
+
+                                    for instr in img_instructions {
+                                        to_client.send(Bytes::from(instr)).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    }
+
+                                    let sync_instr = renderer.format_sync_instruction(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as u64
+                                    );
+                                    to_client.send(Bytes::from(sync_instr)).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    terminal.clear_dirty();
+                                }
+                            }
                         }
                         russh::ChannelMsg::ExitStatus { exit_status } => {
                             error!("SSH handler: SSH command exited with status: {}", exit_status);
@@ -1100,7 +1168,13 @@ impl ProtocolHandler for SshHandler {
 
                     // Parse Guacamole instruction
                     let msg_str = String::from_utf8_lossy(&msg);
-                    trace!("SSH: Received client message: {}", msg_str);
+
+                    // Log clipboard-related messages at debug level for troubleshooting
+                    if msg_str.contains("clipboard") || msg_str.contains("blob") {
+                        debug!("SSH: Received clipboard/blob message: {}", msg_str);
+                    } else {
+                        trace!("SSH: Received client message: {}", msg_str);
+                    }
 
                     if let Some(key_event) = parse_key_instruction(&msg_str) {
                         trace!("SSH: Key event - keysym={} (0x{:04X}), pressed={}, ctrl={}, shift={}, alt={}",
@@ -1164,6 +1238,15 @@ impl ProtocolHandler for SshHandler {
 
                             channel.data(&paste_data[..]).await
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                            // CRITICAL: Force dirty tracker reset after large paste
+                            // Large pastes can cause dirty region tracking to fail, resulting in
+                            // partial screen rendering (black screen with only small region visible)
+                            // Reset forces next render to be full screen
+                            if paste_text.len() > 100 {
+                                debug!("SSH: Large paste detected ({}  chars), resetting dirty tracker to force full render", paste_text.len());
+                                dirty_tracker = DirtyTracker::new(current_rows, current_cols);
+                            }
 
                             continue; // Don't send the 'V' key itself
                         }
@@ -1231,11 +1314,6 @@ impl ProtocolHandler for SshHandler {
                             channel.data(&bytes[..]).await
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         }
-                    } else if msg_str.contains(".clipboard,") {
-                        // Clipboard instruction received - this is just a SYNC, not a paste command!
-                        // The Guacamole protocol sends clipboard instructions to sync clipboard state
-                        // between client and server. This does NOT mean the user wants to paste.
-                        debug!("SSH: Clipboard stream opened - syncing clipboard state (not pasting)");
                     } else if let Some(clipboard_text) = parse_clipboard_blob(&msg_str) {
                         // Clipboard blob instruction: Store clipboard data from client
                         // This is just synchronization - NOT a paste command!
@@ -1243,6 +1321,13 @@ impl ProtocolHandler for SshHandler {
 
                         stored_clipboard = clipboard_text;
                         debug!("SSH: Clipboard updated - stored {} chars (waiting for Ctrl+Shift+V to paste)", stored_clipboard.len());
+                        trace!("SSH: Clipboard content preview: {:?}", &stored_clipboard.chars().take(50).collect::<String>());
+                    } else if msg_str.contains(".clipboard,") {
+                        // Clipboard instruction received - this is just a SYNC, not a paste command!
+                        // The Guacamole protocol sends clipboard instructions to sync clipboard state
+                        // between client and server. This does NOT mean the user wants to paste.
+                        debug!("SSH: Clipboard stream opened - syncing clipboard state (not pasting)");
+                        trace!("SSH: Clipboard instruction: {}", msg_str);
                     } else if msg_str.contains(".size,") {
                         // Handle resize - extract exact pixel dimensions from browser
                         // Format: "4.size,4.1057,3.768;" where args are: width, height
@@ -1268,12 +1353,6 @@ impl ProtocolHandler for SshHandler {
                                             // Calculate new rows/cols using FIXED cell dimensions (guacd-style)
                                             let new_cols = (new_width_px / char_width).clamp(20, 500) as u16;
                                             let new_rows = (new_height_px / char_height).clamp(10, 200) as u16;
-
-                            // Mark that we've received the first resize
-                            if !first_resize_received {
-                                first_resize_received = true;
-                                debug!("SSH: First resize received from client");
-                            }
 
                             // Skip resize if dimensions haven't changed
                             if new_rows == current_rows && new_cols == current_cols {
@@ -1339,12 +1418,6 @@ impl ProtocolHandler for SshHandler {
                                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
                                             terminal.clear_dirty();
-
-                                            // If banner was collected but not yet rendered, mark it as rendered now
-                                            if banner_needs_render {
-                                                debug!("SSH: Banner rendered at correct size after resize");
-                                                banner_needs_render = false;
-                                            }
                                         }
                                     }
                                 }
@@ -1399,17 +1472,10 @@ impl ProtocolHandler for SshHandler {
                                 current_rows,
                                 modifier_state.shift, // Pass shift key state for extend selection
                             ) {
-                                SelectionResult::InProgress(overlay_instructions) => {
-                                    // Send visual feedback (blue overlay) to client
-                                    info!("SSH: Selection in progress, sending {} overlay instructions", overlay_instructions.len());
-                                    for (i, instr) in overlay_instructions.iter().enumerate() {
-                                        debug!("SSH: Overlay [{}]: {}", i, instr);
-                                    }
-                                    for instr in overlay_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                                    }
-                                    debug!("SSH: Overlay instructions sent successfully");
+                                SelectionResult::InProgress(_overlay_instructions) => {
+                                    // Visual overlay disabled for performance
+                                    // Selection still works, just no blue highlight shown
+                                    debug!("SSH: Selection in progress (overlay disabled)");
                                 }
                                 SelectionResult::Complete { text: selected_text, clear_instructions } => {
                                     info!("SSH: Selection complete - {} chars selected", selected_text.len());
@@ -1445,13 +1511,13 @@ impl ProtocolHandler for SshHandler {
                                     let clipboard_stream_id = 10;
                                     let clipboard_instructions = format_clipboard_instructions(&selected_text, clipboard_stream_id);
 
-                                    debug!("SSH: Sending {} clipboard instructions for {} chars", clipboard_instructions.len(), selected_text.len());
+                                    info!("SSH: Sending {} clipboard instructions for {} chars to UI", clipboard_instructions.len(), selected_text.len());
                                     for instr in clipboard_instructions {
-                                        trace!("SSH: Clipboard instruction: {}", instr);
+                                        debug!("SSH: Sending clipboard instruction: {}", instr);
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
-                                    debug!("SSH: Clipboard instructions sent successfully");
+                                    info!("SSH: Clipboard instructions sent successfully to UI");
                                 }
                                 SelectionResult::None => {
                                     // No selection action (hovering, etc.) - ignore

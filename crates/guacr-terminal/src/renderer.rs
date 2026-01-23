@@ -5,7 +5,6 @@ use guacr_protocol::{
     format_blob, format_cfill, format_end, format_instruction, format_rect, format_transfer,
 };
 use image::{Rgb, RgbImage};
-use std::io::Cursor;
 
 // Primary font: Noto Sans Mono (SIL Open Font License)
 // Good coverage for Latin, Cyrillic, Greek, and common symbols
@@ -200,10 +199,12 @@ impl TerminalRenderer {
             }
         }
 
-        // Encode to JPEG (quality 95 for fast encoding with minimal visual loss)
-        // JPEG is 5-10x faster than PNG for terminal rendering
+        // Consistent JPEG quality for uniform appearance
+        // Quality 65 provides good balance: crisp text, small file size
+        // Consistent quality prevents jarring visual differences between updates
         let mut jpeg_data = Vec::new();
-        img.write_to(&mut Cursor::new(&mut jpeg_data), image::ImageFormat::Jpeg)?;
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 65);
+        encoder.encode_image(&img)?;
 
         // Return JPEG + position info (x, y in pixels)
         let x_px = min_col as u32 * self.char_width;
@@ -256,10 +257,12 @@ impl TerminalRenderer {
             }
         }
 
-        // Encode to JPEG (quality 95 for fast encoding with minimal visual loss)
-        // JPEG is 5-10x faster than PNG for terminal rendering
+        // Consistent JPEG quality for uniform appearance
+        // Quality 65 provides good balance: crisp text, small file size
+        // Same quality as dirty region renders for consistent visual experience
         let mut jpeg_data = Vec::new();
-        img.write_to(&mut Cursor::new(&mut jpeg_data), image::ImageFormat::Jpeg)?;
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 65);
+        encoder.encode_image(&img)?;
 
         Ok(jpeg_data)
     }

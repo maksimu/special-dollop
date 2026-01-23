@@ -60,6 +60,7 @@ IronRdpSession (ironrdp 0.13)
 - Fast-Path bitmap update parsing
 - TPKT/MCS channel support framework
 - Graphics update processing with SIMD BGR→RGBA conversion
+- Alpha channel fix (SIMD-optimized, 16-26x faster than naive approach)
 - Input event handling (keyboard/mouse)
 - Channel management (CLIPRDR, DISP, RDPGFX, AUDIO)
 

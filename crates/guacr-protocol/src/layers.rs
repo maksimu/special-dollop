@@ -35,6 +35,22 @@ pub fn format_move(layer: i32, parent: i32, x: u32, y: u32, z: i32) -> String {
     format_instruction("move", &[&layer_str, &parent_str, &x_str, &y_str, &z_str])
 }
 
+/// Format `size` instruction - Set layer size
+///
+/// Format: `4.size,{layer},{width},{height};`
+///
+/// # Arguments
+/// - `layer`: Layer index
+/// - `width`: Layer width in pixels
+/// - `height`: Layer height in pixels
+pub fn format_size(layer: i32, width: u32, height: u32) -> String {
+    let layer_str = layer.to_string();
+    let width_str = width.to_string();
+    let height_str = height.to_string();
+
+    format_instruction("size", &[&layer_str, &width_str, &height_str])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

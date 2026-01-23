@@ -404,11 +404,42 @@ impl OracleHandler {
         }
 
         // Main event loop
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
-                    if let Some(query) = pending_query {
-                        info!("Oracle: Query: {}", query);
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("Oracle: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("Oracle: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
+                            if let Some(query) = pending_query {
+                                info!("Oracle: Query: {}", query);
 
                         // Record query input
                         record_query_input(recorder, recording_config, &query);
@@ -474,17 +505,26 @@ impl OracleHandler {
                         continue;
                     }
 
-                    if needs_render {
-                        for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            if needs_render {
+                                // Render immediately for special cases (Enter, Escape, etc.)
+                                for instr in instructions {
+                                    to_client
+                                        .send(instr)
+                                        .await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+                            // For regular keystrokes, debounce timer will handle rendering
+                        }
+                        Err(e) => {
+                            warn!("Oracle: Input processing error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Oracle: Input processing error: {}", e);
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }
@@ -587,11 +627,42 @@ impl OracleHandler {
         }
 
         // Event loop - process commands in simulation mode
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
-                    if let Some(query) = pending_query {
-                        info!("Oracle: Command: {}", query);
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("Oracle: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("Oracle: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
+                            if let Some(query) = pending_query {
+                                info!("Oracle: Command: {}", query);
 
                         // Record query input
                         record_query_input(recorder, recording_config, &query);
@@ -674,20 +745,29 @@ impl OracleHandler {
                                 .await
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
-                        continue;
-                    }
+                                continue;
+                            }
 
-                    if needs_render {
-                        for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            if needs_render {
+                                // Render immediately for special cases (Enter, Escape, etc.)
+                                for instr in instructions {
+                                    to_client
+                                        .send(instr)
+                                        .await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+                            // For regular keystrokes, debounce timer will handle rendering
+                        }
+                        Err(e) => {
+                            warn!("Oracle: Input processing error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Oracle: Input processing error: {}", e);
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

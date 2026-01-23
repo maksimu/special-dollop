@@ -320,8 +320,41 @@ impl ProtocolHandler for MySqlHandler {
 
         // Event loop - process queries
         // NOTE: Screen was already rendered above after connection success
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal or input changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("MySQL: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        debug!("MySQL: Debounce tick - rendering dirty terminal");
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        debug!("MySQL: Sending {} instructions from debounce", instructions.len());
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("MySQL: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
                 Ok((needs_render, instructions, pending_query)) => {
                     if let Some(query) = pending_query {
                         info!("MySQL: Executing query: {}", query);
@@ -439,7 +472,7 @@ impl ProtocolHandler for MySqlHandler {
                             }
                         }
 
-                        // Re-render with results
+                        // Re-render with results immediately (query results should show right away)
                         let (_, result_instructions) = executor
                             .render_screen()
                             .await
@@ -454,6 +487,7 @@ impl ProtocolHandler for MySqlHandler {
                     }
 
                     if needs_render {
+                        // Render immediately for special cases (Enter, Escape, etc.)
                         for instr in instructions {
                             to_client
                                 .send(instr)
@@ -461,9 +495,17 @@ impl ProtocolHandler for MySqlHandler {
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
                     }
+                    // For regular keystrokes, debounce timer will handle rendering
                 }
                 Err(e) => {
                     warn!("MySQL: Input processing error: {}", e);
+                }
+            }
+                }
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

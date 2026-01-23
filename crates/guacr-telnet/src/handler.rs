@@ -492,6 +492,15 @@ impl ProtocolHandler for TelnetHandler {
                             write_half.write_all(&paste_data[..]).await
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+                            // CRITICAL: Force dirty tracker reset after large paste
+                            // Large pastes can cause dirty region tracking to fail, resulting in
+                            // partial screen rendering (black screen with only small region visible)
+                            // Reset forces next render to be full screen
+                            if paste_text.len() > 100 {
+                                debug!("Telnet: Large paste detected ({} chars), resetting dirty tracker to force full render", paste_text.len());
+                                dirty_tracker = DirtyTracker::new(rows, cols);
+                            }
+
                             continue; // Don't send the 'V' key itself
                         }
 

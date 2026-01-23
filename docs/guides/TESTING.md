@@ -153,6 +153,22 @@ cargo test --workspace
 - Dead code in examples: Add `#[allow(dead_code)]` for placeholder fields
 - Missing documentation: Add doc comments for public items
 
+## RDP Testing
+
+### Alpha Channel Fix
+
+The RDP handler includes an integration test to verify the alpha channel fix:
+
+```bash
+# Start RDP container
+docker start guacr-test-rdp
+
+# Run alpha channel test
+cargo test -p guacr-rdp --test integration_test test_rdp_alpha_channel_fix -- --include-ignored
+```
+
+This test verifies that all pixels have alpha=255 (opaque) in the PNG output, ensuring screenshots render correctly.
+
 ## Running Tests
 
 ### Quick Commands (Makefile)

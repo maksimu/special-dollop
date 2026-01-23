@@ -131,6 +131,7 @@ fn handle_shift_click_extend(
     char_width: u32,
     char_height: u32,
     cols: u16,
+    rows: u16,
 ) -> SelectionResult {
     if let Some(start) = &selection.start {
         // Determine which end to extend from
@@ -159,6 +160,7 @@ fn handle_shift_click_extend(
                 char_width,
                 char_height,
                 cols,
+                rows,
             );
             selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
             SelectionResult::InProgress(overlay_instructions)
@@ -182,6 +184,7 @@ fn handle_double_click_word_selection(
     char_width: u32,
     char_height: u32,
     cols: u16,
+    rows: u16,
 ) -> SelectionResult {
     // Find word boundaries
     let (word_start, word_end) = find_word_boundaries(terminal, point.row, point.column);
@@ -209,6 +212,7 @@ fn handle_double_click_word_selection(
             char_width,
             char_height,
             cols,
+            rows,
         );
         selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
         SelectionResult::InProgress(overlay_instructions)
@@ -225,6 +229,7 @@ fn handle_triple_click_line_selection(
     char_width: u32,
     char_height: u32,
     cols: u16,
+    rows: u16,
 ) -> SelectionResult {
     // Select entire line
     let start_point = SelectionPoint::new(point.row, 0, ColumnSide::Left, terminal);
@@ -249,6 +254,7 @@ fn handle_triple_click_line_selection(
             char_width,
             char_height,
             cols,
+            rows,
         );
         selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
         SelectionResult::InProgress(overlay_instructions)
@@ -575,6 +581,7 @@ pub fn handle_mouse_selection(
                 char_width,
                 char_height,
                 cols,
+                rows,
             );
         }
 
@@ -603,6 +610,7 @@ pub fn handle_mouse_selection(
                         char_width,
                         char_height,
                         cols,
+                        rows,
                     );
                     selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
                     SelectionResult::InProgress(overlay_instructions)
@@ -619,6 +627,7 @@ pub fn handle_mouse_selection(
                     char_width,
                     char_height,
                     cols,
+                    rows,
                 )
             }
             _ => {
@@ -630,6 +639,7 @@ pub fn handle_mouse_selection(
                     char_width,
                     char_height,
                     cols,
+                    rows,
                 )
             }
         }
@@ -655,6 +665,7 @@ pub fn handle_mouse_selection(
                     char_width,
                     char_height,
                     cols,
+                    rows,
                 );
                 selection.last_rendered = Some(current_selection);
                 SelectionResult::InProgress(overlay_instructions)
@@ -701,12 +712,16 @@ pub fn handle_mouse_selection(
 /// Creates blue semi-transparent rectangles to highlight selected text.
 /// Uses layer ID 1 for selection overlay (layer 0 is the terminal display).
 ///
+/// CRITICAL: The overlay must be properly cleared before any terminal rendering,
+/// otherwise the cfill operation will fill the entire screen with the selection color.
+///
 /// # Arguments
 /// * `start` - Start position (row, col)
 /// * `end` - End position (row, col)
 /// * `char_width` - Width of character cell in pixels
 /// * `char_height` - Height of character cell in pixels
 /// * `cols` - Number of columns in terminal
+/// * `rows` - Number of rows in terminal
 ///
 /// # Returns
 /// Vec of Guacamole instructions to draw selection overlay
@@ -716,6 +731,7 @@ pub fn format_selection_overlay_instructions(
     char_width: u32,
     char_height: u32,
     cols: u16,
+    rows: u16,
 ) -> Vec<String> {
     let (start_row, start_col) = start;
     let (end_row, end_col) = end;
@@ -729,7 +745,16 @@ pub fn format_selection_overlay_instructions(
         };
 
     let mut instructions = Vec::new();
-    let layer = "1"; // Selection overlay layer
+    let layer = 1_i32; // Selection overlay layer
+
+    // Set layer size to match terminal dimensions
+    let layer_width = cols as u32 * char_width;
+    let layer_height = rows as u32 * char_height;
+    instructions.push(guacr_protocol::format_size(
+        layer,
+        layer_width,
+        layer_height,
+    ));
 
     if start_row == end_row {
         // Single row selection - one rectangle
@@ -738,19 +763,7 @@ pub fn format_selection_overlay_instructions(
         let width = (end_col - start_col + 1) as u32 * char_width;
         let height = char_height;
 
-        instructions.push(format!(
-            "4.rect,{}.{},{}.{},{}.{},{}.{},{}.{};",
-            layer.len(),
-            layer,
-            x.to_string().len(),
-            x,
-            y.to_string().len(),
-            y,
-            width.to_string().len(),
-            width,
-            height.to_string().len(),
-            height
-        ));
+        instructions.push(guacr_protocol::format_rect(layer, x, y, width, height));
     } else {
         // Multi-row selection - three rectangles
 
@@ -760,19 +773,7 @@ pub fn format_selection_overlay_instructions(
         let width1 = (cols - start_col) as u32 * char_width;
         let height1 = char_height;
 
-        instructions.push(format!(
-            "4.rect,{}.{},{}.{},{}.{},{}.{},{}.{};",
-            layer.len(),
-            layer,
-            x1.to_string().len(),
-            x1,
-            y1.to_string().len(),
-            y1,
-            width1.to_string().len(),
-            width1,
-            height1.to_string().len(),
-            height1
-        ));
+        instructions.push(guacr_protocol::format_rect(layer, x1, y1, width1, height1));
 
         // Middle rows: full width (if any)
         if end_row > start_row + 1 {
@@ -781,19 +782,7 @@ pub fn format_selection_overlay_instructions(
             let width2 = cols as u32 * char_width;
             let height2 = (end_row - start_row - 1) as u32 * char_height;
 
-            instructions.push(format!(
-                "4.rect,{}.{},{}.{},{}.{},{}.{},{}.{};",
-                layer.len(),
-                layer,
-                x2.to_string().len(),
-                x2,
-                y2.to_string().len(),
-                y2,
-                width2.to_string().len(),
-                width2,
-                height2.to_string().len(),
-                height2
-            ));
+            instructions.push(guacr_protocol::format_rect(layer, x2, y2, width2, height2));
         }
 
         // Last row: from start to end_col
@@ -802,30 +791,14 @@ pub fn format_selection_overlay_instructions(
         let width3 = (end_col + 1) as u32 * char_width;
         let height3 = char_height;
 
-        instructions.push(format!(
-            "4.rect,{}.{},{}.{},{}.{},{}.{},{}.{};",
-            layer.len(),
-            layer,
-            x3.to_string().len(),
-            x3,
-            y3.to_string().len(),
-            y3,
-            width3.to_string().len(),
-            width3,
-            height3.to_string().len(),
-            height3
-        ));
+        instructions.push(guacr_protocol::format_rect(layer, x3, y3, width3, height3));
     }
 
     // Fill with blue semi-transparent color (matching guacd visibility)
     // Blue: R=0, G=128 (0x80), B=255 (0xFF), A=200 (0xC8 = 78% opacity)
     // Increased from 160 (62.7%) to 200 (78%) for much better visibility
     // This matches guacd's selection overlay which is quite visible
-    instructions.push(format!(
-        "5.cfill,{}.{},1.0,3.128,3.255,3.200;",
-        layer.len(),
-        layer
-    ));
+    instructions.push(guacr_protocol::format_cfill(layer, 0, 128, 255, 200));
 
     instructions
 }

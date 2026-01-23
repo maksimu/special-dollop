@@ -1,11 +1,14 @@
 // CEF (Chromium Embedded Framework) session manager for RBI
 //
-// CRITICAL SECURITY: Each CefSession spawns a DEDICATED CEF subprocess
-// - NO process sharing between sessions
-// - Each session gets its own isolated Chromium process
-// - Profile directories are locked to prevent concurrent access
-// - Process terminates when session ends
-// - Complete memory and process isolation
+// SECURITY ARCHITECTURE (DESIGN GOALS - PARTIAL IMPLEMENTATION):
+// - Each CefSession should spawn a dedicated CEF subprocess (no process sharing)
+// - Each session should get its own isolated Chromium process
+// - Profile directories should be locked to prevent concurrent access
+// - Processes should terminate when sessions end
+//
+// NOTE: This is currently a stub implementation. Full isolation guarantees
+// are not yet implemented. Do not rely on this for security-critical isolation
+// until the implementation is complete (see TODOs throughout this file).
 //
 // This provides the same capabilities as KCM's CEF implementation:
 // - RenderHandler: Receives raw BGRA pixels for each frame

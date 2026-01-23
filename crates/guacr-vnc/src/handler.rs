@@ -498,7 +498,7 @@ impl VncClient {
     /// Encode a framebuffer region using configured encoding (JPEG or PNG)
     ///
     /// Uses JPEG by default for 5-10x bandwidth savings, with PNG fallback.
-    fn encode_region(&self, rect: guacr_terminal::FrameRect) -> Result<Vec<u8>, String> {
+    fn encode_region(&mut self, rect: guacr_terminal::FrameRect) -> Result<Vec<u8>, String> {
         if self.use_jpeg {
             // Extract region pixels
             let region_pixels = self.framebuffer.get_region_pixels(rect);
@@ -566,7 +566,9 @@ impl VncClient {
         self.height = server_height as u32;
         self.framebuffer = FrameBuffer::new(self.width, self.height);
 
-        let ready_instr = format!("5.ready,{}.{};", 9, "vnc-ready");
+        // Send ready instruction with proper LENGTH.VALUE format
+        let ready_value = "vnc-ready";
+        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
         self.to_client
             .send(Bytes::from(ready_instr))
             .await
@@ -729,10 +731,11 @@ impl VncClient {
             }
             "mouse" => {
                 if instr.args.len() >= 3 {
-                    if let (Ok(mask), Ok(x), Ok(y)) = (
-                        instr.args[0].parse::<u8>(),
+                    // Protocol order: x, y, mask (per Guacamole protocol spec)
+                    if let (Ok(x), Ok(y), Ok(mask)) = (
+                        instr.args[0].parse::<i32>(),
                         instr.args[1].parse::<i32>(),
-                        instr.args[2].parse::<i32>(),
+                        instr.args[2].parse::<u8>(),
                     ) {
                         // Security: Check read-only mode for mouse clicks
                         if self.read_only && !is_mouse_event_allowed_readonly(mask as u32) {

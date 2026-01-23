@@ -216,6 +216,11 @@ impl DatabaseTerminal {
         self.terminal.is_dirty()
     }
 
+    /// Clear dirty flag after rendering
+    pub fn clear_dirty(&mut self) {
+        self.terminal.clear_dirty();
+    }
+
     /// Format Guacamole img instructions for the rendered image
     #[allow(deprecated)]
     pub fn format_img_instructions(&self, jpeg_data: &[u8], stream_id: u32) -> Vec<String> {
@@ -226,6 +231,16 @@ impl DatabaseTerminal {
     /// Format sync instruction to tell client to display buffered instructions
     pub fn format_sync_instruction(&self, timestamp_ms: u64) -> String {
         self.renderer.format_sync_instruction(timestamp_ms)
+    }
+
+    /// Get reference to the renderer (for dirty region optimization)
+    pub fn renderer(&self) -> &TerminalRenderer {
+        &self.renderer
+    }
+
+    /// Get reference to the terminal screen (for dirty region tracking)
+    pub fn screen(&self) -> &vt100::Screen {
+        self.terminal.screen()
     }
 
     /// Get database type

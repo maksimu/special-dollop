@@ -180,6 +180,7 @@ impl TerminalInputHandler {
                 char_width,
                 char_height,
                 self.cols,
+                self.rows,
             )
         } else {
             vec![]

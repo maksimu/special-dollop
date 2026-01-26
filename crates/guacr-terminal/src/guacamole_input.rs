@@ -1,16 +1,29 @@
-use crate::TerminalEmulator;
+use crate::{points_enclose_text, ColumnSide, SelectionPoint, TerminalEmulator};
 /// Guacamole protocol input event handling for terminal-based protocols
 ///
 /// This module provides shared functionality for parsing and handling
 /// Guacamole input instructions (key, mouse, clipboard) for SSH, Telnet, etc.
 use base64::Engine;
+use std::time::{Duration, Instant};
 
-/// Mouse selection state tracking
+/// Mouse selection state tracking with side-aware selection points
 #[derive(Debug, Clone)]
 pub struct MouseSelection {
     pub mouse_down: bool,
-    pub start: Option<(u16, u16)>, // (row, col)
-    pub end: Option<(u16, u16)>,
+    pub start: Option<SelectionPoint>,
+    pub end: Option<SelectionPoint>,
+    pub last_rendered: Option<((u16, u16), (u16, u16))>, // Track last rendered selection for updates
+
+    // Multi-click tracking
+    pub last_click_time: Option<Instant>,
+    pub click_count: u8,
+    pub click_timeout: Duration,
+
+    // Normalized selection boundaries (for rendering)
+    pub selection_start_row: Option<u16>,
+    pub selection_start_column: Option<u16>,
+    pub selection_end_row: Option<u16>,
+    pub selection_end_column: Option<u16>,
 }
 
 impl MouseSelection {
@@ -19,6 +32,14 @@ impl MouseSelection {
             mouse_down: false,
             start: None,
             end: None,
+            last_rendered: None,
+            last_click_time: None,
+            click_count: 0,
+            click_timeout: Duration::from_millis(300), // 300ms double-click threshold
+            selection_start_row: None,
+            selection_start_column: None,
+            selection_end_row: None,
+            selection_end_column: None,
         }
     }
 
@@ -26,6 +47,30 @@ impl MouseSelection {
         self.mouse_down = false;
         self.start = None;
         self.end = None;
+        self.last_rendered = None;
+        self.selection_start_row = None;
+        self.selection_start_column = None;
+        self.selection_end_row = None;
+        self.selection_end_column = None;
+        // Don't reset click tracking - we need it for multi-click detection
+    }
+
+    /// Register a click and return the click count (1=single, 2=double, 3=triple)
+    pub fn register_click(&mut self) -> u8 {
+        let now = Instant::now();
+
+        if let Some(last_time) = self.last_click_time {
+            if now.duration_since(last_time) < self.click_timeout {
+                self.click_count += 1;
+            } else {
+                self.click_count = 1;
+            }
+        } else {
+            self.click_count = 1;
+        }
+
+        self.last_click_time = Some(now);
+        self.click_count
     }
 }
 
@@ -33,6 +78,252 @@ impl Default for MouseSelection {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Result of mouse selection handling
+#[derive(Debug, Clone)]
+pub enum SelectionResult {
+    /// Selection in progress - contains instructions to draw overlay
+    InProgress(Vec<String>),
+    /// Selection complete - contains selected text and instructions to clear overlay
+    Complete {
+        text: String,
+        clear_instructions: Vec<String>,
+    },
+    /// No selection action (hovering, etc.)
+    None,
+}
+
+/// Update the normalized selection boundaries based on selection points
+fn update_selection_boundaries(selection: &mut MouseSelection, _terminal: &TerminalEmulator) {
+    if let (Some(start), Some(end)) = (&selection.start, &selection.end) {
+        // Normalize so start comes before end
+        let (start, end) = if start.is_after(end) {
+            (end, start)
+        } else {
+            (start, end)
+        };
+
+        // Check if points enclose text
+        if points_enclose_text(start, end) {
+            let new_start_column = start.round_up();
+            let new_end_column = end.round_down();
+
+            selection.selection_start_row = Some(start.row);
+            selection.selection_start_column = Some(new_start_column);
+            selection.selection_end_row = Some(end.row);
+            selection.selection_end_column = Some(new_end_column);
+        } else {
+            // No text enclosed - clear selection
+            selection.selection_start_row = None;
+            selection.selection_start_column = None;
+            selection.selection_end_row = None;
+            selection.selection_end_column = None;
+        }
+    }
+}
+
+/// Handle shift+click to extend existing selection
+fn handle_shift_click_extend(
+    selection: &mut MouseSelection,
+    point: SelectionPoint,
+    terminal: &TerminalEmulator,
+    char_width: u32,
+    char_height: u32,
+    cols: u16,
+    rows: u16,
+) -> SelectionResult {
+    if let Some(start) = &selection.start {
+        // Determine which end to extend from
+        if point.is_after(start) {
+            // Extend from start
+            selection.end = Some(point);
+        } else {
+            // Extend from end (swap start/end)
+            selection.end = selection.start.clone();
+            selection.start = Some(point);
+        }
+
+        // Update boundaries
+        update_selection_boundaries(selection, terminal);
+
+        // Generate overlay
+        if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+            selection.selection_start_row,
+            selection.selection_start_column,
+            selection.selection_end_row,
+            selection.selection_end_column,
+        ) {
+            let overlay_instructions = format_selection_overlay_instructions(
+                (start_row, start_col),
+                (end_row, end_col),
+                char_width,
+                char_height,
+                cols,
+                rows,
+            );
+            selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
+            SelectionResult::InProgress(overlay_instructions)
+        } else {
+            SelectionResult::None
+        }
+    } else {
+        // No existing selection - start new one
+        selection.start = Some(point.clone());
+        selection.end = Some(point);
+        update_selection_boundaries(selection, terminal);
+        SelectionResult::None
+    }
+}
+
+/// Handle double-click word selection
+fn handle_double_click_word_selection(
+    selection: &mut MouseSelection,
+    point: SelectionPoint,
+    terminal: &TerminalEmulator,
+    char_width: u32,
+    char_height: u32,
+    cols: u16,
+    rows: u16,
+) -> SelectionResult {
+    // Find word boundaries
+    let (word_start, word_end) = find_word_boundaries(terminal, point.row, point.column);
+
+    // Create selection points at word boundaries
+    let start_point = SelectionPoint::new(point.row, word_start, ColumnSide::Left, terminal);
+    let end_point = SelectionPoint::new(point.row, word_end, ColumnSide::Right, terminal);
+
+    selection.start = Some(start_point);
+    selection.end = Some(end_point);
+
+    // Update boundaries
+    update_selection_boundaries(selection, terminal);
+
+    // Generate overlay
+    if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+        selection.selection_start_row,
+        selection.selection_start_column,
+        selection.selection_end_row,
+        selection.selection_end_column,
+    ) {
+        let overlay_instructions = format_selection_overlay_instructions(
+            (start_row, start_col),
+            (end_row, end_col),
+            char_width,
+            char_height,
+            cols,
+            rows,
+        );
+        selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
+        SelectionResult::InProgress(overlay_instructions)
+    } else {
+        SelectionResult::None
+    }
+}
+
+/// Handle triple-click line selection
+fn handle_triple_click_line_selection(
+    selection: &mut MouseSelection,
+    point: SelectionPoint,
+    terminal: &TerminalEmulator,
+    char_width: u32,
+    char_height: u32,
+    cols: u16,
+    rows: u16,
+) -> SelectionResult {
+    // Select entire line
+    let start_point = SelectionPoint::new(point.row, 0, ColumnSide::Left, terminal);
+    let end_point = SelectionPoint::new(point.row, cols - 1, ColumnSide::Right, terminal);
+
+    selection.start = Some(start_point);
+    selection.end = Some(end_point);
+
+    // Update boundaries
+    update_selection_boundaries(selection, terminal);
+
+    // Generate overlay
+    if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+        selection.selection_start_row,
+        selection.selection_start_column,
+        selection.selection_end_row,
+        selection.selection_end_column,
+    ) {
+        let overlay_instructions = format_selection_overlay_instructions(
+            (start_row, start_col),
+            (end_row, end_col),
+            char_width,
+            char_height,
+            cols,
+            rows,
+        );
+        selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
+        SelectionResult::InProgress(overlay_instructions)
+    } else {
+        SelectionResult::None
+    }
+}
+
+/// Find word boundaries at a given position
+///
+/// A "word" is defined as a sequence of alphanumeric characters or underscores.
+/// This matches the behavior of most terminal emulators.
+fn find_word_boundaries(terminal: &TerminalEmulator, row: u16, col: u16) -> (u16, u16) {
+    let screen = terminal.screen();
+
+    // Helper to check if a character is part of a word
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '.';
+
+    // Get the character at the clicked position
+    let clicked_cell = screen.cell(row, col);
+    if clicked_cell.is_none() {
+        return (col, col);
+    }
+
+    let clicked_contents = clicked_cell.unwrap().contents();
+    if clicked_contents.is_empty() {
+        return (col, col);
+    }
+
+    let clicked_char = clicked_contents.chars().next().unwrap();
+    if !is_word_char(clicked_char) {
+        // Not a word character - select just this character
+        return (col, col);
+    }
+
+    // Find start of word (scan left)
+    let mut word_start = col;
+    while word_start > 0 {
+        if let Some(cell) = screen.cell(row, word_start - 1) {
+            let contents = cell.contents();
+            if !contents.is_empty() {
+                let c = contents.chars().next().unwrap();
+                if is_word_char(c) {
+                    word_start -= 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    // Find end of word (scan right)
+    let cols = screen.size().1;
+    let mut word_end = col;
+    while word_end < cols - 1 {
+        if let Some(cell) = screen.cell(row, word_end + 1) {
+            let contents = cell.contents();
+            if !contents.is_empty() {
+                let c = contents.chars().next().unwrap();
+                if is_word_char(c) {
+                    word_end += 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    (word_start, word_end)
 }
 
 /// Parsed key event from Guacamole protocol
@@ -195,20 +486,26 @@ pub fn extract_selection_text(
     } else {
         // Multi-line selection
         // First line: from start_col to end
+        let mut line = String::new();
         for col in start_col..cols {
             if let Some(cell) = screen.cell(start_row, col) {
-                text.push_str(&cell.contents());
+                line.push_str(&cell.contents());
             }
         }
+        // Trim trailing whitespace from line (like guacd does)
+        text.push_str(line.trim_end());
         text.push('\n');
 
         // Middle lines: full lines
         for row in (start_row + 1)..end_row {
+            let mut line = String::new();
             for col in 0..cols {
                 if let Some(cell) = screen.cell(row, col) {
-                    text.push_str(&cell.contents());
+                    line.push_str(&cell.contents());
                 }
             }
+            // Trim trailing whitespace from line (like guacd does)
+            text.push_str(line.trim_end());
             text.push('\n');
         }
 
@@ -223,10 +520,16 @@ pub fn extract_selection_text(
     text
 }
 
-/// Handle mouse event for text selection
+/// Handle mouse event for text selection with visual feedback
 ///
-/// Processes mouse events and updates selection state. Returns Some(selected_text)
-/// when the selection is complete (mouse up).
+/// Processes mouse events and updates selection state. Returns SelectionResult
+/// with overlay instructions for visual feedback or selected text when complete.
+///
+/// Supports:
+/// - Single click + drag: Character-by-character selection
+/// - Double click: Word selection
+/// - Triple click: Line selection
+/// - Shift + click: Extend selection
 ///
 /// # Arguments
 /// * `event` - Parsed mouse event
@@ -236,9 +539,11 @@ pub fn extract_selection_text(
 /// * `char_height` - Height of character cell in pixels
 /// * `cols` - Number of columns in terminal
 /// * `rows` - Number of rows in terminal
+/// * `shift_pressed` - Whether shift key is currently pressed
 ///
 /// # Returns
-/// Some(String) with selected text when selection completes, None otherwise
+/// SelectionResult indicating current selection state
+#[allow(clippy::too_many_arguments)]
 pub fn handle_mouse_selection(
     event: MouseEvent,
     selection: &mut MouseSelection,
@@ -247,45 +552,268 @@ pub fn handle_mouse_selection(
     char_height: u32,
     cols: u16,
     rows: u16,
-) -> Option<String> {
-    // Convert pixel coords to terminal cell coords
-    let col = (event.x_px / char_width).min(cols as u32 - 1) as u16;
-    let row = (event.y_px / char_height).min(rows as u32 - 1) as u16;
+    shift_pressed: bool,
+) -> SelectionResult {
+    // Create selection point from pixel coordinates
+    let point = SelectionPoint::from_pixel_coords(
+        event.x_px,
+        event.y_px,
+        char_width,
+        char_height,
+        cols,
+        rows,
+        terminal,
+    );
 
     // Button mask: 1=left, 2=middle, 4=right
     let left_button = (event.button_mask & 1) != 0;
 
     if left_button && !selection.mouse_down {
-        // Mouse down - start selection
+        // Mouse down - start or extend selection
         selection.mouse_down = true;
-        selection.start = Some((row, col));
-        selection.end = Some((row, col));
-        None
+
+        if shift_pressed && selection.start.is_some() {
+            // Shift+click: Extend existing selection
+            return handle_shift_click_extend(
+                selection,
+                point,
+                terminal,
+                char_width,
+                char_height,
+                cols,
+                rows,
+            );
+        }
+
+        // Register click for multi-click detection
+        let click_count = selection.register_click();
+
+        match click_count {
+            1 => {
+                // Single click - start new selection
+                selection.start = Some(point.clone());
+                selection.end = Some(point.clone());
+
+                // Update normalized boundaries
+                update_selection_boundaries(selection, terminal);
+
+                // Generate initial overlay
+                if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+                    selection.selection_start_row,
+                    selection.selection_start_column,
+                    selection.selection_end_row,
+                    selection.selection_end_column,
+                ) {
+                    let overlay_instructions = format_selection_overlay_instructions(
+                        (start_row, start_col),
+                        (end_row, end_col),
+                        char_width,
+                        char_height,
+                        cols,
+                        rows,
+                    );
+                    selection.last_rendered = Some(((start_row, start_col), (end_row, end_col)));
+                    SelectionResult::InProgress(overlay_instructions)
+                } else {
+                    SelectionResult::None
+                }
+            }
+            2 => {
+                // Double click - select word
+                handle_double_click_word_selection(
+                    selection,
+                    point,
+                    terminal,
+                    char_width,
+                    char_height,
+                    cols,
+                    rows,
+                )
+            }
+            _ => {
+                // Triple click (or more) - select line
+                handle_triple_click_line_selection(
+                    selection,
+                    point,
+                    terminal,
+                    char_width,
+                    char_height,
+                    cols,
+                    rows,
+                )
+            }
+        }
     } else if left_button && selection.mouse_down {
         // Drag - update selection end
-        selection.end = Some((row, col));
-        None
+        selection.end = Some(point);
+
+        // Update normalized boundaries
+        update_selection_boundaries(selection, terminal);
+
+        // Only send update if selection changed
+        if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+            selection.selection_start_row,
+            selection.selection_start_column,
+            selection.selection_end_row,
+            selection.selection_end_column,
+        ) {
+            let current_selection = ((start_row, start_col), (end_row, end_col));
+            if selection.last_rendered != Some(current_selection) {
+                let overlay_instructions = format_selection_overlay_instructions(
+                    (start_row, start_col),
+                    (end_row, end_col),
+                    char_width,
+                    char_height,
+                    cols,
+                    rows,
+                );
+                selection.last_rendered = Some(current_selection);
+                SelectionResult::InProgress(overlay_instructions)
+            } else {
+                SelectionResult::None
+            }
+        } else {
+            SelectionResult::None
+        }
     } else if !left_button && selection.mouse_down {
         // Mouse up - finalize selection and return text
         selection.mouse_down = false;
-        let end_pos = Some((row, col));
 
-        let result = if let (Some(start), Some(end)) = (selection.start, end_pos) {
-            let text = extract_selection_text(terminal, start, end, cols);
+        let result = if let (Some(start_row), Some(start_col), Some(end_row), Some(end_col)) = (
+            selection.selection_start_row,
+            selection.selection_start_column,
+            selection.selection_end_row,
+            selection.selection_end_column,
+        ) {
+            let text =
+                extract_selection_text(terminal, (start_row, start_col), (end_row, end_col), cols);
             if text.is_empty() {
-                None
+                SelectionResult::None
             } else {
-                Some(text)
+                let clear_instructions = format_clear_selection_instructions();
+                SelectionResult::Complete {
+                    text,
+                    clear_instructions,
+                }
             }
         } else {
-            None
+            SelectionResult::None
         };
 
         selection.reset();
         result
     } else {
-        None
+        SelectionResult::None
     }
+}
+
+/// Generate Guacamole instructions to draw selection overlay
+///
+/// Creates blue semi-transparent rectangles to highlight selected text.
+/// Uses layer ID 1 for selection overlay (layer 0 is the terminal display).
+///
+/// CRITICAL: The overlay must be properly cleared before any terminal rendering,
+/// otherwise the cfill operation will fill the entire screen with the selection color.
+///
+/// # Arguments
+/// * `start` - Start position (row, col)
+/// * `end` - End position (row, col)
+/// * `char_width` - Width of character cell in pixels
+/// * `char_height` - Height of character cell in pixels
+/// * `cols` - Number of columns in terminal
+/// * `rows` - Number of rows in terminal
+///
+/// # Returns
+/// Vec of Guacamole instructions to draw selection overlay
+pub fn format_selection_overlay_instructions(
+    start: (u16, u16),
+    end: (u16, u16),
+    char_width: u32,
+    char_height: u32,
+    cols: u16,
+    rows: u16,
+) -> Vec<String> {
+    let (start_row, start_col) = start;
+    let (end_row, end_col) = end;
+
+    // Normalize selection (ensure start < end)
+    let (start_row, start_col, end_row, end_col) =
+        if start_row > end_row || (start_row == end_row && start_col > end_col) {
+            (end_row, end_col, start_row, start_col)
+        } else {
+            (start_row, start_col, end_row, end_col)
+        };
+
+    let mut instructions = Vec::new();
+    let layer = 1_i32; // Selection overlay layer
+
+    // Set layer size to match terminal dimensions
+    let layer_width = cols as u32 * char_width;
+    let layer_height = rows as u32 * char_height;
+    instructions.push(guacr_protocol::format_size(
+        layer,
+        layer_width,
+        layer_height,
+    ));
+
+    if start_row == end_row {
+        // Single row selection - one rectangle
+        let x = start_col as u32 * char_width;
+        let y = start_row as u32 * char_height;
+        let width = (end_col - start_col + 1) as u32 * char_width;
+        let height = char_height;
+
+        instructions.push(guacr_protocol::format_rect(layer, x, y, width, height));
+    } else {
+        // Multi-row selection - three rectangles
+
+        // First row: from start_col to end of row
+        let x1 = start_col as u32 * char_width;
+        let y1 = start_row as u32 * char_height;
+        let width1 = (cols - start_col) as u32 * char_width;
+        let height1 = char_height;
+
+        instructions.push(guacr_protocol::format_rect(layer, x1, y1, width1, height1));
+
+        // Middle rows: full width (if any)
+        if end_row > start_row + 1 {
+            let x2 = 0;
+            let y2 = (start_row + 1) as u32 * char_height;
+            let width2 = cols as u32 * char_width;
+            let height2 = (end_row - start_row - 1) as u32 * char_height;
+
+            instructions.push(guacr_protocol::format_rect(layer, x2, y2, width2, height2));
+        }
+
+        // Last row: from start to end_col
+        let x3 = 0;
+        let y3 = end_row as u32 * char_height;
+        let width3 = (end_col + 1) as u32 * char_width;
+        let height3 = char_height;
+
+        instructions.push(guacr_protocol::format_rect(layer, x3, y3, width3, height3));
+    }
+
+    // Fill with blue semi-transparent color (matching guacd visibility)
+    // Blue: R=0, G=128 (0x80), B=255 (0xFF), A=200 (0xC8 = 78% opacity)
+    // Increased from 160 (62.7%) to 200 (78%) for much better visibility
+    // This matches guacd's selection overlay which is quite visible
+    instructions.push(guacr_protocol::format_cfill(layer, 0, 128, 255, 200));
+
+    instructions
+}
+
+/// Generate Guacamole instructions to clear selection overlay
+///
+/// Uses the `dispose` instruction to properly destroy the overlay layer.
+/// This is the correct way to clear a layer in the Guacamole protocol.
+///
+/// # Returns
+/// Vec of Guacamole instructions to clear selection overlay
+pub fn format_clear_selection_instructions() -> Vec<String> {
+    // Use dispose instruction to properly clear the overlay layer
+    // Layer 1 is the selection overlay layer
+    vec![guacr_protocol::format_dispose(1)]
 }
 
 /// Format clipboard data as Guacamole protocol instructions

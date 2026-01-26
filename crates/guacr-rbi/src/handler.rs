@@ -52,6 +52,7 @@ pub struct RbiConfig {
     pub popup_handling: PopupHandling,
     pub resource_limits: ResourceLimits,
     pub capture_fps: u32,
+    pub use_screencast: Option<bool>, // Use Page.startScreencast instead of screenshots
     pub servo_allowlist: Vec<String>, // Domains known to work with Servo
     pub download_config: DownloadConfig,
     pub upload_config: crate::file_upload::UploadConfig,
@@ -125,6 +126,7 @@ impl Default for RbiConfig {
                 timeout_seconds: 3600,
             },
             capture_fps: 30,
+            use_screencast: Some(false), // Default to screenshots (more compatible)
             servo_allowlist: vec![
                 "docs.rs".to_string(),
                 "github.com".to_string(),
@@ -383,7 +385,7 @@ impl ProtocolHandler for RbiHandler {
                 .await
                 .map_err(HandlerError::ConnectionFailed)?;
 
-            info!("RBI handler ended");
+            info!("RBI handler ended (Chrome/CDP)");
             return Ok(());
         }
 
@@ -392,13 +394,17 @@ impl ProtocolHandler for RbiHandler {
             use crate::cef_browser_client::CefBrowserClient;
             let mut cef_client = CefBrowserClient::new(_width, _height, self.config.clone());
 
-            // Connect and handle session
+            // SECURITY: Each connect() call spawns a DEDICATED CEF process
+            // No process sharing between sessions - complete isolation
+            info!("RBI: Spawning dedicated CEF process (no sharing with other sessions)");
+
+            // Connect and handle session (spawns isolated CEF subprocess)
             cef_client
-                .connect(url, to_client, from_client)
+                .connect(url, &params, to_client, from_client)
                 .await
                 .map_err(HandlerError::ConnectionFailed)?;
 
-            info!("RBI handler ended (CEF)");
+            info!("RBI handler ended (CEF) - dedicated process terminated");
             return Ok(());
         }
 

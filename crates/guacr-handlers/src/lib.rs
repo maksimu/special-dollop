@@ -31,7 +31,7 @@ pub use connection::{
     connect_tcp_with_timeout, spawn_keepalive_task, ConnectionOptions, KeepAliveManager,
     DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
-pub use error::{HandlerError, Result};
+pub use error::{send_error_and_abort, send_error_best_effort, HandlerError, Result};
 pub use events::{
     connect_with_event_adapter, EventBasedHandler, EventCallback, HandlerEvent, InstructionSender,
 };

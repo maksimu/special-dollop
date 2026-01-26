@@ -93,6 +93,18 @@ pub async fn handle_guacd_with_handlers(
 
                 // WebRTC -> Handler
                 Some(msg) = from_webrtc.recv() => {
+                    // Log clipboard/blob messages for debugging
+                    let msg_str = String::from_utf8_lossy(&msg);
+                    if msg_str.contains("clipboard") || msg_str.contains("blob") {
+                        debug!("WebRTC->Handler: Forwarding clipboard/blob message: {}",
+                            if msg_str.len() > 200 {
+                                format!("{}...", &msg_str[..200])
+                            } else {
+                                msg_str.to_string()
+                            }
+                        );
+                    }
+
                     if let Err(e) = webrtc_tx.send(msg).await {
                         error!("Failed to send to handler: {}", e);
                         break;

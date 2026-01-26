@@ -107,43 +107,73 @@ impl ProtocolHandler for RedisHandler {
 
         info!("Redis: Connecting to {}:{} db={}", hostname, port, database);
 
-        // Create query executor with Redis prompt
+        // Parse display size from parameters (like SSH does)
+        let size_params = params
+            .get("size")
+            .map(|s| s.as_str())
+            .unwrap_or("1024,768,96");
+        let size_parts: Vec<&str> = size_params.split(',').collect();
+        let width: u32 = size_parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let height: u32 = size_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        // Calculate terminal dimensions (9x18 pixels per character cell)
+        let cols = (width / 9).max(80) as u16;
+        let rows = (height / 18).max(24) as u16;
+
+        info!(
+            "Redis: Display size {}x{} px → {}x{} chars",
+            width, height, cols, rows
+        );
+
+        // Create query executor with Redis prompt and correct dimensions
         let prompt = if security.base.read_only {
             "redis [RO]> "
         } else {
             "redis> "
         };
-        let mut executor = QueryExecutor::new(prompt, "redis")
+        let mut executor = QueryExecutor::new_with_size(prompt, "redis", rows, cols)
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-        // Get terminal dimensions for recording
-        let (rows, cols) = executor.terminal.size();
 
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "Redis", cols, rows);
 
-        // Send initial screen
-        executor
-            .terminal
-            .write_line("Connecting to Redis server...")
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
+        // Send display initialization instructions (ready + size)
+        let (ready_instr, size_instr) =
+            QueryExecutor::create_display_init_instructions(width, height);
+        to_client
+            .send(ready_instr)
             .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(size_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        // Build Redis connection URL
+        debug!("Redis: Sent ready and size instructions");
+
+        // NOTE: Don't render initial screen yet - wait until after connection
+        // This matches SSH behavior and prevents rendering at wrong dimensions
+
+        // Build Redis connection URL with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
         let connection_url = if let Some(pwd) = password {
+            let encoded_password = urlencoding::encode(pwd);
             if self.config.require_tls {
-                format!("rediss://:{}@{}:{}/{}", pwd, hostname, port, database)
+                format!(
+                    "rediss://:{}@{}:{}/{}",
+                    encoded_password, hostname, port, database
+                )
             } else {
-                format!("redis://:{}@{}:{}/{}", pwd, hostname, port, database)
+                format!(
+                    "redis://:{}@{}:{}/{}",
+                    encoded_password, hostname, port, database
+                )
             }
         } else if self.config.require_tls {
             format!("rediss://{}:{}/{}", hostname, port, database)
@@ -153,7 +183,12 @@ impl ProtocolHandler for RedisHandler {
 
         debug!(
             "Redis: Connection URL: {}",
-            connection_url.replace(password.unwrap_or(&"".to_string()), "***")
+            connection_url.replace(
+                &password
+                    .map(|p| urlencoding::encode(p).to_string())
+                    .unwrap_or_default(),
+                "***"
+            )
         );
 
         // Connect to Redis
@@ -217,6 +252,24 @@ impl ProtocolHandler for RedisHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+                // Render the connection success screen
+                debug!("Redis: Rendering initial screen with prompt");
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                debug!(
+                    "Redis: Sending {} instructions to client",
+                    instructions.len()
+                );
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+                debug!("Redis: Initial screen sent successfully");
+
                 con
             }
             Err(e) => {
@@ -276,22 +329,42 @@ impl ProtocolHandler for RedisHandler {
             }
         };
 
-        // Send updated screen
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
-
         // Event loop
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
+        // NOTE: Screen was already rendered above after connection success
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("Redis: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("Redis: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
                     if let Some(command) = pending_query {
                         info!("Redis: Executing command: {}", command);
 
@@ -398,8 +471,15 @@ impl ProtocolHandler for RedisHandler {
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Redis: Input processing error: {}", e);
+                        Err(e) => {
+                            warn!("Redis: Input processing error: {}", e);
+                        }
+                    }
+                }
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

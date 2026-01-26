@@ -1,30 +1,30 @@
-# Communication Guidelines
+# Communication Guidelines for AI Assistants
 
-## Professional Language Standards
+## What NOT to do (unless explicitly requested):
 
-When providing technical assistance, always maintain professional communication:
+1. **Do NOT create summary documents** - Don't write up summaries of code exploration or analysis unless specifically asked
+2. **Do NOT commit changes** - Don't create git commits or push to remote unless explicitly instructed
+3. **Do NOT create documentation files proactively** - Only create docs when specifically requested
+4. **Use profanity or crude language
+5. **Take the Lord's name in vain or use religious exclamations inappropriately
+6. **Use excessive capitalization that appears like shouting 
+7. **Express frustration through inappropriate language
 
-### ✅ DO:
-- Use clear, precise technical language
-- Express urgency with professional terms: "Critical issue identified", "Urgent fix required", "Important discovery"
-- Show enthusiasm with appropriate expressions: "Excellent!", "Perfect!", "Great find!", "This is the key issue!"
-- Use emojis sparingly and professionally: ✅ ❌ 🎯 ⚠️ 📝
+## What TO do:
 
-### ❌ DON'T:
-- Use profanity or crude language
-- Take the Lord's name in vain or use religious exclamations inappropriately
-- Use excessive capitalization that appears like shouting
-- Express frustration through inappropriate language
+1. **Explore and understand code** when asked
+2. **Make code changes** when requested
+3. **Answer questions** about the codebase
+4. **Provide analysis** inline in responses, not as separate documents
+5. **Ask clarifying questions** when instructions are unclear
 
-## Example Replacements
+## Working Style:
 
-Instead of inappropriate exclamations, use:
-- "This is the critical issue!" 
-- "Excellent discovery!"
-- "This is exactly what we needed to find!"
-- "Perfect - this explains everything!"
-- "This is a major breakthrough!"
+- Be direct and concise
+- Focus on the task at hand
+- Don't over-document unless asked
+- Assume the user knows what they want
 
-## Reminder
+---
 
-Technical work can be frustrating, but professional communication builds trust and maintains a respectful environment. Always pause before responding to ensure language is appropriate and constructive.
+**Last Updated:** January 7, 2026

@@ -11,7 +11,29 @@ mod parser;
 mod streams;
 mod text_optimized;
 
-pub use advanced::*;
+pub use advanced::{
+    // Instructions
+    format_ack,
+    format_error,
+    format_nest,
+    format_pipe,
+    format_transfer,
+    // Status codes
+    STATUS_CLIENT_BAD_REQUEST,
+    STATUS_CLIENT_BAD_TYPE,
+    STATUS_CLIENT_FORBIDDEN,
+    STATUS_CLIENT_OVERRUN,
+    STATUS_CLIENT_TIMEOUT,
+    STATUS_CLIENT_TOO_MANY,
+    STATUS_CLIENT_UNAUTHORIZED,
+    STATUS_RESOURCE_CLOSED,
+    STATUS_RESOURCE_CONFLICT,
+    STATUS_SERVER_ERROR,
+    STATUS_UPSTREAM_ERROR,
+    STATUS_UPSTREAM_NOT_FOUND,
+    STATUS_UPSTREAM_TIMEOUT,
+    STATUS_UPSTREAM_UNAVAILABLE,
+};
 pub use binary::{
     BinaryEncoder, Opcode, BINARY_PROTOCOL_OVERHEAD, FLAG_COMPRESSED, FLAG_ENCRYPTED,
     FLAG_FIRST_FRAGMENT, FLAG_FRAGMENTED, FLAG_LAST_FRAGMENT, FRAME_PROTOCOL_OVERHEAD,

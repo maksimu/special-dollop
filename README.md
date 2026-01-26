@@ -92,11 +92,27 @@ When enabled:
 
 ## Testing
 
+```bash
+# Unit tests (fast, no Docker)
+make test
+
+# Full integration tests (requires Docker)
+make docker-up
+make test-full
+make docker-down
+
+# Protocol-specific
+make test-ssh
+make test-rdp
+```
+
+See [TESTING_GUIDE.md](docs/TESTING_GUIDE.md) for details.
+
 ### Quick Tests (No Docker Required)
 
-Run unit tests only:
-
 ```bash
+make test
+# Or
 ./scripts/run-all-tests.sh --quick
 ```
 

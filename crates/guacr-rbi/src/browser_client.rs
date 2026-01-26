@@ -1,10 +1,14 @@
 // Browser client integration for RBI (Remote Browser Isolation)
 // Provides headless browser session management with proper input handling
 
+use crate::adaptive_fps::AdaptiveFps;
 use crate::clipboard::RbiClipboard;
 use crate::cursor::format_standard_cursor;
+use crate::dirty_tracker::RbiDirtyTracker;
 use crate::file_upload::{format_upload_dialog_instruction, UploadEngine};
 use crate::js_dialog::{JsDialogConfig, JsDialogManager};
+use crate::screencast::{ScreencastConfig, ScreencastProcessor};
+use crate::scroll_detector::ScrollDetector;
 // Events module provides types used for more complex RBI scenarios
 use crate::handler::{RbiBackend, RbiConfig};
 use crate::input::{KeyboardShortcut, RbiInputHandler};
@@ -143,8 +147,9 @@ impl BrowserClient {
             }
         }
 
-        // Send ready instruction
-        let ready_instr = format!("5.ready,{}.{};", 9, "rbi-ready");
+        // Send ready instruction with proper LENGTH.VALUE format
+        let ready_value = "rbi-ready";
+        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
         to_client
             .send(Bytes::from(ready_instr))
             .await
@@ -184,6 +189,11 @@ impl BrowserClient {
             warn!("RBI: Failed to install cursor tracker: {}", e);
         }
 
+        // Install scroll tracker
+        if let Err(e) = chrome_session.install_scroll_tracker().await {
+            warn!("RBI: Failed to install scroll tracker: {}", e);
+        }
+
         // Enable file chooser interception if uploads are enabled
         if self.upload_engine.manager().is_enabled() {
             if let Err(e) = chrome_session.enable_file_chooser_interception().await {
@@ -191,6 +201,49 @@ impl BrowserClient {
             } else {
                 info!("RBI: File upload support enabled");
             }
+        }
+
+        // Performance optimizations
+        let mut dirty_tracker = RbiDirtyTracker::new();
+        let mut adaptive_fps = AdaptiveFps::new(5, self.config.capture_fps);
+        let mut scroll_detector = ScrollDetector::new();
+
+        // Screencast mode (use if enabled in config, otherwise fall back to screenshots)
+        let use_screencast = self.config.use_screencast.unwrap_or(false);
+
+        if use_screencast {
+            info!("RBI: Screencast mode enabled - H.264 video streaming");
+
+            // Start screencast
+            let screencast_config = ScreencastConfig::default();
+            if let Err(e) = chrome_session
+                .start_screencast(
+                    screencast_config.format.as_str(),
+                    screencast_config.quality,
+                    screencast_config.max_width,
+                    screencast_config.max_height,
+                )
+                .await
+            {
+                warn!(
+                    "RBI: Failed to start screencast, falling back to screenshots: {}",
+                    e
+                );
+                // Continue with screenshot mode
+            } else {
+                // Screencast started successfully
+                let _screencast_processor = ScreencastProcessor::new(screencast_config);
+
+                // TODO: Listen for screencast frame events
+                // This requires chromiumoxide to expose Page.screencastFrame events
+                // For now, we'll use screenshot mode as the implementation
+                warn!("RBI: Screencast events not yet implemented in chromiumoxide, using screenshots");
+            }
+        } else {
+            info!(
+                "RBI: Screenshot mode - adaptive FPS (5-{}), dirty tracking",
+                self.config.capture_fps
+            );
         }
 
         // Main event loop
@@ -206,15 +259,38 @@ impl BrowserClient {
 
         loop {
             tokio::select! {
-                // Capture screenshots at configured FPS
+                // Capture screenshots at adaptive FPS with dirty tracking
                 _ = capture_interval.tick() => {
                     match chrome_session.capture_screenshot().await {
                         Ok(Some(screenshot)) => {
-                            // Send screenshot to client
-                            let msg = self.handle_screenshot(&screenshot)?;
-                            if let Err(e) = to_client.send(msg).await {
-                                warn!("RBI: Failed to send screenshot: {}", e);
-                                break;
+                            // Check if frame has changed (dirty tracking)
+                            let frame_changed = dirty_tracker.has_changed(&screenshot);
+
+                            if frame_changed {
+                                // Send only changed frames
+                                let msg = self.handle_screenshot(&screenshot)?;
+                                if let Err(e) = to_client.send(msg).await {
+                                    warn!("RBI: Failed to send screenshot: {}", e);
+                                    break;
+                                }
+                            }
+
+                            // Boost FPS if actively scrolling
+                            if scroll_detector.is_scrolling() {
+                                adaptive_fps.boost_fps();
+                            }
+
+                            // Update capture interval based on activity (adaptive FPS)
+                            let new_interval = adaptive_fps.update(frame_changed);
+                            capture_interval = interval(new_interval);
+
+                            // Log FPS changes for monitoring
+                            if frame_changed && adaptive_fps.is_active() {
+                                debug!("RBI: Activity detected, FPS={}", adaptive_fps.current_fps());
+                            } else if !frame_changed && adaptive_fps.is_idle() {
+                                debug!("RBI: Static content, FPS={}", adaptive_fps.current_fps());
+                            } else if scroll_detector.is_scrolling() {
+                                debug!("RBI: Scrolling active, FPS={}", adaptive_fps.current_fps());
                             }
                         }
                         Ok(None) => {
@@ -243,7 +319,8 @@ impl BrowserClient {
                     }
 
                     // Detailed metrics every 30 seconds (6 checks)
-                    if resource_check_count % 6 == 0 {
+                    if resource_check_count.is_multiple_of(6) {
+                        // Chrome performance metrics
                         match chrome_session.get_performance_metrics().await {
                             Ok(metrics) => {
                                 info!(
@@ -265,6 +342,35 @@ impl BrowserClient {
                                 debug!("RBI: Performance metrics unavailable: {}", e);
                             }
                         }
+
+                        // Optimization metrics
+                        let dirty_stats = dirty_tracker.stats();
+                        let fps_stats = adaptive_fps.stats();
+                        let scroll_stats = scroll_detector.stats();
+
+                        info!(
+                            "RBI: Optimization stats - FPS={} ({}%), frames: captured={}, sent={}, skipped={} ({}% compression)",
+                            fps_stats.current_fps,
+                            (fps_stats.current_fps * 100) / fps_stats.max_fps,
+                            dirty_stats.frames_captured,
+                            dirty_stats.frames_sent,
+                            dirty_stats.frames_skipped,
+                            dirty_stats.compression_ratio as u32
+                        );
+
+                        if scroll_stats.scroll_events > 0 {
+                            let (avg_x, avg_y) = scroll_stats.avg_distance_per_scroll();
+                            info!(
+                                "RBI: Scroll stats - events={}, avg_distance=({:.0}, {:.0})",
+                                scroll_stats.scroll_events,
+                                avg_x,
+                                avg_y
+                            );
+                        }
+
+                        // Reset stats for next period
+                        dirty_tracker.reset_stats();
+                        scroll_detector.reset_stats();
                     }
                 }
 
@@ -306,6 +412,53 @@ impl BrowserClient {
                         }
                         Err(e) => {
                             debug!("RBI: Cursor poll error: {}", e);
+                        }
+                    }
+
+                    // Poll for scroll changes
+                    match chrome_session.poll_scroll().await {
+                        Ok(Some(position)) => {
+                            if let Some((delta_x, delta_y)) = scroll_detector.update(position) {
+                                // Scroll detected - boost FPS and capture immediately
+                                adaptive_fps.boost_fps();
+
+                                // Determine scroll significance
+                                let viewport_height = self.height as i32;
+                                let is_significant = scroll_detector.is_significant_scroll(delta_y, viewport_height);
+                                let is_page_scroll = scroll_detector.is_page_scroll(delta_y, viewport_height);
+                                let velocity = scroll_detector.velocity();
+
+                                debug!(
+                                    "RBI: Scroll detected: delta=({}, {}), velocity={:.0}px/s, significant={}, page_scroll={}",
+                                    delta_x, delta_y, velocity, is_significant, is_page_scroll
+                                );
+
+                                // Immediate frame capture for smooth scrolling
+                                if is_significant {
+                                    match chrome_session.capture_screenshot().await {
+                                        Ok(Some(screenshot)) => {
+                                            if dirty_tracker.has_changed(&screenshot) {
+                                                let msg = self.handle_screenshot(&screenshot)?;
+                                                if let Err(e) = to_client.send(msg).await {
+                                                    warn!("RBI: Failed to send scroll frame: {}", e);
+                                                } else {
+                                                    debug!("RBI: Sent immediate scroll frame");
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            debug!("RBI: Scroll frame capture error: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // No scroll change
+                        }
+                        Err(e) => {
+                            debug!("RBI: Scroll poll error: {}", e);
                         }
                     }
 
@@ -666,10 +819,10 @@ impl BrowserClient {
         }
 
         for pattern in &self.config.allowed_url_patterns {
-            if pattern.starts_with('*') {
-                // Wildcard pattern
-                let suffix = &pattern[1..];
-                if url.contains(suffix) {
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                // Wildcard pattern - must match as domain suffix
+                // e.g., "*.example.com" should match "sub.example.com" but not "malicious-example.com"
+                if url.ends_with(suffix) || url.contains(&format!("/{}", suffix)) {
                     return true;
                 }
             } else if url.contains(pattern) {
@@ -693,10 +846,20 @@ impl BrowserClient {
 
     /// Handle screenshot from browser
     ///
-    /// Returns Guacamole instructions for the screenshot
+    /// Returns Guacamole instructions for the screenshot.
+    /// Automatically detects format (JPEG or PNG) from image header.
     pub fn handle_screenshot(&mut self, screenshot: &[u8]) -> Result<Bytes, String> {
         // Convert screenshot to Bytes
         let screenshot_bytes = Bytes::from(screenshot.to_vec());
+
+        // Detect image format from header
+        // JPEG: starts with 0xFF 0xD8
+        // PNG: starts with 0x89 0x50 0x4E 0x47
+        let format = if screenshot.len() >= 2 && screenshot[0] == 0xFF && screenshot[1] == 0xD8 {
+            1 // JPEG
+        } else {
+            0 // PNG (default)
+        };
 
         // Format as binary protocol message (zero-copy)
         let msg = self.binary_encoder.encode_image(
@@ -706,7 +869,7 @@ impl BrowserClient {
             0, // y
             self.width as u16,
             self.height as u16,
-            0, // format: PNG
+            format,
             screenshot_bytes,
         );
 

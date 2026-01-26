@@ -33,11 +33,17 @@ mod clipboard;
 mod clipboard_polling;
 mod cursor;
 mod events;
+
+// Performance optimizations
+pub mod adaptive_fps;
+pub mod dirty_tracker;
 mod file_upload;
 mod handler;
 mod input;
 mod js_dialog;
 mod profile_isolation;
+pub mod screencast;
+pub mod scroll_detector;
 mod tabs;
 
 // Re-export public API

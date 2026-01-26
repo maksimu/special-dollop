@@ -109,50 +109,79 @@ impl ProtocolHandler for MySqlHandler {
 
         info!("MySQL: Connecting to {}@{}:{}", username, hostname, port);
 
-        // Create query executor with MySQL prompt
+        // Parse display size from parameters (like SSH does)
+        let size_params = params
+            .get("size")
+            .map(|s| s.as_str())
+            .unwrap_or("1024,768,96");
+        let size_parts: Vec<&str> = size_params.split(',').collect();
+        let width: u32 = size_parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let height: u32 = size_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        // Calculate terminal dimensions (9x18 pixels per character cell)
+        let cols = (width / 9).max(80) as u16;
+        let rows = (height / 18).max(24) as u16;
+
+        info!(
+            "MySQL: Display size {}x{} px → {}x{} chars",
+            width, height, cols, rows
+        );
+
+        // Create query executor with MySQL prompt and correct dimensions
         let prompt = if security.base.read_only {
             "mysql [RO]> "
         } else {
             "mysql> "
         };
-        let mut executor = QueryExecutor::new(prompt, "mysql")
+        let mut executor = QueryExecutor::new_with_size(prompt, "mysql", rows, cols)
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-        // Get terminal dimensions for recording
-        let (rows, cols) = executor.terminal.size();
 
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "MySQL", cols, rows);
 
-        // Send initial screen
-        executor
-            .terminal
-            .write_line("Connecting to MySQL server...")
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
+        // Send display initialization instructions (ready + size)
+        let (ready_instr, size_instr) =
+            QueryExecutor::create_display_init_instructions(width, height);
+        to_client
+            .send(ready_instr)
             .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(size_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        // Build MySQL connection URL
+        debug!("MySQL: Sent ready and size instructions");
+
+        // NOTE: Don't render initial screen yet - wait until after connection
+        // This matches SSH behavior and prevents rendering at wrong dimensions
+
+        // Build MySQL connection URL with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
+        let encoded_username = urlencoding::encode(username);
+        let encoded_password = urlencoding::encode(password);
         let connection_url = if database.is_empty() {
-            format!("mysql://{}:{}@{}:{}", username, password, hostname, port)
+            format!(
+                "mysql://{}:{}@{}:{}",
+                encoded_username, encoded_password, hostname, port
+            )
         } else {
+            let encoded_database = urlencoding::encode(database);
             format!(
                 "mysql://{}:{}@{}:{}/{}",
-                username, password, hostname, port, database
+                encoded_username, encoded_password, hostname, port, encoded_database
             )
         };
 
         debug!(
             "MySQL: Connection URL: {}",
-            connection_url.replace(password, "***")
+            connection_url.replace(&encoded_password.to_string(), "***")
         );
 
         // Connect to MySQL using mysql_async
@@ -211,6 +240,24 @@ impl ProtocolHandler for MySqlHandler {
                     .terminal
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                // Render the connection success screen
+                debug!("MySQL: Rendering initial screen with prompt");
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                debug!(
+                    "MySQL: Sending {} instructions to client",
+                    instructions.len()
+                );
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+                debug!("MySQL: Initial screen sent successfully");
             }
             Err(e) => {
                 let error_msg = format!("Connection failed: {}", e);
@@ -271,21 +318,43 @@ impl ProtocolHandler for MySqlHandler {
             }
         }
 
-        // Send updated screen
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
-
         // Event loop - process queries
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
+        // NOTE: Screen was already rendered above after connection success
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal or input changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("MySQL: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        debug!("MySQL: Debounce tick - rendering dirty terminal");
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        debug!("MySQL: Sending {} instructions from debounce", instructions.len());
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("MySQL: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
                 Ok((needs_render, instructions, pending_query)) => {
                     if let Some(query) = pending_query {
                         info!("MySQL: Executing query: {}", query);
@@ -403,7 +472,7 @@ impl ProtocolHandler for MySqlHandler {
                             }
                         }
 
-                        // Re-render with results
+                        // Re-render with results immediately (query results should show right away)
                         let (_, result_instructions) = executor
                             .render_screen()
                             .await
@@ -418,6 +487,7 @@ impl ProtocolHandler for MySqlHandler {
                     }
 
                     if needs_render {
+                        // Render immediately for special cases (Enter, Escape, etc.)
                         for instr in instructions {
                             to_client
                                 .send(instr)
@@ -425,9 +495,17 @@ impl ProtocolHandler for MySqlHandler {
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
                     }
+                    // For regular keystrokes, debounce timer will handle rendering
                 }
                 Err(e) => {
                     warn!("MySQL: Input processing error: {}", e);
+                }
+            }
+                }
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

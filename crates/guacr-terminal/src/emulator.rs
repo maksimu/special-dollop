@@ -71,6 +71,7 @@ impl ScrollbackLine {
 /// Wraps the vt100 crate and provides dirty tracking for efficient rendering.
 /// Maintains a scrollback buffer of lines that have scrolled off the top.
 /// Tracks mouse mode state for proper X11 mouse event handling.
+/// Tracks Kitty keyboard protocol state for modern keyboard input.
 pub struct TerminalEmulator {
     parser: Parser,
     rows: u16,
@@ -83,6 +84,10 @@ pub struct TerminalEmulator {
     mouse_mode: MouseMode,
     /// Whether SGR extended mouse mode (1006) is active
     sgr_mouse_mode: bool,
+    /// Kitty keyboard protocol level (0 = disabled, 1-3 = enabled)
+    kitty_keyboard_level: u8,
+    /// Kitty keyboard protocol flags (for extended features)
+    kitty_keyboard_flags: u32,
 }
 
 impl TerminalEmulator {
@@ -126,6 +131,8 @@ impl TerminalEmulator {
             last_screen_state,
             mouse_mode: MouseMode::Disabled,
             sgr_mouse_mode: false,
+            kitty_keyboard_level: 0,
+            kitty_keyboard_flags: 0,
         }
     }
 
@@ -134,6 +141,9 @@ impl TerminalEmulator {
         // Check for mouse mode escape sequences BEFORE processing
         // This ensures we track mouse mode changes as they happen
         self.detect_mouse_mode_changes(data);
+
+        // Check for Kitty keyboard protocol enable/disable sequences
+        self.detect_kitty_keyboard_changes(data);
 
         let screen = self.parser.screen();
 
@@ -219,7 +229,9 @@ impl TerminalEmulator {
 
     /// Resize terminal
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser = Parser::new(rows, cols, 0);
+        // Use vt100's set_size() to preserve terminal content during resize
+        // This is critical - Parser::new() would wipe all content!
+        self.parser.set_size(rows, cols);
         self.rows = rows;
         self.cols = cols;
 
@@ -284,6 +296,39 @@ impl TerminalEmulator {
     /// SGR mode uses a different escape sequence format for coordinates.
     pub fn is_sgr_mouse_mode(&self) -> bool {
         self.sgr_mouse_mode
+    }
+
+    /// Check if terminal is in application cursor mode (DECCKM)
+    ///
+    /// When enabled, arrow keys send different escape sequences:
+    /// - Normal mode: ESC[A (up), ESC[B (down), ESC[C (right), ESC[D (left)
+    /// - Application mode: ESCOA, ESCOB, ESCOC, ESCOD
+    ///
+    /// This mode is enabled by full-screen applications like vim, less, and tmux.
+    pub fn is_application_cursor_mode(&self) -> bool {
+        // Check if the vt100 parser has application cursor mode enabled
+        // The vt100 crate tracks this via the DECCKM mode (mode 1)
+        self.parser.screen().application_cursor()
+    }
+
+    /// Get current Kitty keyboard protocol level
+    ///
+    /// Returns the protocol level (0 = disabled, 1-3 = enabled at various levels).
+    /// Applications enable this with `CSI > <level> u` sequences.
+    pub fn kitty_keyboard_level(&self) -> u8 {
+        self.kitty_keyboard_level
+    }
+
+    /// Check if Kitty keyboard protocol is enabled
+    ///
+    /// Returns true if any level (1-3) is active.
+    pub fn is_kitty_keyboard_enabled(&self) -> bool {
+        self.kitty_keyboard_level > 0
+    }
+
+    /// Get Kitty keyboard protocol flags
+    pub fn kitty_keyboard_flags(&self) -> u32 {
+        self.kitty_keyboard_flags
     }
 
     /// Detect mouse mode changes from escape sequences in the data
@@ -365,6 +410,66 @@ impl TerminalEmulator {
             _ => {}
         }
     }
+
+    /// Detect Kitty keyboard protocol enable/disable sequences
+    ///
+    /// Scans for Kitty keyboard protocol control sequences:
+    /// - CSI > <level> u - Enable protocol at level 1-3
+    /// - CSI < u - Disable protocol (return to legacy mode)
+    ///
+    /// The Kitty keyboard protocol provides:
+    /// - Level 1: Disambiguate escape codes (Ctrl+I vs Tab, Ctrl+M vs Enter)
+    /// - Level 2: Report event types (press, repeat, release)
+    /// - Level 3: Report alternate keys (base key + shifted key)
+    fn detect_kitty_keyboard_changes(&mut self, data: &[u8]) {
+        // Look for CSI > <level> u (enable) or CSI < u (disable)
+        // ESC = 0x1b, [ = 0x5b, > = 0x3e, < = 0x3c, u = 0x75
+        let mut i = 0;
+        while i + 3 < data.len() {
+            // Look for ESC [
+            if data[i] == 0x1b && data[i + 1] == 0x5b {
+                match data[i + 2] {
+                    0x3e => {
+                        // '>' - Enable at level
+                        let start = i + 3;
+                        let mut end = start;
+
+                        // Scan for digits
+                        while end < data.len() && data[end].is_ascii_digit() {
+                            end += 1;
+                        }
+
+                        if end > start && end < data.len() && data[end] == 0x75 {
+                            // 'u' terminator
+                            // Parse level number
+                            if let Ok(level_str) = std::str::from_utf8(&data[start..end]) {
+                                if let Ok(level) = level_str.parse::<u8>() {
+                                    if level <= 3 {
+                                        self.kitty_keyboard_level = level;
+                                        log::debug!(
+                                            "Kitty keyboard protocol enabled at level {}",
+                                            level
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    0x3c => {
+                        // '<' - Disable (CSI < u = 4 bytes: ESC [ < u)
+                        if i + 3 < data.len() && data[i + 3] == 0x75 {
+                            // 'u' terminator
+                            self.kitty_keyboard_level = 0;
+                            self.kitty_keyboard_flags = 0;
+                            log::debug!("Kitty keyboard protocol disabled");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +533,91 @@ mod tests {
         let term = TerminalEmulator::new_with_scrollback(24, 80, 150);
         assert_eq!(term.scrollback_lines(), 0);
         assert!(term.scrollback().is_empty());
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_enable_level_1() {
+        let mut term = TerminalEmulator::new(24, 80);
+        assert_eq!(term.kitty_keyboard_level(), 0);
+
+        // Send CSI > 1 u to enable level 1
+        term.process(b"\x1b[>1u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 1);
+        assert!(term.is_kitty_keyboard_enabled());
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_enable_level_2() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable level 2
+        term.process(b"\x1b[>2u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 2);
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_enable_level_3() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable level 3
+        term.process(b"\x1b[>3u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 3);
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_disable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable level 2
+        term.process(b"\x1b[>2u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 2);
+
+        // Disable with CSI < u
+        term.process(b"\x1b[<u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 0);
+        assert!(!term.is_kitty_keyboard_enabled());
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_level_change() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable level 1
+        term.process(b"\x1b[>1u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 1);
+
+        // Change to level 3
+        term.process(b"\x1b[>3u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 3);
+
+        // Change back to level 1
+        term.process(b"\x1b[>1u").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 1);
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_with_other_data() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable protocol mixed with other terminal output
+        term.process(b"Hello\x1b[>2uWorld\n").unwrap();
+        assert_eq!(term.kitty_keyboard_level(), 2);
+
+        // Terminal should still process the text
+        let screen = term.screen();
+        let contents = screen.contents();
+        assert!(contents.contains("Hello"));
+        assert!(contents.contains("World"));
+    }
+
+    #[test]
+    fn test_kitty_keyboard_protocol_invalid_level() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Try to enable invalid level (> 3)
+        term.process(b"\x1b[>5u").unwrap();
+        // Should remain disabled
+        assert_eq!(term.kitty_keyboard_level(), 0);
     }
 
     #[test]
@@ -588,6 +778,211 @@ mod tests {
         let contents = screen.contents();
         assert!(contents.contains("Hello"));
         assert!(contents.contains("World"));
+    }
+
+    #[test]
+    fn test_application_cursor_mode_default() {
+        let term = TerminalEmulator::new(24, 80);
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_enable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // ESC [ ? 1 h - Enable application cursor mode (DECCKM)
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_disable() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable then disable
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // ESC [ ? 1 l - Disable application cursor mode
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_multiple_switches() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Simulate: bash -> vim -> bash -> less -> bash
+
+        // Start in bash (normal mode)
+        assert!(!term.is_application_cursor_mode());
+
+        // Open vim (enables application mode)
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // Exit vim (back to normal mode)
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+
+        // Open less (enables application mode again)
+        term.process(b"\x1b[?1h").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // Exit less (back to normal mode)
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_vim_simulation() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Simulate vim startup sequence
+        // Vim typically sends multiple mode changes
+        term.process(b"\x1b[?1h").unwrap(); // Enable application cursor
+        term.process(b"\x1b[?1h").unwrap(); // Redundant enable (should be idempotent)
+        assert!(term.is_application_cursor_mode());
+
+        // Vim exit sequence
+        term.process(b"\x1b[?1l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_in_mixed_data() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Application cursor mode sequence embedded in regular output
+        term.process(b"Hello \x1b[?1h World").unwrap();
+        assert!(term.is_application_cursor_mode());
+
+        // More text with disable sequence
+        term.process(b"More text \x1b[?1l here").unwrap();
+        assert!(!term.is_application_cursor_mode());
+    }
+
+    #[test]
+    fn test_application_cursor_mode_with_other_modes() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Enable multiple modes at once (like vim does)
+        term.process(b"\x1b[?1h\x1b[?1000h").unwrap(); // App cursor + mouse
+        assert!(term.is_application_cursor_mode());
+        assert!(term.is_mouse_enabled());
+
+        // Disable both
+        term.process(b"\x1b[?1l\x1b[?1000l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mouse_mode_and_text_selection_interaction() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // In bash: mouse mode disabled, text selection should work
+        assert!(!term.is_mouse_enabled());
+
+        // Open vim with mouse enabled
+        term.process(b"\x1b[?1000h").unwrap();
+        assert!(term.is_mouse_enabled());
+        // When mouse mode is enabled, mouse events go to terminal (not text selection)
+
+        // Exit vim
+        term.process(b"\x1b[?1000l").unwrap();
+        assert!(!term.is_mouse_enabled());
+        // Back to bash: text selection should work again
+    }
+
+    #[test]
+    fn test_vim_full_mode_sequence() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Vim startup: enables application cursor + mouse
+        term.process(b"\x1b[?1h\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+            .unwrap();
+
+        assert!(
+            term.is_application_cursor_mode(),
+            "Vim should enable app cursor"
+        );
+        assert!(term.is_mouse_enabled(), "Vim should enable mouse");
+        assert!(term.is_sgr_mouse_mode(), "Vim should enable SGR mouse");
+
+        // In vim:
+        // - Arrow keys send ESCOA/OB/OC/OD (application cursor mode)
+        // - Mouse events send X11 sequences (mouse mode enabled)
+        // - Text selection is disabled (mouse goes to vim)
+
+        // Vim exit: disables all modes
+        term.process(b"\x1b[?1l\x1b[?1000l\x1b[?1002l\x1b[?1006l")
+            .unwrap();
+
+        assert!(
+            !term.is_application_cursor_mode(),
+            "Should return to normal cursor"
+        );
+        assert!(!term.is_mouse_enabled(), "Should disable mouse");
+        assert!(!term.is_sgr_mouse_mode(), "Should disable SGR mouse");
+
+        // Back in bash:
+        // - Arrow keys send ESC[A/B/C/D (normal mode)
+        // - Mouse events trigger text selection
+        // - Highlighting/copy works
+    }
+
+    #[test]
+    fn test_less_mode_sequence() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Less typically enables application cursor but not mouse
+        term.process(b"\x1b[?1h").unwrap();
+
+        assert!(
+            term.is_application_cursor_mode(),
+            "Less should enable app cursor"
+        );
+        assert!(
+            !term.is_mouse_enabled(),
+            "Less typically doesn't enable mouse"
+        );
+
+        // In less:
+        // - Arrow keys send ESCOA/OB/OC/OD (application cursor mode)
+        // - Mouse events still trigger text selection (mouse mode disabled)
+        // - Highlighting/copy still works!
+
+        // Exit less
+        term.process(b"\x1b[?1l").unwrap();
+
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn test_mode_combinations_bash_vim_bash() {
+        let mut term = TerminalEmulator::new(24, 80);
+
+        // Bash: Both modes disabled
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+        // Text selection: ✓ Works
+        // Arrow keys: ESC[A/B/C/D
+
+        // Open vim
+        term.process(b"\x1b[?1h\x1b[?1000h").unwrap();
+        assert!(term.is_application_cursor_mode());
+        assert!(term.is_mouse_enabled());
+        // Text selection: ✗ Disabled (mouse goes to vim)
+        // Arrow keys: ESCOA/OB/OC/OD
+
+        // Exit vim
+        term.process(b"\x1b[?1l\x1b[?1000l").unwrap();
+        assert!(!term.is_application_cursor_mode());
+        assert!(!term.is_mouse_enabled());
+        // Text selection: ✓ Works again
+        // Arrow keys: ESC[A/B/C/D
     }
 
     #[test]

@@ -110,38 +110,65 @@ impl ProtocolHandler for MongoDbHandler {
             username, hostname, port, database
         );
 
-        // Create query executor with MongoDB prompt
+        // Parse display size from parameters (like SSH does)
+        let size_params = params
+            .get("size")
+            .map(|s| s.as_str())
+            .unwrap_or("1024,768,96");
+        let size_parts: Vec<&str> = size_params.split(',').collect();
+        let width: u32 = size_parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let height: u32 = size_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        // Calculate terminal dimensions (9x18 pixels per character cell)
+        let cols = (width / 9).max(80) as u16;
+        let rows = (height / 18).max(24) as u16;
+
+        info!(
+            "MongoDB: Display size {}x{} px → {}x{} chars",
+            width, height, cols, rows
+        );
+
+        // Create query executor with MongoDB prompt and correct dimensions
         let prompt = if security.base.read_only {
             "[RO]> "
         } else {
             "> "
         };
-        let mut executor = QueryExecutor::new(prompt, "mongodb")
+        let mut executor = QueryExecutor::new_with_size(prompt, "mongodb", rows, cols)
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-        // Get terminal dimensions for recording
-        let (rows, cols) = executor.terminal.size();
 
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "MongoDB", cols, rows);
 
-        // Send initial screen
-        executor
-            .terminal
-            .write_line("Connecting to MongoDB server...")
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
+        // Send display initialization instructions (ready + size)
+        let (ready_instr, size_instr) =
+            QueryExecutor::create_display_init_instructions(width, height);
+        to_client
+            .send(ready_instr)
             .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(size_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        // Build MongoDB connection URI
+        debug!("MongoDB: Sent ready and size instructions");
+
+        // NOTE: Don't render initial screen yet - wait until after connection
+        // This matches SSH behavior and prevents rendering at wrong dimensions
+
+        // Build MongoDB connection URI with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
+        let encoded_username = urlencoding::encode(username);
+        let encoded_password = urlencoding::encode(password);
+        let encoded_database = urlencoding::encode(database);
+        let encoded_auth_source = urlencoding::encode(auth_source);
         let tls_param = if self.config.require_tls {
             "&tls=true"
         } else {
@@ -149,12 +176,18 @@ impl ProtocolHandler for MongoDbHandler {
         };
         let connection_uri = format!(
             "mongodb://{}:{}@{}:{}/{}?authSource={}{}",
-            username, password, hostname, port, database, auth_source, tls_param
+            encoded_username,
+            encoded_password,
+            hostname,
+            port,
+            encoded_database,
+            encoded_auth_source,
+            tls_param
         );
 
         debug!(
             "MongoDB: Connection URI: {}",
-            connection_uri.replace(password, "***")
+            connection_uri.replace(&encoded_password.to_string(), "***")
         );
 
         // Connect to MongoDB
@@ -258,6 +291,24 @@ impl ProtocolHandler for MongoDbHandler {
                     .terminal
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                // Render the connection success screen
+                debug!("MongoDB: Rendering initial screen with prompt");
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                debug!(
+                    "MongoDB: Sending {} instructions to client",
+                    instructions.len()
+                );
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+                debug!("MongoDB: Initial screen sent successfully");
             }
             Err(e) => {
                 let error_msg = format!("MongoDB connection test failed: {}", e);
@@ -316,25 +367,45 @@ impl ProtocolHandler for MongoDbHandler {
             }
         }
 
-        // Send updated screen
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
-
         // Track current database
         let mut current_db = database.to_string();
 
         // Event loop
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
+        // NOTE: Screen was already rendered above after connection success
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal or input changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("MongoDB: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("MongoDB: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
                     if let Some(command) = pending_query {
                         info!("MongoDB: Executing command: {}", command);
 
@@ -458,8 +529,15 @@ impl ProtocolHandler for MongoDbHandler {
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("MongoDB: Input processing error: {}", e);
+                        Err(e) => {
+                            warn!("MongoDB: Input processing error: {}", e);
+                        }
+                    }
+                }
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

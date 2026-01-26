@@ -68,6 +68,7 @@ image = "0.25"
 
 # Utilities
 base64.workspace = true
+urlencoding = "2.1"
 
 # Lock primitives (no poisoning)
 parking_lot = "0.12"

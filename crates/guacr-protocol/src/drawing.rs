@@ -190,6 +190,60 @@ pub fn format_shade(
     )
 }
 
+/// Format `cursor` instruction - Set client cursor
+///
+/// Format: `6.cursor,{x},{y},{srclayer},{srcx},{srcy},{srcwidth},{srcheight};`
+///
+/// Sets the client's cursor to the image data from the specified rectangle of a layer,
+/// with the specified hotspot coordinates.
+///
+/// # Arguments
+/// - `hotspot_x`: X coordinate of the cursor's hotspot (click point)
+/// - `hotspot_y`: Y coordinate of the cursor's hotspot (click point)
+/// - `src_layer`: Layer index to copy cursor image from
+/// - `src_x`: X coordinate of upper-left corner of source rectangle
+/// - `src_y`: Y coordinate of upper-left corner of source rectangle
+/// - `src_width`: Width of the cursor image
+/// - `src_height`: Height of the cursor image
+///
+/// # Example
+/// ```
+/// use guacr_protocol::format_cursor;
+/// // Set cursor to 32x32 image from layer 1 at (0,0), with hotspot at (16,16)
+/// let instr = format_cursor(16, 16, 1, 0, 0, 32, 32);
+/// assert_eq!(instr, "6.cursor,2.16,2.16,1.1,1.0,1.0,2.32,2.32;");
+/// ```
+pub fn format_cursor(
+    hotspot_x: i32,
+    hotspot_y: i32,
+    src_layer: i32,
+    src_x: i32,
+    src_y: i32,
+    src_width: u32,
+    src_height: u32,
+) -> String {
+    let hotspot_x_str = hotspot_x.to_string();
+    let hotspot_y_str = hotspot_y.to_string();
+    let src_layer_str = src_layer.to_string();
+    let src_x_str = src_x.to_string();
+    let src_y_str = src_y.to_string();
+    let src_width_str = src_width.to_string();
+    let src_height_str = src_height.to_string();
+
+    format_instruction(
+        "cursor",
+        &[
+            &hotspot_x_str,
+            &hotspot_y_str,
+            &src_layer_str,
+            &src_x_str,
+            &src_y_str,
+            &src_width_str,
+            &src_height_str,
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

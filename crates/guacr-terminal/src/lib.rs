@@ -27,12 +27,17 @@ mod database_renderer;
 mod dirty_tracker;
 mod emulator;
 mod framebuffer;
+mod graphics_protocol;
 mod guacamole_input;
 mod input_handler;
 mod keysym;
 mod recorder;
+mod recording_pipeline;
 mod renderer;
+mod scroll_detector;
+mod selection_point;
 mod simd;
+mod terminal_input_handler;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use clipboard::{RdpClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
@@ -41,22 +46,28 @@ pub use database_renderer::{DatabaseTerminal, QueryResult, SpreadsheetRenderer};
 pub use dirty_tracker::{DirtyRect, DirtyTracker};
 pub use emulator::{Rect, ScrollbackLine, TerminalEmulator};
 pub use framebuffer::{FrameBuffer, FrameRect};
+pub use graphics_protocol::{GraphicsMode, GraphicsRenderer};
 pub use guacamole_input::{
-    extract_selection_text, format_clipboard_instructions, handle_mouse_selection,
-    parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction, KeyEvent, MouseEvent,
-    MouseSelection,
+    extract_selection_text, format_clear_selection_instructions, format_clipboard_instructions,
+    format_selection_overlay_instructions, handle_mouse_selection, parse_clipboard_blob,
+    parse_key_instruction, parse_mouse_instruction, KeyEvent, MouseEvent, MouseSelection,
+    SelectionResult,
 };
 pub use input_handler::{RdpInputHandler, RdpKeyEvent, RdpPointerEvent};
 pub use keysym::{
     mouse_event_to_x11_sequence, x11_keysym_to_bytes, x11_keysym_to_bytes_with_backspace,
-    ModifierState,
+    x11_keysym_to_bytes_with_modes, x11_keysym_to_kitty_sequence, ModifierState,
 };
 pub use recorder::{
     create_recording_transports, AsciicastHeader, AsciicastRecorder, AsyncDualFormatRecorder,
     ChannelRecordingTransport, DualFormatRecorder, EventType, FileRecordingTransport,
     GuacamoleSessionRecorder, MultiTransportRecorder, RecordingTransport,
 };
+pub use recording_pipeline::{RecordingPipeline, RecordingTaskManager};
+pub use scroll_detector::{ScrollDetector, ScrollDirection, ScrollOperation};
+pub use selection_point::{points_enclose_text, ColumnSide, SelectionPoint};
 pub use simd::convert_bgr_to_rgba_simd;
+pub use terminal_input_handler::TerminalInputHandler;
 
 // S3 recording transport available when s3 feature is enabled
 // #[cfg(feature = "s3")]

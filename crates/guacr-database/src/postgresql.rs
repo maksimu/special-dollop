@@ -81,6 +81,9 @@ impl ProtocolHandler for PostgreSqlHandler {
     ) -> guacr_handlers::Result<()> {
         info!("PostgreSQL handler starting");
 
+        // Initialize rustls crypto provider (required for rustls 0.23+)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Parse security settings
         let security = DatabaseSecuritySettings::from_params(&params);
         if security.base.read_only {
@@ -114,46 +117,72 @@ impl ProtocolHandler for PostgreSqlHandler {
             username, hostname, port, database
         );
 
-        // Create query executor with PostgreSQL prompt
+        // Parse display size from parameters (like SSH does)
+        let size_params = params
+            .get("size")
+            .map(|s| s.as_str())
+            .unwrap_or("1024,768,96");
+        let size_parts: Vec<&str> = size_params.split(',').collect();
+        let width: u32 = size_parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let height: u32 = size_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        // Calculate terminal dimensions (9x18 pixels per character cell)
+        let cols = (width / 9).max(80) as u16;
+        let rows = (height / 18).max(24) as u16;
+
+        info!(
+            "PostgreSQL: Display size {}x{} px → {}x{} chars",
+            width, height, cols, rows
+        );
+
+        // Create query executor with PostgreSQL prompt and correct dimensions
         let prompt = if security.base.read_only {
             "postgres [RO]=# "
         } else {
             "postgres=# "
         };
-        let mut executor = QueryExecutor::new(prompt, "postgresql")
+        let mut executor = QueryExecutor::new_with_size(prompt, "postgresql", rows, cols)
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-        // Get terminal dimensions for recording
-        let (rows, cols) = executor.terminal.size();
 
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "PostgreSQL", cols, rows);
 
-        // Send initial screen
-        executor
-            .terminal
-            .write_line("Connecting to PostgreSQL server...")
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
+        // Send display initialization instructions (ready + size)
+        let (ready_instr, size_instr) =
+            QueryExecutor::create_display_init_instructions(width, height);
+        to_client
+            .send(ready_instr)
             .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(size_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        // Build PostgreSQL connection URL
+        debug!("PostgreSQL: Sent ready and size instructions");
+
+        // NOTE: Don't render initial screen yet - wait until after connection
+        // This matches SSH behavior and prevents rendering at wrong dimensions
+
+        // Build PostgreSQL connection URL with proper URL encoding for special characters
+        // This is critical for passwords containing: | & ? @ : / # %
+        let encoded_username = urlencoding::encode(username);
+        let encoded_password = urlencoding::encode(password);
+        let encoded_database = urlencoding::encode(database);
         let connection_url = format!(
             "postgres://{}:{}@{}:{}/{}",
-            username, password, hostname, port, database
+            encoded_username, encoded_password, hostname, port, encoded_database
         );
 
         debug!(
             "PostgreSQL: Connection URL: {}",
-            connection_url.replace(password, "***")
+            connection_url.replace(&encoded_password.to_string(), "***")
         );
 
         // Connect to PostgreSQL using sqlx
@@ -206,6 +235,24 @@ impl ProtocolHandler for PostgreSqlHandler {
                     .terminal
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+                // Render the connection success screen
+                debug!("PostgreSQL: Rendering initial screen with prompt");
+                let (_, instructions) = executor
+                    .render_screen()
+                    .await
+                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                debug!(
+                    "PostgreSQL: Sending {} instructions to client",
+                    instructions.len()
+                );
+                for instr in instructions {
+                    to_client
+                        .send(instr)
+                        .await
+                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                }
+                debug!("PostgreSQL: Initial screen sent successfully");
 
                 pool
             }
@@ -266,22 +313,42 @@ impl ProtocolHandler for PostgreSqlHandler {
             }
         };
 
-        // Send updated screen
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
-
         // Event loop
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
+        // NOTE: Screen was already rendered above after connection success
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal or input changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("PostgreSQL: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("PostgreSQL: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
                     if let Some(query) = pending_query {
                         info!("PostgreSQL: Executing query: {}", query);
 
@@ -418,6 +485,7 @@ impl ProtocolHandler for PostgreSqlHandler {
                     }
 
                     if needs_render {
+                        // Render immediately for special cases (Enter, Escape, etc.)
                         for instr in instructions {
                             to_client
                                 .send(instr)
@@ -425,9 +493,17 @@ impl ProtocolHandler for PostgreSqlHandler {
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
                     }
+                    // For regular keystrokes, debounce timer will handle rendering
+                        }
+                        Err(e) => {
+                            warn!("PostgreSQL: Input processing error: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("PostgreSQL: Input processing error: {}", e);
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

@@ -69,6 +69,22 @@ impl DatabaseTerminal {
         Ok(())
     }
 
+    /// Set a new prompt
+    pub fn set_prompt(&mut self, prompt: &str) {
+        self.prompt = prompt.to_string();
+    }
+
+    /// Get the current prompt
+    pub fn get_prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    /// Process raw bytes (for ANSI escape sequences, etc.)
+    pub fn process(&mut self, data: &[u8]) -> crate::Result<()> {
+        self.terminal.process(data)?;
+        Ok(())
+    }
+
     /// Write a line to terminal with newline
     pub fn write_line(&mut self, text: &str) -> crate::Result<()> {
         let line = format!("{}\r\n", text);
@@ -200,11 +216,31 @@ impl DatabaseTerminal {
         self.terminal.is_dirty()
     }
 
+    /// Clear dirty flag after rendering
+    pub fn clear_dirty(&mut self) {
+        self.terminal.clear_dirty();
+    }
+
     /// Format Guacamole img instructions for the rendered image
     #[allow(deprecated)]
     pub fn format_img_instructions(&self, jpeg_data: &[u8], stream_id: u32) -> Vec<String> {
         self.renderer
             .format_img_instructions(jpeg_data, stream_id, 0, 0, 0)
+    }
+
+    /// Format sync instruction to tell client to display buffered instructions
+    pub fn format_sync_instruction(&self, timestamp_ms: u64) -> String {
+        self.renderer.format_sync_instruction(timestamp_ms)
+    }
+
+    /// Get reference to the renderer (for dirty region optimization)
+    pub fn renderer(&self) -> &TerminalRenderer {
+        &self.renderer
+    }
+
+    /// Get reference to the terminal screen (for dirty region tracking)
+    pub fn screen(&self) -> &vt100::Screen {
+        self.terminal.screen()
     }
 
     /// Get database type
@@ -215,6 +251,16 @@ impl DatabaseTerminal {
     /// Get terminal size
     pub fn size(&self) -> (u16, u16) {
         self.terminal.size()
+    }
+
+    /// Get mutable reference to terminal emulator
+    pub fn emulator_mut(&mut self) -> &mut TerminalEmulator {
+        &mut self.terminal
+    }
+
+    /// Get reference to terminal emulator
+    pub fn emulator(&self) -> &TerminalEmulator {
+        &self.terminal
     }
 }
 

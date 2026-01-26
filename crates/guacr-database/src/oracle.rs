@@ -4,7 +4,7 @@ use guacr_handlers::{
     EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
     RecordingConfig,
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -147,20 +147,55 @@ impl ProtocolHandler for OracleHandler {
             username, hostname, port, service
         );
 
-        // Create query executor with SQL*Plus prompt
+        // Parse display size from parameters (like SSH does)
+        let size_params = params
+            .get("size")
+            .map(|s| s.as_str())
+            .unwrap_or("1024,768,96");
+        let size_parts: Vec<&str> = size_params.split(',').collect();
+        let width: u32 = size_parts
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let height: u32 = size_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        // Calculate terminal dimensions (9x18 pixels per character cell)
+        let cols = (width / 9).max(80) as u16;
+        let rows = (height / 18).max(24) as u16;
+
+        info!(
+            "Oracle: Display size {}x{} px → {}x{} chars",
+            width, height, cols, rows
+        );
+
+        // Create query executor with SQL*Plus prompt and correct dimensions
         let prompt = if security.base.read_only {
             "SQL [RO]> "
         } else {
             "SQL> "
         };
-        let mut executor = QueryExecutor::new(prompt, "oracle")
+        let mut executor = QueryExecutor::new_with_size(prompt, "oracle", rows, cols)
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-        // Get terminal dimensions for recording
-        let (rows, cols) = executor.terminal.size();
 
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "Oracle", cols, rows);
+
+        // Send display initialization instructions (ready + size)
+        let (ready_instr, size_instr) =
+            QueryExecutor::create_display_init_instructions(width, height);
+        to_client
+            .send(ready_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(size_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+        debug!("Oracle: Sent ready and size instructions");
 
         // Check if real Oracle mode is available
         let real_mode = oracle_client_available();
@@ -369,11 +404,42 @@ impl OracleHandler {
         }
 
         // Main event loop
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
-                    if let Some(query) = pending_query {
-                        info!("Oracle: Query: {}", query);
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("Oracle: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("Oracle: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
+                            if let Some(query) = pending_query {
+                                info!("Oracle: Query: {}", query);
 
                         // Record query input
                         record_query_input(recorder, recording_config, &query);
@@ -439,17 +505,26 @@ impl OracleHandler {
                         continue;
                     }
 
-                    if needs_render {
-                        for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            if needs_render {
+                                // Render immediately for special cases (Enter, Escape, etc.)
+                                for instr in instructions {
+                                    to_client
+                                        .send(instr)
+                                        .await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+                            // For regular keystrokes, debounce timer will handle rendering
+                        }
+                        Err(e) => {
+                            warn!("Oracle: Input processing error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Oracle: Input processing error: {}", e);
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }
@@ -552,11 +627,42 @@ impl OracleHandler {
         }
 
         // Event loop - process commands in simulation mode
-        while let Some(msg) = from_client.recv().await {
-            match executor.process_input(&msg).await {
-                Ok((needs_render, instructions, pending_query)) => {
-                    if let Some(query) = pending_query {
-                        info!("Oracle: Command: {}", query);
+
+        // Debounce timer for batching screen updates (60 FPS)
+        let mut debounce = tokio::time::interval(std::time::Duration::from_millis(16));
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        'outer: loop {
+            tokio::select! {
+                // Debounce tick - render if terminal changed
+                _ = debounce.tick() => {
+                    // Check if client is still connected before rendering
+                    if to_client.is_closed() {
+                        debug!("Oracle: Client disconnected, stopping debounce timer");
+                        break;
+                    }
+
+                    if executor.is_dirty() {
+                        let (_, instructions) = executor
+                            .render_screen()
+                            .await
+                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                        for instr in instructions {
+                            // Break if send fails (client disconnected)
+                            if to_client.send(instr).await.is_err() {
+                                debug!("Oracle: Client channel closed during debounce, stopping");
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                // Process input from client
+                Some(msg) = from_client.recv() => {
+                    match executor.process_input(&msg).await {
+                        Ok((needs_render, instructions, pending_query)) => {
+                            if let Some(query) = pending_query {
+                                info!("Oracle: Command: {}", query);
 
                         // Record query input
                         record_query_input(recorder, recording_config, &query);
@@ -639,20 +745,29 @@ impl OracleHandler {
                                 .await
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
-                        continue;
-                    }
+                                continue;
+                            }
 
-                    if needs_render {
-                        for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            if needs_render {
+                                // Render immediately for special cases (Enter, Escape, etc.)
+                                for instr in instructions {
+                                    to_client
+                                        .send(instr)
+                                        .await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+                            // For regular keystrokes, debounce timer will handle rendering
+                        }
+                        Err(e) => {
+                            warn!("Oracle: Input processing error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Oracle: Input processing error: {}", e);
+
+                // Client disconnected
+                else => {
+                    break;
                 }
             }
         }

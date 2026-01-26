@@ -17,10 +17,11 @@
 
 services:
   # ============================================================================
-  # SSH Server (OpenSSH)
+  # SSH Server (OpenSSH with SFTP)
   # ============================================================================
   ssh:
-    image: lscr.io/linuxserver/openssh-server:latest
+    platform: linux/amd64
+    image: keeper/playground-ssh:latest
     container_name: guacr-test-ssh
     hostname: test-ssh
     environment:
@@ -28,8 +29,8 @@ services:
       - PGID=1000
       - TZ=UTC
       - PASSWORD_ACCESS=true
-      - USER_PASSWORD=test_password
-      - USER_NAME=test_user
+      - USER_PASSWORD=alpine
+      - USER_NAME=linuxuser
       - SUDO_ACCESS=true
     ports:
       - "2222:2222"
@@ -69,24 +70,22 @@ services:
       - guacr-test-network
 
   # ============================================================================
-  # RDP Server (xrdp on Ubuntu)
+  # RDP Server (xrdp with XFCE)
   # ============================================================================
   rdp:
-    image: danielguerra/ubuntu-xrdp:latest
+    platform: linux/amd64
+    image: keeper/playground-rdp-xfce:latest
     container_name: guacr-test-rdp
     hostname: test-rdp
+    shm_size: 2g
+    security_opt:
+      - seccomp:unconfined
     environment:
-      - TZ=UTC
+      - USER=linuxuser
+      - PASSWORD=alpine
+      - ROOT_PASSWORD=rootpassword
     ports:
       - "3389:3389"
-    # Create test user on startup
-    entrypoint: |
-      bash -c "
-        useradd -m -s /bin/bash test_user 2>/dev/null || true
-        echo 'test_user:test_password' | chpasswd
-        echo 'root:test_password' | chpasswd
-        /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
-      "
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 3389 || exit 1"]
@@ -96,26 +95,25 @@ services:
       start_period: 30s
     networks:
       - guacr-test-network
-    # xrdp needs more resources
     deploy:
       resources:
         limits:
-          memory: 1G
+          cpus: "4"
+          memory: 2G
 
   # ============================================================================
-  # VNC Server (TigerVNC on Alpine)
+  # VNC Server (TigerVNC with XFCE)
   # ============================================================================
   vnc:
-    image: consol/alpine-xfce-vnc:latest
+    platform: linux/amd64
+    image: keeper/playground-vnc-xfce:latest
     container_name: guacr-test-vnc
     hostname: test-vnc
     environment:
-      - VNC_PW=test_password
-      - VNC_RESOLUTION=1024x768
-      - VNC_COL_DEPTH=24
+      - VNC_PW=alpine
+      - VNC_RESOLUTION=1010x760
     ports:
       - "5900:5901"
-      - "6900:6901"  # noVNC web interface
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 5901 || exit 1"]

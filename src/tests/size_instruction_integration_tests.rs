@@ -55,13 +55,13 @@ async fn mock_process_size_instruction(
 async fn test_expandable_size_instruction_detection() {
     // Test the new expandable validation function detects size instructions correctly
 
-    let size_instructions = vec![
+    let size_instructions = [
         b"4.size,1.0,4.1920,4.1080;" as &[u8], // 1920x1080 on layer 0
         b"4.size,1.1,3.800,3.600;" as &[u8],   // 800x600 on layer 1
         b"4.size,2.10,4.1024,3.768;" as &[u8], // 1024x768 on layer 10
     ];
 
-    let non_size_instructions = vec![
+    let non_size_instructions = [
         b"4.sync,4.1000;" as &[u8],
         b"5.error,11.Auth failed;" as &[u8],
         b"4.copy,2.-1,1.0,1.0,3.100,3.100,1.0,1.0,2.50,2.50;" as &[u8],
@@ -186,7 +186,7 @@ async fn test_size_instruction_background_processing_pipeline() {
     });
 
     // Simulate the hot path detection and sending
-    let test_size_instructions = vec![
+    let test_size_instructions = [
         (b"4.size,1.0,4.1920,4.1080;" as &[u8], 0i32), // layer 0
         (b"4.size,1.5,4.1440,3.900;" as &[u8], 5i32),  // layer 5
         (b"4.size,2.10,4.1024,3.768;" as &[u8], 10i32), // layer 10

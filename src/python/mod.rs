@@ -1,6 +1,8 @@
+pub mod channel_logger;
 mod connectivity;
 mod enums;
 pub mod handler_task;
+pub mod logger_task;
 mod signal_handler;
 mod tube_registry_binding;
 mod utils;
@@ -16,6 +18,16 @@ pub use tube_registry_binding::PyTubeRegistry;
 
 #[pymodule]
 pub fn keeper_pam_webrtc_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize rustls crypto provider for DTLS - CRITICAL for WebRTC to work!
+    // This must be called before any DTLS connections are attempted
+    use std::sync::Once;
+    static INIT_CRYPTO: Once = Once::new();
+    INIT_CRYPTO.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider - required for DTLS/WebRTC");
+    });
+
     m.add_class::<PyTubeRegistry>()?;
     m.add_class::<PyCloseConnectionReason>()?;
 

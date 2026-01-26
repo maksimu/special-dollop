@@ -191,9 +191,6 @@ cargo build --release
 
 # Run comprehensive test suite
 cargo test --release
-
-# Optional: Enable debug logging for troubleshooting
-cargo build --release --features production_debug
 ```
 
 ## Why This Implementation?

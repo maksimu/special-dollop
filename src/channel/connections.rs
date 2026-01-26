@@ -1502,11 +1502,25 @@ pub async fn setup_outbound_task(
 
         // Signal that this connection task has exited
         if let Err(e) = conn_closed_tx_for_task.send((conn_no, channel_id_for_task.clone())) {
-            // Only log if the error is not related to an expected channel closure
+            // Proper error handling: Connection closure signal failed
+            // This means the Channel run loop's receiver is closed (likely during shutdown)
+            // The connection will remain in DashMap until Channel drops and RAII cleans it up
+            // This is not ideal but acceptable - connection resources are already released by this point
             if !e.to_string().contains("channel closed") {
-                debug!("Failed to send connection closure signal; channel might be shutting down. (channel_id: {}, conn_no: {}, error: {:?})", channel_id_for_task, conn_no, e
+                warn!(
+                    "Connection closure signal failed - receiver closed (channel_id: {}, conn_no: {}). \
+                     Connection will remain in map until Channel Drop. Error: {:?}",
+                    channel_id_for_task, conn_no, e
                 );
             }
+            // Note: We cannot remove the connection from DashMap here because we don't have
+            // access to it. The connection will be cleaned up when Channel drops via RAII.
+            // This is acceptable because:
+            // 1. Connection resources (socket, tasks) are already released
+            // 2. Only the map entry remains
+            // 3. Channel Drop will clean up the map
+            // The "proper way" would be to pass a Weak<DashMap> reference, but that adds
+            // significant complexity for a rare edge case (shutdown race condition).
         } else if unlikely!(should_log_connection(true)) {
             // Critical: disconnect event
             debug!(

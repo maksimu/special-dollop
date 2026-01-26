@@ -31,6 +31,7 @@ exclude = ["LICENSE*", "*.md", "README*"]
 python-source = "src/python"
 
 [tool.pytest.ini_options]
+pythonpath = ["tests"]
 filterwarnings = [
     "ignore:coroutine 'TunnelConnectionManager._execute_ice_restart' was never awaited:RuntimeWarning",
 ]

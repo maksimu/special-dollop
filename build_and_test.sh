@@ -8,6 +8,28 @@ set -e  # Exit on any error
 # - The actual tube cleanup only happens when marked Closed and removed from registry
 # - Look for "TUBE CLEANUP COMPLETE" message to confirm full cleanup
 
+echo "Building with protocol handlers (SSH, Telnet, VNC, RDP, etc) - always included"
+echo ""
+
+echo "========================================"
+echo "Running code quality checks..."
+echo "========================================"
+
+echo "Checking code formatting..."
+cargo fmt --all -- --check
+echo "✓ Formatting check passed"
+echo ""
+
+echo "Running clippy..."
+cargo clippy -- -D warnings
+echo "✓ Clippy check passed"
+echo ""
+
+echo "Running Rust unit tests..."
+cargo test --lib --no-default-features
+echo "✓ Rust tests passed"
+echo ""
+
 echo "Cleaning previous builds..."
 # Clean Rust build artifacts
 cargo clean

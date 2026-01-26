@@ -272,14 +272,18 @@ pub fn ice_gather_timeout() -> Duration {
 
 /// Timeout waiting for ICE restart answer from remote peer.
 ///
-/// **Default**: 10 seconds
+/// **Default**: 20 seconds
 ///
-/// **Rationale**: Signaling round-trip + remote SDP generation + processing.
-/// 10s is enough for most networks; 5 attempts = 50s total before giving up.
+/// **Rationale**: ICE restart involves only WebRTC signaling operations (no user creation).
+/// Client waits 15s for restart answers (PrivateTunnel.ts:1106). Gateway must wait slightly
+/// longer to avoid racing the client. Industry standard for ICE restart: 10-20 seconds.
+/// 20s = 15s (client timeout) + 5s (processing/network buffer).
+///
+/// **Note**: Ephemeral user creation only happens during initial connection, not ICE restart.
 ///
 /// **Tuning**:
-/// - Fast signaling: 5s
-/// - Slow/satellite: 15-30s
+/// - Fast signaling: 15s
+/// - Slow/satellite: 30s
 ///
 /// **Env**: `KEEPER_GATEWAY_ICE_RESTART_ANSWER_TIMEOUT_SECS`
 pub fn ice_restart_answer_timeout() -> Duration {
@@ -287,7 +291,7 @@ pub fn ice_restart_answer_timeout() -> Duration {
         std::env::var("KEEPER_GATEWAY_ICE_RESTART_ANSWER_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10),
+            .unwrap_or(20),
     )
 }
 

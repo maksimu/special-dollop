@@ -51,6 +51,8 @@ pub(crate) async fn setup_channel_for_data_channel(
     client_version: String,
     capabilities: crate::tube_protocol::Capabilities,
     python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
+    handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -58,7 +60,6 @@ pub(crate) async fn setup_channel_for_data_channel(
     // Create shutdown notifier for clean async cancellation
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
-    // Create the channel
     let channel_instance = Channel::new(crate::channel::core::ChannelParams {
         webrtc: data_channel.clone(),
         rx_from_dc: rx,
@@ -72,6 +73,8 @@ pub(crate) async fn setup_channel_for_data_channel(
         client_version,
         capabilities,
         python_handler_tx,
+        handler_registry,
+        spawned_task_completion_tx,
     })
     .await?;
 

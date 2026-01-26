@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Old TubeRegistry tests - replaced by registry_actor_tests.rs
 //!
 //! These tests tested internal TubeRegistry implementation which has been

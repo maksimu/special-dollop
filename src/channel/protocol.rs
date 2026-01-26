@@ -3,6 +3,7 @@ use crate::unlikely;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
 use log::{debug, error, info, warn};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::core::Channel;
@@ -49,6 +50,9 @@ impl Channel {
         let is_open_flag = webrtc.is_open.clone();
         let open_notify = webrtc.open_notify.clone();
 
+        // Clone task tracking for proper resource management
+        let state_tasks_for_open = self.state_monitoring_tasks.clone();
+
         data_channel.on_open(Box::new(move || {
             // Update the shared is_open flag and notify waiters
             // This ensures wait_for_channel_open() works even though we replaced the callback
@@ -57,7 +61,9 @@ impl Channel {
 
             let tx = state_tx_open.clone();
             let channel_id_log = channel_id_for_open.clone(); // Clone for async block
-            tokio::spawn(async move {
+
+            // Proper resource handling: Store AbortHandle for explicit lifecycle management
+            let handle = tokio::spawn(async move {
                 if let Err(e) = tx.send("Open".to_string()).await {
                     warn!(
                         "Failed to send open state notification (channel_id: {}, error: {})",
@@ -65,15 +71,24 @@ impl Channel {
                     );
                 }
             });
+
+            // Store abort handle synchronously - no race condition possible
+            let abort_handle = handle.abort_handle();
+            state_tasks_for_open.lock().push(abort_handle);
+
             Box::pin(async {})
         }));
 
         let state_tx_close = state_tx.clone();
         let channel_id_for_close = channel_id_base.clone(); // Clone for on_close
+        let state_tasks_for_close = self.state_monitoring_tasks.clone();
+
         data_channel.on_close(Box::new(move || {
             let tx = state_tx_close.clone();
             let channel_id_log = channel_id_for_close.clone(); // Clone for async block
-            tokio::spawn(async move {
+
+            // Proper resource handling: Store AbortHandle for explicit lifecycle management
+            let handle = tokio::spawn(async move {
                 if let Err(e) = tx.send("Closed".to_string()).await {
                     warn!(
                         "Failed to send close state notification (channel_id: {}, error: {})",
@@ -81,16 +96,25 @@ impl Channel {
                     );
                 }
             });
+
+            // Store abort handle synchronously - no race condition possible
+            let abort_handle = handle.abort_handle();
+            state_tasks_for_close.lock().push(abort_handle);
+
             Box::pin(async {})
         }));
 
         let state_tx_error = state_tx.clone();
         let channel_id_for_error = channel_id_base.clone(); // Clone for on_error
+        let state_tasks_for_error = self.state_monitoring_tasks.clone();
+
         data_channel.on_error(Box::new(move |err| {
             let tx = state_tx_error.clone();
             let err_str = format!("Error: {err}");
             let channel_id_log = channel_id_for_error.clone(); // Clone for async block
-            tokio::spawn(async move {
+
+            // Proper resource handling: Store AbortHandle for explicit lifecycle management
+            let handle = tokio::spawn(async move {
                 if let Err(e) = tx.send(err_str).await {
                     warn!(
                         "Failed to send error state notification (channel_id: {}, error: {})",
@@ -98,6 +122,11 @@ impl Channel {
                     );
                 }
             });
+
+            // Store abort handle synchronously - no race condition possible
+            let abort_handle = handle.abort_handle();
+            state_tasks_for_error.lock().push(abort_handle);
+
             Box::pin(async {})
         }));
 
@@ -318,7 +347,8 @@ impl Channel {
             && (self.connect_as_settings.allow_supply_user
                 || self.connect_as_settings.allow_supply_host)
         {
-            if let Some(ref gateway_private_key_pem) = self.connect_as_settings.gateway_private_key
+            if let Some(gateway_private_key_pem) =
+                self.connect_as_settings.gateway_private_key.as_ref()
             {
                 debug!(
                     "Channel({}): Attempting ConnectAs for Guacd target_conn_no {}",
@@ -440,14 +470,14 @@ impl Channel {
                         self.buffer_pool.release(crypto_buffer);
                     } else {
                         warn!("Channel({}): ConnectAs payload too short for PK, Nonce, and encrypted data (expected {}, got {}) for target_conn_no {}",
-                          self.channel_id, required_crypto_block_len, cursor.remaining(), target_connection_no);
+                              self.channel_id, required_crypto_block_len, cursor.remaining(), target_connection_no);
                         return Err(anyhow!(
                             "ConnectAs payload too short for PK, Nonce, and encrypted data"
                         ));
                     }
                 } else {
                     warn!("Channel({}): ConnectAs payload too short for connect_as_payload_len field (expected {} bytes, got {}) for target_conn_no {}",
-                      self.channel_id, CONNECT_AS_DETAILS_LEN_FIELD_BYTES, cursor.remaining(), target_connection_no);
+                          self.channel_id, CONNECT_AS_DETAILS_LEN_FIELD_BYTES, cursor.remaining(), target_connection_no);
                     // If ConnectAs was expected but the payload is too short even for its length, it's an error.
                     // If ConnectAs was optional and this path is reached, it implies no ConnectAs data was provided.
                     // The original connections.rs returned Err. Here, we might just log and proceed if ConnectAs is not mandatory.
@@ -558,9 +588,72 @@ impl Channel {
             }
         }
 
-        // --- Actual Connection Opening Logic ---
         let open_result = match self.active_protocol {
             super::types::ActiveProtocol::Guacd => {
+                // Check if we should use built-in handlers based on use_guacr parameter
+                {
+                    // Read use_guacr parameter from guacd_params
+                    let guacd_params = self.guacd_params.lock().await;
+                    let use_guacr = guacd_params
+                        .get("use_guacr")
+                        .and_then(|v| v.parse::<bool>().ok())
+                        .unwrap_or(false);
+                    drop(guacd_params); // Release lock
+
+                    // Only use built-in handlers if use_guacr=true
+                    if use_guacr {
+                        if let (Some(registry), Some(conv_type)) =
+                            (&self.handler_registry, &self.conversation_type)
+                        {
+                            // Use built-in protocol handlers instead of external guacd
+
+                            // Spawn handler and return result - will fall through to send ConnectionOpened
+                            return match super::handler_connections::invoke_builtin_handler(
+                                self,
+                                conv_type,
+                                registry,
+                                target_connection_no,
+                                Arc::clone(&self.spawned_task_completion_tx),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    debug!("Handler spawned successfully, sending ConnectionOpened (channel: {}, conn: {})",
+                                    self.channel_id, target_connection_no);
+                                    let mut payload = self.buffer_pool.acquire();
+                                    payload.put_u32(target_connection_no);
+                                    let result = self
+                                        .send_control_message(
+                                            ControlMessage::ConnectionOpened,
+                                            &payload,
+                                        )
+                                        .await;
+                                    self.buffer_pool.release(payload);
+                                    result
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Handler failed to start (channel: {}, conn: {}): {}",
+                                        self.channel_id, target_connection_no, e
+                                    );
+                                    let mut payload = self.buffer_pool.acquire();
+                                    payload.put_u32(target_connection_no);
+                                    payload.put_u8(CloseConnectionReason::ConnectionFailed as u8);
+                                    let result = self
+                                        .send_control_message(
+                                            ControlMessage::CloseConnection,
+                                            &payload,
+                                        )
+                                        .await;
+                                    self.buffer_pool.release(payload);
+                                    result.and(Err(e))
+                                }
+                            };
+                        }
+                    }
+                }
+
+                // Original: Connect to external guacd server
                 if let (Some(host), Some(port)) =
                     (effective_guacd_host.as_deref(), effective_guacd_port)
                 {

@@ -25,6 +25,7 @@ async fn test_tube_with_raii_signal_sender() {
         Some(signal_tx),
         Some("test_tube_123".to_string()),
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
 
@@ -212,6 +213,7 @@ async fn test_tube_raii_metrics_cleanup() {
         Some(signal_tx),
         Some("raii_metrics_tube".to_string()),
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
 
@@ -363,6 +365,7 @@ async fn test_tube_drop_closes_peer_connection() {
         None,
         Some("drop_test_tube".to_string()),
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
 

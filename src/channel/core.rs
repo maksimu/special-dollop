@@ -17,14 +17,15 @@ use bytes::Bytes;
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue; // For clarity when matching JsonValue types
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::task::{AbortHandle, JoinHandle};
 // Add this
 
 // Import from sibling modules
@@ -143,6 +144,14 @@ pub struct Channel {
     pub(crate) local_client_server_conn_rx:
         Option<mpsc::Receiver<(u32, OwnedWriteHalf, JoinHandle<()>)>>,
 
+    // Task tracking for proper resource management (not just RAII safety net)
+    /// Track server connection handler tasks for explicit cancellation on shutdown
+    pub(crate) server_connection_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    /// Track state monitoring tasks for explicit cancellation
+    pub(crate) state_monitoring_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    /// Track delayed cleanup tasks for explicit cancellation
+    pub(crate) cleanup_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+
     // Protocol handling integrated into Channel
     pub(crate) active_protocol: ActiveProtocol,
     pub(crate) protocol_state: ProtocolLogicState,
@@ -151,25 +160,33 @@ pub struct Channel {
     pub(crate) guacd_host: Option<String>,
     pub(crate) guacd_port: Option<u16>,
     pub(crate) connect_as_settings: ConnectAsSettings,
-    pub(crate) guacd_params: Arc<Mutex<HashMap<String, String>>>, // Kept for now for minimal diff
+    pub(crate) guacd_params: Arc<AsyncMutex<HashMap<String, String>>>, // Kept for now for minimal diff
     // Database proxy settings (for DatabaseProxy protocol)
     pub(crate) proxy_host: Option<String>,
     pub(crate) proxy_port: Option<u16>,
-    pub(crate) db_params: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) db_params: Arc<AsyncMutex<HashMap<String, String>>>,
+
+    // Protocol handler registry and conversation type (for built-in handlers)
+    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    #[allow(dead_code)]
+    pub(crate) conversation_type: Option<ConversationType>,
+
+    // Handler senders for forwarding inbound messages to protocol handlers
+    pub(crate) handler_senders: Arc<DashMap<u32, mpsc::Sender<Bytes>>>,
 
     // Buffer pool for efficient buffer management
     pub(crate) buffer_pool: BufferPool,
     // Timestamp for the last channel-level ping sent (conn_no=0)
-    pub(crate) channel_ping_sent_time: Mutex<Option<u64>>,
+    pub(crate) channel_ping_sent_time: AsyncMutex<Option<u64>>,
 
     // For signaling connection task closures to the main Channel run loop
     pub(crate) conn_closed_tx: mpsc::UnboundedSender<(u32, String)>, // (conn_no, channel_id)
     conn_closed_rx: Option<mpsc::UnboundedReceiver<(u32, String)>>,
     // Stores the conn_no of the primary Guacd data connection
-    pub(crate) primary_guacd_conn_no: Arc<Mutex<Option<u32>>>,
+    pub(crate) primary_guacd_conn_no: Arc<AsyncMutex<Option<u32>>>,
 
     // Store the close reason when control connection closes
-    pub(crate) channel_close_reason: Arc<Mutex<Option<CloseConnectionReason>>>,
+    pub(crate) channel_close_reason: Arc<AsyncMutex<Option<CloseConnectionReason>>>,
     // Callback token for router communication
     pub(crate) callback_token: Option<String>,
     // KSM config for router communication
@@ -177,7 +194,7 @@ pub struct Channel {
     // Client version for router communication
     pub(crate) client_version: String,
     /// Capabilities enabled for this channel
-    pub(crate) capabilities: crate::tube_protocol::Capabilities,
+    pub(crate) capabilities: Capabilities,
     /// Multi-channel assembler (created when FRAGMENTATION capability is enabled)
     #[allow(dead_code)] // Used at runtime when FRAGMENTATION enabled
     pub(crate) assembler: Option<super::assembler::Assembler>,
@@ -186,6 +203,10 @@ pub struct Channel {
     pub(crate) pending_fragments: DashMap<u32, FragmentBuffer>,
     // Python handler channel for PythonHandler protocol mode
     pub(crate) python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
+
+    // Task completion tracking (passed from Tube for handler task monitoring)
+    // Handler tasks signal completion via this channel to ensure proper cleanup
+    pub(crate) spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 // NOTE: Channel is intentionally NOT Clone because it contains a single-consumer receiver
@@ -204,9 +225,12 @@ pub struct ChannelParams {
     pub ksm_config: Option<String>,
     pub client_version: String,
     /// Capabilities enabled for this channel (e.g., FRAGMENTATION for multi-channel)
-    pub capabilities: crate::tube_protocol::Capabilities,
+    pub capabilities: Capabilities,
     /// Optional Python handler channel for PythonHandler protocol mode
     pub python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
+    pub handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    /// Task completion tracking from Tube (for handler task monitoring)
+    pub spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl Channel {
@@ -224,6 +248,8 @@ impl Channel {
             client_version,
             capabilities,
             python_handler_tx,
+            handler_registry,
+            spawned_task_completion_tx,
         } = params;
         debug!("Channel::new called (channel_id: {})", channel_id);
         if unlikely!(crate::logger::is_verbose_logging()) {
@@ -249,6 +275,7 @@ impl Channel {
         let mut temp_initial_guacd_params_map = HashMap::new();
 
         let mut local_listen_addr_setting: Option<String> = None;
+        let mut stored_conversation_type: Option<ConversationType> = None;
 
         // Database proxy settings
         let mut proxy_host_setting: Option<String> = None;
@@ -338,6 +365,7 @@ impl Channel {
                                 warn!("DatabaseProxy: 'db_params' block not found in protocol_settings (channel_id: {})", channel_id);
                             }
                         } else if is_guacd_session(&parsed_conversation_type) {
+                            stored_conversation_type = Some(parsed_conversation_type.clone());
                             debug!("Configuring for GuacD protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                             determined_protocol = ActiveProtocol::Guacd;
                             initial_protocol_state =
@@ -397,18 +425,18 @@ impl Channel {
                                                 JsonValue::Array(arr) => {
                                                     let str_arr: Vec<String> = arr
                                                         .iter()
-                                                        .filter_map(|val| {
-                                                            val.as_str().map(String::from)
+                                                        .map(|val| match val {
+                                                            JsonValue::String(s) => s.clone(),
+                                                            JsonValue::Number(n) => n.to_string(),
+                                                            JsonValue::Bool(b) => b.to_string(),
+                                                            _ => serde_json::to_string(val)
+                                                                .unwrap_or_default(),
                                                         })
                                                         .collect();
                                                     if !str_arr.is_empty() {
                                                         Some((k.clone(), str_arr.join(",")))
                                                     } else {
-                                                        // For arrays not of strings, or empty string arrays, produce empty string or skip.
-                                                        // Guacamole usually expects comma-separated for multiple values like image/audio mimetypes.
-                                                        // If it's an array of other things, stringifying the whole array might be an option.
                                                         Some((k.clone(), "".to_string()))
-                                                        // Or None to skip
                                                     }
                                                 }
                                                 JsonValue::Null => None, // Omit null values by not adding them
@@ -644,23 +672,34 @@ impl Channel {
             local_client_server_task: None,
             local_client_server_conn_tx: Some(server_conn_tx),
             local_client_server_conn_rx: Some(server_conn_rx),
+
+            // Initialize task tracking for proper resource management
+            server_connection_tasks: Arc::new(Mutex::new(Vec::new())),
+            state_monitoring_tasks: Arc::new(Mutex::new(Vec::new())),
+            cleanup_tasks: Arc::new(Mutex::new(Vec::new())),
+
             active_protocol: determined_protocol,
             protocol_state: initial_protocol_state,
 
             guacd_host: guacd_host_setting,
             guacd_port: guacd_port_setting,
             connect_as_settings: final_connect_as_settings,
-            guacd_params: Arc::new(Mutex::new(temp_initial_guacd_params_map)),
+            guacd_params: Arc::new(AsyncMutex::new(temp_initial_guacd_params_map)),
             proxy_host: proxy_host_setting,
             proxy_port: proxy_port_setting,
-            db_params: Arc::new(Mutex::new(temp_db_params_map)),
+            db_params: Arc::new(AsyncMutex::new(temp_db_params_map)),
+
+            handler_registry,
+            conversation_type: stored_conversation_type,
+
+            handler_senders: Arc::new(DashMap::new()),
 
             buffer_pool,
-            channel_ping_sent_time: Mutex::new(None),
+            channel_ping_sent_time: AsyncMutex::new(None),
             conn_closed_tx,
             conn_closed_rx: Some(conn_closed_rx),
-            primary_guacd_conn_no: Arc::new(Mutex::new(None)),
-            channel_close_reason: Arc::new(Mutex::new(None)),
+            primary_guacd_conn_no: Arc::new(AsyncMutex::new(None)),
+            channel_close_reason: Arc::new(AsyncMutex::new(None)),
             callback_token,
             ksm_config,
             client_version,
@@ -668,6 +707,7 @@ impl Channel {
             assembler: None, // Will be created below if FRAGMENTATION enabled
             pending_fragments: DashMap::new(),
             python_handler_tx,
+            spawned_task_completion_tx,
         };
 
         debug!(
@@ -734,6 +774,10 @@ impl Channel {
     }
 
     pub async fn run(mut self) -> Result<(), ChannelError> {
+        error!(
+            "DEBUG_CHANNEL_RUN: Channel.run() started (channel_id: {})",
+            self.channel_id
+        );
         self.setup_webrtc_state_monitoring();
 
         let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -1009,7 +1053,37 @@ impl Channel {
             }
         }
 
-        // Collect connection numbers from DashMap
+        // CRITICAL: Clean up handler-based connections first
+        // Handler-based connections (guacr) don't create Conn entries in the DashMap,
+        // they only exist in handler_senders. Dropping their senders signals them to exit.
+        {
+            let handler_conn_nos: Vec<u32> = self
+                .handler_senders
+                .iter()
+                .map(|entry| *entry.key())
+                .collect();
+
+            if !handler_conn_nos.is_empty() {
+                debug!(
+                    "Cleaning up {} handler-based connections (channel_id: {})",
+                    handler_conn_nos.len(),
+                    self.channel_id
+                );
+
+                for conn_no in handler_conn_nos {
+                    // Remove the sender to signal the handler to stop
+                    // The handler's from_client.recv() will return None
+                    if self.handler_senders.remove(&conn_no).is_some() {
+                        debug!(
+                            "Signaled handler to stop (channel_id: {}, conn_no: {})",
+                            self.channel_id, conn_no
+                        );
+                    }
+                }
+            }
+        }
+
+        // Collect connection numbers from DashMap (TCP-based connections)
         let conn_keys = self.get_connection_ids();
         for conn_no in conn_keys {
             if conn_no != 0 {
@@ -1207,27 +1281,42 @@ impl Channel {
             // Schedule delayed cleanup
             let conns_arc = Arc::clone(&self.conns);
             let channel_id_clone = self.channel_id.clone();
+            let cleanup_tasks = self.cleanup_tasks.clone();
+            let shutdown_notify = self.shutdown_notify.clone();
 
-            // Spawn a task to remove the connection after a grace period
-            tokio::spawn(async move {
-                // Wait a bit to allow in-flight messages to be processed
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Proper resource handling: Store AbortHandle and make cancellable
+            let handle = tokio::spawn(async move {
+                // Wait with cancellation support
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        debug!(
+                            "Grace period elapsed, removing connection from maps (channel_id: {})",
+                            channel_id_clone
+                        );
 
-                debug!(
-                    "Grace period elapsed, removing connection from maps (channel_id: {})",
-                    channel_id_clone
-                );
-
-                // Now remove from maps
-                if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
-                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
-                    conn.graceful_shutdown(conn_no, &channel_id_clone).await;
-                    debug!(
-                        "Connection {} removed with graceful TCP shutdown (channel_id: {})",
-                        conn_no, channel_id_clone
-                    );
+                        // Now remove from maps
+                        if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
+                            // Gracefully shutdown to ensure TCP cleanup completes
+                            conn.graceful_shutdown(conn_no, &channel_id_clone).await;
+                            debug!(
+                                "Connection {} removed with graceful TCP shutdown (channel_id: {})",
+                                conn_no, channel_id_clone
+                            );
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        // Channel shutting down, cancel delayed cleanup
+                        debug!(
+                            "Cleanup cancelled due to channel shutdown (channel_id: {}, conn_no: {})",
+                            channel_id_clone, conn_no
+                        );
+                    }
                 }
             });
+
+            // Store abort handle for explicit lifecycle management
+            let abort_handle = handle.abort_handle();
+            cleanup_tasks.lock().push(abort_handle);
         }
 
         if conn_no == 0 {
@@ -1484,27 +1573,42 @@ impl Channel {
             // Schedule delayed cleanup
             let conns_arc = Arc::clone(&self.conns);
             let channel_id_clone = self.channel_id.clone();
+            let cleanup_tasks = self.cleanup_tasks.clone();
+            let shutdown_notify = self.shutdown_notify.clone();
 
-            // Spawn a task to remove the connection after a grace period
-            tokio::spawn(async move {
-                // Wait a bit to allow in-flight messages to be processed
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Proper resource handling: Store AbortHandle and make cancellable
+            let handle = tokio::spawn(async move {
+                // Wait with cancellation support
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        debug!(
+                            "Grace period elapsed, removing connection from maps (channel_id: {})",
+                            channel_id_clone
+                        );
 
-                debug!(
-                    "Grace period elapsed, removing connection from maps (channel_id: {})",
-                    channel_id_clone
-                );
-
-                // Now remove from maps
-                if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
-                    // Gracefully shutdown to ensure TCP cleanup completes (fixes guacd memory leak)
-                    conn.graceful_shutdown(conn_no, &channel_id_clone).await;
-                    debug!(
-                        "Connection {} removed with graceful TCP shutdown (channel_id: {})",
-                        conn_no, channel_id_clone
-                    );
+                        // Now remove from maps
+                        if let Some((_, mut conn)) = conns_arc.remove(&conn_no) {
+                            // Gracefully shutdown to ensure TCP cleanup completes
+                            conn.graceful_shutdown(conn_no, &channel_id_clone).await;
+                            debug!(
+                                "Connection {} removed with graceful TCP shutdown (channel_id: {})",
+                                conn_no, channel_id_clone
+                            );
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        // Channel shutting down, cancel delayed cleanup
+                        debug!(
+                            "Cleanup cancelled due to channel shutdown (channel_id: {}, conn_no: {})",
+                            channel_id_clone, conn_no
+                        );
+                    }
                 }
             });
+
+            // Store abort handle for explicit lifecycle management
+            let abort_handle = handle.abort_handle();
+            cleanup_tasks.lock().push(abort_handle);
         }
 
         if conn_no == 0 {
@@ -1568,6 +1672,19 @@ impl Channel {
             ActiveProtocol::DatabaseProxy => {
                 // DatabaseProxy connections are similar to Guacd - TCP streams with handshake
                 // No special cleanup needed beyond what's done for Guacd
+            }
+        }
+
+        // CRITICAL: Clean up handler senders to signal built-in handlers to stop
+        // Dropping the sender causes from_client.recv() to return None in the handler,
+        // allowing it to exit gracefully. Without this, handlers block forever waiting
+        // for messages that will never come after WebRTC closes.
+        {
+            if self.handler_senders.remove(&conn_no).is_some() {
+                debug!(
+                    "Removed handler sender for conn {} to signal handler shutdown (channel_id: {})",
+                    conn_no, self.channel_id
+                );
             }
         }
 
@@ -1646,6 +1763,29 @@ impl Drop for Channel {
     fn drop(&mut self) {
         self.should_exit
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Proper resource handling: Abort all tracked tasks explicitly
+        // This provides graceful shutdown instead of relying solely on RAII safety net
+        // Using parking_lot::Mutex::lock() which blocks but never poisons
+        let mut tasks = self.server_connection_tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+        drop(tasks);
+
+        let mut tasks = self.state_monitoring_tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+        drop(tasks);
+
+        let mut tasks = self.cleanup_tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+        drop(tasks);
+
+        // Abort server task
         if let Some(task) = &self.local_client_server_task {
             task.abort();
         }

@@ -7,6 +7,7 @@ mod connect_as;
 pub(crate) mod connections;
 pub(crate) mod core;
 pub(crate) mod frame_handling; // Logic to be merged into core.rs
+pub(crate) mod handler_connections;
 mod server;
 pub mod types; // Added new types module
 mod utils; // Added a new connect_as module

@@ -123,6 +123,8 @@ struct RegistryActor {
     /// Stale tube cleanup metrics (shared for cross-task updates)
     stale_tubes_removed: Arc<AtomicUsize>,
     close_timeouts: Arc<AtomicUsize>,
+    /// Protocol handler registry (for built-in guacr handlers)
+    handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
 }
 
 // ============================================================================
@@ -338,7 +340,11 @@ async fn close_tube_async(
 }
 
 impl RegistryActor {
-    fn new(command_rx: mpsc::UnboundedReceiver<RegistryCommand>, max_concurrent: usize) -> Self {
+    fn new(
+        command_rx: mpsc::UnboundedReceiver<RegistryCommand>,
+        max_concurrent: usize,
+        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    ) -> Self {
         Self {
             tubes: Arc::new(DashMap::new()),
             conversations: Arc::new(DashMap::new()),
@@ -351,6 +357,7 @@ impl RegistryActor {
             create_times: Vec::with_capacity(100),
             stale_tubes_removed: Arc::new(AtomicUsize::new(0)),
             close_timeouts: Arc::new(AtomicUsize::new(0)),
+            handler_registry,
         }
     }
 
@@ -618,6 +625,7 @@ impl RegistryActor {
             Some(req.signal_sender.clone()),
             tube_id_opt,
             req.capabilities,
+            self.handler_registry.clone(),
         )?;
         let tube_id = tube_arc.id();
 
@@ -964,6 +972,9 @@ pub struct RegistryHandle {
     tubes: Arc<DashMap<String, Arc<Tube>>>,
     /// Direct access to conversations
     conversations: Arc<DashMap<String, String>>,
+    /// Protocol handler registry (for built-in guacr handlers)
+    #[allow(dead_code)] // Used by Tube through RegistryActor
+    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
 }
 
 impl RegistryHandle {
@@ -971,11 +982,13 @@ impl RegistryHandle {
         command_tx: mpsc::UnboundedSender<RegistryCommand>,
         tubes: Arc<DashMap<String, Arc<Tube>>>,
         conversations: Arc<DashMap<String, String>>,
+        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
     ) -> Self {
         Self {
             command_tx,
             tubes,
             conversations,
+            handler_registry,
         }
     }
 
@@ -985,6 +998,7 @@ impl RegistryHandle {
     }
 
     /// Hot path: Get tube by conversation (lock-free!)
+    #[allow(dead_code)]
     pub fn get_by_conversation_fast(&self, conversation_id: &str) -> Option<Arc<Tube>> {
         self.conversations
             .get(conversation_id)
@@ -992,6 +1006,7 @@ impl RegistryHandle {
     }
 
     /// Cold path: Create tube through actor (with backpressure)
+    #[allow(dead_code)]
     pub async fn create_tube(&self, req: CreateTubeRequest) -> Result<HashMap<String, String>> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -1002,6 +1017,7 @@ impl RegistryHandle {
     }
 
     /// Get metrics for backpressure coordination
+    #[allow(dead_code)]
     pub async fn get_metrics(&self) -> Result<RegistryMetrics> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -1071,6 +1087,7 @@ impl RegistryHandle {
     }
 
     /// Get tube by conversation ID (compatibility alias)
+    #[allow(dead_code)]
     pub fn get_by_conversation_id(&self, conversation_id: &str) -> Option<Arc<Tube>> {
         self.get_by_conversation_fast(conversation_id)
     }
@@ -1081,6 +1098,7 @@ impl RegistryHandle {
     }
 
     /// Find tubes by search term (lock-free iteration)
+    #[allow(dead_code)]
     pub fn find_tubes(&self, search_term: &str) -> Vec<String> {
         self.tubes
             .iter()
@@ -1100,11 +1118,13 @@ impl RegistryHandle {
     }
 
     /// Get tube count (lock-free)
+    #[allow(dead_code)]
     pub fn tube_count(&self) -> usize {
         self.tubes.len()
     }
 
     /// Check if any tubes exist (lock-free)
+    #[allow(dead_code)]
     pub fn has_tubes(&self) -> bool {
         !self.tubes.is_empty()
     }
@@ -1224,7 +1244,10 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
         max_concurrent
     );
 
-    let actor = RegistryActor::new(command_rx, max_concurrent);
+    // Initialize protocol handler registry (handlers remain dormant until use_guacr=true)
+    let handler_registry = Some(crate::handler_integration::create_handler_registry());
+
+    let actor = RegistryActor::new(command_rx, max_concurrent, handler_registry.clone());
     let tubes = Arc::clone(&actor.tubes);
     let conversations = Arc::clone(&actor.conversations);
 
@@ -1240,5 +1263,5 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
         });
     });
 
-    RegistryHandle::new(command_tx, tubes, conversations)
+    RegistryHandle::new(command_tx, tubes, conversations, handler_registry)
 });

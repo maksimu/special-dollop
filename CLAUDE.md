@@ -36,12 +36,6 @@ cargo test test_name -- --nocapture
 ### Debug Builds and Logging
 
 ```bash
-# Production with debug logging enabled
-cargo build --release --features production_debug
-
-# Maximum performance (disable hot path logging)
-cargo build --release --features disable_hot_path_logging
-
 # Development with profiling instrumentation
 cargo build --features profiling
 ```
@@ -381,6 +375,18 @@ For deep dives into specific subsystems, see:
 5. **Performance check**: If touching hot paths, benchmark before/after
 6. **Verify no zombies**: Check that RAII cleanup still works correctly
 
+## Git Workflow Rules
+
+**CRITICAL**: Never commit code automatically. Always let the user review changes and commit manually.
+
+- ❌ **NEVER** run `git commit` commands
+- ❌ **NEVER** run `git add` commands
+- ❌ **NEVER** run `git push` commands
+- ✅ Make code changes using edit tools
+- ✅ Let user review with `git diff`
+- ✅ Let user decide when to commit
+- ✅ Let user write commit messages
+
 ## Understanding the "Always Fast" Philosophy
 
 This project follows an **"always fast"** design:
@@ -569,5 +575,8 @@ When adding **any** of these operations, test on Windows:
 - ❌ Assume "fast on Linux" means "fast everywhere"
 - ❌ Use verbose console logging on Windows
 - ❌ Use aggressive timeouts without testing on Windows DNS/network
+- ❌ Make .md summary files for everything. And don't try to use another format for this like .txt
+- ❌ Add or use EMOJIS in any code or documentation
+- ❌ Make speed/performance claims in comments without testing them
 
-**Remember**: The main use case is **100s of developers editing 4K videos over these connections**. A 10× slowdown on Windows is unacceptable.
+**Remember**: The main use case is **100s of developers editing 4K videos over these connections**.

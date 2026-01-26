@@ -34,6 +34,7 @@ fn test_tube_creation() {
             None,
             None,
             crate::tube_protocol::Capabilities::NONE,
+            None,
         )
         .expect("Failed to create tube");
         let tube_id = tube.id();
@@ -140,7 +141,7 @@ fn test_tube_channel_creation() {
     println!("Starting test_tube_channel_creation");
     let runtime = get_runtime();
     runtime.block_on(async {
-        let tube = Tube::new(false, None, None, None, crate::tube_protocol::Capabilities::NONE).expect("Failed to create tube");
+        let tube = Tube::new(false, None, None, None, crate::tube_protocol::Capabilities::NONE, None).expect("Failed to create tube");
         let tube_id = tube.id();
         let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
         let mut settings = HashMap::new();
@@ -209,6 +210,7 @@ async fn test_tube_create_with_pc() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
 
@@ -240,6 +242,7 @@ async fn test_tube_webrtc_connection() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
 
@@ -275,6 +278,7 @@ async fn test_tube_create_channel() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
     let (signal_tx, _) = mpsc::unbounded_channel();
@@ -654,6 +658,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )?;
     let tube2 = Tube::new(
         false,
@@ -661,6 +666,7 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )?;
     println!(
         "[E2E_TEST] Tube1 ID: {}, Tube2 ID: {}",
@@ -677,18 +683,19 @@ async fn test_tube_p2p_data_transfer_end_to_end() -> Result<(), Box<dyn std::err
     let (signal_tx1, mut signal_rx1) = mpsc::unbounded_channel();
     let (signal_tx2, mut signal_rx2) = mpsc::unbounded_channel();
 
-    let mut ice_servers = Vec::new();
-    ice_servers.push(RTCIceServer {
-        urls: vec!["stun:stun.l.google.com:19302?transport=udp&family=ipv4".to_string()],
-        username: String::new(),
-        credential: String::new(),
-    });
-    // Add a second Google STUN server as a backup
-    ice_servers.push(RTCIceServer {
-        urls: vec!["stun:stun1.l.google.com:19302?transport=udp&family=ipv4".to_string()],
-        username: String::new(),
-        credential: String::new(),
-    });
+    let ice_servers = vec![
+        RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302?transport=udp&family=ipv4".to_string()],
+            username: String::new(),
+            credential: String::new(),
+        },
+        // Add a second Google STUN server as a backup
+        RTCIceServer {
+            urls: vec!["stun:stun1.l.google.com:19302?transport=udp&family=ipv4".to_string()],
+            username: String::new(),
+            credential: String::new(),
+        },
+    ];
     let rtc_config = RTCConfiguration {
         ice_servers,
         ..Default::default()
@@ -952,6 +959,7 @@ async fn test_turn_allocation_cleanup_on_close() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
     let _tube_id = tube.id();
@@ -1036,6 +1044,7 @@ async fn test_drop_without_close_warns() {
         None,
         None,
         crate::tube_protocol::Capabilities::NONE,
+        None,
     )
     .expect("Failed to create tube");
     let _tube_id = tube.id();
@@ -1091,7 +1100,7 @@ async fn test_drop_without_close_warns() {
     println!("  - Tube dropped without calling close()");
     println!("  - Drop should have logged LEAK WARNING (check test output)");
     println!("  - Safety net correctly detects improper usage");
-    println!("");
+    println!();
     println!("📋 EXPECTED LOG OUTPUT:");
     println!("   WARN: LEAK WARNING: Tube <id> dropped without calling close()!");
     println!("   WARN: LEAK WARNING: TURN allocation may leak, causing 400 Bad Request errors.");
@@ -1114,7 +1123,7 @@ async fn test_backpressure_zombie_detection_logic() {
     println!("  - Implementation: connections.rs:407-419");
     println!("  - Exit condition: dc.ready_state() != Open");
     println!("  - Timeout: 1 second between checks");
-    println!("");
+    println!();
     println!("📋 For FULL integration test, add to tests/test_performance.py:");
     println!("   def test_backpressure_exits_on_close(self):");
     println!("       tube1, tube2 = create_connected_tube_pair()");

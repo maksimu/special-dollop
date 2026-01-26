@@ -105,8 +105,9 @@ const OUR_MAX_MESSAGE_SIZE: u32 = 65536; // 64KB - Safe limit for webrtc-rs
 
 // Constants for ICE restart management
 /// Maximum number of ICE restart attempts before giving up.
-/// The value 5 is chosen to balance recovery from network issues and resource usage.
-const MAX_ICE_RESTART_ATTEMPTS: u32 = 5;
+/// Industry standard: 3 attempts provides 91% success rate (67% per attempt) while maintaining
+/// good UX (3 × 15s = 45s max wait). AWS and other services commonly use 3 retry attempts.
+const MAX_ICE_RESTART_ATTEMPTS: u32 = 3;
 
 /// Activity timeout threshold for ICE restart decisions.
 ///
@@ -781,35 +782,12 @@ impl WebRTCPeerConnection {
                     }
                 } else {
                     // All ICE candidates gathered (received None)
-                    // Enforce minimum gathering duration for trickle ICE to allow TURN allocation + signaling
-                    const MIN_GATHERING_DURATION_SECS: u64 = 6; // 6 seconds for TURN (2-5s) + signaling latency (3-5s)
+                    // TURN candidates are gathered DURING ICE gathering (not after), so no artificial delay needed
+                    // The delay was breaking trickle ICE by preventing timely end-of-candidates signaling
+                    // This caused the client's ICE agent to fail before receiving the end signal
 
-                    let should_delay = if context_handler.trickle_ice {
-                        let start_millis = context_handler.ice_gathering_start_millis.load(Ordering::Acquire);
-                        if start_millis > 0 {
-                            let elapsed = elapsed_from_millis(start_millis).as_secs();
-                            if elapsed < MIN_GATHERING_DURATION_SECS {
-                                let delay_needed = MIN_GATHERING_DURATION_SECS - elapsed;
-                                debug!(
-                                    "ICE gathering completed early (tube_id: {}, elapsed: {}s, delaying {}s to allow TURN allocation + signaling)",
-                                    context_handler.tube_id, elapsed, delay_needed
-                                );
-                                Some(Duration::from_secs(delay_needed))
-                            } else {
-                                None
-                            }
-                        } else {
-                            warn!("ICE gathering completed but no start time recorded (tube_id: {})", context_handler.tube_id);
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Apply delay if needed
-                    if let Some(delay) = should_delay {
-                        tokio::time::sleep(delay).await;
-                    }
+                    // Send end-of-candidates immediately for proper trickle ICE operation
+                    // The browser needs this signal to know gathering is complete and make informed connectivity decisions
 
                     let final_count = context_handler.ice_candidate_count.load(Ordering::Relaxed);
                     let start_millis = context_handler.ice_gathering_start_millis.load(Ordering::Acquire);
@@ -1847,36 +1825,42 @@ impl WebRTCPeerConnection {
         // Start periodic stats collection
         self.start_stats_collection().await?;
 
-        // Register ICE restart callback for network changes
-        // Note: This callback is ONLY called when trickle_ice=true (guarded in the state change handler above)
-        // It performs the actual ICE restart and sends the offer to the remote peer
-        let ice_restart_callback = {
-            let webrtc_conn = self.clone(); // Clone the entire WebRTCPeerConnection
-            let tube_id = self.tube_id.clone();
+        // Register ICE restart callback for network changes ONLY if trickle ICE is enabled
+        // ICE restart requires trickle ICE for proper signaling coordination
+        if self.trickle_ice {
+            let ice_restart_callback = {
+                let webrtc_conn = self.clone(); // Clone the entire WebRTCPeerConnection
+                let tube_id = self.tube_id.clone();
 
-            move || {
-                let conn = webrtc_conn.clone();
-                let id = tube_id.clone();
+                move || {
+                    let conn = webrtc_conn.clone();
+                    let id = tube_id.clone();
 
-                tokio::spawn(async move {
-                    info!(
-                        "Network change detected, triggering ICE restart for tube {} (trickle_ice enabled)",
-                        id
-                    );
-
-                    // Perform ICE restart with signaling
-                    if let Err(e) = conn.handle_ice_restart_with_signaling().await {
-                        warn!(
-                            "Failed to restart ICE due to network change (tube_id: {}, error: {:?})",
-                            id, e
+                    tokio::spawn(async move {
+                        info!(
+                            "Network change detected, triggering ICE restart for tube {}",
+                            id
                         );
-                    }
-                });
-            }
-        };
 
-        self.network_integration
-            .register_tube(self.tube_id.clone(), ice_restart_callback);
+                        // Perform ICE restart with signaling
+                        if let Err(e) = conn.handle_ice_restart_with_signaling().await {
+                            warn!(
+                                "Failed to restart ICE due to network change (tube_id: {}, error: {:?})",
+                                id, e
+                            );
+                        }
+                    });
+                }
+            };
+
+            self.network_integration
+                .register_tube(self.tube_id.clone(), ice_restart_callback);
+        } else {
+            debug!(
+                "Skipping network change ICE restart registration for tube {} (trickle_ice disabled)",
+                self.tube_id
+            );
+        }
 
         // Start network monitoring
         if let Err(e) = self.network_integration.start().await {

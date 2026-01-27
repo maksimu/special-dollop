@@ -286,19 +286,41 @@ impl Channel {
             if let Some(protocol_name_str) = protocol_name_val.as_str() {
                 match protocol_name_str.parse::<ConversationType>() {
                     Ok(parsed_conversation_type) => {
-                        // Check for database session FIRST (before guacd check)
-                        // Database sessions use DatabaseProxy protocol for routing to dynamic-db-proxy
+                        // Database sessions can use TWO modes:
+                        // 1. DatabaseProxy mode: Rust connects directly to database (KeeperDB Proxy in tunnel mode)
+                        //    - Used for: tunnelType == "database" (port forwards to database via KeeperDB Proxy)
+                        //    - Configuration: 'proxy' or 'host' block with target database host/port
+                        //    - conversationType: 'tunnel' with tunnelType: 'database' and databaseType: 'mysql'
                         //
-                        // Two ways to detect a database session:
-                        // 1. tunnelType == "database" (new way - keeps conversationType as "tunnel" for client compatibility)
-                        // 2. conversationType is mysql/postgresql/sql-server (legacy way)
+                        // 2. Guacd mode: Rust connects to guacd, which handles database connection (traditional)
+                        //    - Used for: conversationType == mysql/postgresql/sql-server (without proxy config)
+                        //    - Configuration: 'guacd' block with guacd server host/port
+                        //    - Database credentials in 'guacd_params' are passed to guacd
+                        //
+                        // Note: KeeperDB (with GUI/RBI) uses conversationType: 'http', not handled here
+
                         let is_database_tunnel = protocol_settings
                             .get("tunnelType")
                             .and_then(|v| v.as_str())
                             .map(|s| s == "database")
                             .unwrap_or(false);
 
-                        if is_database_tunnel || is_database_session(&parsed_conversation_type) {
+                        // Check if this is a proxy connection (has 'host' or 'proxy' block)
+                        // These are ONLY sent by Vault for:
+                        // - Port forward tunnels (conversationType: 'tunnel' with optional tunnelType: 'database')
+                        // - The 'host' field specifies the target to proxy to
+                        let has_proxy_config = protocol_settings.contains_key("proxy")
+                            || protocol_settings.contains_key("host");
+
+                        // Use DatabaseProxy mode ONLY if:
+                        // 1. Explicitly marked as database tunnel (tunnelType == "database"), OR
+                        // 2. Has explicit proxy/host configuration (tunnel with target host)
+                        //
+                        // Regular database connections (conversationType == mysql/postgresql/sql-server)
+                        // WITHOUT proxy config will fall through to Guacd mode below
+                        let use_database_proxy = is_database_tunnel || has_proxy_config;
+
+                        if use_database_proxy {
                             // Determine the database protocol name
                             // If tunnelType == "database", get from databaseType field
                             // Otherwise, use conversationType (legacy path)
@@ -312,17 +334,19 @@ impl Channel {
                                 parsed_conversation_type.to_string()
                             };
 
-                            debug!("Configuring for DatabaseProxy protocol (channel_id: {}, tunnelType: {}, databaseType: {}, conversationType: {})",
+                            debug!("Configuring for DatabaseProxy protocol (channel_id: {}, tunnelType: {}, databaseType: {}, conversationType: {}, has_proxy_config: {})",
                                 channel_id,
                                 if is_database_tunnel { "database" } else { "none" },
                                 db_protocol_name,
-                                protocol_name_str);
+                                protocol_name_str,
+                                has_proxy_config);
                             determined_protocol = ActiveProtocol::DatabaseProxy;
                             initial_protocol_state = ProtocolLogicState::DatabaseProxy(
                                 ChannelDatabaseProxyState::default(),
                             );
 
-                            // Extract proxy host/port from 'proxy' block in protocol_settings
+                            // Extract proxy host/port from 'proxy' or 'host' block
+                            // These are ONLY sent by Vault for tunnel/port forward connections
                             if let Some(JsonValue::Object(proxy_map)) =
                                 protocol_settings.get("proxy")
                             {
@@ -335,7 +359,24 @@ impl Channel {
                                     .and_then(|v| v.as_u64())
                                     .map(|p| p as u16);
                                 debug!(
-                                    "Parsed proxy settings: host={:?}, port={:?} (channel_id: {})",
+                                    "Parsed proxy settings from 'proxy' block: host={:?}, port={:?} (channel_id: {})",
+                                    proxy_host_setting, proxy_port_setting, channel_id
+                                );
+                            }
+                            // Vault format for tunnel target: { "host": { "hostName": "...", "port": 3306 } }
+                            else if let Some(JsonValue::Object(host_map)) =
+                                protocol_settings.get("host")
+                            {
+                                proxy_host_setting = host_map
+                                    .get("hostName")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+                                proxy_port_setting = host_map
+                                    .get("port")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|p| p as u16);
+                                debug!(
+                                    "Parsed proxy settings from 'host' block (tunnel target): host={:?}, port={:?} (channel_id: {})",
                                     proxy_host_setting, proxy_port_setting, channel_id
                                 );
                             }
@@ -364,7 +405,11 @@ impl Channel {
                             } else {
                                 warn!("DatabaseProxy: 'db_params' block not found in protocol_settings (channel_id: {})", channel_id);
                             }
-                        } else if is_guacd_session(&parsed_conversation_type) {
+                        } else if is_guacd_session(&parsed_conversation_type)
+                            || is_database_session(&parsed_conversation_type)
+                        {
+                            // Guacd mode: handles both traditional guacd sessions (SSH, RDP, VNC, etc.)
+                            // AND database sessions that connect through guacd (mysql, postgresql, sql-server)
                             stored_conversation_type = Some(parsed_conversation_type.clone());
                             debug!("Configuring for GuacD protocol (channel_id: {}, protocol_type: {})", channel_id, protocol_name_str);
                             determined_protocol = ActiveProtocol::Guacd;

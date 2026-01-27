@@ -1,6 +1,6 @@
 [package]
 name = "keeper-pam-webrtc-rs"
-version = "2.0.0"
+version = "1.6.0"
 edition = "2021"
 license = "MIT"
 authors = ["Keeper Security Engineering <engineering@keeper.io>"]

@@ -65,8 +65,15 @@ else
     maturin build --release --auditwheel skip
 fi
 
-# Find the newly built wheel
-WHEEL=$(find target/wheels -name "*.whl" | head -1)
+# Find the newly built wheel (maturin puts it in workspace root target/wheels)
+WHEEL=$(find ../../target/wheels -name "*.whl" 2>/dev/null | head -1)
+
+if [ -z "$WHEEL" ]; then
+    echo "ERROR: No wheel found in ../../target/wheels/"
+    ls -la ../../target/wheels/ || echo "../../target/wheels/ directory not found"
+    exit 1
+fi
+
 echo "Installing wheel: $WHEEL"
 
 # Force reinstall to ensure the latest version is used

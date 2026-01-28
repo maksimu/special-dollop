@@ -1,0 +1,164 @@
+# Cursor AI Rules for keeper-pam-connections
+
+## Essential Reading (Auto-loaded)
+
+Before starting any work, read these files:
+
+1. **CLAUDE.md** - Workspace overview and monorepo structure
+2. **docs/README.md** - Documentation hub and navigation
+3. **docs/webrtc/** - WebRTC-specific documentation
+4. **docs/guacr/** - Protocol handler documentation
+5. **COMMUNICATION_GUIDELINES.md** - How to interact with the user
+
+## Key Guidelines
+
+### What NOT to do:
+- ❌ Do NOT create new .md files unless explicitly requested by user
+- ❌ Do NOT create summary documents or exploration reports
+- ❌ Do NOT create planning documents or TODO.md files
+- ❌ ONLY update existing documentation files when needed
+- ❌ Do NOT commit changes unless explicitly requested
+- ❌ Do NOT use emojis in code/comments/commits
+- ❌ Do NOT use Mutex<Vec<T>> - use ArrayQueue or atomic counters
+- ❌ Do NOT allocate buffers per frame - use buffer pools
+- ❌ Do NOT copy pixel data - use bytes::Bytes
+
+### What TO do:
+- ✅ Read existing docs before asking questions
+- ✅ Update existing .md files if information is outdated
+- ✅ Use lock-free concurrency (DashMap, ArrayQueue, parking_lot::RwLock)
+- ✅ Use zero-copy techniques (bytes::Bytes, buffer pools)
+- ✅ Follow async patterns (tokio, no blocking)
+- ✅ Run `cargo clippy --workspace` before finishing
+
+## Monorepo Structure
+
+This is a **unified monorepo** containing:
+
+**WebRTC Core:**
+- keeper-pam-webrtc-rs (WebRTC tunneling)
+- python-bindings (unified Python package)
+
+**Protocol Handlers (from pam-guacr):**
+- guacr (aggregator)
+- guacr-ssh (PRODUCTION READY)
+- guacr-telnet (Complete)
+- guacr-rdp (Complete with IronRDP)
+- guacr-vnc (Complete)
+- guacr-database (MySQL/PostgreSQL/SQL Server/Oracle/MongoDB/Redis/MariaDB)
+- guacr-sftp (Complete)
+- guacr-rbi (Complete with Chrome/CDP)
+- guacr-threat-detection (AI threat detection)
+
+## Core Principles (Both Projects)
+
+**WebRTC:**
+1. Actor model for coordination (RegistryActor)
+2. Lock-free hot paths (DashMap, atomic counters)
+3. RAII resource management (Tube::drop)
+4. Failure isolation (IsolatedWebRTCAPI per tube)
+5. Event-driven backpressure (no polling)
+
+**guacr:**
+1. Zero-copy I/O (bytes::Bytes everywhere)
+2. Lock-free concurrency (ArrayQueue, not Mutex)
+3. Buffer pooling (no per-frame allocations)
+4. SIMD acceleration (AVX2/NEON with scalar fallback)
+5. Async/await (tokio runtime)
+
+## Performance Requirements
+
+**WebRTC:**
+- Frame processing: 398-2213ns (700K-2.5M frames/sec)
+- Queue depth: ~1ns atomic read
+- Max concurrent creates: 100 (configurable)
+
+**guacr:**
+- <100ms latency for input events
+- 30+ FPS for graphical protocols
+- 10,000+ concurrent connections per instance
+- <10MB memory per connection
+
+## Testing
+
+Always run before committing:
+```bash
+# Workspace-wide
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace --lib --exclude keeper-pam-connections-py
+
+# Python tests (if applicable)
+cd crates/python-bindings/tests
+python -m pytest -v
+```
+
+## Documentation Structure
+
+```
+docs/
+├── README.md                    # Documentation hub
+├── ARCHITECTURE_EXPLANATION.md  # Python bindings architecture
+├── TESTING_STRATEGY.md          # Workspace testing strategy
+├── webrtc/                      # WebRTC-specific docs
+│   ├── PYTHON_API_CONTRACT.md
+│   ├── ACTOR_DASHMAP_RAII.md
+│   ├── FAILURE_ISOLATION_ARCHITECTURE.md
+│   ├── HOT_PATH_OPTIMIZATION_SUMMARY.md
+│   └── PERFORMANCE_BENCHMARKS.md
+└── guacr/                       # Protocol handler docs
+    ├── README.md
+    ├── CLAUDE.md
+    ├── concepts/
+    ├── crates/
+    ├── guides/
+    └── reference/
+```
+
+**IMPORTANT**: Do NOT create new .md files. Update existing ones only.
+
+## Common Patterns
+
+**WebRTC Tube Creation:**
+```rust
+let tube_info = registry.create_tube(
+    conversation_type,
+    trickle_ice: true,  // Required for ICE restart
+    // ...
+)?;
+```
+
+**Protocol Handler:**
+```rust
+#[async_trait]
+impl ProtocolHandler for MyHandler {
+    async fn connect(
+        &self,
+        params: HashMap<String, String>,
+        to_client: mpsc::Sender<Bytes>,
+        from_client: mpsc::Receiver<Bytes>,
+    ) -> Result<()> {
+        // Implementation
+    }
+}
+```
+
+**Buffer Pool:**
+```rust
+let mut buf = buffer_pool.acquire();
+encoder.encode_into(&mut buf, data)?;
+let bytes = buf.freeze(); // Zero-copy via Arc
+```
+
+## When in Doubt
+
+1. Check CLAUDE.md (workspace overview)
+2. Check docs/webrtc/ for WebRTC specifics
+3. Check docs/guacr/CLAUDE.md for protocol handler specifics
+4. Look at keeper-pam-webrtc-rs/src/tube_registry.rs (WebRTC reference)
+5. Look at guacr-ssh (protocol handler reference)
+6. Ask the user for clarification
+
+---
+
+**Remember:** Be direct, concise, and focus on the task. Don't over-document.

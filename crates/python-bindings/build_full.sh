@@ -23,7 +23,7 @@ echo "PHASE 1: Code Quality Checks"
 echo "========================================"
 
 echo "Running cargo fmt check..."
-if ! cargo fmt --all -- --check; then
+if ! (cd ../.. && cargo fmt --all -- --check); then
     echo "ERROR: Code formatting check failed!"
     echo "Run 'cargo fmt --all' to fix formatting issues."
     exit 1
@@ -32,7 +32,7 @@ echo "✓ Formatting check passed"
 echo ""
 
 echo "Running cargo clippy..."
-if ! cargo clippy -- -D warnings; then
+if ! (cd ../.. && cargo clippy --workspace --all-targets --features chrome -- -D warnings); then
     echo "ERROR: Clippy linting failed!"
     echo "Fix the warnings above before proceeding."
     exit 1
@@ -47,8 +47,9 @@ echo "========================================"
 echo "PHASE 2: Rust Unit Tests"
 echo "========================================"
 
-echo "Running Rust unit tests (library only, no Python bindings)..."
-cargo test --lib --no-default-features
+echo "Running Rust unit tests..."
+(cd ../.. && cargo test -p keeper-pam-webrtc-rs --lib --no-default-features)
+(cd ../.. && cargo test --workspace --lib --exclude keeper-pam-webrtc-rs --exclude python-bindings)
 echo "✓ Rust unit tests passed"
 echo ""
 
@@ -66,16 +67,17 @@ rm -rf target/wheels && mkdir -p target/wheels
 echo "Building macOS wheel..."
 maturin build --release
 
-# Find the newly built wheel
-WHEEL=$(find target/wheels -name "*.whl" | head -1)
+# Find the newly built wheel (maturin puts it in workspace root target/wheels)
+WHEEL=$(find ../../target/wheels -name "*.whl" 2>/dev/null | head -1)
 if [ -z "$WHEEL" ]; then
     echo "ERROR: No wheel found after build!"
+    ls -la ../../target/wheels/ || echo "../../target/wheels/ not found"
     exit 1
 fi
 echo "Built wheel: $WHEEL"
 
 echo "Installing wheel..."
-pip uninstall -y keeper_pam_webrtc_rs || true
+pip uninstall -y keeper_pam_connections || true
 pip install "$WHEEL" --force-reinstall
 
 echo "Running Python tests..."
@@ -112,7 +114,7 @@ echo "========================================"
 echo ""
 echo "Summary of built wheels:"
 echo "------------------------"
-find target/wheels -name "*.whl" -type f | while read wheel; do
+find ../../target/wheels -name "*.whl" -type f 2>/dev/null | while read wheel; do
     echo "  - $(basename $wheel)"
 done
 echo ""

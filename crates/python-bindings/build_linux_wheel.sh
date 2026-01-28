@@ -5,6 +5,7 @@ set -e
 # This script builds inside the manylinux2014 container to ensure glibc 2.17 compatibility
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Optional: Check for combined_certs.pem (LOCAL DEVELOPMENT ONLY)
 # This is for developers behind corporate VPNs that intercept SSL.
@@ -12,9 +13,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # simply not find the file and skip SSL configuration (which is correct).
 CERT_MOUNT=""
 CERT_ENVS=""
-if [ -f "$SCRIPT_DIR/combined_certs.pem" ]; then
+if [ -f "$WORKSPACE_ROOT/combined_certs.pem" ]; then
     echo "Using combined_certs.pem for SSL (local VPN environment detected)..."
-    CERT_MOUNT="-v $SCRIPT_DIR/combined_certs.pem:/tmp/combined_certs.pem:ro"
+    CERT_MOUNT="-v $WORKSPACE_ROOT/combined_certs.pem:/tmp/combined_certs.pem:ro"
     CERT_ENVS="-e REQUESTS_CA_BUNDLE=/tmp/combined_certs.pem -e SSL_CERT_FILE=/tmp/combined_certs.pem -e CURL_CA_BUNDLE=/tmp/combined_certs.pem -e GIT_SSL_CAINFO=/tmp/combined_certs.pem"
 fi
 

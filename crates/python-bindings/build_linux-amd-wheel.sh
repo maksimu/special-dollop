@@ -15,12 +15,13 @@ set -e
 # - Cargo patch to redirect git dependency to local mount
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PAM_GUACR_DIR="$SCRIPT_DIR/../pam-guacr"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PAM_GUACR_DIR="$WORKSPACE_ROOT/../pam-guacr"
 
 # Check if pam-guacr exists (REQUIRED for handler builds)
 if [ ! -d "$PAM_GUACR_DIR" ]; then
     echo "ERROR: pam-guacr not found at $PAM_GUACR_DIR"
-    echo "Clone it with: git clone git@github.com:Keeper-Security/pam-guacr.git ../pam-guacr"
+    echo "Clone it with: git clone git@github.com:Keeper-Security/pam-guacr.git $WORKSPACE_ROOT/../pam-guacr"
     echo ""
     echo "This build ALWAYS includes protocol handlers (RDP, SSH, VNC, Telnet, etc.)"
     echo "The handlers feature can be controlled at runtime via KEEPER_GATEWAY_USE_GUACR flag."
@@ -43,9 +44,9 @@ echo "Note: IronRDP will be fetched from GitHub (https://github.com/miroberts/Ir
 # simply not find the file and skip SSL configuration (which is correct).
 CERT_MOUNT=""
 CERT_ENVS=""
-if [ -f "$SCRIPT_DIR/combined_certs.pem" ]; then
+if [ -f "$WORKSPACE_ROOT/combined_certs.pem" ]; then
     echo "Using combined_certs.pem for SSL (local VPN environment detected)..."
-    CERT_MOUNT="-v $SCRIPT_DIR/combined_certs.pem:/tmp/combined_certs.pem:ro"
+    CERT_MOUNT="-v $WORKSPACE_ROOT/combined_certs.pem:/tmp/combined_certs.pem:ro"
     CERT_ENVS="-e REQUESTS_CA_BUNDLE=/tmp/combined_certs.pem -e SSL_CERT_FILE=/tmp/combined_certs.pem -e CURL_CA_BUNDLE=/tmp/combined_certs.pem -e GIT_SSL_CAINFO=/tmp/combined_certs.pem"
 fi
 

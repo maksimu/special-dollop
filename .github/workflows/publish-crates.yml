@@ -1,0 +1,64 @@
+name: Publish Crates to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: 'Crate to publish'
+        required: true
+        type: choice
+        options:
+          - guacr-handlers
+          - guacr-protocol
+          - guacr-terminal
+          - guacr-ssh
+          - guacr-telnet
+          - guacr-rdp
+          - guacr-vnc
+          - guacr-database
+          - guacr-sftp
+          - guacr-rbi
+          - guacr-threat-detection
+          - guacr
+          - keeper-pam-webrtc-rs
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.crate }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Verify crate builds
+        run: |
+          cd crates/${{ inputs.crate }}
+          cargo build --release
+
+      - name: Run tests
+        run: |
+          cd crates/${{ inputs.crate }}
+          cargo test --release
+
+      - name: Publish ${{ inputs.crate }} to crates.io
+        run: |
+          cd crates/${{ inputs.crate }}
+          cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Create git tag
+        if: success()
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "${{ inputs.crate }}") | .version')
+          git tag -a "${{ inputs.crate }}-v${VERSION}" -m "Release ${{ inputs.crate }} v${VERSION}"
+          git push origin "${{ inputs.crate }}-v${VERSION}"

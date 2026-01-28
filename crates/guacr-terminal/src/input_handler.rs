@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_mouse_handling() {
-        let handler = RdpInputHandler::new();
+        let mut handler = RdpInputHandler::new();
 
         // Test left button click
         let event = handler.handle_mouse(0x01, 100, 200).unwrap();

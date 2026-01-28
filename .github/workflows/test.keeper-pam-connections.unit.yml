@@ -19,33 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Configure git and Cargo to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            echo "ACCESS_TOKEN not set, falling back to GITHUB_TOKEN"
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          # Configure git (for git CLI)
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (which respects the git config above)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-          # Verify config
-          echo "Cargo config:"
-          cat ~/.cargo/config.toml
-          # Verify git config is working
-          echo "Git URL rewrite config:"
-          git config --global --get-regexp url
-          # Test git access to private repo (will fail fast if token is bad)
-          echo "Testing git access to pam-guacr..."
-          git ls-remote https://github.com/Keeper-Security/pam-guacr.git HEAD || echo "WARNING: Cannot access pam-guacr repo"
-        shell: bash
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -160,9 +133,6 @@ jobs:
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io ${{ matrix.platform.image }} bash -c "
             # Install OpenSSL development packages
             yum install -y openssl-devel
-
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

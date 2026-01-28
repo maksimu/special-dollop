@@ -29,19 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -77,9 +64,6 @@ jobs:
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_x86_64 bash -c "
             # Install OpenSSL development packages
             yum install -y openssl-devel
-
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -169,19 +153,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-
       # Check system info before proceeding
       - name: Check host system info
         run: |
@@ -237,9 +208,6 @@ jobs:
             # Install OpenSSL development packages
             yum install -y openssl-devel
             
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
-
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source \$HOME/.cargo/env
@@ -350,19 +318,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -415,20 +370,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config) instead of libgit2
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-        shell: bash
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -504,19 +445,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -547,9 +475,6 @@ jobs:
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io alpine:3.16 sh -c "
             # Install build dependencies including patchelf, git, and OpenSSL
             apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf git openssl-dev openssl-libs-static
-
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -661,19 +586,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5

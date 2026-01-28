@@ -16,7 +16,7 @@ pub use tube_registry_binding::PyTubeRegistry;
 
 /// Register WebRTC functionality into a parent Python module.
 /// This allows the unified bindings crate to aggregate all functionality.
-/// 
+///
 /// Called by the unified python-bindings crate to expose WebRTC classes/functions
 /// under the keeper_pam_connections module.
 pub fn register_webrtc_module(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -37,10 +37,13 @@ pub fn register_webrtc_module(_py: Python<'_>, parent: &Bound<'_, PyModule>) -> 
     // Register functions
     use crate::logger::{initialize_logger as py_initialize_logger, set_verbose_logging};
     use crate::runtime::shutdown_runtime_from_python;
-    
+
     parent.add_function(pyo3::wrap_pyfunction!(py_initialize_logger, parent)?)?;
     parent.add_function(pyo3::wrap_pyfunction!(set_verbose_logging, parent)?)?;
-    parent.add_function(pyo3::wrap_pyfunction!(shutdown_runtime_from_python, parent)?)?;
+    parent.add_function(pyo3::wrap_pyfunction!(
+        shutdown_runtime_from_python,
+        parent
+    )?)?;
 
     Ok(())
 }

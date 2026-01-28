@@ -174,8 +174,8 @@ pub struct RdpPointerEvent {
     pub left_button: bool,
     pub middle_button: bool,
     pub right_button: bool,
-    pub left_down: bool,   // Button just pressed
-    pub left_up: bool,     // Button just released
+    pub left_down: bool, // Button just pressed
+    pub left_up: bool,   // Button just released
     pub middle_down: bool,
     pub middle_up: bool,
     pub right_down: bool,

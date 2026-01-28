@@ -1,0 +1,234 @@
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ============================================================================
+  # Integration Tests with Docker Services
+  # ============================================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      # SSH Server (with SFTP support)
+      ssh:
+        image: keeper/playground-ssh:latest
+        env:
+          PUID: 1000
+          PGID: 1000
+          TZ: UTC
+          PASSWORD_ACCESS: "true"
+          USER_PASSWORD: alpine
+          USER_NAME: linuxuser
+          SUDO_ACCESS: "true"
+        ports:
+          - 2222:2222
+        options: >-
+          --health-cmd "nc -z localhost 2222 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+
+      - name: Wait for SSH service
+        run: |
+          for i in {1..30}; do
+            nc -z localhost 2222 && echo "SSH ready" && exit 0
+            echo "Waiting for SSH... ($i/30)"
+            sleep 2
+          done
+          echo "SSH service did not start"
+          exit 1
+
+      - name: Start Telnet container
+        run: |
+          docker run -d \
+            --name telnet-test \
+            -p 2323:23 \
+            alpine:latest \
+            sh -c "apk add --no-cache busybox-extras shadow && \
+                   adduser -D test_user && \
+                   echo 'test_user:test_password' | chpasswd && \
+                   echo 'root:test_password' | chpasswd && \
+                   busybox telnetd -F -l /bin/sh -p 23"
+          
+          echo "Telnet container started"
+
+      - name: Wait for Telnet service
+        run: |
+          for i in {1..30}; do
+            nc -z localhost 2323 && echo "Telnet ready" && exit 0
+            echo "Waiting for Telnet... ($i/30)"
+            sleep 2
+          done
+          echo "Telnet service did not start. Container logs:"
+          docker logs telnet-test
+          exit 1
+
+      - name: Start RDP container
+        run: |
+          # Using Keeper's playground RDP image with XFCE
+          docker run -d \
+            --name rdp-test \
+            --shm-size=2g \
+            --security-opt seccomp=unconfined \
+            -p 3389:3389 \
+            -e USER=linuxuser \
+            -e PASSWORD=alpine \
+            -e ROOT_PASSWORD=rootpassword \
+            keeper/playground-rdp-xfce:latest
+          
+          echo "RDP container started, waiting for xrdp to initialize..."
+
+      - name: Wait for RDP service
+        run: |
+          echo "Waiting for RDP service to start (xrdp takes ~60 seconds)..."
+          for i in {1..90}; do
+            if nc -z localhost 3389 2>/dev/null; then
+              echo "RDP port is open, waiting a bit more for full initialization..."
+              sleep 10
+              echo "RDP ready"
+              exit 0
+            fi
+            echo "Waiting for RDP... ($i/90)"
+            sleep 2
+          done
+          echo "RDP service did not start. Container logs:"
+          docker logs rdp-test
+          exit 1
+
+      - name: Start VNC container
+        run: |
+          # Using Keeper's playground VNC image with XFCE
+          docker run -d \
+            --name vnc-test \
+            -p 5900:5901 \
+            -e VNC_PW=alpine \
+            -e VNC_RESOLUTION=1010x760 \
+            keeper/playground-vnc-xfce:latest
+          
+          echo "VNC container started, waiting for VNC to initialize..."
+
+      - name: Wait for VNC service
+        run: |
+          for i in {1..60}; do
+            if nc -z localhost 5900 2>/dev/null; then
+              echo "VNC ready"
+              exit 0
+            fi
+            echo "Waiting for VNC... ($i/60)"
+            sleep 2
+          done
+          echo "VNC service did not start. Container logs:"
+          docker logs vnc-test
+          exit 1
+
+      - name: Run SSH integration tests
+        run: cargo test -p guacr-ssh --test integration_test -- --include-ignored --test-threads=1
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          TEST_SSH_HOST: localhost
+          TEST_SSH_PORT: 2222
+          TEST_SSH_USER: linuxuser
+          TEST_SSH_PASSWORD: alpine
+
+      - name: Run SFTP integration tests
+        run: cargo test -p guacr-sftp --test integration_test -- --include-ignored --test-threads=1
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          TEST_SSH_HOST: localhost
+          TEST_SSH_PORT: 2222
+          TEST_SSH_USER: linuxuser
+          TEST_SSH_PASSWORD: alpine
+
+      - name: Run Telnet integration tests
+        run: cargo test -p guacr-telnet --test integration_test -- --include-ignored
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          TEST_TELNET_HOST: localhost
+          TEST_TELNET_PORT: 2323
+          TEST_TELNET_USER: test_user
+          TEST_TELNET_PASSWORD: test_password
+
+      - name: Run RDP integration tests
+        run: cargo test -p guacr-rdp --test integration_test -- --include-ignored --test-threads=1
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          TEST_RDP_HOST: localhost
+          TEST_RDP_PORT: 3389
+          TEST_RDP_USER: linuxuser
+          TEST_RDP_PASSWORD: alpine
+
+      - name: Run VNC integration tests
+        run: cargo test -p guacr-vnc --test integration_test -- --include-ignored --test-threads=1
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          TEST_VNC_HOST: localhost
+          TEST_VNC_PORT: 5900
+          TEST_VNC_PASSWORD: alpine
+
+      - name: Run performance tests
+        run: cargo test -p guacr-handlers --test performance_test -- --include-ignored
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - name: Run security tests
+        run: cargo test -p guacr-handlers --test security_test -- --include-ignored
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - name: Run threat detection tests
+        run: cargo test -p guacr-threat-detection --test integration_test -- --include-ignored
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - name: Install Chromium for RBI tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+          chromium-browser --version
+
+      - name: Run RBI integration tests
+        run: cargo test -p guacr-rbi --test integration_test --features chrome -- --include-ignored --test-threads=1
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CHROMIUM_PATH: /usr/bin/chromium-browser
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          docker stop telnet-test || true
+          docker rm telnet-test || true
+          docker stop rdp-test || true
+          docker rm rdp-test || true
+          docker stop vnc-test || true
+          docker rm vnc-test || true

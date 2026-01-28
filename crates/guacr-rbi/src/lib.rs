@@ -712,11 +712,12 @@ mod chrome_tests {
     #[ignore] // Run with --ignored flag
     async fn test_chrome_full_session() {
         // Lock ensures only one Chrome test runs at a time
-        let _lock = CHROME_TEST_LOCK.lock().unwrap();
-
-        if skip_if_no_chrome() {
-            return;
-        }
+        {
+            let _lock = CHROME_TEST_LOCK.lock().unwrap();
+            if skip_if_no_chrome() {
+                return;
+            }
+        } // Drop lock before async code
 
         let chrome_path = find_chrome().unwrap();
         println!("Using Chrome: {}", chrome_path);
@@ -838,11 +839,12 @@ mod chrome_tests {
     #[ignore]
     async fn test_chrome_connection() {
         // Lock ensures only one Chrome test runs at a time
-        let _lock = CHROME_TEST_LOCK.lock().unwrap();
-
-        if skip_if_no_chrome() {
-            return;
-        }
+        {
+            let _lock = CHROME_TEST_LOCK.lock().unwrap();
+            if skip_if_no_chrome() {
+                return;
+            }
+        } // Drop lock before async code
 
         let chrome_path = find_chrome().unwrap();
 

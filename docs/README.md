@@ -7,15 +7,25 @@ This directory contains workspace-level documentation that applies to the entire
 ### Workspace-Level Docs (this directory)
 
 **User-Facing Documentation:**
-- **[PYTHON_API_CONTRACT.md](PYTHON_API_CONTRACT.md)** - Python API reference, base64 SDP encoding rules
-- **[TESTING_STRATEGY.md](TESTING_STRATEGY.md)** - Workspace testing strategy, CI vs manual tests
 - **[ARCHITECTURE_EXPLANATION.md](ARCHITECTURE_EXPLANATION.md)** - Python bindings architecture
+- **[TESTING_STRATEGY.md](TESTING_STRATEGY.md)** - Workspace testing strategy, CI vs manual tests
 
-**Architecture & Design:**
-- **[ACTOR_DASHMAP_RAII.md](ACTOR_DASHMAP_RAII.md)** - Registry concurrency architecture
-- **[FAILURE_ISOLATION_ARCHITECTURE.md](FAILURE_ISOLATION_ARCHITECTURE.md)** - WebRTC isolation, circuit breakers
-- **[HOT_PATH_OPTIMIZATION_SUMMARY.md](HOT_PATH_OPTIMIZATION_SUMMARY.md)** - Performance optimizations, SIMD details
-- **[PERFORMANCE_BENCHMARKS.md](PERFORMANCE_BENCHMARKS.md)** - Benchmark results and methodology
+### Project-Specific Docs
+
+**WebRTC** ([webrtc/](webrtc/)):
+- **[PYTHON_API_CONTRACT.md](webrtc/PYTHON_API_CONTRACT.md)** - Python API reference, base64 SDP encoding rules
+- **[ACTOR_DASHMAP_RAII.md](webrtc/ACTOR_DASHMAP_RAII.md)** - Registry concurrency architecture
+- **[FAILURE_ISOLATION_ARCHITECTURE.md](webrtc/FAILURE_ISOLATION_ARCHITECTURE.md)** - WebRTC isolation, circuit breakers
+- **[HOT_PATH_OPTIMIZATION_SUMMARY.md](webrtc/HOT_PATH_OPTIMIZATION_SUMMARY.md)** - Performance optimizations, SIMD details
+- **[PERFORMANCE_BENCHMARKS.md](webrtc/PERFORMANCE_BENCHMARKS.md)** - Benchmark results and methodology
+
+**guacr Protocol Handlers** ([guacr/](guacr/)):
+- **[README.md](guacr/README.md)** - guacr documentation hub
+- **[CLAUDE.md](guacr/CLAUDE.md)** - Development guidance for protocol handlers
+- **[concepts/](guacr/concepts/)** - Core concepts (Guacamole protocol, zero-copy, threat detection)
+- **[crates/](guacr/crates/)** - Per-crate documentation (SSH, RDP, VNC, etc.)
+- **[guides/](guacr/guides/)** - How-to guides (integration, testing, performance)
+- **[reference/](guacr/reference/)** - Reference documentation (original guacd analysis)
 
 ### Crate-Specific Docs
 
@@ -28,18 +38,25 @@ This directory contains workspace-level documentation that applies to the entire
 ## 🎯 Quick Links by Topic
 
 ### For Python Users
-1. Start here: [Python API Contract](PYTHON_API_CONTRACT.md)
+1. Start here: [Python API Contract](webrtc/PYTHON_API_CONTRACT.md)
 2. Understanding architecture: [Architecture Explanation](ARCHITECTURE_EXPLANATION.md)
 3. Testing your code: [Testing Strategy](TESTING_STRATEGY.md)
 
-### For Rust Developers
-1. Architecture overview: [Actor + DashMap + RAII](ACTOR_DASHMAP_RAII.md)
-2. Performance details: [Hot Path Optimizations](HOT_PATH_OPTIMIZATION_SUMMARY.md)
-3. Failure handling: [Failure Isolation](FAILURE_ISOLATION_ARCHITECTURE.md)
-4. Benchmarks: [Performance Benchmarks](PERFORMANCE_BENCHMARKS.md)
+### For Rust Developers - WebRTC
+1. Architecture overview: [Actor + DashMap + RAII](webrtc/ACTOR_DASHMAP_RAII.md)
+2. Performance details: [Hot Path Optimizations](webrtc/HOT_PATH_OPTIMIZATION_SUMMARY.md)
+3. Failure handling: [Failure Isolation](webrtc/FAILURE_ISOLATION_ARCHITECTURE.md)
+4. Benchmarks: [Performance Benchmarks](webrtc/PERFORMANCE_BENCHMARKS.md)
+
+### For Rust Developers - Protocol Handlers
+1. Start here: [guacr README](guacr/README.md)
+2. Development guide: [guacr CLAUDE.md](guacr/CLAUDE.md)
+3. SSH handler: [guacr-ssh](guacr/crates/guacr-ssh.md)
+4. RDP handler: [guacr-rdp](guacr/crates/guacr-rdp.md)
+5. VNC handler: [guacr-vnc](guacr/crates/guacr-vnc.md)
 
 ### For Contributors
-1. Architecture overview: [Architecture Explanation](ARCHITECTURE_EXPLANATION.md)
+1. Workspace architecture: [Architecture Explanation](ARCHITECTURE_EXPLANATION.md)
 2. Testing approach: [Testing Strategy](TESTING_STRATEGY.md)
 3. Build system: [../CLAUDE.md](../CLAUDE.md)
 
@@ -50,14 +67,18 @@ This directory contains workspace-level documentation that applies to the entire
 
 ## 📖 Documentation Philosophy
 
-### Workspace-Level Docs
-Documentation that applies to the **entire project** or **multiple crates**:
-- Python API (affects all users)
-- Architecture decisions (affects all crates)
-- Performance characteristics (system-wide)
-- Testing strategy (workspace-wide)
+### Workspace-Level Docs (`docs/`)
+Documentation that applies to the **entire project**:
+- Monorepo architecture and structure
+- Workspace-wide testing strategy
+- Cross-project integration patterns
 
-### Crate-Level Docs
+### Project-Level Docs (`docs/webrtc/`, `docs/guacr/`)
+Documentation specific to one major component:
+- **WebRTC**: Python API, concurrency, performance, benchmarks
+- **guacr**: Protocol handlers, Guacamole protocol, implementation guides
+
+### Crate-Level Docs (`crates/<crate-name>/docs/`)
 Documentation specific to **one crate's implementation**:
 - Protocol-specific details (ICE, SOCKS5, WebSocket)
 - Crate-internal architecture
@@ -65,21 +86,20 @@ Documentation specific to **one crate's implementation**:
 
 ## 🔄 Adding New Documentation
 
-### When to Add Workspace-Level Docs
-- Affects Python users
-- Describes cross-crate architecture
-- Documents workspace-wide patterns
-- Explains system-level performance
+### Workspace-Level (`docs/`)
+- Affects multiple projects (WebRTC + guacr)
+- Workspace-wide patterns and decisions
+- Cross-project architecture
 
-**Location**: `docs/` (this directory)
+### Project-Level (`docs/webrtc/` or `docs/guacr/`)
+- Specific to WebRTC or guacr
+- Project-wide architecture and design
+- User-facing documentation for that project
 
-### When to Add Crate-Level Docs
+### Crate-Level (`crates/<crate-name>/docs/`)
 - Specific to one crate's implementation
-- Protocol-specific details
-- Internal implementation notes
+- Internal implementation details
 - Crate-specific benchmarks
-
-**Location**: `crates/<crate-name>/docs/`
 
 ## 📝 Documentation Standards
 

@@ -90,13 +90,11 @@ mod chrome_integration_tests {
         // Try to receive any messages
         let mut received_any = false;
         for _ in 0..10 {
-            match timeout(Duration::from_millis(500), to_client_rx.recv()).await {
-                Ok(Some(_msg)) => {
-                    received_any = true;
-                    break;
-                }
-                _ => break,
+            if let Ok(Some(_msg)) = timeout(Duration::from_millis(500), to_client_rx.recv()).await {
+                received_any = true;
+                break;
             }
+            // Continue trying on timeout or error
         }
 
         // RBI handler may not send messages if Chrome fails to launch
@@ -176,13 +174,11 @@ mod chrome_integration_tests {
         // Try to receive any messages
         let mut received_any = false;
         for _ in 0..10 {
-            match timeout(Duration::from_millis(500), to_client_rx.recv()).await {
-                Ok(Some(_msg)) => {
-                    received_any = true;
-                    break;
-                }
-                _ => break,
+            if let Ok(Some(_msg)) = timeout(Duration::from_millis(500), to_client_rx.recv()).await {
+                received_any = true;
+                break;
             }
+            // Continue trying on timeout or error
         }
 
         // Note: We don't test actual mouse input because Chrome may not launch

@@ -73,7 +73,7 @@ impl TerminalStateExtractor {
             command: command.to_string(),
             screen_contents,
             current_directory,
-            cursor_position: terminal.cursor_position(),
+            cursor_position: terminal.screen().cursor_position(),
             command_history: command_history.to_vec(),
             recent_output,
             scrollback: self.extract_scrollback(terminal),
@@ -164,8 +164,11 @@ impl TerminalStateExtractor {
         let mut scrollback = Vec::new();
 
         // Get scrollback lines (up to 100 lines)
-        for line in terminal.scrollback_lines().take(100) {
-            scrollback.push(line.text.clone());
+        let scrollback_count = terminal.scrollback_lines().min(100);
+        for i in 0..scrollback_count {
+            if let Some(line) = terminal.get_scrollback_line(i) {
+                scrollback.push(line.text.clone());
+            }
         }
 
         scrollback

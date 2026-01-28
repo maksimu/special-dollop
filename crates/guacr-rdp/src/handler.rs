@@ -1574,7 +1574,8 @@ impl IronRdpSession {
                         flags |= PointerFlags::LEFT_BUTTON; // No DOWN flag = release
                     } else if pointer_event.left_button {
                         // Button held while moving
-                        flags |= PointerFlags::LEFT_BUTTON | PointerFlags::DOWN | PointerFlags::MOVE;
+                        flags |=
+                            PointerFlags::LEFT_BUTTON | PointerFlags::DOWN | PointerFlags::MOVE;
                     } else {
                         // Just moving, no button
                         flags |= PointerFlags::MOVE;
@@ -1585,7 +1586,9 @@ impl IronRdpSession {
                     } else if pointer_event.middle_up {
                         flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL;
                     } else if pointer_event.middle_button {
-                        flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL | PointerFlags::DOWN | PointerFlags::MOVE;
+                        flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL
+                            | PointerFlags::DOWN
+                            | PointerFlags::MOVE;
                     }
 
                     if pointer_event.right_down {
@@ -1593,7 +1596,8 @@ impl IronRdpSession {
                     } else if pointer_event.right_up {
                         flags |= PointerFlags::RIGHT_BUTTON;
                     } else if pointer_event.right_button {
-                        flags |= PointerFlags::RIGHT_BUTTON | PointerFlags::DOWN | PointerFlags::MOVE;
+                        flags |=
+                            PointerFlags::RIGHT_BUTTON | PointerFlags::DOWN | PointerFlags::MOVE;
                     }
 
                     if pointer_event.scroll_up {
@@ -1629,7 +1633,10 @@ impl IronRdpSession {
                                 // IMPORTANT: With pointer_software_rendering=true, IronRDP renders
                                 // the cursor into the framebuffer. We MUST send these updates!
                                 // The rect will be small (just the cursor area), so bandwidth is minimal.
-                                trace!("RDP: Cursor moved, sending framebuffer update for rect: {:?}", rect);
+                                trace!(
+                                    "RDP: Cursor moved, sending framebuffer update for rect: {:?}",
+                                    rect
+                                );
                                 self.send_graphics_update_with_rect(image, rect).await?;
                             }
                             _ => {}

@@ -22,7 +22,7 @@ dashmap.workspace = true
 log.workspace = true
 
 # Protocol support
-guacr-protocol = { path = "../guacr-protocol" }
+guacr-protocol = { path = "../guacr-protocol", version = "2.0.0" }
 
 # Additional dependencies
 parking_lot = "0.12"

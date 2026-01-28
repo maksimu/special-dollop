@@ -54,6 +54,7 @@ pub enum PythonHandlerMessage {
 /// Message types sent from Python handler back to WebRTC (outbound)
 /// These are queued by send_handler_data and processed by the outbound sender task
 #[derive(Debug)]
+#[allow(dead_code)] // Used by Python handler infrastructure
 pub struct PythonHandlerOutbound {
     pub conversation_id: String,
     pub conn_no: u32,

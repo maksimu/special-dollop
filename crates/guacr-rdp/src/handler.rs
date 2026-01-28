@@ -174,6 +174,7 @@ impl ProtocolHandler for RdpHandler {
         let session = IronRdpSession::new(
             settings.width,
             settings.height,
+            settings.dpi,
             settings.clipboard_buffer_size,
             settings.disable_copy,
             settings.disable_paste,
@@ -352,10 +353,7 @@ impl RdpSettings {
             .and_then(|d| d.parse().ok())
             .unwrap_or(defaults.default_dpi);
 
-        info!(
-            "RDP: Display settings - {}x{} @ {} DPI",
-            width, height, dpi
-        );
+        info!("RDP: Display settings - {}x{} @ {} DPI", width, height, dpi);
 
         let security_mode = params
             .get("security")
@@ -545,35 +543,6 @@ impl RdpSettings {
             sftp_port,
         })
     }
-
-    /// Calculate effective desktop size accounting for DPI
-    ///
-    /// For HiDPI displays (DPI > 96), intelligently scales resolution for sharper rendering.
-    /// This provides better quality than guacd's approach which ignores DPI for rendering.
-    ///
-    /// Examples:
-    /// - 96 DPI (standard): 1920x1080 → 1920x1080
-    /// - 144 DPI (1.5x): 1920x1080 → 2880x1620
-    /// - 192 DPI (2x Retina): 1920x1080 → 3840x2160 (4K)
-    pub fn effective_desktop_size(&self) -> (u16, u16) {
-        if self.dpi <= 96 {
-            // Standard DPI - use dimensions as-is
-            (self.width as u16, self.height as u16)
-        } else {
-            // High DPI - scale resolution for sharper rendering
-            // This matches terminal protocol behavior where DPI affects character cell size
-            let scale = self.dpi as f32 / 96.0;
-            let scaled_w = (self.width as f32 * scale).min(8192.0) as u16;
-            let scaled_h = (self.height as f32 * scale).min(8192.0) as u16;
-
-            info!(
-                "RDP: High-DPI rendering enabled - {}x{} @ {} DPI → {}x{} effective ({}x scale)",
-                self.width, self.height, self.dpi, scaled_w, scaled_h, scale
-            );
-
-            (scaled_w, scaled_h)
-        }
-    }
 }
 
 // ============================================================================
@@ -651,6 +620,7 @@ struct IronRdpSession {
     to_client: mpsc::Sender<Bytes>,
     width: u32,
     height: u32,
+    dpi: u32,
     #[allow(dead_code)] // TODO: Used to track encoding mode
     use_hardware_encoding: bool,
     #[cfg(feature = "sftp")]
@@ -664,6 +634,7 @@ impl IronRdpSession {
     fn new(
         width: u32,
         height: u32,
+        dpi: u32,
         clipboard_buffer_size: usize,
         disable_copy: bool,
         disable_paste: bool,
@@ -746,10 +717,40 @@ impl IronRdpSession {
             to_client,
             width,
             height,
+            dpi,
             use_hardware_encoding: false, // Hardware encoding disabled for now
             #[cfg(feature = "sftp")]
             sftp_session: None,
             terminal_renderer,
+        }
+    }
+
+    /// Calculate effective desktop size accounting for DPI
+    ///
+    /// For HiDPI displays (DPI > 96), intelligently scales resolution for sharper rendering.
+    /// This provides better quality than guacd's approach which ignores DPI for rendering.
+    ///
+    /// Examples:
+    /// - 96 DPI (standard): 1920x1080 → 1920x1080
+    /// - 144 DPI (1.5x): 1920x1080 → 2880x1620
+    /// - 192 DPI (2x Retina): 1920x1080 → 3840x2160 (4K)
+    pub fn effective_desktop_size(&self) -> (u16, u16) {
+        if self.dpi <= 96 {
+            // Standard DPI - use dimensions as-is
+            (self.width as u16, self.height as u16)
+        } else {
+            // High DPI - scale resolution for sharper rendering
+            // This matches terminal protocol behavior where DPI affects character cell size
+            let scale = self.dpi as f32 / 96.0;
+            let scaled_w = (self.width as f32 * scale).min(8192.0) as u16;
+            let scaled_h = (self.height as f32 * scale).min(8192.0) as u16;
+
+            info!(
+                "RDP: High-DPI rendering enabled - {}x{} @ {} DPI → {}x{} effective ({}x scale)",
+                self.width, self.height, self.dpi, scaled_w, scaled_h, scale
+            );
+
+            (scaled_w, scaled_h)
         }
     }
 
@@ -1746,7 +1747,10 @@ impl IronRdpSession {
                     };
 
                     // Try server-side resize via DisplayControl DVC
-                    match self.send_display_resize(active_stage, effective_width, effective_height).await {
+                    match self
+                        .send_display_resize(active_stage, effective_width, effective_height)
+                        .await
+                    {
                         Ok(_) => {
                             info!("RDP: DisplayControl resize sent successfully");
                         }

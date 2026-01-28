@@ -49,6 +49,7 @@ static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
 static INSTANCE_ID: OnceCell<String> = OnceCell::new();
 
 /// Initialize the global instance ID (call once at startup)
+#[allow(dead_code)] // Used by Python bindings for instance identification
 pub fn initialize_instance_id(instance_id: String) -> Result<(), String> {
     INSTANCE_ID
         .set(instance_id)

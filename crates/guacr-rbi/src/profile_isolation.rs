@@ -5,7 +5,6 @@
 //
 // Based on KCM's isolation implementation.
 
-use log::warn;
 use log::{debug, info};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -13,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+
+#[cfg(not(target_os = "linux"))]
+use log::warn;
 
 /// Name of the lock file placed in profile directories
 const PROFILE_LOCK_FILE_NAME: &str = "guacr-rbi-profile.lock";

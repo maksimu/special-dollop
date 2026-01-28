@@ -23,12 +23,14 @@ log.workspace = true
 # Note: Using rustls for pure Rust TLS (no OpenSSL dependency)
 
 # MySQL/MariaDB
-mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+# Note: 0.36+ fixes rustls-pemfile and lru vulnerabilities
+mysql_async = { version = "0.36", default-features = false, features = ["default-rustls"] }
 
 # PostgreSQL
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"], default-features = false }
 
 # SQL Server
+# Note: Latest stable version. rustls-pemfile warning addressed via workspace patch
 tiberius = { version = "0.12", features = ["sql-browser-tokio", "rustls"], default-features = false }
 
 # MongoDB

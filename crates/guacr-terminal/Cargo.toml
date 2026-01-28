@@ -28,8 +28,10 @@ fontdue = "0.9"
 image = "0.25"
 png = "0.17"  # Streaming PNG encoder for zero-copy encoding
 
-# Graphics protocols  
-sixel = { version = "0.3", optional = true }
+# Graphics protocols
+# Note: sixel 0.3 has outdated dependencies with security issues (regex 0.1.80)
+# Disabling sixel support until upstream updates or we find an alternative
+# sixel = { version = "0.3", optional = true }
 
 # Protocol support
 guacr-protocol = { path = "../guacr-protocol" }
@@ -46,7 +48,7 @@ criterion = "0.5"
 
 [features]
 default = []
-sixel-support = ["sixel"]
+# sixel-support = ["sixel"]  # Disabled due to security vulnerabilities in sixel 0.3
 
 [[bench]]
 name = "alpha_fix_bench"

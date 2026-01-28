@@ -96,7 +96,7 @@ impl TerminalStateExtractor {
                 }
             }
             // Trim trailing whitespace but preserve line structure
-            contents.push_str(&line.trim_end());
+            contents.push_str(line.trim_end());
             contents.push('\n');
         }
 
@@ -147,7 +147,7 @@ impl TerminalStateExtractor {
         let mut output = Vec::new();
 
         // Get last 10 lines before the current prompt line
-        let start_row = if rows > 10 { rows - 10 } else { 0 };
+        let start_row = rows.saturating_sub(10);
         for row in start_row..rows.saturating_sub(1) {
             let line = self.extract_line(terminal, row);
             if !line.trim().is_empty() {

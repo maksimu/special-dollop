@@ -177,7 +177,7 @@ pub struct NetworkMonitor {
     callbacks: Arc<Mutex<Vec<NetworkChangeCallback>>>,
     /// Monitor configuration
     config: NetworkMonitorConfig,
-    /// Last connectivity check result - AtomicU8 encoding Option<bool> (see CONNECTIVITY_* constants)
+    /// Last connectivity check result - AtomicU8 encoding `Option<bool>` (see CONNECTIVITY_* constants)
     last_connectivity_check: Arc<std::sync::atomic::AtomicU8>,
     /// Monitor task handle - AtomicBool for lock-free check
     monitoring_active: Arc<AtomicBool>,

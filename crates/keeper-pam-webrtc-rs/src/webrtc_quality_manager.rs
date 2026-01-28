@@ -711,7 +711,7 @@ pub struct AdaptiveQualityManager {
     qos_manager: Arc<QoSManager>,
     current_metrics: Arc<TokioRwLock<NetworkQualityMetrics>>,
     stats_history: Arc<Mutex<VecDeque<WebRTCStats>>>,
-    /// Lock-free monitoring flag - replaces Mutex<bool>
+    /// Lock-free monitoring flag - replaces `Mutex<bool>`
     monitoring_active: Arc<AtomicBool>,
     config: QualityManagerConfig,
     monitoring_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,

@@ -167,7 +167,9 @@ impl TerminalStateExtractor {
         let scrollback_count = terminal.scrollback_lines().min(100);
         for i in 0..scrollback_count {
             if let Some(line) = terminal.get_scrollback_line(i) {
-                scrollback.push(line.text.clone());
+                // Convert cells to text
+                let text: String = line.cells.iter().map(|cell| cell.contents()).collect();
+                scrollback.push(text.trim_end().to_string());
             }
         }
 

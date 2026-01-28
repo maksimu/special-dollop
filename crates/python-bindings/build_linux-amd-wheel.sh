@@ -5,33 +5,21 @@ set -e
 #
 # This script ALWAYS builds with protocol handlers (SSH, Telnet, VNC, RDP, etc.)
 # Requirements:
-# - pam-guacr repo checked out at ../pam-guacr
-# - Cargo.toml must use path dependency for guacr
+# - guacr crate is part of the monorepo workspace at crates/guacr
 #
 # This script handles:
-# - Mounting local pam-guacr to avoid GitHub auth issues in Docker
+# - Mounting the entire workspace for access to all crates
 # - Building FreeRDP 3.x from source for RDP support
 # - SSL certificates for VPN environments
-# - Cargo patch to redirect git dependency to local mount
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PAM_GUACR_DIR="$WORKSPACE_ROOT/../pam-guacr"
 
-# Check if pam-guacr exists (REQUIRED for handler builds)
-if [ ! -d "$PAM_GUACR_DIR" ]; then
-    echo "ERROR: pam-guacr not found at $PAM_GUACR_DIR"
-    echo "Clone it with: git clone git@github.com:Keeper-Security/pam-guacr.git $WORKSPACE_ROOT/../pam-guacr"
-    echo ""
-    echo "This build ALWAYS includes protocol handlers (RDP, SSH, VNC, Telnet, etc.)"
-    echo "The handlers feature can be controlled at runtime via KEEPER_GATEWAY_USE_GUACR flag."
-    exit 1
-fi
-
-# Verify Cargo.toml is using local path
-if ! grep -q 'guacr = { path = "../pam-guacr/crates/guacr"' "$SCRIPT_DIR/Cargo.toml"; then
-    echo "ERROR: Cargo.toml must use local path for guacr dependency"
-    echo "Please uncomment the local path line and comment out the git line in Cargo.toml"
+# guacr is now part of the monorepo at crates/guacr
+# Verify it exists
+if [ ! -d "$WORKSPACE_ROOT/crates/guacr" ]; then
+    echo "ERROR: guacr not found at $WORKSPACE_ROOT/crates/guacr"
+    echo "The guacr crate should be part of the monorepo workspace."
     exit 1
 fi
 
@@ -51,9 +39,10 @@ if [ -f "$WORKSPACE_ROOT/combined_certs.pem" ]; then
 fi
 
 # Build with handlers using manylinux_2_28 (AlmaLinux 8) for better compatibility
+# Mount the entire workspace so all crates are accessible
 docker run --rm --platform linux/amd64 \
+  -v "$WORKSPACE_ROOT":/workspace:ro \
   -v "$SCRIPT_DIR":/io \
-  -v "$PAM_GUACR_DIR":/pam-guacr:ro \
   $CERT_MOUNT \
   $CERT_ENVS \
   quay.io/pypa/manylinux_2_28_x86_64 bash -c '
@@ -311,14 +300,15 @@ docker run --rm --platform linux/amd64 \
         # Return to /io
         cd /io
         
-        # Verify pam-guacr is mounted
-        if [ ! -d /pam-guacr/crates/guacr ]; then
-            echo "ERROR: pam-guacr not properly mounted at /pam-guacr"
+        # Verify workspace is mounted with guacr crate
+        if [ ! -d /workspace/crates/guacr ]; then
+            echo "ERROR: workspace not properly mounted at /workspace or guacr crate missing"
             exit 1
         fi
         
-        echo "pam-guacr mounted successfully at /pam-guacr"
-        ls -la /pam-guacr/crates/
+        echo "Workspace mounted successfully at /workspace"
+        echo "Available crates:"
+        ls -la /workspace/crates/
         
         echo "IronRDP will be fetched from git during build from https://github.com/miroberts/IronRDP.git"
         

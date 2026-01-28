@@ -376,7 +376,7 @@ pub struct WebRTCPeerConnection {
     pub(crate) is_server_mode: bool,
     /// ICE agent resource guard wrapped in Arc<Mutex<>> for thread-safe access.
     ///
-    /// This change from Arc<Option<IceAgentGuard>> to Arc<Mutex<Option<IceAgentGuard>>>
+    /// This change from `Arc<Option<IceAgentGuard>>` to `Arc<Mutex<Option<IceAgentGuard>>>`
     /// was necessary to ensure proper resource cleanup during connection close operations.
     /// The Mutex provides thread-safe access for explicitly dropping the guard to prevent
     /// circular references that could block resource cleanup. This is critical for avoiding

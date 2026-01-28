@@ -1,7 +1,7 @@
 // Audio handling for RBI
 //
 // NOTE: Chrome DevTools Protocol (CDP) does not directly expose audio streams.
-// KCM uses patched CEF which has cef_audio_handler callbacks. For CDP-based RBI,
+// KCM which has cef_audio_handler callbacks. For CDP-based RBI,
 // audio capture requires one of:
 // 1. Chrome extension with tabCapture API
 // 2. Web Audio API hooks (limited to pages that use Web Audio)

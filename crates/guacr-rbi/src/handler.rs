@@ -386,34 +386,7 @@ impl ProtocolHandler for RbiHandler {
                 .map_err(HandlerError::ConnectionFailed)?;
 
             info!("RBI handler ended (Chrome/CDP)");
-            return Ok(());
-        }
-
-        #[cfg(feature = "cef")]
-        {
-            use crate::cef_browser_client::CefBrowserClient;
-            let mut cef_client = CefBrowserClient::new(_width, _height, self.config.clone());
-
-            // SECURITY: Each connect() call spawns a DEDICATED CEF process
-            // No process sharing between sessions - complete isolation
-            info!("RBI: Spawning dedicated CEF process (no sharing with other sessions)");
-
-            // Connect and handle session (spawns isolated CEF subprocess)
-            cef_client
-                .connect(url, &params, to_client, from_client)
-                .await
-                .map_err(HandlerError::ConnectionFailed)?;
-
-            info!("RBI handler ended (CEF) - dedicated process terminated");
-            return Ok(());
-        }
-
-        #[cfg(not(any(feature = "chrome", feature = "cef")))]
-        {
-            return Err(HandlerError::ConnectionFailed(
-                "No browser backend enabled. Build with --features chrome or --features cef"
-                    .to_string(),
-            ));
+            Ok(())
         }
     }
 

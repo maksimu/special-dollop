@@ -2,13 +2,9 @@
 //
 // Provides security mechanisms to ensure RBI sessions are properly isolated:
 // 1. Profile lock files - Prevent concurrent use of the same persistent profile
-// 2. DBus isolation - Linux namespace isolation for CEF (prevents cross-session IPC)
 //
 // Based on KCM's isolation implementation.
 
-#[cfg(all(target_os = "linux", feature = "cef"))]
-use log::error;
-#[cfg(any(not(target_os = "linux"), all(target_os = "linux", feature = "cef")))]
 use log::warn;
 use log::{debug, info};
 use std::fs::{self, File, OpenOptions};
@@ -255,248 +251,18 @@ impl std::error::Error for ProfileLockError {
 }
 
 // ============================================================================
-// DBus Isolation (Linux only, CEF only)
+// DBus Isolation (Not needed for Chrome CDP)
 // ============================================================================
 
-/// DBus isolation state for CEF sessions
+/// DBus isolation is not needed for Chrome CDP backend
 ///
-/// On Linux, CEF uses DBus for various system interactions. To prevent
-/// cross-session communication, we create an isolated DBus environment
-/// using Linux namespaces.
-///
-/// # How it works
-///
-/// 1. Create a user namespace (for mount permissions without root)
-/// 2. Create a mount namespace
-/// 3. Bind-mount a private directory over /var/run/dbus
-/// 4. Start a private dbus-daemon in that directory
-///
-/// This ensures CEF processes in different sessions cannot communicate
-/// via DBus, even if they're running on the same host.
-#[cfg(all(target_os = "linux", feature = "cef"))]
-pub struct DbusIsolation {
-    /// PID of the isolated dbus-daemon
-    dbus_pid: Option<u32>,
-    /// Path to the temporary DBus directory
-    temp_dir: Option<tempfile::TempDir>,
-}
-
-#[cfg(all(target_os = "linux", feature = "cef"))]
-impl DbusIsolation {
-    /// Set up an isolated DBus environment
-    ///
-    /// # Safety
-    ///
-    /// This function uses Linux-specific system calls:
-    /// - `unshare(CLONE_NEWUSER)` - Create user namespace
-    /// - `unshare(CLONE_NEWNS)` - Create mount namespace
-    /// - `mount()` - Bind mount private directory
-    ///
-    /// These require appropriate kernel support and may fail in
-    /// restricted environments (some containers, older kernels).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(DbusIsolation)` - Isolation set up successfully
-    /// * `Err(String)` - Failed to set up isolation
-    pub fn setup() -> Result<Self, String> {
-        use libc::{
-            fork, getgid, getuid, mount, unshare, CLONE_NEWNS, CLONE_NEWUSER, MS_BIND, MS_PRIVATE,
-            MS_REC,
-        };
-        use std::ffi::CString;
-        use std::ptr;
-
-        let original_uid = unsafe { getuid() };
-        let original_gid = unsafe { getgid() };
-
-        // Create user namespace
-        let result = unsafe { unshare(CLONE_NEWUSER) };
-        if result != 0 {
-            return Err(format!(
-                "Failed to create user namespace: {}",
-                io::Error::last_os_error()
-            ));
-        }
-
-        // Set up UID mapping
-        // Map our original UID to 1000 inside the namespace
-        let uid_map = format!("1000 {} 1\n", original_uid);
-        fs::write("/proc/self/uid_map", &uid_map)
-            .map_err(|e| format!("Failed to write uid_map: {}", e))?;
-
-        // Disable setgroups (required before gid_map)
-        fs::write("/proc/self/setgroups", "deny\n")
-            .map_err(|e| format!("Failed to write setgroups: {}", e))?;
-
-        // Set up GID mapping
-        let gid_map = format!("1000 {} 1\n", original_gid);
-        fs::write("/proc/self/gid_map", &gid_map)
-            .map_err(|e| format!("Failed to write gid_map: {}", e))?;
-
-        // Create mount namespace
-        let result = unsafe { unshare(CLONE_NEWNS) };
-        if result != 0 {
-            return Err(format!(
-                "Failed to create mount namespace: {}",
-                io::Error::last_os_error()
-            ));
-        }
-
-        // Make mounts private
-        let root = CString::new("/").unwrap();
-        let result = unsafe {
-            mount(
-                ptr::null(),
-                root.as_ptr(),
-                ptr::null(),
-                MS_REC | MS_PRIVATE,
-                ptr::null(),
-            )
-        };
-        if result != 0 {
-            return Err(format!(
-                "Failed to make mounts private: {}",
-                io::Error::last_os_error()
-            ));
-        }
-
-        // Create temporary directory for DBus
-        let temp_dir = tempfile::Builder::new()
-            .prefix("guacr-cef-dbus-")
-            .tempdir()
-            .map_err(|e| format!("Failed to create DBus temp directory: {}", e))?;
-
-        let temp_path = CString::new(temp_dir.path().to_string_lossy().as_bytes()).unwrap();
-        let dbus_dir = CString::new("/var/run/dbus").unwrap();
-
-        // Check if system DBus directory exists
-        if !Path::new("/var/run/dbus").exists() {
-            warn!("System DBus directory /var/run/dbus does not exist, skipping DBus isolation");
-            return Ok(Self {
-                dbus_pid: None,
-                temp_dir: Some(temp_dir),
-            });
-        }
-
-        // Bind mount our temp directory over system DBus
-        let result = unsafe {
-            mount(
-                temp_path.as_ptr(),
-                dbus_dir.as_ptr(),
-                ptr::null(),
-                MS_BIND,
-                ptr::null(),
-            )
-        };
-        if result != 0 {
-            return Err(format!(
-                "Failed to bind mount DBus directory: {}",
-                io::Error::last_os_error()
-            ));
-        }
-
-        debug!(
-            "Mounted private DBus directory {} at /var/run/dbus",
-            temp_dir.path().display()
-        );
-
-        // Set environment variables
-        std::env::set_var(
-            "DBUS_SYSTEM_BUS_ADDRESS",
-            "unix:path=/var/run/dbus/system_bus_socket",
-        );
-        std::env::set_var(
-            "DBUS_SESSION_BUS_ADDRESS",
-            "unix:path=/var/run/dbus/system_bus_socket",
-        );
-
-        // Fork and exec dbus-daemon
-        let pid = unsafe { fork() };
-        if pid < 0 {
-            return Err(format!(
-                "Failed to fork for dbus-daemon: {}",
-                io::Error::last_os_error()
-            ));
-        }
-
-        if pid == 0 {
-            // Child process - exec dbus-daemon
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new("/usr/bin/dbus-daemon")
-                .args([
-                    "--session",
-                    "--nofork",
-                    "--nosyslog",
-                    "--nopidfile",
-                    "--address=unix:path=/var/run/dbus/system_bus_socket",
-                ])
-                .exec();
-
-            // If we get here, exec failed
-            error!("Failed to exec dbus-daemon: {}", err);
-            std::process::exit(1);
-        }
-
-        info!("Started isolated dbus-daemon with PID {}", pid);
-
-        Ok(Self {
-            dbus_pid: Some(pid as u32),
-            temp_dir: Some(temp_dir),
-        })
-    }
-
-    /// Clean up the isolated DBus environment
-    pub fn cleanup(&mut self) {
-        if let Some(pid) = self.dbus_pid.take() {
-            debug!("Terminating dbus-daemon (PID: {})", pid);
-
-            // Send SIGTERM
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-
-            // Wait briefly
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // Check if still running, send SIGKILL if needed
-            let result = unsafe { libc::kill(pid as i32, 0) };
-            if result == 0 {
-                warn!("dbus-daemon did not terminate, sending SIGKILL");
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-
-            // Reap the child
-            let mut status: i32 = 0;
-            unsafe {
-                libc::waitpid(pid as i32, &mut status, libc::WNOHANG);
-            }
-        }
-
-        // temp_dir is cleaned up automatically when dropped
-        if self.temp_dir.take().is_some() {
-            debug!("Cleaned up DBus temp directory");
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "cef"))]
-impl Drop for DbusIsolation {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
-}
-
-// Stub for non-Linux or non-CEF builds
-#[cfg(not(all(target_os = "linux", feature = "cef")))]
+/// Chrome/Chromium via CDP doesn't require DBus isolation since each
+/// session runs in its own isolated profile directory.
 pub struct DbusIsolation;
 
-#[cfg(not(all(target_os = "linux", feature = "cef")))]
 impl DbusIsolation {
     pub fn setup() -> Result<Self, String> {
-        debug!("DBus isolation not available on this platform/configuration");
+        debug!("DBus isolation not needed for Chrome CDP");
         Ok(Self)
     }
 

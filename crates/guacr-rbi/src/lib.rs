@@ -1,17 +1,11 @@
 // guacr-rbi: Remote Browser Isolation handler
 //
-// Provides isolated browser sessions using CEF (Chromium Embedded Framework),
-// the same browser engine used by KCM's libguac-client-http.
-//
-// ## Backends
-//
-// - **CEF (default)**: Full feature parity with KCM including audio streaming
-// - **Chrome/CDP (fallback)**: Uses stock Chrome via DevTools Protocol (no audio)
+// Provides isolated browser sessions using Chrome via DevTools Protocol (CDP).
 //
 // ## Features
 //
 // - Comprehensive keyboard/mouse/touch input handling
-// - Audio streaming (CEF only - via AudioHandler callbacks)
+// - Audio streaming via Web Audio API
 // - Clipboard synchronization (256KB - 50MB configurable)
 // - Dirty rect optimization for display updates
 // - Navigation history (back/forward/refresh)
@@ -21,13 +15,7 @@
 
 mod audio;
 mod autofill;
-#[cfg(feature = "chrome")]
 mod browser_client;
-#[cfg(feature = "cef")]
-mod cef_browser_client;
-#[cfg(feature = "cef")]
-mod cef_session;
-#[cfg(feature = "chrome")]
 mod chrome_session;
 mod clipboard;
 mod clipboard_polling;
@@ -48,17 +36,6 @@ mod tabs;
 
 // Re-export public API
 
-// CEF session (primary backend with audio support)
-#[cfg(feature = "cef")]
-pub use cef_session::{
-    CefAudioPacket, CefDisplayEvent, CefSession, CefSharedState,
-    DisplayEventType as CefDisplayEventType, DisplaySurface as CefDisplaySurface,
-    AUDIO_PACKET_SIZE as CEF_AUDIO_PACKET_SIZE, BYTES_PER_PIXEL, MAX_HEIGHT as CEF_MAX_HEIGHT,
-    MAX_WIDTH as CEF_MAX_WIDTH,
-};
-
-// Chrome/CDP session (fallback, no audio)
-#[cfg(feature = "chrome")]
 pub use chrome_session::PerformanceMetrics;
 
 pub use audio::{
@@ -69,10 +46,7 @@ pub use autofill::{
     generate_autofill_js, generate_totp, AutofillCredentials, AutofillManager, AutofillRule,
     TotpAlgorithm, TotpConfig,
 };
-#[cfg(feature = "chrome")]
 pub use browser_client::BrowserClient;
-#[cfg(feature = "cef")]
-pub use cef_browser_client::CefBrowserClient;
 pub use clipboard::{RbiClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
 pub use clipboard_polling::{
     ClipboardPollingConfig, ClipboardState, CLIPBOARD_READ_JS, CLIPBOARD_WRITE_JS,
@@ -103,7 +77,7 @@ pub use input::{
     BrowserKeyEvent,
     BrowserMouseEvent,
     BrowserTouchEvent,
-    CefEventFlags,
+    ChromeEventFlags,
     InputState,
     KeyMapping,
     KeyboardShortcut,

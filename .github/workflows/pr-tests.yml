@@ -153,9 +153,9 @@ jobs:
           maturin build --release
           
           if [ "${{ runner.os }}" == "Windows" ]; then
-            pip install $(ls target/wheels/*.whl | head -1)
+            pip install $(ls ../../target/wheels/*.whl | head -1)
           else
-            pip install $(find target/wheels -name "*.whl" | head -1)
+            pip install $(find ../../target/wheels -name "*.whl" | head -1)
           fi
           
           python -c "import keeper_pam_connections; print('Successfully imported keeper_pam_connections')"

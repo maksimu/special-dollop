@@ -8,7 +8,7 @@
 // - No cross-session data access possible
 //
 // CLIPBOARD APPROACH (No Chrome Patches Required):
-// Unlike KCM which patches CEF to add cef_kcm_add_clipboard_observer(),
+// Unlike KCM to add cef_kcm_add_clipboard_observer(),
 // we use JavaScript-based clipboard monitoring:
 // 1. Inject copy event listener on page load
 // 2. Poll for captured clipboard data

@@ -1,7 +1,7 @@
 // Clipboard polling for browser → client sync
-// Alternative to KCM's CEF patch - uses JavaScript polling
+// Alternative to KCM patch - uses JavaScript polling
 //
-// KCM patches CEF to add cef_kcm_add_clipboard_observer() which hooks into
+// KCM to add cef_kcm_add_clipboard_observer() which hooks into
 // Chromium's internal clipboard. Without that patch, we can use JavaScript
 // to poll the clipboard periodically.
 //

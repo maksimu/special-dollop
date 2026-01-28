@@ -28,11 +28,11 @@ pub const MOUSE_SCROLL_DISTANCE: i32 = 160;
 /// Maximum number of concurrent touch events (14 fingers per hand = 28 max)
 pub const MAX_TOUCH_EVENTS: usize = 28;
 
-/// CEF event flags for modifiers
+/// Chrome event flags for modifiers
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CefEventFlags(pub u32);
+pub struct ChromeEventFlags(pub u32);
 
-impl CefEventFlags {
+impl ChromeEventFlags {
     pub const CAPS_LOCK_ON: u32 = 1 << 0;
     pub const SHIFT_DOWN: u32 = 1 << 1;
     pub const CONTROL_DOWN: u32 = 1 << 2;
@@ -465,28 +465,28 @@ impl KeyboardState {
         self.pressed_count
     }
 
-    /// Get current modifier flags for CEF events
+    /// Get current modifier flags for Chrome events
     pub fn get_modifiers(&self) -> u32 {
         let mut modifiers = 0u32;
 
         if self.is_pressed(KEYSYM_ALTGR) {
-            modifiers |= CefEventFlags::ALTGR_DOWN;
+            modifiers |= ChromeEventFlags::ALTGR_DOWN;
         }
 
         if self.is_pressed(KEYSYM_SHIFT_LEFT) || self.is_pressed(KEYSYM_SHIFT_RIGHT) {
-            modifiers |= CefEventFlags::SHIFT_DOWN;
+            modifiers |= ChromeEventFlags::SHIFT_DOWN;
         }
 
         if self.is_pressed(KEYSYM_CTRL_LEFT) || self.is_pressed(KEYSYM_CTRL_RIGHT) {
-            modifiers |= CefEventFlags::CONTROL_DOWN;
+            modifiers |= ChromeEventFlags::CONTROL_DOWN;
         }
 
         if self.is_pressed(KEYSYM_META_LEFT) || self.is_pressed(KEYSYM_META_RIGHT) {
-            modifiers |= CefEventFlags::COMMAND_DOWN;
+            modifiers |= ChromeEventFlags::COMMAND_DOWN;
         }
 
         if self.is_pressed(KEYSYM_ALT_LEFT) || self.is_pressed(KEYSYM_ALT_RIGHT) {
-            modifiers |= CefEventFlags::ALT_DOWN;
+            modifiers |= ChromeEventFlags::ALT_DOWN;
         }
 
         modifiers
@@ -507,18 +507,18 @@ impl MouseState {
         Self::default()
     }
 
-    /// Get mouse button modifiers for CEF events
+    /// Get mouse button modifiers for Chrome events
     pub fn get_mouse_modifiers(&self, mask: u32) -> u32 {
         let mut modifiers = 0u32;
 
         if (mask & MOUSE_BUTTON_LEFT) != 0 {
-            modifiers |= CefEventFlags::LEFT_MOUSE_BUTTON;
+            modifiers |= ChromeEventFlags::LEFT_MOUSE_BUTTON;
         }
         if (mask & MOUSE_BUTTON_RIGHT) != 0 {
-            modifiers |= CefEventFlags::RIGHT_MOUSE_BUTTON;
+            modifiers |= ChromeEventFlags::RIGHT_MOUSE_BUTTON;
         }
         if (mask & MOUSE_BUTTON_MIDDLE) != 0 {
-            modifiers |= CefEventFlags::MIDDLE_MOUSE_BUTTON;
+            modifiers |= ChromeEventFlags::MIDDLE_MOUSE_BUTTON;
         }
 
         modifiers
@@ -622,7 +622,7 @@ pub fn is_printable(keysym: u32) -> bool {
 /// Convert keysym to Unicode character (for text input)
 pub fn keysym_to_unicode(keysym: u32) -> Option<char> {
     match keysym {
-        0xFF0D => Some('\r'), // Enter (CEF wants CR)
+        0xFF0D => Some('\r'), // Enter (Chrome wants CR)
         0xFF09 => Some('\t'), // Tab
 
         // Number pad symbols
@@ -735,7 +735,7 @@ impl RbiInputHandler {
 
         let modifiers = self.state.keyboard.get_modifiers();
         let ctrl_or_cmd =
-            (modifiers & (CefEventFlags::CONTROL_DOWN | CefEventFlags::COMMAND_DOWN)) != 0;
+            (modifiers & (ChromeEventFlags::CONTROL_DOWN | ChromeEventFlags::COMMAND_DOWN)) != 0;
 
         // Only handle 2-key shortcuts (modifier + key)
         if self.state.keyboard.pressed_count() == 2 && ctrl_or_cmd {
@@ -904,8 +904,8 @@ mod tests {
         assert!(state.is_pressed(KEYSYM_CTRL_LEFT));
         assert_eq!(state.pressed_count(), 1);
         assert_eq!(
-            state.get_modifiers() & CefEventFlags::CONTROL_DOWN,
-            CefEventFlags::CONTROL_DOWN
+            state.get_modifiers() & ChromeEventFlags::CONTROL_DOWN,
+            ChromeEventFlags::CONTROL_DOWN
         );
 
         // Press 'A'
@@ -924,12 +924,12 @@ mod tests {
 
         let modifiers = state.get_mouse_modifiers(MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
         assert_eq!(
-            modifiers & CefEventFlags::LEFT_MOUSE_BUTTON,
-            CefEventFlags::LEFT_MOUSE_BUTTON
+            modifiers & ChromeEventFlags::LEFT_MOUSE_BUTTON,
+            ChromeEventFlags::LEFT_MOUSE_BUTTON
         );
         assert_eq!(
-            modifiers & CefEventFlags::RIGHT_MOUSE_BUTTON,
-            CefEventFlags::RIGHT_MOUSE_BUTTON
+            modifiers & ChromeEventFlags::RIGHT_MOUSE_BUTTON,
+            ChromeEventFlags::RIGHT_MOUSE_BUTTON
         );
     }
 

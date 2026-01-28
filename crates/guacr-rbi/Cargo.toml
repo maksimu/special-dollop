@@ -18,13 +18,8 @@ futures = "0.3"
 thiserror.workspace = true
 log.workspace = true
 
-# Browser engines
-# CEF - Chromium Embedded Framework (same as KCM uses)
-# The 'cef' crate from Tauri provides safe Rust bindings to CEF
-# Requires CEF binaries - use export-cef-dir to download them
-cef = { version = "142", optional = true, default-features = false }
-
-# Chrome CDP fallback (no audio support, but works out of the box)
+# Browser engine
+# Chrome CDP - uses installed Chrome via DevTools Protocol
 chromiumoxide = { version = "0.7", optional = true }
 
 # Protocol parsing
@@ -43,11 +38,6 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 
-# Image encoding for CEF raw pixels -> PNG
-png = { version = "0.17", optional = true }
-
-# Parking lot for efficient synchronization in CEF callbacks
-parking_lot = { version = "0.12", optional = true }
 
 # Secure temp directory creation for session isolation
 tempfile = "3"
@@ -57,14 +47,9 @@ tempfile = "3"
 libc = "0.2"
 
 [features]
-default = []  # No default - user must choose backend
+default = ["chrome"]
 
-# CEF backend - full Chromium Embedded Framework with audio support
-# Build with: cargo build --features cef
-# Requires CEF binaries in CEF_PATH environment variable
-cef = ["dep:cef", "dep:png", "dep:parking_lot"]
-
-# Chrome CDP backend - uses installed Chrome via DevTools Protocol (no audio)
+# Chrome CDP backend - uses installed Chrome via DevTools Protocol
 # Build with: cargo build --features chrome
 # Requires Chrome/Chromium installed on the system at runtime
 chrome = ["chromiumoxide", "reqwest"]

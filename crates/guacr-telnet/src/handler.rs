@@ -272,6 +272,26 @@ impl ProtocolHandler for TelnetHandler {
                     deny_tags: HashMap::new(), // TODO: Parse from params if needed
                     allow_tags: HashMap::new(),
                     enable_tag_checking: true,
+                    proactive_mode: params
+                        .get("threat_detection_proactive_mode")
+                        .map(|s| s == "true")
+                        .unwrap_or(false),
+                    approval_timeout_ms: params
+                        .get("threat_detection_approval_timeout_ms")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(2000),
+                    fail_closed_on_error: params
+                        .get("threat_detection_fail_closed_on_error")
+                        .map(|s| s == "true")
+                        .unwrap_or(false),
+                    show_approval_status: params
+                        .get("threat_detection_show_approval_status")
+                        .map(|s| s == "true")
+                        .unwrap_or(true),
+                    auto_approve_safe_commands: params
+                        .get("threat_detection_auto_approve_safe_commands")
+                        .map(|s| s == "true")
+                        .unwrap_or(true),
                 };
 
                 match ThreatDetector::new(config) {

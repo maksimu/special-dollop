@@ -18,9 +18,8 @@ profiling = []
 [dependencies]
 # Protocol handlers integration (now part of monorepo)
 # Provides: SSH, Telnet, VNC, SFTP, RDP, Database, RBI (Remote Browser Isolation)
-# rbi-chrome: requires Chrome/Chromium installed on system at runtime (no audio)
-# rbi-cef: requires CEF binaries at build time (has audio support)
-guacr = { path = "../guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"] }
+# RBI requires Chrome/Chromium installed on system at runtime
+guacr = { path = "../guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi", "rdp", "database"] }
 
 # Core async
 tokio.workspace = true

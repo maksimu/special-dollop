@@ -92,6 +92,7 @@ pub struct RdpConfig {
     pub default_port: u16,
     pub default_width: u32,
     pub default_height: u32,
+    pub default_dpi: u32,
     pub security_mode: String,
     /// Clipboard buffer size in bytes (256KB - 50MB)
     pub clipboard_buffer_size: usize,
@@ -121,6 +122,7 @@ impl Default for RdpConfig {
             default_port: 3389,
             default_width: 1920,
             default_height: 1080,
+            default_dpi: 96, // Standard Windows DPI (matches guacd default)
             security_mode: "nla".to_string(), // Network Level Authentication
             clipboard_buffer_size: CLIPBOARD_DEFAULT_SIZE,
             disable_copy: false,
@@ -266,6 +268,7 @@ pub struct RdpSettings {
     pub password: String,
     pub width: u32,
     pub height: u32,
+    pub dpi: u32,
     pub security_mode: String,
     pub clipboard_buffer_size: usize,
     pub disable_copy: bool,
@@ -343,6 +346,16 @@ impl RdpSettings {
             .get("height")
             .and_then(|h| h.parse().ok())
             .unwrap_or(defaults.default_height);
+
+        let dpi = params
+            .get("dpi")
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(defaults.default_dpi);
+
+        info!(
+            "RDP: Display settings - {}x{} @ {} DPI",
+            width, height, dpi
+        );
 
         let security_mode = params
             .get("security")
@@ -499,6 +512,7 @@ impl RdpSettings {
             password,
             width,
             height,
+            dpi,
             security_mode,
             clipboard_buffer_size,
             disable_copy,
@@ -530,6 +544,35 @@ impl RdpSettings {
             #[cfg(feature = "sftp")]
             sftp_port,
         })
+    }
+
+    /// Calculate effective desktop size accounting for DPI
+    ///
+    /// For HiDPI displays (DPI > 96), intelligently scales resolution for sharper rendering.
+    /// This provides better quality than guacd's approach which ignores DPI for rendering.
+    ///
+    /// Examples:
+    /// - 96 DPI (standard): 1920x1080 → 1920x1080
+    /// - 144 DPI (1.5x): 1920x1080 → 2880x1620
+    /// - 192 DPI (2x Retina): 1920x1080 → 3840x2160 (4K)
+    pub fn effective_desktop_size(&self) -> (u16, u16) {
+        if self.dpi <= 96 {
+            // Standard DPI - use dimensions as-is
+            (self.width as u16, self.height as u16)
+        } else {
+            // High DPI - scale resolution for sharper rendering
+            // This matches terminal protocol behavior where DPI affects character cell size
+            let scale = self.dpi as f32 / 96.0;
+            let scaled_w = (self.width as f32 * scale).min(8192.0) as u16;
+            let scaled_h = (self.height as f32 * scale).min(8192.0) as u16;
+
+            info!(
+                "RDP: High-DPI rendering enabled - {}x{} @ {} DPI → {}x{} effective ({}x scale)",
+                self.width, self.height, self.dpi, scaled_w, scaled_h, scale
+            );
+
+            (scaled_w, scaled_h)
+        }
     }
 }
 
@@ -887,9 +930,12 @@ impl IronRdpSession {
             keyboard_functional_keys_count: 12,
             ime_file_name: String::new(),
             dig_product_id: String::new(),
-            desktop_size: DesktopSize {
-                width: self.width as u16,
-                height: self.height as u16,
+            desktop_size: {
+                let (effective_width, effective_height) = self.effective_desktop_size();
+                DesktopSize {
+                    width: effective_width,
+                    height: effective_height,
+                }
             },
             bitmap: None,
             client_build: 0,
@@ -1666,13 +1712,41 @@ impl IronRdpSession {
                 if instr.args.len() >= 2 {
                     let width: u32 = instr.args[0].parse().map_err(|_| "Invalid width")?;
                     let height: u32 = instr.args[1].parse().map_err(|_| "Invalid height")?;
+
+                    // Parse DPI from 3rd argument if present (backwards compatibility with custom protocol)
+                    // Standard guacd sends only width,height but we support DPI for HiDPI displays
+                    let dpi: u32 = if instr.args.len() >= 3 {
+                        instr.args[2].parse().unwrap_or(self.dpi)
+                    } else {
+                        self.dpi // Use initial DPI if not provided
+                    };
+
                     info!(
-                        "RDP: Client resize request: {}x{} (current server: {}x{})",
-                        width, height, self.width, self.height
+                        "RDP: Client resize request: {}x{} @ {} DPI (current: {}x{} @ {} DPI)",
+                        width, height, dpi, self.width, self.height, self.dpi
                     );
 
+                    // Update internal state
+                    self.width = width;
+                    self.height = height;
+                    self.dpi = dpi;
+
+                    // Calculate effective size for HiDPI
+                    let (effective_width, effective_height) = if dpi > 96 {
+                        let scale = dpi as f32 / 96.0;
+                        let scaled_w = (width as f32 * scale).min(8192.0) as u32;
+                        let scaled_h = (height as f32 * scale).min(8192.0) as u32;
+                        info!(
+                            "RDP: HiDPI scaling applied: {}x{} @ {} DPI → {}x{} effective",
+                            width, height, dpi, scaled_w, scaled_h
+                        );
+                        (scaled_w, scaled_h)
+                    } else {
+                        (width, height)
+                    };
+
                     // Try server-side resize via DisplayControl DVC
-                    match self.send_display_resize(active_stage, width, height).await {
+                    match self.send_display_resize(active_stage, effective_width, effective_height).await {
                         Ok(_) => {
                             info!("RDP: DisplayControl resize sent successfully");
                         }

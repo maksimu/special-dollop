@@ -34,19 +34,9 @@ sftp = ["guacr-sftp"]
 database = ["guacr-database"]
 rbi = ["guacr-rbi"]
 
-# RBI backend options (require "rbi" feature)
-# Chrome/CDP - uses installed Chrome via DevTools Protocol (no audio)
-rbi-chrome = ["rbi", "guacr-rbi/chrome"]
-# CEF - Chromium Embedded Framework with audio support (requires CEF binaries)
-rbi-cef = ["rbi", "guacr-rbi/cef"]
-
 # Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
 # This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
 guacd-compat = ["guacr-handlers/guacd-compat"]
 
 # All protocols (RDP requires FreeRDP system library)
 all = ["ssh", "telnet", "rdp", "vnc", "sftp", "database", "rbi"]
-# All handlers with Chrome/CDP for RBI (easy setup, no audio)
-all-chrome = ["all", "rbi-chrome"]
-# All handlers with CEF for RBI (requires CEF binaries, has audio)
-all-cef = ["all", "rbi-cef"]

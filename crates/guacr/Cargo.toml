@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Protocol handlers for remote desktop access (SSH, RDP, VNC, Telnet, Database protocols, RBI)"
+repository = "https://github.com/Keeper-Security/keeper-pam-webrtc-rs"
+homepage = "https://github.com/Keeper-Security/keeper-pam-webrtc-rs/tree/main/crates/guacr"
 
 [dependencies]
 # Core handler traits and registry

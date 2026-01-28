@@ -1,0 +1,33 @@
+[package]
+name = "guacr-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSH protocol handler for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-protocol = { path = "../guacr-protocol" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# SSH client
+russh = "0.45"
+russh-keys = "0.45"
+
+# Utilities
+base64.workspace = true
+
+# Threat detection (optional)
+guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }
+
+[features]
+default = []
+threat-detection = ["guacr-threat-detection"]

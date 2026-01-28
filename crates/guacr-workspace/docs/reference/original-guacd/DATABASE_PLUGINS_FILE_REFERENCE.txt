@@ -1,0 +1,293 @@
+================================================================================
+KCM DATABASE PLUGINS - ABSOLUTE FILE PATH REFERENCE
+================================================================================
+
+MAIN PACKAGE - kcm-libguac-client-db (Version 1.6.0, Release 5)
+================================================================================
+
+Root Package Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/kcm-libguac-client-db.spec
+
+Source Code Root:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/
+
+Build Configuration Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/configure.ac
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/Makefile.am
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/README.md
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/NOTICE
+
+Autotools M4 Macros:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/m4/
+
+Test Utilities:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/util/generate-test-runner.pl
+
+================================================================================
+SHARED DATABASE LIBRARY - libguac-client-db.so
+================================================================================
+
+Common Code Location:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/
+
+Core Source Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/argv.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/argv.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/client.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/client.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/clipboard.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/clipboard.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/export.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/export.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/help.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/help.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/input.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/input.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/parse.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/parse.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/pipe.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/pipe.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/result.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/result.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/settings.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/settings.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/status.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/status.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/util.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/util.h
+
+Shared DB Headers Directory:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/
+
+Header Files in db/db/:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/argv.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/client.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/clipboard.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/export.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/help.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/input.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/parse.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/pipe.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/result.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/settings.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/status.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/db/util.h
+
+DB Shared Library Tests:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/tests/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/tests/Makefile.am
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/tests/test_parse.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/tests/test_util.c
+
+Common Clipboard Implementation:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/common/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/common/common/clipboard.h
+
+================================================================================
+MYSQL PLUGIN - libguac-client-mysql.so
+================================================================================
+
+MySQL Plugin Location:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/
+
+MySQL Source Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/argv.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/argv.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/export.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/export.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/help.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/import.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/import.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/mysql.c (main entry point)
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/mysql.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/parse.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/parse.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/result.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/result.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/settings.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/settings.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/status.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/status.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/user.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/user.h
+
+MySQL Build Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/Makefile.am
+
+MySQL Tests:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/tests/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/tests/Makefile.am
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/tests/test_parse.c
+
+================================================================================
+POSTGRESQL PLUGIN - libguac-client-postgres.so
+================================================================================
+
+PostgreSQL Plugin Location:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/
+
+PostgreSQL Source Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/argv.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/argv.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/export.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/export.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/help.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/import.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/import.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/meta.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/meta.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/parse.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/parse.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/postgres.c (main entry point)
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/postgres.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/result.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/result.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/settings.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/settings.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/status.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/status.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/user.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/user.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/util.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/util.h
+
+PostgreSQL Build Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/Makefile.am
+
+PostgreSQL Tests:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/tests/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/tests/Makefile.am
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/tests/test_parse.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/tests/test_util.c
+
+================================================================================
+SQL SERVER PLUGIN - libguac-client-sql-server.so
+================================================================================
+
+SQL Server Plugin Location:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/
+
+SQL Server Source Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/argv.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/argv.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/bind.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/bind.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/callback.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/callback.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/csv.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/csv.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/export.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/export.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/help.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/import.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/import.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/login.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/login.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/parse.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/parse.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/result.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/result.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/settings.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/settings.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/sql_server.c (main entry point)
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/sql_server.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/status.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/status.h
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/user.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/user.h
+
+SQL Server Build Files:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/Makefile.am
+
+SQL Server Tests:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/tests/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/tests/Makefile.am
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/tests/test_csv.c
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/tests/test_parse.c
+
+================================================================================
+SUPPORTING PACKAGES
+================================================================================
+
+FreeTDS Library (for SQL Server support):
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libsybdb/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-libsybdb/kcm-libsybdb.spec
+
+MariaDB/MySQL JDBC Driver (for guacamole-client configuration storage):
+  /Users/mroberts/Documents/kcm/core/packages/kcm-mariadb-java-client/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-mariadb-java-client/kcm-mariadb-java-client.spec
+
+MSSQL JDBC Driver (for guacamole-client configuration storage):
+  /Users/mroberts/Documents/kcm/core/packages/kcm-mssql-jdbc/
+  /Users/mroberts/Documents/kcm/core/packages/kcm-mssql-jdbc/kcm-mssql-jdbc.spec
+
+================================================================================
+PROTOCOL DEFINITIONS
+================================================================================
+
+MySQL Protocol Definition:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-guacamole-client/extra/mysql.json
+
+PostgreSQL Protocol Definition:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-guacamole-client/extra/postgres.json
+
+SQL Server Protocol Definition:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-guacamole-client/extra/sql-server.json
+
+================================================================================
+PATCHES
+================================================================================
+
+Database-Related Patches in guacamole-client:
+  /Users/mroberts/Documents/kcm/core/packages/kcm-guacamole-client/patches/0015-KCM-446-Correct-SQL-syntax-errors-affecting-MySQL-Ma.patch
+  /Users/mroberts/Documents/kcm/core/packages/kcm-guacamole-client/patches/5001-KCM-265-Do-NOT-set-useSSL-when-SSL-should-only-be-pr.patch
+
+================================================================================
+DOCKER IMAGES
+================================================================================
+
+MySQL Database Image:
+  /Users/mroberts/Documents/kcm/docker/images/guacamole-db-mysql/
+  /Users/mroberts/Documents/kcm/docker/images/guacamole-db-mysql/README.md
+
+PostgreSQL Database Image:
+  /Users/mroberts/Documents/kcm/docker/images/guacamole-db-postgres/
+  /Users/mroberts/Documents/kcm/docker/images/guacamole-db-postgres/README.md
+
+================================================================================
+DOCUMENTATION FILES
+================================================================================
+
+Generated Analysis Documents:
+  /Users/mroberts/Documents/kcm/DATABASE_PLUGINS_ANALYSIS.md (908 lines, comprehensive)
+  /Users/mroberts/Documents/kcm/DATABASE_PLUGINS_QUICK_REFERENCE.md (quick guide)
+  /Users/mroberts/Documents/kcm/DATABASE_PLUGINS_FILE_REFERENCE.txt (this file)
+
+Architecture Documentation:
+  /Users/mroberts/Documents/kcm/GUACD_ARCHITECTURE_DEEP_DIVE.md
+  /Users/mroberts/Documents/kcm/GUACD_KEY_FILES_REFERENCE.md
+
+================================================================================
+KEY ENTRY POINTS (guac_client_init)
+================================================================================
+
+MySQL:  /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/mysql.c (line 98)
+PostgreSQL: /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/postgres.c (line 88)
+SQL Server: /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/sql_server.c
+
+================================================================================
+KEY HANDLER FUNCTIONS
+================================================================================
+
+Handler Files:
+  MySQL handlers: /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/mysql/user.c
+  PostgreSQL handlers: /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/postgres/user.c
+  SQL Server handlers: /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/sql-server/user.c
+
+Common handlers:
+  Shared DB client: /Users/mroberts/Documents/kcm/core/packages/kcm-libguac-client-db/extra/libguac-client-db/src/db/client.c
+
+================================================================================
+END OF FILE REFERENCE
+================================================================================

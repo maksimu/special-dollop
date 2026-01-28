@@ -1,0 +1,55 @@
+[package]
+name = "guacr-rdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RDP protocol handler for guacr remote desktop"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# RDP client - using ironrdp (pure Rust) - GitHub fork with Update PDU support
+ironrdp = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu", features = ["connector", "session", "graphics", "input", "cliprdr"] }
+ironrdp-async = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-tokio = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-pdu = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-displaycontrol = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+x509-cert = "0.2"
+
+# Image processing
+image = "0.25.9"
+webp = "0.3"
+
+# Utilities
+base64.workspace = true
+
+# Zero-copy optimizations
+guacr-terminal = { path = "../guacr-terminal" }
+guacr-protocol = { path = "../guacr-protocol" }
+
+# Hardware encoding support comes from guacr-terminal (shared across protocols)
+# SFTP integration support
+guacr-sftp = { path = "../guacr-sftp", optional = true }
+russh = { version = "0.46", optional = true }
+russh-sftp = { version = "2.1", optional = true }
+russh-keys = { version = "0.46", optional = true }
+
+[features]
+default = []
+# Hardware encoding features temporarily disabled
+# nvenc = ["guacr-terminal/nvenc"]
+# quicksync = ["guacr-terminal/quicksync"]
+# videotoolbox = ["guacr-terminal/videotoolbox"]
+# vaapi = ["guacr-terminal/vaapi"]
+# SFTP integration feature
+sftp = ["guacr-sftp", "russh", "russh-sftp", "russh-keys"]

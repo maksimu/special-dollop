@@ -1,0 +1,31 @@
+[package]
+name = "guacr-telnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telnet protocol handler for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-protocol = { path = "../guacr-protocol" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[features]
+default = []
+threat-detection = ["guacr-threat-detection", "uuid"]
+
+[dependencies.guacr-threat-detection]
+path = "../guacr-threat-detection"
+optional = true
+
+[dependencies.uuid]
+workspace = true
+optional = true

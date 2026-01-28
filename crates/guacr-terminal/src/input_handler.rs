@@ -8,12 +8,19 @@ use log::{debug, warn};
 /// Converts Guacamole input instructions to RDP protocol input events.
 /// This will be wired to ironrdp's input API once the connection is established.
 pub struct RdpInputHandler {
-    // Future: will hold reference to ironrdp session for sending input
+    // Track previous button states to detect transitions
+    prev_left: bool,
+    prev_middle: bool,
+    prev_right: bool,
 }
 
 impl RdpInputHandler {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            prev_left: false,
+            prev_middle: false,
+            prev_right: false,
+        }
     }
 
     /// Handle keyboard input from Guacamole client
@@ -53,7 +60,7 @@ impl RdpInputHandler {
     /// # Returns
     ///
     /// RDP pointer event for sending to RDP server
-    pub fn handle_mouse(&self, mask: u8, x: i32, y: i32) -> Result<RdpPointerEvent, String> {
+    pub fn handle_mouse(&mut self, mask: u8, x: i32, y: i32) -> Result<RdpPointerEvent, String> {
         // Extract button states from mask
         let left_button = (mask & 0x01) != 0;
         let middle_button = (mask & 0x02) != 0;
@@ -61,9 +68,22 @@ impl RdpInputHandler {
         let scroll_up = (mask & 0x08) != 0;
         let scroll_down = (mask & 0x10) != 0;
 
+        // Detect button state changes
+        let left_down = left_button && !self.prev_left;
+        let left_up = !left_button && self.prev_left;
+        let middle_down = middle_button && !self.prev_middle;
+        let middle_up = !middle_button && self.prev_middle;
+        let right_down = right_button && !self.prev_right;
+        let right_up = !right_button && self.prev_right;
+
+        // Update previous state
+        self.prev_left = left_button;
+        self.prev_middle = middle_button;
+        self.prev_right = right_button;
+
         debug!(
-            "RDP: Mouse - x: {}, y: {}, buttons: L={} M={} R={}",
-            x, y, left_button, middle_button, right_button
+            "RDP: Mouse - x: {}, y: {}, buttons: L={} M={} R={}, transitions: L_down={} L_up={} R_down={} R_up={}",
+            x, y, left_button, middle_button, right_button, left_down, left_up, right_down, right_up
         );
 
         Ok(RdpPointerEvent {
@@ -72,6 +92,12 @@ impl RdpInputHandler {
             left_button,
             middle_button,
             right_button,
+            left_down,
+            left_up,
+            middle_down,
+            middle_up,
+            right_down,
+            right_up,
             scroll_up,
             scroll_down,
         })
@@ -148,6 +174,12 @@ pub struct RdpPointerEvent {
     pub left_button: bool,
     pub middle_button: bool,
     pub right_button: bool,
+    pub left_down: bool,   // Button just pressed
+    pub left_up: bool,     // Button just released
+    pub middle_down: bool,
+    pub middle_up: bool,
+    pub right_down: bool,
+    pub right_up: bool,
     pub scroll_up: bool,
     pub scroll_down: bool,
 }

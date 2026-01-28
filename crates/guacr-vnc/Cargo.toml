@@ -29,6 +29,7 @@ base64.workspace = true
 
 # Image encoding (JPEG compression for bandwidth optimization)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+webp = "0.3"
 
 # SFTP integration (optional)
 guacr-sftp = { path = "../guacr-sftp", optional = true }

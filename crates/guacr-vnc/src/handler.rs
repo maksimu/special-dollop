@@ -58,6 +58,10 @@ pub struct VncConfig {
     pub jpeg_quality: u8,
     /// Use JPEG encoding instead of PNG (default true for bandwidth savings)
     pub use_jpeg: bool,
+    /// Client supports WebP format (40% smaller than JPEG)
+    pub supports_webp: bool,
+    /// Client supports JPEG format
+    pub supports_jpeg: bool,
     /// Frame rate limit in FPS (default 30)
     pub frame_rate: u32,
 }
@@ -68,9 +72,11 @@ impl Default for VncConfig {
             default_port: 5900,
             default_width: 1920,
             default_height: 1080,
-            jpeg_quality: 85, // Same as RDP for consistency
-            use_jpeg: true,   // Enable by default for bandwidth savings
-            frame_rate: 30,   // 30 FPS default (can go up to 60)
+            jpeg_quality: 85,     // Same as RDP for consistency
+            use_jpeg: true,       // Enable by default for bandwidth savings
+            supports_webp: false, // Will be overridden by client capabilities
+            supports_jpeg: false, // Will be overridden by client capabilities
+            frame_rate: 30,       // 30 FPS default (can go up to 60)
         }
     }
 }
@@ -116,6 +122,8 @@ impl ProtocolHandler for VncHandler {
             settings.recording_config.clone(),
             settings.jpeg_quality,
             settings.use_jpeg,
+            settings.supports_webp,
+            settings.supports_jpeg,
             settings.frame_rate,
             to_client,
             &params,
@@ -196,6 +204,10 @@ pub struct VncSettings {
     pub jpeg_quality: u8,
     /// Use JPEG encoding (vs PNG)
     pub use_jpeg: bool,
+    /// Client supports WebP format
+    pub supports_webp: bool,
+    /// Client supports JPEG format
+    pub supports_jpeg: bool,
     /// Frame rate limit (FPS)
     pub frame_rate: u32,
     #[cfg(feature = "sftp")]
@@ -274,6 +286,20 @@ impl VncSettings {
             .and_then(|f| f.parse().ok())
             .unwrap_or(defaults.frame_rate)
             .clamp(1, 60);
+
+        // Parse client image format support
+        let supported_formats = params
+            .get("image")
+            .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec!["image/png"]);
+
+        let supports_webp = supported_formats.iter().any(|f| f.contains("webp"));
+        let supports_jpeg = supported_formats.iter().any(|f| f.contains("jpeg"));
+
+        info!(
+            "VNC: Client image support - WebP: {}, JPEG: {}, formats: {:?}",
+            supports_webp, supports_jpeg, supported_formats
+        );
 
         info!(
             "VNC: Image encoding - use_jpeg={}, quality={}, frame_rate={} FPS",
@@ -355,6 +381,8 @@ impl VncSettings {
             recording_config,
             jpeg_quality,
             use_jpeg,
+            supports_webp,
+            supports_jpeg,
             frame_rate,
             #[cfg(feature = "sftp")]
             enable_sftp,
@@ -401,6 +429,10 @@ struct VncClient {
     jpeg_quality: u8,
     /// Use JPEG encoding (vs PNG)
     use_jpeg: bool,
+    /// Client supports WebP format
+    supports_webp: bool,
+    /// Client supports JPEG format
+    supports_jpeg: bool,
     /// Frame rate limit (FPS) - currently unused for VNC (server controls rate)
     #[allow(dead_code)]
     frame_rate: u32,
@@ -419,6 +451,8 @@ impl VncClient {
         recording_config: RecordingConfig,
         jpeg_quality: u8,
         use_jpeg: bool,
+        supports_webp: bool,
+        supports_jpeg: bool,
         frame_rate: u32,
         to_client: mpsc::Sender<Bytes>,
         params: &HashMap<String, String>,
@@ -458,6 +492,8 @@ impl VncClient {
             scroll_detector: ScrollDetector::new(width, height),
             jpeg_quality,
             use_jpeg,
+            supports_webp,
+            supports_jpeg,
             frame_rate,
             #[cfg(feature = "sftp")]
             sftp_session: None,
@@ -495,18 +531,55 @@ impl VncClient {
         Ok(jpeg_data)
     }
 
-    /// Encode a framebuffer region using configured encoding (JPEG or PNG)
-    ///
-    /// Uses JPEG by default for 5-10x bandwidth savings, with PNG fallback.
-    fn encode_region(&mut self, rect: guacr_terminal::FrameRect) -> Result<Vec<u8>, String> {
-        if self.use_jpeg {
-            // Extract region pixels
-            let region_pixels = self.framebuffer.get_region_pixels(rect);
+    /// Encode RGBA data as WebP (lossy)
+    fn encode_webp_lossy(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        quality: f32,
+    ) -> Result<Vec<u8>, String> {
+        use webp::{Encoder, WebPMemory};
 
-            // Encode as JPEG
+        let encoder = Encoder::from_rgba(data, width, height);
+        let webp: WebPMemory = encoder.encode(quality);
+        Ok(webp.to_vec())
+    }
+
+    /// Encode RGBA data as WebP (lossless)
+    fn encode_webp_lossless(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        use webp::{Encoder, WebPMemory};
+
+        let encoder = Encoder::from_rgba(data, width, height);
+        let webp: WebPMemory = encoder.encode_lossless();
+        Ok(webp.to_vec())
+    }
+
+    /// Encode a framebuffer region using configured encoding (WebP, JPEG, or PNG)
+    ///
+    /// Uses WebP by default for 40% bandwidth savings vs JPEG, with fallback.
+    fn encode_region(&mut self, rect: guacr_terminal::FrameRect) -> Result<Vec<u8>, String> {
+        // Calculate update size for smart encoding
+        let total_pixels = self.width * self.height;
+        let rect_pixels = rect.width * rect.height;
+        let is_large_update = rect_pixels > total_pixels / 10; // >10% of screen
+
+        if self.supports_webp {
+            // WebP: Best of both worlds
+            let region_pixels = self.framebuffer.get_region_pixels(rect);
+            if is_large_update {
+                // Large update: WebP lossy
+                let quality = self.jpeg_quality as f32 / 100.0;
+                Self::encode_webp_lossy(&region_pixels, rect.width, rect.height, quality)
+            } else {
+                // Small update: WebP lossless
+                Self::encode_webp_lossless(&region_pixels, rect.width, rect.height)
+            }
+        } else if self.supports_jpeg && self.use_jpeg {
+            // Fallback: JPEG encoding (only if client supports it)
+            let region_pixels = self.framebuffer.get_region_pixels(rect);
             Self::encode_jpeg(&region_pixels, rect.width, rect.height, self.jpeg_quality)
         } else {
-            // Fallback to PNG encoding
+            // Fallback: PNG encoding (always supported)
             self.framebuffer
                 .encode_region(rect)
                 .map_err(|e| format!("PNG encoding failed: {}", e))

@@ -28,6 +28,7 @@ x509-cert = "0.2"
 
 # Image processing
 image = "0.25.9"
+webp = "0.3"
 
 # Utilities
 base64.workspace = true

@@ -355,9 +355,10 @@ impl FrameBuffer {
 
     /// Optimize dirty rectangles by merging overlapping ones
     pub fn optimize_dirty_rects(&mut self) {
-        // First, filter out cursor-sized artifacts (1x1 or 2x2 pixels)
-        // These are often spurious updates from RDP cursor movements
-        self.dirty_rects.retain(|r| r.width > 2 || r.height > 2);
+        // IMPORTANT: Do NOT filter out small updates!
+        // IronRDP provides accurate dirty rects including 1x1 cursor updates.
+        // Filtering them out causes mouse cursor artifacts and missing updates.
+        // Trust the RDP server - it knows what changed.
 
         if self.dirty_rects.len() < 2 {
             return;

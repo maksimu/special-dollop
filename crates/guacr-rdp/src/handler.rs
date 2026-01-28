@@ -103,6 +103,10 @@ pub struct RdpConfig {
     pub use_jpeg: bool,
     /// JPEG quality (1-100, default 85)
     pub jpeg_quality: u8,
+    /// Client supports WebP format (40% smaller than JPEG)
+    pub supports_webp: bool,
+    /// Client supports JPEG format
+    pub supports_jpeg: bool,
     /// Terminal graphics mode (None = normal Guacamole protocol)
     pub terminal_mode: Option<GraphicsMode>,
     /// Terminal columns (for terminal mode)
@@ -121,9 +125,11 @@ impl Default for RdpConfig {
             clipboard_buffer_size: CLIPBOARD_DEFAULT_SIZE,
             disable_copy: false,
             disable_paste: false,
-            use_jpeg: true,      // Enable JPEG by default (33x bandwidth savings)
-            jpeg_quality: 85,    // Optimal balance (same as VNC)
-            terminal_mode: None, // Default to normal Guacamole protocol
+            use_jpeg: true,       // Enable JPEG by default (33x bandwidth savings)
+            jpeg_quality: 85,     // Optimal balance (same as VNC)
+            supports_webp: false, // Will be overridden by client capabilities
+            supports_jpeg: false, // Will be overridden by client capabilities
+            terminal_mode: None,  // Default to normal Guacamole protocol
             terminal_cols: 240,
             terminal_rows: 60,
         }
@@ -179,6 +185,8 @@ impl ProtocolHandler for RdpHandler {
             self.config.terminal_rows,
             settings.use_jpeg,
             settings.jpeg_quality,
+            settings.supports_webp,
+            settings.supports_jpeg,
         );
 
         // Connect and run session
@@ -266,6 +274,10 @@ pub struct RdpSettings {
     pub use_jpeg: bool,
     /// JPEG quality (1-100)
     pub jpeg_quality: u8,
+    /// Client supports WebP format (40% smaller than JPEG)
+    pub supports_webp: bool,
+    /// Client supports JPEG format
+    pub supports_jpeg: bool,
     /// Read-only mode - blocks keyboard/mouse input
     pub read_only: bool,
     /// Security settings (includes connection timeout)
@@ -370,6 +382,20 @@ impl RdpSettings {
             .and_then(|q| q.parse().ok())
             .unwrap_or(defaults.jpeg_quality)
             .clamp(1, 100);
+
+        // Parse client image format support
+        let supported_formats = params
+            .get("image")
+            .map(|s| s.split(',').map(|f| f.trim()).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec!["image/png"]);
+
+        let supports_webp = supported_formats.iter().any(|f| f.contains("webp"));
+        let supports_jpeg = supported_formats.iter().any(|f| f.contains("jpeg"));
+
+        info!(
+            "RDP: Client image support - WebP: {}, JPEG: {}, formats: {:?}",
+            supports_webp, supports_jpeg, supported_formats
+        );
 
         // Parse security settings (includes connection timeout)
         let security = HandlerSecuritySettings::from_params(params);
@@ -479,6 +505,8 @@ impl RdpSettings {
             disable_paste,
             use_jpeg,
             jpeg_quality,
+            supports_webp,
+            supports_jpeg,
             read_only,
             security,
             domain,
@@ -553,9 +581,11 @@ struct IronRdpSession {
     png_buffer: Vec<u8>,
     base64_buffer: String,
     instruction_buffer: String,
-    // JPEG encoding settings
+    // Image encoding settings
     use_jpeg: bool,
     jpeg_quality: u8,
+    supports_webp: bool,
+    supports_jpeg: bool,
     channel_handler: RdpChannelHandler,
     /// Scroll detector for bandwidth optimization (90-99% savings on scrolling)
     scroll_detector: ScrollDetector,
@@ -604,6 +634,8 @@ impl IronRdpSession {
         terminal_rows: u16,
         use_jpeg: bool,
         jpeg_quality: u8,
+        supports_webp: bool,
+        supports_jpeg: bool,
     ) -> Self {
         let frame_size = (width * height * 4) as usize;
         let buffer_pool = Arc::new(BufferPool::new(8, frame_size));
@@ -652,6 +684,8 @@ impl IronRdpSession {
             instruction_buffer,
             use_jpeg,
             jpeg_quality,
+            supports_webp,
+            supports_jpeg,
             scroll_detector: ScrollDetector::new(width, height),
             window_detector: WindowMoveDetector::new(),
             channel_handler: RdpChannelHandler::new(
@@ -869,11 +903,11 @@ impl IronRdpSession {
             platform: MajorPlatformType::WINDOWS,
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             platform: MajorPlatformType::UNIX,
-            enable_server_pointer: true,
+            enable_server_pointer: false, // Let client render cursor to avoid artifacts
             request_data: None,
             autologon,
             enable_audio_playback: false,
-            pointer_software_rendering: true,
+            pointer_software_rendering: false, // Client-side cursor rendering
             performance_flags: PerformanceFlags::default(),
             desktop_scale_factor: 0,
             hardware_id: None,
@@ -939,6 +973,10 @@ impl IronRdpSession {
         .await
         .map_err(|e| format!("RDP connection finalize failed: {}", e))?;
 
+        info!(
+            "RDP: Connection established - enable_server_pointer: {}, pointer_software_rendering: {}",
+            connection_result.enable_server_pointer, connection_result.pointer_software_rendering
+        );
         Ok((connection_result, upgraded_framed))
     }
 
@@ -1274,18 +1312,8 @@ impl IronRdpSession {
         Ok(())
     }
 
-    async fn send_graphics_update(&mut self, image: &DecodedImage) -> Result<(), String> {
-        // Fallback for when no rect is provided - use full screen
-        use ironrdp_pdu::geometry::InclusiveRectangle;
-        let full_screen_rect = InclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: (self.width - 1) as u16,
-            bottom: (self.height - 1) as u16,
-        };
-        self.send_graphics_update_with_rect(image, full_screen_rect)
-            .await
-    }
+    // Removed send_graphics_update() - it was causing full-screen redraws on mouse moves
+    // Always use send_graphics_update_with_rect() with the actual dirty rect from IronRDP
 
     async fn send_graphics_update_with_rect(
         &mut self,
@@ -1535,18 +1563,39 @@ impl IronRdpSession {
 
                     // Convert Guacamole mouse mask to RDP PointerFlags
                     // Guacamole mask: bit 0=left, bit 1=middle, bit 2=right, bit 3=scroll up, bit 4=scroll down
-                    let mut flags = PointerFlags::MOVE;
+                    let mut flags = PointerFlags::empty();
                     let mut wheel_units: i16 = 0;
 
-                    if pointer_event.left_button {
+                    // Handle button state changes
+                    // RDP protocol: DOWN flag means "button just pressed", no DOWN means "button released"
+                    if pointer_event.left_down {
                         flags |= PointerFlags::LEFT_BUTTON | PointerFlags::DOWN;
+                    } else if pointer_event.left_up {
+                        flags |= PointerFlags::LEFT_BUTTON; // No DOWN flag = release
+                    } else if pointer_event.left_button {
+                        // Button held while moving
+                        flags |= PointerFlags::LEFT_BUTTON | PointerFlags::DOWN | PointerFlags::MOVE;
+                    } else {
+                        // Just moving, no button
+                        flags |= PointerFlags::MOVE;
                     }
-                    if pointer_event.middle_button {
+
+                    if pointer_event.middle_down {
                         flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL | PointerFlags::DOWN;
+                    } else if pointer_event.middle_up {
+                        flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL;
+                    } else if pointer_event.middle_button {
+                        flags |= PointerFlags::MIDDLE_BUTTON_OR_WHEEL | PointerFlags::DOWN | PointerFlags::MOVE;
                     }
-                    if pointer_event.right_button {
+
+                    if pointer_event.right_down {
                         flags |= PointerFlags::RIGHT_BUTTON | PointerFlags::DOWN;
+                    } else if pointer_event.right_up {
+                        flags |= PointerFlags::RIGHT_BUTTON;
+                    } else if pointer_event.right_button {
+                        flags |= PointerFlags::RIGHT_BUTTON | PointerFlags::DOWN | PointerFlags::MOVE;
                     }
+
                     if pointer_event.scroll_up {
                         flags |= PointerFlags::VERTICAL_WHEEL;
                         wheel_units = 120; // Standard wheel delta
@@ -1576,9 +1625,12 @@ impl IronRdpSession {
                                     format!("Failed to write mouse response: {}", e)
                                 })?;
                             }
-                            ActiveStageOutput::GraphicsUpdate(_rect) => {
-                                // Pointer moved, send graphics update
-                                self.send_graphics_update(image).await?;
+                            ActiveStageOutput::GraphicsUpdate(rect) => {
+                                // IMPORTANT: With pointer_software_rendering=true, IronRDP renders
+                                // the cursor into the framebuffer. We MUST send these updates!
+                                // The rect will be small (just the cursor area), so bandwidth is minimal.
+                                trace!("RDP: Cursor moved, sending framebuffer update for rect: {:?}", rect);
+                                self.send_graphics_update_with_rect(image, rect).await?;
                             }
                             _ => {}
                         }
@@ -1653,13 +1705,44 @@ impl IronRdpSession {
         Ok(jpeg_data)
     }
 
+    /// Encode RGBA data as WebP (lossy)
+    ///
+    /// Converts RGBA pixels to WebP with specified quality.
+    /// This provides 40% bandwidth reduction compared to JPEG encoding.
+    fn encode_webp_lossy(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        quality: f32,
+    ) -> Result<Vec<u8>, String> {
+        use webp::{Encoder, WebPMemory};
+
+        let encoder = Encoder::from_rgba(data, width, height);
+        let webp: WebPMemory = encoder.encode(quality);
+        Ok(webp.to_vec())
+    }
+
+    /// Encode RGBA data as WebP (lossless)
+    ///
+    /// Converts RGBA pixels to WebP lossless format.
+    /// Perfect quality with 33% smaller size than PNG.
+    fn encode_webp_lossless(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        use webp::{Encoder, WebPMemory};
+
+        let encoder = Encoder::from_rgba(data, width, height);
+        let webp: WebPMemory = encoder.encode_lossless();
+        Ok(webp.to_vec())
+    }
+
     /// Encode and send dirty rectangles from framebuffer
     async fn encode_and_send_dirty_rects(&mut self) -> Result<(), String> {
         self.framebuffer.optimize_dirty_rects();
 
         // Check if we have dirty rects (without cloning)
         if self.framebuffer.dirty_rects().is_empty() {
-            warn!("RDP: No dirty rects after optimization - skipping render");
+            // This should rarely happen - it means IronRDP sent us an update but
+            // after processing there's nothing to render. This is OK for cursor-only updates.
+            trace!("RDP: No dirty rects after optimization - skipping render (cursor-only update)");
             return Ok(());
         }
 
@@ -1699,25 +1782,66 @@ impl IronRdpSession {
                 rect.width, rect.height, rect.x, rect.y
             );
 
-            // Encode as JPEG or PNG
-            let (encoded_data, mimetype) = if self.use_jpeg {
-                // Extract region pixels for JPEG encoding
+            // Smart encoding: JPEG for large updates, PNG for small updates
+            // JPEG is lossy and causes artifacts on re-encoding, so only use it for
+            // large updates where bandwidth savings matter.
+            // PNG is lossless and perfect for small dirty regions.
+            let total_pixels = self.width * self.height;
+            let rect_pixels = rect.width * rect.height;
+            let is_large_update = rect_pixels > total_pixels / 10; // >10% of screen
+
+            let (encoded_data, mimetype) = if self.supports_webp {
+                // WebP: Best of both worlds (40% smaller than JPEG, perfect quality)
+                if is_large_update {
+                    // Large update: WebP lossy (60KB vs 98KB JPEG)
+                    let region_pixels = self.framebuffer.get_region_pixels(*rect);
+                    let quality = self.jpeg_quality as f32 / 100.0;
+                    let webp_data =
+                        Self::encode_webp_lossy(&region_pixels, rect.width, rect.height, quality)
+                            .map_err(|e| format!("WebP encoding failed: {}", e))?;
+                    debug!(
+                        "RDP: WebP lossy encoded - {} bytes (quality {}, {}% of screen)",
+                        webp_data.len(),
+                        self.jpeg_quality,
+                        (rect_pixels * 100) / total_pixels
+                    );
+                    (webp_data, "image/webp")
+                } else {
+                    // Small update: WebP lossless (2KB vs 5KB PNG)
+                    let region_pixels = self.framebuffer.get_region_pixels(*rect);
+                    let webp_data =
+                        Self::encode_webp_lossless(&region_pixels, rect.width, rect.height)
+                            .map_err(|e| format!("WebP encoding failed: {}", e))?;
+                    debug!(
+                        "RDP: WebP lossless encoded - {} bytes ({}% of screen)",
+                        webp_data.len(),
+                        (rect_pixels * 100) / total_pixels
+                    );
+                    (webp_data, "image/webp")
+                }
+            } else if self.supports_jpeg && self.use_jpeg && is_large_update {
+                // Fallback: JPEG for large updates (only if client supports it)
                 let region_pixels = self.framebuffer.get_region_pixels(*rect);
                 let jpeg_data =
                     Self::encode_jpeg(&region_pixels, rect.width, rect.height, self.jpeg_quality)
                         .map_err(|e| format!("JPEG encoding failed: {}", e))?;
                 debug!(
-                    "RDP: JPEG encoded - {} bytes (quality {})",
+                    "RDP: JPEG encoded - {} bytes (quality {}, {}% of screen)",
                     jpeg_data.len(),
-                    self.jpeg_quality
+                    self.jpeg_quality,
+                    (rect_pixels * 100) / total_pixels
                 );
                 (jpeg_data, "image/jpeg")
             } else {
-                // ZERO-COPY: Encode directly into reusable buffer (no allocation)
+                // Fallback: PNG (always supported)
                 self.framebuffer
                     .encode_region_into_vec(*rect, &mut self.png_buffer)
                     .map_err(|e| format!("PNG encoding failed: {}", e))?;
-                debug!("RDP: PNG encoded - {} bytes", self.png_buffer.len());
+                debug!(
+                    "RDP: PNG encoded - {} bytes ({}% of screen)",
+                    self.png_buffer.len(),
+                    (rect_pixels * 100) / total_pixels
+                );
                 (self.png_buffer.clone(), "image/png")
             };
 

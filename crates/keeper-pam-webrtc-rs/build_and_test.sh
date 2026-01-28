@@ -1,10 +1,14 @@
 #!/bin/bash
 set -e  # Exit on any error
 
-# WORKSPACE BUILD SCRIPT
-# This script builds and tests the unified keeper-pam-connections Python package
+# TUBE LIFECYCLE NOTES:
+# - Multiple "Drop called for tube" messages are NORMAL and expected
+# - They represent Arc reference drops, not premature tube destruction
+# - Tubes remain fully functional after these drops
+# - The actual tube cleanup only happens when marked Closed and removed from registry
+# - Look for "TUBE CLEANUP COMPLETE" message to confirm full cleanup
 
-echo "Building keeper-pam-connections (unified Python package)"
+echo "Building with protocol handlers (SSH, Telnet, VNC, RDP, etc) - always included"
 echo ""
 
 echo "========================================"
@@ -17,20 +21,14 @@ echo "✓ Formatting check passed"
 echo ""
 
 echo "Running clippy..."
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy -- -D warnings
 echo "✓ Clippy check passed"
 echo ""
 
 echo "Running Rust unit tests..."
-cargo test --workspace --lib
+cargo test --lib --no-default-features
 echo "✓ Rust tests passed"
 echo ""
-
-echo "========================================"
-echo "Building Python package..."
-echo "========================================"
-
-cd crates/python-bindings
 
 echo "Cleaning previous builds..."
 # Clean Rust build artifacts
@@ -38,6 +36,7 @@ cargo clean
 
 # Make sure to remove any cached wheels, but don't error if none exist
 rm -rf target/wheels && mkdir -p target/wheels
+# Alternatively: if [ -d "target/wheels" ]; then rm -rf target/wheels/*; fi
 
 echo "Building wheel..."
 # Detect platform and build accordingly
@@ -47,6 +46,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     maturin build --release --auditwheel skip
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     # Linux build - check if we want manylinux compliance
+    # Use explicit check to only enable when BUILD_MANYLINUX=1 (not just any non-empty value)
     if [ "$BUILD_MANYLINUX" = "1" ]; then
         echo "Building Linux wheel with manylinux_2_28 compliance (using Docker)..."
         docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin:v1.8.1 build --release --manylinux 2_28
@@ -66,20 +66,12 @@ WHEEL=$(find target/wheels -name "*.whl" | head -1)
 echo "Installing wheel: $WHEEL"
 
 # Force reinstall to ensure the latest version is used
-pip uninstall -y keeper_pam_connections || true
+pip uninstall -y keeper_pam_webrtc_rs || true
 pip install "$WHEEL" --force-reinstall
 
-echo "========================================"
-echo "Running Python tests..."
-echo "========================================"
-
+echo "Running tests..."
 cd tests
 
 # Run all tests
 export RUST_BACKTRACE=1
 python3 -m pytest -v --log-cli-level=DEBUG
-
-echo ""
-echo "========================================"
-echo "✓ All checks passed!"
-echo "========================================"

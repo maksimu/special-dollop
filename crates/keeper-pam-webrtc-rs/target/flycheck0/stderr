@@ -1,0 +1,103 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   1.008514125s  INFO prepare_target{force=false package_id=keeper-pam-connections-py v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings) target="keeper_pam_connections"}: cargo::core::compiler::fingerprint: fingerprint error for keeper-pam-connections-py v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings)/Check { test: false }/TargetInner { ..: lib_target("keeper_pam_connections", ["cdylib"], "/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings/src/lib.rs", Edition2021) }
+   1.008585958s  INFO prepare_target{force=false package_id=keeper-pam-connections-py v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings) target="keeper_pam_connections"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/mroberts/Documents/keeper-pam-webrtc-rs/target/debug/.fingerprint/keeper-pam-connections-py-83dc51c694e86744/lib-keeper_pam_connections`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   1.015734916s  INFO prepare_target{force=false package_id=keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs) target="keeper_pam_webrtc_rs"}: cargo::core::compiler::fingerprint: fingerprint error for keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs)/Check { test: false }/TargetInner { ..: lib_target("keeper_pam_webrtc_rs", ["rlib"], "/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs/src/lib.rs", Edition2021) }
+   1.015749375s  INFO prepare_target{force=false package_id=keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs) target="keeper_pam_webrtc_rs"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/mroberts/Documents/keeper-pam-webrtc-rs/target/debug/.fingerprint/keeper-pam-webrtc-rs-de4a037b37d80364/lib-keeper_pam_webrtc_rs`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   1.179281750s  INFO prepare_target{force=false package_id=keeper-pam-connections-py v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings) target="keeper_pam_connections"}: cargo::core::compiler::fingerprint: fingerprint error for keeper-pam-connections-py v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings)/Check { test: true }/TargetInner { ..: lib_target("keeper_pam_connections", ["cdylib"], "/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings/src/lib.rs", Edition2021) }
+   1.179299375s  INFO prepare_target{force=false package_id=keeper-pam-connections-py v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/python-bindings) target="keeper_pam_connections"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/mroberts/Documents/keeper-pam-webrtc-rs/target/debug/.fingerprint/keeper-pam-connections-py-e251f882d9aa6195/test-lib-keeper_pam_connections`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   1.182618250s  INFO prepare_target{force=false package_id=keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs) target="keeper_pam_webrtc_rs"}: cargo::core::compiler::fingerprint: fingerprint error for keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs)/Check { test: true }/TargetInner { ..: lib_target("keeper_pam_webrtc_rs", ["rlib"], "/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs/src/lib.rs", Edition2021) }
+   1.182630875s  INFO prepare_target{force=false package_id=keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs) target="keeper_pam_webrtc_rs"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/mroberts/Documents/keeper-pam-webrtc-rs/target/debug/.fingerprint/keeper-pam-webrtc-rs-88da56aa81d9c63b/test-lib-keeper_pam_webrtc_rs`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+    Checking keeper-pam-webrtc-rs v2.0.0 (/Users/mroberts/Documents/keeper-pam-webrtc-rs/crates/keeper-pam-webrtc-rs)
+error: could not compile `keeper-pam-webrtc-rs` (lib) due to 8 previous errors; 18 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `keeper-pam-webrtc-rs` (lib test) due to 8 previous errors; 18 warnings emitted

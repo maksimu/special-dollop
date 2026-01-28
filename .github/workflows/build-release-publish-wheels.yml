@@ -89,7 +89,7 @@ jobs:
             /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
 
             # Build the wheel
-            cd /io
+            cd /io/crates/python-bindings
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
             
             # Check if build succeeded
@@ -153,13 +153,13 @@ jobs:
           
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
-          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
+          python -c "import keeper_pam_connections; print('Import successful')"
           cd tests && python -m pytest -v
         shell: bash
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-linux-x86_64
+          name: keeper-pam-connections-linux-x86_64
           path: target/wheels/*.whl
 
   # Linux ARM64 build
@@ -248,7 +248,7 @@ jobs:
             /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
 
             # Build the wheel
-            cd /io
+            cd /io/crates/python-bindings
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
             
             # Check if build succeeded
@@ -315,7 +315,7 @@ jobs:
           
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
-          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
+          python -c "import keeper_pam_connections; print('Import successful')"
           cd tests && python -m pytest -v
         shell: bash
 
@@ -340,7 +340,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-linux-arm64
+          name: keeper-pam-connections-linux-arm64
           path: target/wheels/*.whl
 
   # macOS builds (x86_64 and arm64)
@@ -406,7 +406,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-macos
+          name: keeper-pam-connections-macos
           path: target/wheels/*.whl
 
   # Windows build
@@ -488,13 +488,13 @@ jobs:
           
           Write-Host "Installing wheel: $($wheel.FullName)"
           pip install $wheel.FullName
-          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
+          python -c "import keeper_pam_connections; print('Import successful')"
           cd tests && python -m pytest -v
         shell: pwsh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-windows-x86_64
+          name: keeper-pam-connections-windows-x86_64
           path: target/wheels/*.whl
 
   # Alpine Linux build
@@ -560,7 +560,7 @@ jobs:
 
             # Build the wheel directly in a temporary directory within the container
             TEMP_DIR=\$(mktemp -d)
-            cd /io
+            cd /io/crates/python-bindings
 
             # Use maturin to build the wheel with explicit output location
             mkdir -p /io/target/wheels
@@ -640,19 +640,19 @@ jobs:
             pip install /io/$WHEEL_PATH
           
             # Verify import works
-            python -c 'import keeper_pam_webrtc_rs; print(\"Import successful\")'
+            python -c 'import keeper_pam_connections; print(\"Import successful\")'
           
             # Install test dependencies
             pip install pytest pytest-asyncio 
           
             # Run tests
-            cd /io/tests && python -m pytest -v
+            cd /io/crates/python-bindings/tests && python -m pytest -v
           "
         shell: bash
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-alpine-x86_64
+          name: keeper-pam-connections-alpine-x86_64
           path: target/wheels/*.whl
 
   # Build source distribution
@@ -698,7 +698,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-sdist
+          name: keeper-pam-connections-sdist
           path: target/wheels/*.tar.gz
 
   # Create release with all wheels if on tag
@@ -725,7 +725,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist/
-          pattern: keeper-pam-webrtc-rs-*
+          pattern: keeper-pam-connections-*
           merge-multiple: true
 
       - name: Debug wheel and sdist files
@@ -753,7 +753,7 @@ jobs:
           files: |
             dist/wheels/*.whl
             dist/wheels/*.tar.gz
-          name: keeper-pam-webrtc-rs ${{ env.VERSION }}
+          name: keeper-pam-connections ${{ env.VERSION }}
           body: |
             WebRTC Python extension module using Rust
 

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.8"]
+build-backend = "maturin"
+
+[project]
+name = "keeper-pam-connections"
+dynamic = ["version"]
+description = "Keeper PAM Connections - Unified Python API for secure connection management (WebRTC, SSH, RDP, and more)"
+readme = "../../README.md"
+license = "MIT"
+license-files = ["../../LICENSE"]
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Security",
+    "Topic :: Communications",
+]
+
+[tool.maturin]
+module-name = "keeper_pam_connections"
+exclude = ["LICENSE*", "*.md", "README*"]
+python-source = "python"
+
+[tool.pytest.ini_options]
+pythonpath = ["tests"]
+filterwarnings = [
+    "ignore:coroutine 'TunnelConnectionManager._execute_ice_restart' was never awaited:RuntimeWarning",
+]

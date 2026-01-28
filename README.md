@@ -1,205 +1,169 @@
-# Keeper PAM WebRTC for Python
+# keeper-pam-connections
 
-A secure, stable, and high-performance **Tube API** for Python, providing WebRTC-based secure tunneling with enterprise-grade security and reliability optimizations.
+Keeper PAM connection management monorepo - unified Python package for secure connection management.
 
-## Core Values
+## Overview
 
-**Security • Stability • Performance** - Built for Keeper Security's mission-critical applications:
+This workspace provides a unified Python package (`keeper-pam-connections`) that aggregates multiple Rust-based connection management libraries. The architecture allows for easy extension with new protocol-specific crates while maintaining a single, cohesive Python API.
 
-- **🔒 Security First**: Memory-safe Rust implementation with comprehensive bounds checking
-- **🛡️ Enterprise Stability**: Lock-free architecture eliminates race conditions and deadlocks  
-- **⚡ Optimized Performance**: Advanced optimizations deliver exceptional speed when you need it
-- **🔧 Production Ready**: Zero-configuration reliability for demanding security applications
+## Architecture
 
-## Description
+```
+keeper-pam-connections/
+├── crates/
+│   ├── keeper-pam-webrtc-rs/     # Core WebRTC tunneling library
+│   └── python-bindings/           # Unified Python package (aggregates all crates)
+```
 
-`keeper-pam-webrtc-rs` provides Python bindings to a Rust-based **Tube API** for secure communication, designed for:
+## Crates
 
-- **Secure tunneling** via WebRTC data channels with memory-safe operations
-- **Multi-connection management** through tube abstractions
-- **Reliable peer connection handling** with comprehensive error handling
-- **Efficient channel management** for different communication patterns
-- **Cross-platform compatibility** (Linux, macOS, Windows, Alpine)
-- **Mission-critical reliability** for security-focused applications
+### keeper-pam-webrtc-rs
+Core WebRTC-based secure tunneling library providing:
+- Secure WebRTC data channel management
+- Multi-protocol support (TCP tunnel, Guacamole, SOCKS5)
+- High-performance frame processing (700K-2.5M frames/sec)
+- Enterprise-grade stability and failure isolation
 
-This package is designed to be used with Keeper Gateway and Keeper Commander. It provides a **secure, reliable tube-based communication system** built on WebRTC, specifically tailored for Keeper Security's internal products and security-critical tunneling use cases.
+**Documentation**:
+- [Crate README](crates/keeper-pam-webrtc-rs/README.md.original)
+- [Architecture Docs](docs/) (workspace-level)
+- [Protocol Docs](crates/keeper-pam-webrtc-rs/docs/) (crate-specific)
 
-> **Note**: This package is intended for internal Keeper Security products and is not being actively advertised for general use.
+### python-bindings
+Unified Python package that exposes all functionality through a single module:
+```python
+import keeper_pam_connections
+
+# Access WebRTC functionality
+registry = keeper_pam_connections.PyTubeRegistry()
+
+# Future: Access other protocol-specific functionality
+# All available through the same import
+```
 
 ## Installation
 
-```shell
-pip install keeper-pam-webrtc-rs
-```
-
-## Usage
-
-```python
-import keeper_pam_webrtc_rs
-
-# Create a tube registry
-registry = keeper_pam_webrtc_rs.PyTubeRegistry()
-
-# Define a signal callback for WebRTC events
-def on_signal(signal_dict):
-    print(f"Received signal: {signal_dict}")
-    # Handle ICE candidates, connection state changes, etc.
-
-# Create a server-side tube for tunneling
-server_result = registry.create_tube(
-    conversation_id="tunnel-session-123",
-    settings={
-        "conversationType": "tunnel",
-        "target_host": "127.0.0.1", 
-        "target_port": "22"  # SSH tunnel example
-    },
-    trickle_ice=True,
-    callback_token="server-token",
-    ksm_config="server-config",
-    signal_callback=on_signal
-)
-
-# Get the offer SDP to send to the client
-# NOTE: All SDP (offers, answers) are base64-encoded - use them directly, don't decode!
-server_offer = server_result['offer']  # Base64-encoded WebRTC offer
-server_tube_id = server_result['tube_id']
-
-# Create a client-side tube with the offer
-client_result = registry.create_tube(
-    conversation_id="tunnel-client-123",
-    settings={
-        "conversationType": "tunnel",
-        "target_host": "192.168.1.100",
-        "target_port": "22"
-    },
-    trickle_ice=True,
-    callback_token="client-token",
-    ksm_config="client-config",
-    offer=server_offer,  # Pass base64-encoded offer directly (don't decode!)
-    signal_callback=on_signal
-)
-
-# Get the answer SDP to send back to server
-client_answer = client_result['answer']  # Base64-encoded WebRTC answer
-client_tube_id = client_result['tube_id']
-
-# Set the remote description on the server
-# NOTE: Pass base64-encoded answer directly
-registry.set_remote_description(server_tube_id, client_answer, is_answer=True)
-
-# Check connection state
-state = registry.get_connection_state(server_tube_id)
-print(f"Connection state: {state}")
-
-# Close when done
-registry.close_tube(server_tube_id)
-registry.close_tube(client_tube_id)
-```
-
-### Server Mode with TCP Listener
-
-For server tubes that listen for external TCP connections:
-
-```python
-# Create server tube with TCP listener (dynamic port)
-server_result = registry.create_tube(
-    conversation_id="tcp-tunnel",
-    settings={
-        "conversationType": "tunnel",
-        "local_listen_addr": "127.0.0.1:0"  # 0 = dynamic port assignment
-    },
-    trickle_ice=True,
-    callback_token="token",
-    ksm_config="config",
-    signal_callback=on_signal
-)
-
-# Get actual listening address (port assigned by OS)
-listen_addr = server_result['actual_local_listen_addr']  # "127.0.0.1:59194"
-host, port = listen_addr.split(':')
-
-# External clients can now connect to this address
-import socket
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect((host, int(port)))
-# Data flows: TCP → WebRTC → Remote tube → Remote target
-```
-
-**API Documentation**: See [docs/PYTHON_API_CONTRACT.md](docs/PYTHON_API_CONTRACT.md) for complete API reference including:
-- Base64 SDP encoding requirements
-- Return value specifications
-- Migration guides and common pitfalls
-
-## Features
-
-- **🔒 Memory Safety**: Rust-powered implementation prevents buffer overflows and memory corruption
-- **🛡️ Reliable Architecture**: Lock-free design eliminates race conditions and ensures stability
-- **⚡ Efficient Performance**: Optimized for speed without compromising security or stability
-- **🌊 Tube Abstraction**: High-level API for managing WebRTC-based secure tunnels
-- **🌍 Cross-Platform**: Secure, consistent behavior across Linux, macOS, Windows, Alpine
-- **🐍 Python Integration**: Built with abi3 for maximum compatibility (Python 3.7+)
-- **🔧 Production Hardened**: Comprehensive error handling and graceful degradation
-
-## Tube API Architecture
-
-This implementation provides a **Tube-based abstraction** over WebRTC:
-
-### **Security Features**
-- **Memory-Safe Operations**: Rust's ownership system prevents common security vulnerabilities
-- **Bounds Checking**: Comprehensive validation prevents buffer overflows and data corruption
-- **Zero Unsafe Code**: Hot paths use only verified, safe Rust code (except vetted SIMD intrinsics)
-- **Graceful Error Handling**: Robust error recovery prevents crashes and data leaks
-
-### **Tube Management**  
-- **Multi-Connection Support**: Each tube can manage multiple WebRTC connections
-- **Channel Abstraction**: High-level channel management for different protocols
-- **State Management**: Comprehensive connection state tracking and reporting
-- **Signal Handling**: Event-driven architecture for ICE candidates and state changes
-
-### **Performance Features**
-- **SIMD Optimization**: Hardware-accelerated frame parsing with safe fallbacks
-- **Zero-Copy Pipelines**: Efficient data handling minimizes memory overhead
-- **Event-Driven Design**: Native WebRTC events provide responsive communication
-- **Always Optimized**: Maximum efficiency by default, no configuration required
-
-## Tube API Reference
-
-### **Core Methods**
-
-- `create_tube(conversation_id, settings, ...)` - Create a new secure tube or add conversation to existing tube
-- `set_remote_description(tube_id, sdp, is_answer)` - Set remote SDP description
-- `add_ice_candidate(tube_id, candidate)` - Add ICE candidate for connection
-- `get_connection_state(tube_id)` - Get current connection state
-- `close_connection(connection_id)` - Close specific connection
-- `close_tube(tube_id)` - Close entire tube
-
-### **Conversation Types**
-
-The tube API supports different communication patterns:
-
-- **`tunnel`** - Secure TCP tunneling through WebRTC
-- **`guacd`** - Apache Guacamole protocol tunneling
-- **`socks5`** - SOCKS5 proxy tunneling
-
-## Build & Verification
-
-To build and verify the implementation:
-
+### From PyPI
 ```bash
-# Standard build (all optimizations enabled)
+pip install keeper-pam-connections
+```
+
+### From Source
+```bash
+# Build all crates
 cargo build --release
 
-# Run comprehensive test suite
-cargo test --release
+# Build Python package
+cd crates/python-bindings
+maturin develop --release
 ```
 
-## Why This Implementation?
+## Development
 
-Built specifically for Keeper Security's tunneling requirements:
+### Build All Crates
+```bash
+cargo build --release
+```
 
-- **Security-First Design**: Memory safety and comprehensive validation prevent vulnerabilities
-- **Mission-Critical Reliability**: Lock-free architecture ensures stable operation under load  
-- **Optimized for Security Applications**: Performance optimizations that don't compromise security
-- **Tube Abstraction**: High-level API designed specifically for secure tunneling use cases
+### Run All Tests
+```bash
+# Rust tests
+cargo test --release
 
-**The secure, stable, high-performance tube communication system for enterprise security applications.**
+# Python tests
+cd crates/python-bindings
+python -m pytest tests/ -v
+```
+
+### Add New Protocol Crate
+
+1. Create new crate in `crates/`:
+```bash
+cargo new --lib crates/my-protocol-rs
+```
+
+2. Add to workspace in root `Cargo.toml`:
+```toml
+[workspace]
+members = [
+    "crates/keeper-pam-webrtc-rs",
+    "crates/python-bindings",
+    "crates/my-protocol-rs"  # Add here
+]
+```
+
+3. Implement Python registration function in your crate:
+```rust
+// crates/my-protocol-rs/src/python/mod.rs
+pub fn register_my_protocol_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    parent.add_class::<MyProtocolClass>()?;
+    // ... register your functionality
+    Ok(())
+}
+```
+
+4. Add dependency and registration in `crates/python-bindings/src/lib.rs`:
+```rust
+#[pymodule]
+fn keeper_pam_connections(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    keeper_pam_webrtc_rs::python::register_webrtc_module(py, m)?;
+    my_protocol_rs::python::register_my_protocol_module(py, m)?;  // Add here
+    Ok(())
+}
+```
+
+5. Rebuild:
+```bash
+cd crates/python-bindings
+maturin develop --release
+```
+
+Now your new functionality is available:
+```python
+import keeper_pam_connections
+# Use both WebRTC and your new protocol
+```
+
+## Project Structure
+
+- **Root**: Workspace configuration, shared dependencies
+- **crates/keeper-pam-webrtc-rs/**: Core WebRTC library (pure Rust)
+- **crates/python-bindings/**: Unified Python package (cdylib)
+- **.github/workflows/**: CI/CD pipelines
+- **build_*.sh**: Build scripts for various platforms
+
+## Key Features
+
+- **Unified Python API**: Single import for all functionality
+- **Extensible Architecture**: Easy to add new protocol crates
+- **High Performance**: Sub-microsecond frame processing
+- **Enterprise Stability**: Lock-free architecture, RAII resource management
+- **Cross-Platform**: Linux, macOS, Windows, Alpine support
+- **Memory Safe**: Rust-powered with comprehensive bounds checking
+
+## Documentation
+
+### 📚 Quick Start
+- **Python Users**: [Python API Contract](docs/PYTHON_API_CONTRACT.md)
+- **Architecture Overview**: [Architecture Explanation](docs/ARCHITECTURE_EXPLANATION.md)
+- **Testing Guide**: [Testing Strategy](docs/TESTING_STRATEGY.md)
+
+### 🏗️ Architecture & Design
+- [Actor + DashMap + RAII](docs/ACTOR_DASHMAP_RAII.md) - Registry concurrency architecture
+- [Failure Isolation](docs/FAILURE_ISOLATION_ARCHITECTURE.md) - WebRTC isolation, circuit breakers
+- [Hot Path Optimizations](docs/HOT_PATH_OPTIMIZATION_SUMMARY.md) - Performance details
+- [Performance Benchmarks](docs/PERFORMANCE_BENCHMARKS.md) - Measured results
+
+### 🔧 Implementation Details
+- [Testing Strategy](docs/TESTING_STRATEGY.md) - Workspace-wide testing approach
+- [Protocol-Specific Docs](crates/keeper-pam-webrtc-rs/docs/) - ICE, SOCKS5, WebSocket
+
+**Full documentation index**: [docs/README.md](docs/README.md)
+
+## License
+
+MIT - See [LICENSE](LICENSE) for details.
+
+## Authors
+
+Keeper Security Engineering <engineering@keeper.io>

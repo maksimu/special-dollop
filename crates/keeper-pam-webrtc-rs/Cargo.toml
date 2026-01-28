@@ -1,0 +1,85 @@
+[package]
+name = "keeper-pam-webrtc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Keeper WebRTC tube abstraction - secure WebRTC tunneling core library"
+
+[lib]
+name = "keeper_pam_webrtc_rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+python-support = ["pyo3"]
+profiling = []
+
+[dependencies]
+# Protocol handlers integration (from separate pam-guacr repo)
+# Provides: SSH, Telnet, VNC, SFTP, RDP, Database, RBI (Remote Browser Isolation)
+# CI uses git dependency with ACCESS_TOKEN/GITHUB_TOKEN for authentication
+# Local development can use path dependency when both repos are checked out side-by-side
+# rbi-chrome: requires Chrome/Chromium installed on system at runtime (no audio)
+# rbi-cef: requires CEF binaries at build time (has audio support)
+
+# Git dependency (for CI and when pam-guacr is not checked out locally)
+guacr = { git = "https://github.com/Keeper-Security/pam-guacr.git", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"] }
+# Path dependency (for local development - uncomment and comment out git dependency above)
+# guacr = { path = "../pam-guacr/crates/guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"] }
+
+# Core async
+tokio.workspace = true
+tokio-util.workspace = true
+
+# Data structures
+bytes.workspace = true
+crossbeam-queue.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+
+# WebRTC
+webrtc.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+log.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+uuid.workspace = true
+base64.workspace = true
+lazy_static.workspace = true
+once_cell.workspace = true
+arc-swap.workspace = true
+bitflags.workspace = true
+
+# Crate-specific dependencies
+aes-gcm.workspace = true
+chrono.workspace = true
+futures.workspace = true
+heapless.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+if-addrs.workspace = true
+ipnet.workspace = true
+p256.workspace = true
+pyo3 = { workspace = true, optional = true }
+reqwest.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+ctor = "0.6.2"  # For test initialization (rustls crypto provider setup)
+
+# IronRDP patches are now at workspace level

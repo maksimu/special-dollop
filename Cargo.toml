@@ -1,7 +1,19 @@
 [workspace]
 members = [
     "crates/keeper-pam-webrtc-rs",
-    "crates/python-bindings"
+    "crates/python-bindings",
+    "crates/guacr",
+    "crates/guacr-handlers",
+    "crates/guacr-protocol",
+    "crates/guacr-terminal",
+    "crates/guacr-ssh",
+    "crates/guacr-telnet",
+    "crates/guacr-rdp",
+    "crates/guacr-vnc",
+    "crates/guacr-database",
+    "crates/guacr-sftp",
+    "crates/guacr-rbi",
+    "crates/guacr-threat-detection",
 ]
 resolver = "2"
 
@@ -16,6 +28,7 @@ authors = ["Keeper Security Engineering <engineering@keeper.io>"]
 # Core async
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tokio-util = "0.7.18"
+async-trait = "0.1.89"
 
 # Data structures
 bytes = "1.11.0"

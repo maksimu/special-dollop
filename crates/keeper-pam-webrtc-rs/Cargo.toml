@@ -16,17 +16,11 @@ python-support = ["pyo3"]
 profiling = []
 
 [dependencies]
-# Protocol handlers integration (from separate pam-guacr repo)
+# Protocol handlers integration (now part of monorepo)
 # Provides: SSH, Telnet, VNC, SFTP, RDP, Database, RBI (Remote Browser Isolation)
-# CI uses git dependency with ACCESS_TOKEN/GITHUB_TOKEN for authentication
-# Local development can use path dependency when both repos are checked out side-by-side
 # rbi-chrome: requires Chrome/Chromium installed on system at runtime (no audio)
 # rbi-cef: requires CEF binaries at build time (has audio support)
-
-# Git dependency (for CI and when pam-guacr is not checked out locally)
-guacr = { git = "https://github.com/Keeper-Security/pam-guacr.git", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"] }
-# Path dependency (for local development - uncomment and comment out git dependency above)
-# guacr = { path = "../pam-guacr/crates/guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"] }
+guacr = { path = "../guacr", features = ["ssh", "telnet", "vnc", "sftp", "rbi-chrome", "rdp", "database"] }
 
 # Core async
 tokio.workspace = true

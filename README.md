@@ -12,7 +12,48 @@ This workspace provides a unified Python package (`keeper-pam-connections`) that
 keeper-pam-connections/
 ├── crates/
 │   ├── keeper-pam-webrtc-rs/     # Core WebRTC tunneling library
-│   └── python-bindings/           # Unified Python package (aggregates all crates)
+│   ├── python-bindings/           # Unified Python package (aggregates all crates)
+│   ├── guacr/                     # Protocol handlers (aggregator)
+│   ├── guacr-handlers/            # Handler trait definitions
+│   ├── guacr-protocol/            # Guacamole protocol codec
+│   ├── guacr-terminal/            # Terminal emulation
+│   ├── guacr-ssh/                 # SSH protocol handler
+│   ├── guacr-telnet/              # Telnet protocol handler
+│   ├── guacr-rdp/                 # RDP protocol handler
+│   ├── guacr-vnc/                 # VNC protocol handler
+│   ├── guacr-database/            # Database protocol handlers
+│   ├── guacr-sftp/                # SFTP file transfer
+│   ├── guacr-rbi/                 # Remote Browser Isolation
+│   └── guacr-threat-detection/    # AI threat detection
+```
+
+## Distribution Channels
+
+This monorepo supports multiple distribution channels for different use cases:
+
+### For Python Users
+```bash
+pip install keeper-pam-connections
+```
+
+```python
+import keeper_pam_connections
+
+# Access WebRTC + protocol handlers
+registry = keeper_pam_connections.PyTubeRegistry()
+```
+
+### For Rust Users - Protocol Handlers Only
+```toml
+[dependencies]
+guacr = { version = "1.1", features = ["ssh", "rdp", "vnc"] }
+```
+
+### For Rust Users - WebRTC Tunneling
+```toml
+[dependencies]
+keeper-pam-webrtc-rs = "2.0"
+guacr = "1.1"  # Optional, for built-in protocol handlers
 ```
 
 ## Crates
@@ -29,17 +70,23 @@ Core WebRTC-based secure tunneling library providing:
 - [Architecture Docs](docs/) (workspace-level)
 - [Protocol Docs](crates/keeper-pam-webrtc-rs/docs/) (crate-specific)
 
+### guacr (Protocol Handlers)
+Protocol handlers for remote desktop access:
+- **SSH** - Secure Shell (production-ready)
+- **Telnet** - Telnet protocol
+- **RDP** - Remote Desktop Protocol (production-ready with IronRDP)
+- **VNC** - Virtual Network Computing
+- **Database** - MySQL, PostgreSQL, MongoDB, Redis, Oracle, SQL Server, MariaDB
+- **SFTP** - SSH File Transfer Protocol
+- **RBI** - Remote Browser Isolation (Chrome/CDP)
+
+**Documentation**:
+- [guacr README](docs/guacr/README.md)
+- [Protocol Documentation](docs/guacr/)
+
 ### python-bindings
-Unified Python package that exposes all functionality through a single module:
-```python
-import keeper_pam_connections
-
-# Access WebRTC functionality
-registry = keeper_pam_connections.PyTubeRegistry()
-
-# Future: Access other protocol-specific functionality
-# All available through the same import
-```
+Unified Python package that exposes all functionality through a single module.
+Combines WebRTC tunneling with protocol handlers for a complete solution.
 
 ## Installation
 

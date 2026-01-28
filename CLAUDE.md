@@ -17,15 +17,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 keeper-pam-connections/
 ├── Cargo.toml                          # Workspace root
 ├── docs/                               # Workspace-level documentation
+│   ├── guacr/                          # guacr protocol handler docs
+│   └── ...                             # WebRTC docs
 ├── crates/
 │   ├── keeper-pam-webrtc-rs/          # Core WebRTC library (rlib)
 │   │   ├── CLAUDE.md                   # Crate-specific guidance
 │   │   ├── src/                        # Core Rust code
 │   │   └── docs/                       # Protocol-specific docs
-│   └── python-bindings/                # Unified Python package (cdylib)
-│       ├── src/lib.rs                  # Aggregates all bindings
-│       ├── python/keeper_pam_connections/  # Python module
-│       └── tests/                      # All Python tests
+│   ├── python-bindings/                # Unified Python package (cdylib)
+│   │   ├── src/lib.rs                  # Aggregates all bindings
+│   │   ├── python/keeper_pam_connections/  # Python module
+│   │   └── tests/                      # All Python tests
+│   ├── guacr/                          # Protocol handlers (aggregator)
+│   ├── guacr-handlers/                 # Handler trait definitions
+│   ├── guacr-protocol/                 # Guacamole protocol codec
+│   ├── guacr-terminal/                 # Terminal emulation
+│   ├── guacr-ssh/                      # SSH protocol handler
+│   ├── guacr-telnet/                   # Telnet protocol handler
+│   ├── guacr-rdp/                      # RDP protocol handler (IronRDP)
+│   ├── guacr-vnc/                      # VNC protocol handler
+│   ├── guacr-database/                 # Database protocol handlers
+│   ├── guacr-sftp/                     # SFTP file transfer
+│   ├── guacr-rbi/                      # Remote Browser Isolation
+│   └── guacr-threat-detection/         # AI threat detection
 └── README.md                           # Workspace overview
 ```
 
@@ -88,7 +102,46 @@ import keeper_pam_connections
 
 All functionality is identical, only the import name changed.
 
-### 3. Workspace-Wide Testing
+### 3. guacr Protocol Handlers (Merged from pam-guacr)
+
+**Important**: The guacr crates were merged from the separate pam-guacr repository
+and are now part of this monorepo while remaining independently publishable.
+
+**Protocol Handlers Available**:
+- **SSH** - Production-ready with auth, clipboard, JPEG rendering
+- **Telnet** - Complete with scrollback, mouse events
+- **RDP** - Production-ready with IronRDP (60fps, dynamic resize)
+- **VNC** - Complete VNC protocol implementation (RFB 3.8)
+- **Database** - MySQL, PostgreSQL, MongoDB, Redis, Oracle, SQL Server, MariaDB
+- **SFTP** - Complete file transfer implementation
+- **RBI** - Remote Browser Isolation with Chrome/CDP
+
+**Independent Publishing**:
+Each guacr crate can be published independently to crates.io:
+```bash
+# Publish individual crate
+cd crates/guacr-ssh
+cargo publish
+
+# Or use GitHub workflow (manual trigger)
+# .github/workflows/publish-crates.yml
+```
+
+**For External Users**:
+```toml
+[dependencies]
+guacr = { version = "1.1", features = ["ssh", "rdp"] }
+```
+
+**For Internal Use (Monorepo)**:
+```toml
+[dependencies]
+guacr = { path = "../guacr", features = ["ssh", "rdp"] }
+```
+
+See [docs/guacr/](docs/guacr/) for protocol handler documentation.
+
+### 4. Workspace-Wide Testing
 
 All quality checks run across **all crates**:
 - `cargo fmt --all` - Formats all crates

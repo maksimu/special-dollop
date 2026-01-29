@@ -323,8 +323,8 @@ async fn test_guacd_handshake_successful() {
                                         Ok(instr) => {
                                             println!("Server (success_new): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
                                             if instr.opcode == "size" {
-                                                // Size instruction contains only width and height (DPI is sent separately in connect instruction)
-                                                assert_eq!(instr.args, vec!["1024", "768"]);
+                                                // Guacamole protocol: size instruction has 3 args (width, height, dpi)
+                                                assert_eq!(instr.args, vec!["1024", "768", "96"]);
                                             } else if instr.opcode == "audio"
                                                 || instr.opcode == "video"
                                                 || instr.opcode == "image"

@@ -2035,7 +2035,7 @@ where
         let size_parts: Vec<String> = width_for_new
             .split(',')
             .chain(height_for_new.split(','))
-            // DPI is sent in the connect instruction as a parameter, not in the size instruction
+            .chain(dpi_for_new.split(','))
             .map(String::from)
             .collect();
         if unlikely!(should_log_connection(false)) {
@@ -2047,8 +2047,8 @@ where
 
         // **HANDSHAKE SIZE INSTRUCTION DETECTION**: Log for debugging (no Python signal)
         let size_instruction = GuacdInstruction::new("size".to_string(), size_parts.clone());
-        if size_parts.len() >= 2 && unlikely!(should_log_connection(false)) {
-            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {}) - DPI will be sent separately in connect instruction", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), dpi_for_new);
+        if size_parts.len() >= 3 && unlikely!(should_log_connection(false)) {
+            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {})", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), size_parts.get(2).map(|s| s.as_str()).unwrap_or("96"));
         }
 
         writer

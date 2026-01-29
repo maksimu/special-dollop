@@ -127,10 +127,14 @@ impl log::Log for ChannelLogger {
 /// Create a channel logger and return (logger, receiver)
 ///
 /// Usage:
-/// ```
+/// ```no_run
+/// use keeper_pam_webrtc_rs::python::channel_logger::create_channel_logger;
+/// use keeper_pam_webrtc_rs::python::logger_task::spawn_logger_task;
+///
 /// let (logger, receiver) = create_channel_logger(log::LevelFilter::Debug);
 /// log::set_boxed_logger(Box::new(logger)).unwrap();
-/// spawn_logger_task(receiver, runtime_handle);  // From logger_task.rs
+/// # let runtime_handle = todo!(); // Runtime handle from your tokio runtime
+/// spawn_logger_task(receiver, runtime_handle);
 /// ```
 pub fn create_channel_logger(
     level_filter: LevelFilter,

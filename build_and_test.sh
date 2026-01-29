@@ -17,16 +17,15 @@ echo "✓ Formatting check passed"
 echo ""
 
 echo "Running clippy..."
-# Skip CEF feature (requires binary download with cert issues)
-cargo clippy --workspace --all-targets --features chrome -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 echo "✓ Clippy check passed"
 echo ""
 
 echo "Running Rust unit tests..."
 # Test keeper-pam-webrtc-rs without Python support (pure Rust tests)
 cargo test -p keeper-pam-webrtc-rs --lib --no-default-features
-# Test all other workspace crates (excluding python-bindings which needs maturin)
-cargo test --workspace --lib --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+# Test all other workspace crates with all features (excluding python-bindings which needs maturin)
+cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
 echo "✓ Rust tests passed"
 echo ""
 

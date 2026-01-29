@@ -32,7 +32,7 @@ echo "✓ Formatting check passed"
 echo ""
 
 echo "Running cargo clippy..."
-if ! (cd ../.. && cargo clippy --workspace --all-targets --features chrome -- -D warnings); then
+if ! (cd ../.. && cargo clippy --workspace --all-targets --all-features -- -D warnings); then
     echo "ERROR: Clippy linting failed!"
     echo "Fix the warnings above before proceeding."
     exit 1
@@ -49,7 +49,7 @@ echo "========================================"
 
 echo "Running Rust unit tests..."
 (cd ../.. && cargo test -p keeper-pam-webrtc-rs --lib --no-default-features)
-(cd ../.. && cargo test --workspace --lib --exclude keeper-pam-webrtc-rs --exclude python-bindings)
+(cd ../.. && cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude python-bindings)
 echo "✓ Rust unit tests passed"
 echo ""
 

@@ -85,8 +85,8 @@ jobs:
         run: |
           # Test keeper-pam-webrtc-rs without Python support (pure Rust)
           cargo test -p keeper-pam-webrtc-rs --lib --no-default-features
-          # Test all other workspace crates (excluding python-bindings which needs maturin)
-          cargo test --workspace --lib --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+          # Test all other workspace crates with all features (excluding python-bindings which needs maturin)
+          cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 

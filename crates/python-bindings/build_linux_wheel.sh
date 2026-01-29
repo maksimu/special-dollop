@@ -22,7 +22,7 @@ fi
 echo "Building Linux x86_64 wheel with manylinux 2014 compliance..."
 
 docker run --rm --platform linux/amd64 \
-  -v "$(pwd)":/io \
+  -v "$WORKSPACE_ROOT":/io \
   $CERT_MOUNT \
   $CERT_ENVS \
   quay.io/pypa/manylinux2014_x86_64 bash -c "
@@ -115,7 +115,7 @@ CARGO_EOF
     
     # Build the wheel with manylinux 2014 compliance
     # Building inside manylinux2014 container ensures glibc 2.17 compatibility
-    cd /io
+    cd /io/crates/python-bindings
     /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2014
     
     # Ensure wheels are in target/wheels

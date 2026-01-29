@@ -39,10 +39,9 @@ if [ -f "$WORKSPACE_ROOT/combined_certs.pem" ]; then
 fi
 
 # Build with handlers using manylinux_2_28 (AlmaLinux 8) for better compatibility
-# Mount the entire workspace so all crates are accessible
+# Mount the workspace root at /io so maturin can find the workspace
 docker run --rm --platform linux/amd64 \
-  -v "$WORKSPACE_ROOT":/workspace:ro \
-  -v "$SCRIPT_DIR":/io \
+  -v "$WORKSPACE_ROOT":/io \
   $CERT_MOUNT \
   $CERT_ENVS \
   quay.io/pypa/manylinux_2_28_x86_64 bash -c '
@@ -297,18 +296,15 @@ docker run --rm --platform linux/amd64 \
             exit 1
         fi
         
-        # Return to /io
-        cd /io
-        
         # Verify workspace is mounted with guacr crate
-        if [ ! -d /workspace/crates/guacr ]; then
-            echo "ERROR: workspace not properly mounted at /workspace or guacr crate missing"
+        if [ ! -d /io/crates/guacr ]; then
+            echo "ERROR: workspace not properly mounted at /io or guacr crate missing"
             exit 1
         fi
-        
-        echo "Workspace mounted successfully at /workspace"
+
+        echo "Workspace mounted successfully at /io"
         echo "Available crates:"
-        ls -la /workspace/crates/
+        ls -la /io/crates/
         
         echo "IronRDP will be fetched from git during build from https://github.com/miroberts/IronRDP.git"
         
@@ -318,12 +314,14 @@ docker run --rm --platform linux/amd64 \
         
         # Build with handlers - use manylinux_2_28 (better compatibility than 2_34)
         echo "Building wheel with handlers..."
-        
+
         # Ensure PKG_CONFIG_PATH is set for cargo to find FreeRDP 3.x
         export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
-        
-        cd /io && /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
-        
+
+        # Navigate to python-bindings crate within workspace (matches CI approach)
+        cd /io/crates/python-bindings
+        /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
+
         echo "Build complete!"
         ls -la /io/target/wheels/
       '

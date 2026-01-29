@@ -191,15 +191,15 @@ import keeper_pam_connections
 ## Documentation
 
 ### 📚 Quick Start
-- **Python Users**: [Python API Contract](docs/PYTHON_API_CONTRACT.md)
+- **Python Users**: [Python API Contract](crates/python-bindings/docs/PYTHON_API_CONTRACT.md)
 - **Architecture Overview**: [Architecture Explanation](docs/ARCHITECTURE_EXPLANATION.md)
 - **Testing Guide**: [Testing Strategy](docs/TESTING_STRATEGY.md)
 
 ### 🏗️ Architecture & Design
-- [Actor + DashMap + RAII](docs/ACTOR_DASHMAP_RAII.md) - Registry concurrency architecture
-- [Failure Isolation](docs/FAILURE_ISOLATION_ARCHITECTURE.md) - WebRTC isolation, circuit breakers
-- [Hot Path Optimizations](docs/HOT_PATH_OPTIMIZATION_SUMMARY.md) - Performance details
-- [Performance Benchmarks](docs/PERFORMANCE_BENCHMARKS.md) - Measured results
+- [Actor + DashMap + RAII](crates/keeper-pam-webrtc-rs/docs/ACTOR_DASHMAP_RAII.md) - Registry concurrency architecture
+- [Failure Isolation](crates/keeper-pam-webrtc-rs/docs/FAILURE_ISOLATION_ARCHITECTURE.md) - WebRTC isolation, circuit breakers
+- [Hot Path Optimizations](crates/keeper-pam-webrtc-rs/docs/HOT_PATH_OPTIMIZATION_SUMMARY.md) - Performance details
+- [Performance Benchmarks](crates/keeper-pam-webrtc-rs/docs/PERFORMANCE_BENCHMARKS.md) - Measured results
 
 ### 🔧 Implementation Details
 - [Testing Strategy](docs/TESTING_STRATEGY.md) - Workspace-wide testing approach

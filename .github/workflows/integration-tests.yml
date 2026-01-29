@@ -220,7 +220,7 @@ jobs:
           chromium-browser --version
 
       - name: Run RBI integration tests
-        run: cargo test -p guacr-rbi --test integration_test --features chrome -- --include-ignored --test-threads=1
+        run: cargo test -p guacr-rbi --test integration_test --all-features -- --include-ignored --test-threads=1
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           CHROMIUM_PATH: /usr/bin/chromium-browser

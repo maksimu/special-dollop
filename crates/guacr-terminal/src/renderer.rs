@@ -1,9 +1,7 @@
 use crate::config::ColorScheme;
 use crate::Result;
 use fontdue::{Font, FontSettings};
-use guacr_protocol::{
-    format_blob, format_cfill, format_end, format_instruction, format_rect, format_transfer,
-};
+use guacr_protocol::{format_cfill, format_instruction, format_rect, format_transfer};
 use image::{Rgb, RgbImage};
 
 // Primary font: Noto Sans Mono (SIL Open Font License)
@@ -151,19 +149,35 @@ impl TerminalRenderer {
     /// Render terminal screen to JPEG
     ///
     /// Renders at exact pixel dimensions, padding if necessary to match browser's layer size
+    /// Uses default quality of 65
     pub fn render_screen(&self, screen: &vt100::Screen, rows: u16, cols: u16) -> Result<Vec<u8>> {
-        self.render_screen_with_size(
+        self.render_screen_with_quality(screen, rows, cols, 65)
+    }
+
+    /// Render terminal screen with adaptive quality (for bandwidth optimization)
+    ///
+    /// Same as render_screen but allows specifying JPEG quality (10-100)
+    pub fn render_screen_with_quality(
+        &self,
+        screen: &vt100::Screen,
+        rows: u16,
+        cols: u16,
+        quality: u8,
+    ) -> Result<Vec<u8>> {
+        self.render_screen_with_size_and_quality(
             screen,
             rows,
             cols,
             cols as u32 * self.char_width,
             rows as u32 * self.char_height,
+            quality,
         )
     }
 
     /// Render only a specific region of the terminal (dirty region optimization)
     ///
     /// This is the guacd optimization - only render changed portions of the screen
+    /// Uses default quality of 65
     pub fn render_region(
         &self,
         screen: &vt100::Screen,
@@ -171,6 +185,21 @@ impl TerminalRenderer {
         max_row: u16,
         min_col: u16,
         max_col: u16,
+    ) -> Result<(Vec<u8>, u32, u32, u32, u32)> {
+        self.render_region_with_quality(screen, min_row, max_row, min_col, max_col, 65)
+    }
+
+    /// Render region with adaptive quality (for bandwidth optimization)
+    ///
+    /// Same as render_region but allows specifying JPEG quality (10-100)
+    pub fn render_region_with_quality(
+        &self,
+        screen: &vt100::Screen,
+        min_row: u16,
+        max_row: u16,
+        min_col: u16,
+        max_col: u16,
+        quality: u8,
     ) -> Result<(Vec<u8>, u32, u32, u32, u32)> {
         let width = (max_col - min_col + 1) as u32;
         let height = (max_row - min_row + 1) as u32;
@@ -199,11 +228,12 @@ impl TerminalRenderer {
             }
         }
 
-        // Consistent JPEG quality for uniform appearance
-        // Quality 65 provides good balance: crisp text, small file size
-        // Consistent quality prevents jarring visual differences between updates
+        // JPEG encoding with specified quality (10-100)
+        // Higher quality = better text clarity but larger file size
+        // Lower quality = smaller bandwidth usage for slow connections
         let mut jpeg_data = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 65);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, quality);
         encoder.encode_image(&img)?;
 
         // Return JPEG + position info (x, y in pixels)
@@ -215,7 +245,7 @@ impl TerminalRenderer {
     /// Render terminal screen to JPEG with exact pixel dimensions
     ///
     /// This version allows specifying exact output dimensions, useful for
-    /// matching browser layer size exactly.
+    /// matching browser layer size exactly. Uses default quality of 65.
     pub fn render_screen_with_size(
         &self,
         screen: &vt100::Screen,
@@ -223,6 +253,21 @@ impl TerminalRenderer {
         cols: u16,
         width_px: u32,
         height_px: u32,
+    ) -> Result<Vec<u8>> {
+        self.render_screen_with_size_and_quality(screen, rows, cols, width_px, height_px, 65)
+    }
+
+    /// Render terminal screen with exact dimensions and adaptive quality
+    ///
+    /// Allows full control over output dimensions and JPEG quality (10-100)
+    pub fn render_screen_with_size_and_quality(
+        &self,
+        screen: &vt100::Screen,
+        rows: u16,
+        cols: u16,
+        width_px: u32,
+        height_px: u32,
+        quality: u8,
     ) -> Result<Vec<u8>> {
         // CRITICAL: Prevent rendering zero-size images (causes black screen)
         if width_px == 0 || height_px == 0 || rows == 0 || cols == 0 {
@@ -257,11 +302,12 @@ impl TerminalRenderer {
             }
         }
 
-        // Consistent JPEG quality for uniform appearance
-        // Quality 65 provides good balance: crisp text, small file size
-        // Same quality as dirty region renders for consistent visual experience
+        // JPEG encoding with specified quality (10-100)
+        // Higher quality = better text clarity but larger file size
+        // Lower quality = smaller bandwidth usage for slow connections
         let mut jpeg_data = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, 65);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, quality);
         encoder.encode_image(&img)?;
 
         Ok(jpeg_data)
@@ -684,63 +730,6 @@ impl TerminalRenderer {
                 }
             }
         }
-
-        instructions
-    }
-
-    /// Generate Guacamole protocol instructions to send a JPEG image
-    ///
-    /// This is what guacd actually uses - JPEG images for terminal rendering.
-    /// JPEG encoding is fast and efficient for terminal screenshots.
-    pub fn format_img_instructions(
-        &self,
-        image_data: &[u8],
-        stream_id: u32,
-        layer: i32,
-        x: i32,
-        y: i32,
-    ) -> Vec<String> {
-        use base64::Engine;
-
-        const BLOB_CHUNK_SIZE: usize = 6144; // 6KB chunks (8KB base64-encoded)
-        let mut instructions = Vec::new();
-
-        // 1. img instruction: allocate stream for image
-        // Format: img,<stream>,<mask>,<layer>,<mimetype>,<x>,<y>;
-        // Every element needs LENGTH.VALUE format
-        let mask = 0x07; // RGB channels (no alpha) - matches RgbImage format
-        let stream_str = stream_id.to_string();
-        let mask_str = mask.to_string();
-        let layer_str = layer.to_string();
-        let x_str = x.to_string();
-        let y_str = y.to_string();
-
-        let img_instr = format!(
-            "3.img,{}.{},{}.{},{}.{},10.image/jpeg,{}.{},{}.{};",
-            stream_str.len(),
-            stream_str,
-            mask_str.len(),
-            mask_str,
-            layer_str.len(),
-            layer_str,
-            x_str.len(),
-            x_str,
-            y_str.len(),
-            y_str
-        );
-        instructions.push(img_instr);
-
-        // 2. blob instructions: send base64-encoded JPEG data in chunks
-        let base64_data = base64::engine::general_purpose::STANDARD.encode(image_data);
-
-        for chunk in base64_data.as_bytes().chunks(BLOB_CHUNK_SIZE) {
-            let chunk_str = String::from_utf8_lossy(chunk);
-            let blob_instr = format_blob(stream_id, &chunk_str);
-            instructions.push(blob_instr);
-        }
-
-        // 3. end instruction: close stream
-        instructions.push(format_end(stream_id));
 
         instructions
     }

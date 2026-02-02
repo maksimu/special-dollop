@@ -24,6 +24,8 @@ impl RuntimeHandle {
     }
 
     /// Block on a future using this runtime
+    /// Used extensively by Python bindings (tube_registry_binding.rs has 22+ calls)
+    #[allow(dead_code)] // Called from Python bindings, Rust analyzer doesn't detect cross-FFI usage
     pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
     }

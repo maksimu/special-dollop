@@ -4,6 +4,10 @@ use guacr_handlers::{
     // Connection utilities
     connect_tcp_with_timeout,
     is_mouse_event_allowed_readonly,
+    // Adaptive quality (bandwidth-aware quality adjustment, shared with RDP)
+    AdaptiveQuality,
+    // Cursor support
+    CursorManager,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -16,6 +20,9 @@ use guacr_handlers::{
     ProtocolHandler,
     // Recording
     RecordingConfig,
+    StandardCursor,
+    // Sync flow control (prevents overwhelming slow clients, shared with RDP)
+    SyncFlowControl,
     DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
 use guacr_protocol::{BinaryEncoder, GuacamoleParser};
@@ -425,7 +432,8 @@ struct VncClient {
     recorder: Option<MultiFormatRecorder>,
     /// Scroll detector for bandwidth optimization (shared with RDP)
     scroll_detector: ScrollDetector,
-    /// JPEG quality (1-100)
+    /// JPEG quality (1-100) - max quality for adaptive quality manager
+    #[allow(dead_code)] // Used only to initialize adaptive_quality
     jpeg_quality: u8,
     /// Use JPEG encoding (vs PNG)
     use_jpeg: bool,
@@ -438,6 +446,14 @@ struct VncClient {
     frame_rate: u32,
     #[cfg(feature = "sftp")]
     sftp_session: Option<russh_sftp::client::SftpSession>,
+    /// Cursor manager for client-side cursor rendering (matches KCM behavior)
+    cursor_manager: CursorManager,
+    /// VNC pixel format (needed for cursor parsing)
+    pixel_format: Option<crate::vnc_protocol::VncPixelFormat>,
+    /// Adaptive quality manager (bandwidth-aware quality adjustment, shared with RDP)
+    adaptive_quality: AdaptiveQuality,
+    /// Sync flow control (prevents overwhelming slow clients, shared with RDP)
+    sync_control: SyncFlowControl,
     to_client: mpsc::Sender<Bytes>,
 }
 
@@ -497,6 +513,10 @@ impl VncClient {
             frame_rate,
             #[cfg(feature = "sftp")]
             sftp_session: None,
+            cursor_manager: CursorManager::new(supports_jpeg, supports_webp, jpeg_quality),
+            pixel_format: None,
+            adaptive_quality: AdaptiveQuality::new(jpeg_quality),
+            sync_control: SyncFlowControl::new(),
             to_client,
         }
     }
@@ -563,33 +583,37 @@ impl VncClient {
         let rect_pixels = rect.width * rect.height;
         let is_large_update = rect_pixels > total_pixels / 10; // >10% of screen
 
+        // Get adaptive quality based on measured throughput (bandwidth-aware)
+        let adaptive_quality = self.adaptive_quality.calculate_quality();
+
         if self.supports_webp {
             // WebP: Best of both worlds
             let region_pixels = self.framebuffer.get_region_pixels(rect);
             if is_large_update {
-                // Large update: WebP lossy
-                let quality = self.jpeg_quality as f32 / 100.0;
+                // Large update: WebP lossy with adaptive quality
+                let quality = adaptive_quality as f32 / 100.0;
                 Self::encode_webp_lossy(&region_pixels, rect.width, rect.height, quality)
             } else {
-                // Small update: WebP lossless
+                // Small update: WebP lossless (quality doesn't matter)
                 Self::encode_webp_lossless(&region_pixels, rect.width, rect.height)
             }
         } else if self.supports_jpeg && self.use_jpeg {
-            // Fallback: JPEG encoding (only if client supports it)
+            // Fallback: JPEG encoding with adaptive quality
             let region_pixels = self.framebuffer.get_region_pixels(rect);
-            Self::encode_jpeg(&region_pixels, rect.width, rect.height, self.jpeg_quality)
+            Self::encode_jpeg(&region_pixels, rect.width, rect.height, adaptive_quality)
         } else {
-            // Fallback: PNG encoding (always supported)
+            // Fallback: PNG encoding (always supported, lossless)
             self.framebuffer
                 .encode_region(rect)
                 .map_err(|e| format!("PNG encoding failed: {}", e))
         }
     }
 
-    /// Send sync instruction for frame timing
+    /// Send sync instruction for frame timing and flow control
     ///
     /// Helps with session recording playback timing and client-side frame synchronization.
-    async fn send_sync(&self) -> Result<(), String> {
+    /// Also enables flow control to prevent overwhelming slow clients.
+    async fn send_sync(&mut self) -> Result<(), String> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -600,7 +624,12 @@ impl VncClient {
         self.to_client
             .send(Bytes::from(sync_instr))
             .await
-            .map_err(|e| format!("Failed to send sync: {}", e))
+            .map_err(|e| format!("Failed to send sync: {}", e))?;
+
+        // Store pending sync for flow control (prevents overwhelming slow clients)
+        self.sync_control.set_pending_sync(timestamp);
+
+        Ok(())
     }
 
     async fn connect(
@@ -625,7 +654,7 @@ impl VncClient {
 
         info!("VNC: TCP connection established");
 
-        let (_version, _pixel_format, server_width, server_height, server_name) =
+        let (_version, pixel_format, server_width, server_height, server_name) =
             VncProtocol::handshake(&mut stream, password)
                 .await
                 .map_err(|e| format!("VNC handshake failed: {}", e))?;
@@ -638,6 +667,7 @@ impl VncClient {
         self.width = server_width as u32;
         self.height = server_height as u32;
         self.framebuffer = FrameBuffer::new(self.width, self.height);
+        self.pixel_format = Some(pixel_format);
 
         // Send ready instruction with proper LENGTH.VALUE format
         let ready_value = "vnc-ready";
@@ -652,6 +682,23 @@ impl VncClient {
             .send(size_instr)
             .await
             .map_err(|e| format!("Failed to send size: {}", e))?;
+
+        // Set initial cursor to pointer (matches KCM/guacamole behavior)
+        if !self.read_only {
+            let cursor_instr = self
+                .cursor_manager
+                .send_standard_cursor(StandardCursor::Pointer);
+            self.to_client
+                .send(Bytes::from(cursor_instr))
+                .await
+                .map_err(|e| format!("Failed to send initial cursor: {}", e))?;
+            info!("VNC: Initial cursor set to pointer");
+        }
+
+        // Enable cursor pseudo-encoding for client-side cursor rendering (matches KCM)
+        VncProtocol::send_set_encodings(&mut stream, !self.read_only)
+            .await
+            .map_err(|e| format!("Failed to send encodings: {}", e))?;
 
         #[cfg(feature = "sftp")]
         if let Some(settings) = settings {
@@ -723,6 +770,16 @@ impl VncClient {
                             if let Err(e) = self.process_vnc_messages(&mut stream, &read_buf[..n]).await {
                                 error!("VNC: Error processing messages: {}", e);
                                 break;
+                            }
+
+                            // Wait for client sync acknowledgment if pending (flow control)
+                            if let Some(ts) = self.sync_control.pending_timestamp() {
+                                if let Err(e) = self.sync_control.wait_for_client_sync(&mut from_client, ts).await {
+                                    warn!("VNC: Sync flow control error: {}", e);
+                                    break;
+                                }
+                                self.sync_control.clear_pending();
+                                trace!("VNC: Client acknowledged sync, ready for next frame");
                             }
                         }
                         Err(e) => {
@@ -866,11 +923,68 @@ impl VncClient {
         Ok(())
     }
 
+    /// Handle cursor update from VNC server (client-side cursor rendering)
+    async fn handle_cursor_update(
+        &mut self,
+        rect: crate::vnc_protocol::VncRectangle,
+    ) -> Result<(), String> {
+        if self.read_only {
+            // Don't send cursor updates in read-only mode
+            return Ok(());
+        }
+
+        // Parse cursor data from VNC
+        let pixel_format = self
+            .pixel_format
+            .as_ref()
+            .ok_or_else(|| "Pixel format not set".to_string())?;
+
+        let cursor = crate::vnc_protocol::VncProtocol::parse_cursor_data(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            &rect.pixels,
+            pixel_format,
+        )?;
+
+        // Send cursor to client using shared cursor manager
+        let instructions = self.cursor_manager.send_custom_cursor(
+            &cursor.rgba_data,
+            cursor.width as u32,
+            cursor.height as u32,
+            cursor.hotspot_x as i32,
+            cursor.hotspot_y as i32,
+        )?;
+
+        for instr in instructions {
+            self.to_client
+                .send(Bytes::from(instr))
+                .await
+                .map_err(|e| format!("Failed to send cursor instruction: {}", e))?;
+        }
+
+        debug!(
+            "VNC: Sent cursor update {}x{} with hotspot ({}, {})",
+            cursor.width, cursor.height, cursor.hotspot_x, cursor.hotspot_y
+        );
+
+        Ok(())
+    }
+
     async fn handle_framebuffer_rectangle(
         &mut self,
         rect: crate::vnc_protocol::VncRectangle,
     ) -> Result<(), String> {
-        if rect.encoding == -239 {
+        // Check for cursor pseudo-encoding (-239 = Rich Cursor, -240 = X Cursor)
+        if rect.encoding == crate::vnc_protocol::encodings::CURSOR
+            || rect.encoding == crate::vnc_protocol::encodings::X_CURSOR
+        {
+            return self.handle_cursor_update(rect).await;
+        }
+
+        // Check for CopyRect encoding
+        if rect.encoding == crate::vnc_protocol::encodings::COPYRECT {
             warn!("VNC: CopyRect encoding not yet implemented, requesting full update");
             return Ok(());
         }
@@ -945,6 +1059,10 @@ impl VncClient {
                         height: scroll_op.pixels,
                     })?;
 
+                    // Track bytes for adaptive quality
+                    self.adaptive_quality
+                        .track_frame_sent(new_region_data.len());
+
                     let msg = self.binary_encoder.encode_image(
                         self.stream_id,
                         0,
@@ -990,6 +1108,10 @@ impl VncClient {
                         height: scroll_op.pixels,
                     })?;
 
+                    // Track bytes for adaptive quality
+                    self.adaptive_quality
+                        .track_frame_sent(new_region_data.len());
+
                     let msg = self.binary_encoder.encode_image(
                         self.stream_id,
                         0,
@@ -1031,8 +1153,10 @@ impl VncClient {
                 dirty_rects.len()
             );
 
+            let mut total_bytes = 0;
             for dirty_rect in &dirty_rects {
                 let encoded_data = self.encode_region(*dirty_rect)?;
+                total_bytes += encoded_data.len();
                 let encoded_bytes = Bytes::from(encoded_data);
 
                 let msg = self.binary_encoder.encode_image(
@@ -1051,6 +1175,9 @@ impl VncClient {
                     .await
                     .map_err(|e| format!("Failed to send image: {}", e))?;
             }
+
+            // Track total bytes sent for adaptive quality calculation
+            self.adaptive_quality.track_frame_sent(total_bytes);
 
             // Send sync after all dirty rects
             self.send_sync().await?;
@@ -1073,6 +1200,7 @@ impl VncClient {
             };
 
             let encoded_data = self.encode_region(full_screen)?;
+            let total_bytes = encoded_data.len();
             let encoded_bytes = Bytes::from(encoded_data);
 
             let msg = self.binary_encoder.encode_image(
@@ -1090,6 +1218,9 @@ impl VncClient {
                 .send(msg)
                 .await
                 .map_err(|e| format!("Failed to send image: {}", e))?;
+
+            // Track bytes sent for adaptive quality calculation
+            self.adaptive_quality.track_frame_sent(total_bytes);
 
             // Send sync after full screen
             self.send_sync().await?;

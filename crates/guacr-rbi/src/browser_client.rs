@@ -16,6 +16,8 @@ use bytes::Bytes;
 use guacr_protocol::{BinaryEncoder, GuacamoleParser};
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
+// Sync flow control (shared with RDP/VNC)
+use guacr_handlers::SyncFlowControl;
 
 /// Browser client for RBI sessions
 pub struct BrowserClient {
@@ -28,6 +30,7 @@ pub struct BrowserClient {
     clipboard: RbiClipboard,
     upload_engine: UploadEngine,
     dialog_manager: JsDialogManager,
+    sync_control: SyncFlowControl,
 }
 
 impl BrowserClient {
@@ -56,6 +59,7 @@ impl BrowserClient {
             clipboard,
             upload_engine: UploadEngine::new(upload_config),
             dialog_manager: JsDialogManager::new(dialog_config),
+            sync_control: SyncFlowControl::new(),
             config,
         }
     }
@@ -267,12 +271,25 @@ impl BrowserClient {
                             let frame_changed = dirty_tracker.has_changed(&screenshot);
 
                             if frame_changed {
-                                // Send only changed frames
-                                let msg = self.handle_screenshot(&screenshot)?;
-                                if let Err(e) = to_client.send(msg).await {
+                                // Send only changed frames (using chunked blob protocol)
+                                if let Err(e) = self.send_screenshot(&screenshot, &to_client).await {
                                     warn!("RBI: Failed to send screenshot: {}", e);
                                     break;
                                 }
+
+                                // Send sync instruction for flow control (prevents overwhelming slow clients)
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
+
+                                if let Err(e) = to_client.send(Bytes::from(sync_instr)).await {
+                                    warn!("RBI: Failed to send sync: {}", e);
+                                    break;
+                                }
+
+                                self.sync_control.set_pending_sync(timestamp);
                             }
 
                             // Boost FPS if actively scrolling
@@ -438,8 +455,7 @@ impl BrowserClient {
                                     match chrome_session.capture_screenshot().await {
                                         Ok(Some(screenshot)) => {
                                             if dirty_tracker.has_changed(&screenshot) {
-                                                let msg = self.handle_screenshot(&screenshot)?;
-                                                if let Err(e) = to_client.send(msg).await {
+                                                if let Err(e) = self.send_screenshot(&screenshot, &to_client).await {
                                                     warn!("RBI: Failed to send scroll frame: {}", e);
                                                 } else {
                                                     debug!("RBI: Sent immediate scroll frame");
@@ -492,8 +508,20 @@ impl BrowserClient {
                     }
                 }
 
-                // Handle client input
+                // Handle client input (including sync acknowledgments for flow control)
                 Some(msg) = from_client.recv() => {
+                    // Check if this is a sync acknowledgment for flow control
+                    if let Ok(msg_str) = std::str::from_utf8(&msg) {
+                        if msg_str.starts_with("4.sync,") {
+                            // Client acknowledged sync - flow control satisfied
+                            if let Some(ts) = self.sync_control.pending_timestamp() {
+                                self.sync_control.clear_pending();
+                                debug!("RBI: Client acknowledged sync (ts={})", ts);
+                            }
+                            continue; // Don't process sync as input
+                        }
+                    }
+
                     if let Err(e) = self.handle_client_input(&mut chrome_session, &msg, &to_client).await {
                         warn!("RBI: Error handling input: {}", e);
                     }
@@ -844,36 +872,68 @@ impl BrowserClient {
         false
     }
 
-    /// Handle screenshot from browser
+    /// Send screenshot to client using chunked blob protocol
     ///
-    /// Returns Guacamole instructions for the screenshot.
-    /// Automatically detects format (JPEG or PNG) from image header.
-    pub fn handle_screenshot(&mut self, screenshot: &[u8]) -> Result<Bytes, String> {
-        // Convert screenshot to Bytes
-        let screenshot_bytes = Bytes::from(screenshot.to_vec());
+    /// This uses the shared chunking logic from guacr-protocol, matching RDP/SSH/Terminal.
+    /// Pattern: img instruction + chunked blobs (6KB each) + end instruction.
+    async fn send_screenshot(
+        &mut self,
+        screenshot: &[u8],
+        to_client: &mpsc::Sender<Bytes>,
+    ) -> Result<(), String> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use guacr_protocol::{format_chunked_blobs, TextProtocolEncoder};
 
         // Detect image format from header
         // JPEG: starts with 0xFF 0xD8
         // PNG: starts with 0x89 0x50 0x4E 0x47
-        let format = if screenshot.len() >= 2 && screenshot[0] == 0xFF && screenshot[1] == 0xD8 {
-            1 // JPEG
+        let mimetype = if screenshot.len() >= 2 && screenshot[0] == 0xFF && screenshot[1] == 0xD8 {
+            "image/jpeg"
         } else {
-            0 // PNG (default)
+            "image/png"
         };
 
-        // Format as binary protocol message (zero-copy)
-        let msg = self.binary_encoder.encode_image(
+        // Base64 encode the screenshot
+        let base64_data = BASE64.encode(screenshot);
+        let base64_len = base64_data.len();
+
+        debug!(
+            "RBI: Sending screenshot ({} KB, {})",
+            base64_len / 1024,
+            mimetype
+        );
+
+        // Send img instruction with metadata
+        let mut text_encoder = TextProtocolEncoder::new();
+        let img_instr = text_encoder.format_img_instruction(
             self.stream_id,
             0, // layer
             0, // x
             0, // y
-            self.width as u16,
-            self.height as u16,
-            format,
-            screenshot_bytes,
+            mimetype,
         );
 
-        Ok(msg)
+        to_client
+            .send(img_instr.freeze())
+            .await
+            .map_err(|e| format!("Failed to send img instruction: {}", e))?;
+
+        // Send blob data in 6KB chunks + end instruction (shared logic from guacr-protocol)
+        let blob_instructions = format_chunked_blobs(self.stream_id, &base64_data, None);
+
+        debug!(
+            "RBI: Sending {} blob chunks + end instruction",
+            blob_instructions.len() - 1 // -1 for end instruction
+        );
+
+        for (idx, instr) in blob_instructions.iter().enumerate() {
+            to_client
+                .send(Bytes::from(instr.clone()))
+                .await
+                .map_err(|e| format!("Failed to send instruction {}: {}", idx, e))?;
+        }
+
+        Ok(())
     }
 }
 

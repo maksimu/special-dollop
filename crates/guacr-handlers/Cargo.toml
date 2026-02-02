@@ -29,6 +29,10 @@ parking_lot = "0.12"
 chrono = "0.4"
 base64.workspace = true
 
+# Image encoding for cursor support
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+webp = "0.3"
+
 # Host key verification
 sha2 = "0.10"
 sha1 = "0.10"

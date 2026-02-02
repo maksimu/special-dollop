@@ -112,13 +112,57 @@ pub struct ResourceLimits {
     pub timeout_seconds: u64, // Max session duration (default: 3600 = 1 hour)
 }
 
+impl RbiConfig {
+    /// Auto-detect Chromium/Chrome installation path
+    fn find_chromium_path() -> String {
+        // Common Chromium/Chrome paths across different Linux distributions
+        let candidates = vec![
+            "/usr/bin/chromium",                                            // Debian/Ubuntu
+            "/usr/bin/chromium-browser",                                    // Rocky/RHEL/CentOS
+            "/usr/lib64/chromium-browser/chromium-browser",                 // Rocky/RHEL alternate
+            "/usr/bin/google-chrome",                                       // Google Chrome
+            "/usr/bin/google-chrome-stable",                                // Google Chrome stable
+            "/snap/bin/chromium",                                           // Snap package
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", // macOS
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",           // macOS Chromium
+        ];
+
+        for path in candidates {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+
+        // Fallback: try to find via which command
+        if let Ok(output) = std::process::Command::new("which")
+            .arg("chromium-browser")
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(path) = String::from_utf8(output.stdout) {
+                    let path = path.trim();
+                    if !path.is_empty() && std::path::Path::new(path).exists() {
+                        return path.to_string();
+                    }
+                }
+            }
+        }
+
+        // Last resort: return default and let it fail with helpful error
+        "/usr/bin/chromium".to_string()
+    }
+}
+
 impl Default for RbiConfig {
     fn default() -> Self {
+        // Auto-detect Chromium path
+        let chromium_path = Self::find_chromium_path();
+
         Self {
             backend: RbiBackend::ServoWithFallback, // Try Servo, fallback to Chrome
             default_width: 1920,
             default_height: 1080,
-            chromium_path: "/usr/bin/chromium".to_string(),
+            chromium_path,
             popup_handling: PopupHandling::Block,
             resource_limits: ResourceLimits {
                 max_memory_mb: 500,

@@ -820,10 +820,7 @@ impl Channel {
     }
 
     pub async fn run(mut self) -> Result<(), ChannelError> {
-        error!(
-            "DEBUG_CHANNEL_RUN: Channel.run() started (channel_id: {})",
-            self.channel_id
-        );
+        debug!("Channel.run() started (channel_id: {})", self.channel_id);
         self.setup_webrtc_state_monitoring();
 
         let mut buf = BytesMut::with_capacity(64 * 1024);

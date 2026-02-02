@@ -1544,7 +1544,9 @@ impl Tube {
         Ok(control_channel)
     }
 
-    // Close a specific channel by signaling its run loop to exit
+    /// Close a specific channel by signaling its run loop to exit
+    /// Used by Python bindings (tube_registry_binding.rs) and tests
+    #[allow(dead_code)] // Called from Python bindings, Rust analyzer doesn't detect cross-FFI usage
     pub(crate) async fn close_channel(
         &self,
         name: &str,

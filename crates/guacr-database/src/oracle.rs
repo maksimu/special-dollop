@@ -184,10 +184,14 @@ impl ProtocolHandler for OracleHandler {
         let mut recorder = init_recording(&recording_config, &params, "Oracle", cols, rows);
 
         // Send display initialization instructions (ready + size)
-        let (ready_instr, size_instr) =
+        let (ready_instr, cursor_instr, size_instr) =
             QueryExecutor::create_display_init_instructions(width, height);
         to_client
             .send(ready_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(cursor_instr)
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         to_client
@@ -195,7 +199,7 @@ impl ProtocolHandler for OracleHandler {
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        debug!("Oracle: Sent ready and size instructions");
+        debug!("Oracle: Sent ready, cursor and size instructions");
 
         // Check if real Oracle mode is available
         let real_mode = oracle_client_available();

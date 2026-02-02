@@ -88,6 +88,29 @@ impl Default for VncPixelFormat {
     }
 }
 
+/// VNC encoding types
+#[allow(dead_code)]
+pub mod encodings {
+    /// Raw encoding
+    pub const RAW: i32 = 0;
+    /// CopyRect encoding
+    pub const COPYRECT: i32 = 1;
+    /// RRE encoding
+    pub const RRE: i32 = 2;
+    /// Hextile encoding
+    pub const HEXTILE: i32 = 5;
+    /// ZRLE encoding
+    pub const ZRLE: i32 = 16;
+    /// Cursor pseudo-encoding (cursor shape update)
+    pub const CURSOR: i32 = -239;
+    /// DesktopSize pseudo-encoding
+    pub const DESKTOP_SIZE: i32 = -223;
+    /// X Cursor pseudo-encoding (X11 cursor format)
+    pub const X_CURSOR: i32 = -240;
+    /// Rich Cursor pseudo-encoding (RGBA cursor with alpha)
+    pub const RICH_CURSOR: i32 = -239;
+}
+
 /// VNC protocol handler
 pub struct VncProtocol;
 
@@ -430,7 +453,7 @@ impl VncProtocol {
                     .map_err(|e| format!("Failed to read raw pixels: {}", e))?;
                 pixels
             }
-            -239 => {
+            1 => {
                 // CopyRect encoding - just read source coordinates
                 let mut copyrect = [0u8; 4];
                 stream
@@ -460,6 +483,164 @@ impl VncProtocol {
             encoding,
             pixels,
         })
+    }
+
+    /// Parse cursor pseudo-encoding data
+    ///
+    /// VNC cursor format (Rich Cursor encoding -239):
+    /// - width x height pixels in server pixel format (RGBA or RGB)
+    /// - width x height bitmask (1 bit per pixel, packed into bytes)
+    ///
+    /// The x,y from the rectangle header are the hotspot coordinates.
+    pub fn parse_cursor_data(
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        data: &[u8],
+        pixel_format: &VncPixelFormat,
+    ) -> Result<VncCursor, String> {
+        if width == 0 || height == 0 {
+            return Err("Invalid cursor dimensions".to_string());
+        }
+
+        let pixel_count = (width as usize) * (height as usize);
+        let bytes_per_pixel = (pixel_format.bits_per_pixel / 8) as usize;
+        let pixel_data_size = pixel_count * bytes_per_pixel;
+
+        // Bitmask size (1 bit per pixel, rounded up to bytes)
+        let bitmask_size = pixel_count.div_ceil(8);
+
+        let expected_size = pixel_data_size + bitmask_size;
+        if data.len() < expected_size {
+            return Err(format!(
+                "Cursor data too short: expected {}, got {}",
+                expected_size,
+                data.len()
+            ));
+        }
+
+        // Extract pixel data and bitmask
+        let pixel_data = &data[..pixel_data_size];
+        let bitmask = &data[pixel_data_size..pixel_data_size + bitmask_size];
+
+        // Convert to RGBA format
+        let mut rgba_data = Vec::with_capacity(pixel_count * 4);
+
+        for i in 0..pixel_count {
+            let pixel_offset = i * bytes_per_pixel;
+
+            // Check bitmask (1 = visible, 0 = transparent)
+            let byte_idx = i / 8;
+            let bit_idx = 7 - (i % 8);
+            let is_visible = (bitmask[byte_idx] >> bit_idx) & 1 == 1;
+
+            // Extract RGB from pixel data based on pixel format
+            let (r, g, b) = if pixel_format.true_color {
+                // True color - extract RGB from pixel data
+                let pixel_bytes = &pixel_data[pixel_offset..pixel_offset + bytes_per_pixel];
+
+                // Read pixel value (big-endian or little-endian based on format)
+                let pixel_value = if pixel_format.big_endian {
+                    match bytes_per_pixel {
+                        4 => u32::from_be_bytes([
+                            pixel_bytes[0],
+                            pixel_bytes[1],
+                            pixel_bytes[2],
+                            pixel_bytes[3],
+                        ]),
+                        2 => u16::from_be_bytes([pixel_bytes[0], pixel_bytes[1]]) as u32,
+                        _ => pixel_bytes[0] as u32,
+                    }
+                } else {
+                    match bytes_per_pixel {
+                        4 => u32::from_le_bytes([
+                            pixel_bytes[0],
+                            pixel_bytes[1],
+                            pixel_bytes[2],
+                            pixel_bytes[3],
+                        ]),
+                        2 => u16::from_le_bytes([pixel_bytes[0], pixel_bytes[1]]) as u32,
+                        _ => pixel_bytes[0] as u32,
+                    }
+                };
+
+                // Extract RGB components using shifts and masks
+                let r =
+                    ((pixel_value >> pixel_format.red_shift) & pixel_format.red_max as u32) as u8;
+                let g = ((pixel_value >> pixel_format.green_shift) & pixel_format.green_max as u32)
+                    as u8;
+                let b =
+                    ((pixel_value >> pixel_format.blue_shift) & pixel_format.blue_max as u32) as u8;
+
+                // Scale to 8-bit (0-255)
+                let r = (r as u32 * 255 / pixel_format.red_max as u32) as u8;
+                let g = (g as u32 * 255 / pixel_format.green_max as u32) as u8;
+                let b = (b as u32 * 255 / pixel_format.blue_max as u32) as u8;
+
+                (r, g, b)
+            } else {
+                // Color map mode - not commonly used for cursors
+                warn!("VNC: Color map mode not supported for cursors, using black");
+                (0, 0, 0)
+            };
+
+            // Add RGBA pixel
+            rgba_data.push(r);
+            rgba_data.push(g);
+            rgba_data.push(b);
+            rgba_data.push(if is_visible { 255 } else { 0 }); // Alpha channel
+        }
+
+        Ok(VncCursor {
+            width,
+            height,
+            hotspot_x: x,
+            hotspot_y: y,
+            rgba_data,
+        })
+    }
+
+    /// Send SetEncodings message to enable cursor support
+    ///
+    /// Requests the VNC server to send cursor updates using pseudo-encodings.
+    /// This enables client-side cursor rendering for smooth cursor movement.
+    pub async fn send_set_encodings<S>(stream: &mut S, enable_cursor: bool) -> Result<(), String>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let mut encodings = vec![
+            encodings::RAW,      // Raw encoding (always supported)
+            encodings::COPYRECT, // CopyRect for scroll optimization
+            encodings::HEXTILE,  // Hextile for better compression
+        ];
+
+        // Add cursor pseudo-encoding if requested (for client-side cursor)
+        if enable_cursor {
+            encodings.push(encodings::CURSOR); // Rich cursor with alpha
+            encodings.push(encodings::X_CURSOR); // X11 cursor format (fallback)
+        }
+
+        let mut message = vec![
+            2u8, // Message type: SetEncodings
+            0u8, // Padding
+        ];
+
+        // Number of encodings (2 bytes, big-endian)
+        message.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+
+        // Encoding types (4 bytes each, big-endian)
+        for encoding in encodings {
+            message.extend_from_slice(&encoding.to_be_bytes());
+        }
+
+        stream
+            .write_all(&message)
+            .await
+            .map_err(|e| format!("Failed to send SetEncodings: {}", e))?;
+
+        info!("VNC: Sent SetEncodings (cursor support: {})", enable_cursor);
+        Ok(())
     }
 
     /// Send FramebufferUpdateRequest
@@ -549,6 +730,22 @@ pub struct VncRectangle {
     pub height: u16,
     pub encoding: i32,
     pub pixels: Vec<u8>,
+}
+
+/// VNC cursor data (from cursor pseudo-encoding)
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // TODO: Used when parsing cursor updates from VNC server
+pub struct VncCursor {
+    /// Cursor width in pixels
+    pub width: u16,
+    /// Cursor height in pixels
+    pub height: u16,
+    /// X coordinate of hotspot (click point)
+    pub hotspot_x: u16,
+    /// Y coordinate of hotspot (click point)
+    pub hotspot_y: u16,
+    /// RGBA pixel data (4 bytes per pixel)
+    pub rgba_data: Vec<u8>,
 }
 
 #[cfg(test)]

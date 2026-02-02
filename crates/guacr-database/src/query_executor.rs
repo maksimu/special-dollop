@@ -3,7 +3,7 @@
 
 use crate::{DatabaseError, Result};
 use bytes::Bytes;
-use guacr_protocol::GuacamoleParser;
+use guacr_protocol::{format_chunked_blobs, GuacamoleParser, TextProtocolEncoder};
 use guacr_terminal::{
     DatabaseTerminal, DirtyTracker, QueryResult, TerminalInputHandler, TerminalRenderer,
 };
@@ -48,6 +48,9 @@ pub struct QueryExecutor {
 
     // Dirty region tracker for optimized rendering (only send changed portions)
     dirty_tracker: DirtyTracker,
+
+    // Zero-allocation protocol encoder (shared scratch buffer)
+    protocol_encoder: TextProtocolEncoder,
 }
 
 impl QueryExecutor {
@@ -83,6 +86,7 @@ impl QueryExecutor {
             input_handler: TerminalInputHandler::new_with_scrollback(rows, cols, 1000),
             input_dirty: false,
             dirty_tracker: DirtyTracker::new(rows, cols),
+            protocol_encoder: TextProtocolEncoder::new(),
         })
     }
 
@@ -92,16 +96,21 @@ impl QueryExecutor {
     }
 
     /// Generate Guacamole protocol display initialization instructions
-    /// Returns (ready_instruction, size_instruction)
-    pub fn create_display_init_instructions(width: u32, height: u32) -> (Bytes, Bytes) {
+    /// Returns (ready_instruction, cursor_instruction, size_instruction)
+    pub fn create_display_init_instructions(width: u32, height: u32) -> (Bytes, Bytes, Bytes) {
+        use guacr_protocol::format_cursor;
+
         // Create ready instruction with protocol name (matches SSH approach)
         let ready = Bytes::from(TerminalRenderer::format_ready_instruction("database"));
+
+        // Create cursor instruction to show default cursor (enables cursor visibility)
+        let cursor = Bytes::from(format_cursor(0, 0, 0, 0, 0, 0, 0));
 
         // Create size instruction with layer 0 (matches SSH approach)
         // This tells the client the dimensions of layer 0 where we'll render
         let size = Bytes::from(TerminalRenderer::format_size_instruction(0, width, height));
 
-        (ready, size)
+        (ready, cursor, size)
     }
 
     /// Get terminal size (rows, cols)
@@ -476,19 +485,44 @@ impl QueryExecutor {
                     )
                     .map_err(|e| DatabaseError::QueryError(format!("Render error: {}", e)))?;
 
-                let img_instructions = self.terminal.renderer().format_img_instructions(
-                    &jpeg_data,
+                // Base64 encode and send via modern zero-allocation protocol
+                let base64_data =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg_data);
+
+                let img_instr = self.protocol_encoder.format_img_instruction(
                     self.stream_id,
                     0,
                     x_px as i32,
                     y_px as i32,
+                    "image/jpeg",
                 );
-                img_instructions.into_iter().map(Bytes::from).collect()
+                let blob_instructions = format_chunked_blobs(self.stream_id, &base64_data, None);
+
+                let mut instructions = Vec::with_capacity(1 + blob_instructions.len());
+                instructions.push(img_instr.freeze());
+                instructions.extend(blob_instructions.into_iter().map(Bytes::from));
+                instructions
             } else {
                 // Full render - most of screen changed
                 let jpeg = self.terminal.render_jpeg()?;
-                let img_instructions = self.terminal.format_img_instructions(&jpeg, self.stream_id);
-                img_instructions.into_iter().map(Bytes::from).collect()
+
+                // Base64 encode and send via modern zero-allocation protocol
+                let base64_data =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
+
+                let img_instr = self.protocol_encoder.format_img_instruction(
+                    self.stream_id,
+                    0,
+                    0,
+                    0,
+                    "image/jpeg",
+                );
+                let blob_instructions = format_chunked_blobs(self.stream_id, &base64_data, None);
+
+                let mut instructions = Vec::with_capacity(1 + blob_instructions.len());
+                instructions.push(img_instr.freeze());
+                instructions.extend(blob_instructions.into_iter().map(Bytes::from));
+                instructions
             }
         } else {
             // No changes detected

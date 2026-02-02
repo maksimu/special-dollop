@@ -32,8 +32,8 @@ where
             match rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(result) => result,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // Log detailed error - this indicates a potential deadlock
-                    log::error!(
+                    // Log as warning - this indicates a potential deadlock
+                    log::warn!(
                         "safe_python_async_execute: TIMEOUT after 10s waiting for async task. \
                          This may indicate a deadlock when sending from within a Python callback. \
                          Check if send_handler_data is being called from within handle_events callback."

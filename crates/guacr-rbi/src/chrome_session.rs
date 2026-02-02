@@ -219,6 +219,8 @@ impl ChromeSession {
             "--incognito".to_string(), // Extra layer: don't persist anything by default
             "--disable-features=ChromeWhatsNewUI".to_string(),
             "--disable-domain-reliability".to_string(),
+            // Required when running as root (common in Docker containers)
+            "--no-sandbox".to_string(),
         ];
 
         // SECURITY: Session Isolation via Profile Directory
@@ -314,10 +316,11 @@ impl ChromeSession {
             }
         }
 
-        // Wait for page to load
-        page.wait_for_navigation()
-            .await
-            .map_err(|e| format!("Failed to wait for navigation: {}", e))?;
+        // Don't wait for navigation - start capturing immediately
+        // Like KCM, we rely on asynchronous load handlers and start
+        // capturing screenshots right away. The page will render
+        // progressively as content loads.
+        info!("RBI: Page navigation started (async)");
 
         self.browser = Some(browser);
         self.page = Some(page);
@@ -358,7 +361,7 @@ impl ChromeSession {
             .screenshot(
                 ScreenshotParams::builder()
                     .format(CaptureScreenshotFormat::Jpeg)
-                    .quality(85) // Good balance: 5-10x smaller than PNG, minimal quality loss
+                    .quality(50) // Lower quality to fit within 64KB WebRTC limit (was 85)
                     .build(),
             )
             .await

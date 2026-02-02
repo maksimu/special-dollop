@@ -144,10 +144,14 @@ impl ProtocolHandler for RedisHandler {
         let mut recorder = init_recording(&recording_config, &params, "Redis", cols, rows);
 
         // Send display initialization instructions (ready + size)
-        let (ready_instr, size_instr) =
+        let (ready_instr, cursor_instr, size_instr) =
             QueryExecutor::create_display_init_instructions(width, height);
         to_client
             .send(ready_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(cursor_instr)
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         to_client
@@ -155,7 +159,7 @@ impl ProtocolHandler for RedisHandler {
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        debug!("Redis: Sent ready and size instructions");
+        debug!("Redis: Sent ready, cursor and size instructions");
 
         // NOTE: Don't render initial screen yet - wait until after connection
         // This matches SSH behavior and prevents rendering at wrong dimensions

@@ -27,7 +27,7 @@ use guacr_handlers::{
     PIPE_NAME_STDIN,
     PIPE_STREAM_STDOUT,
 };
-use guacr_protocol::format_error;
+use guacr_protocol::{format_chunked_blobs, format_error, TextProtocolEncoder};
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, mouse_event_to_x11_sequence,
     parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction,
@@ -195,6 +195,9 @@ impl ProtocolHandler for TelnetHandler {
             terminal_config.color_scheme,
         )
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
+        // Zero-allocation protocol encoder (reused for all img instructions)
+        let mut protocol_encoder = TextProtocolEncoder::new();
 
         // Store backspace code for key handling
         let backspace_code = terminal_config.backspace_code;
@@ -771,9 +774,20 @@ impl ProtocolHandler for TelnetHandler {
                                         dirty.max_col,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
-                                    for instr in img_instructions {
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
+
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, 0, 0, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -785,9 +799,20 @@ impl ProtocolHandler for TelnetHandler {
                                         terminal.size().1,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
-                                    for instr in img_instructions {
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
+
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, 0, 0, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -804,9 +829,20 @@ impl ProtocolHandler for TelnetHandler {
                                     dirty.max_col,
                                 ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                                #[allow(deprecated)]
-                                let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
-                                for instr in img_instructions {
+                                // Base64 encode and send via modern zero-allocation protocol
+                                let base64_data = base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &jpeg,
+                                );
+
+                                let img_instr = protocol_encoder.format_img_instruction(
+                                    stream_id, 0, 0, 0, "image/jpeg",
+                                );
+                                to_client.send(img_instr.freeze()).await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                for instr in blob_instructions {
                                     to_client.send(Bytes::from(instr)).await
                                         .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                 }
@@ -819,9 +855,20 @@ impl ProtocolHandler for TelnetHandler {
                                 terminal.size().1,
                             ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                            #[allow(deprecated)]
-                            let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
-                            for instr in img_instructions {
+                            // Base64 encode and send via modern zero-allocation protocol
+                            let base64_data = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &jpeg,
+                            );
+
+                            let img_instr = protocol_encoder.format_img_instruction(
+                                stream_id, 0, 0, 0, "image/jpeg",
+                            );
+                            to_client.send(img_instr.freeze()).await
+                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                            let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                            for instr in blob_instructions {
                                 to_client.send(Bytes::from(instr)).await
                                     .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                             }

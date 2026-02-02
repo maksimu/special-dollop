@@ -147,10 +147,14 @@ impl ProtocolHandler for MongoDbHandler {
         let mut recorder = init_recording(&recording_config, &params, "MongoDB", cols, rows);
 
         // Send display initialization instructions (ready + size)
-        let (ready_instr, size_instr) =
+        let (ready_instr, cursor_instr, size_instr) =
             QueryExecutor::create_display_init_instructions(width, height);
         to_client
             .send(ready_instr)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        to_client
+            .send(cursor_instr)
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         to_client
@@ -158,7 +162,7 @@ impl ProtocolHandler for MongoDbHandler {
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        debug!("MongoDB: Sent ready and size instructions");
+        debug!("MongoDB: Sent ready, cursor and size instructions");
 
         // NOTE: Don't render initial screen yet - wait until after connection
         // This matches SSH behavior and prevents rendering at wrong dimensions

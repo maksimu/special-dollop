@@ -1916,12 +1916,21 @@ where
         .cloned()
         .unwrap_or_default();
 
-    let connect_params_for_new_conn: HashMap<String, String> = if join_connection_id_opt.is_none() {
-        guacd_params_locked.clone()
-    } else {
-        HashMap::new()
-    };
+    let mut connect_params_for_new_conn: HashMap<String, String> =
+        if join_connection_id_opt.is_none() {
+            guacd_params_locked.clone()
+        } else {
+            HashMap::new()
+        };
     drop(guacd_params_locked);
+
+    // Ensure width, height, and dpi are in connect params (needed for guacd connect instruction)
+    // These may have been extracted with defaults if not originally in guacd_params
+    if join_connection_id_opt.is_none() {
+        connect_params_for_new_conn.insert("width".to_string(), width_for_new.clone());
+        connect_params_for_new_conn.insert("height".to_string(), height_for_new.clone());
+        connect_params_for_new_conn.insert("dpi".to_string(), dpi_for_new.clone());
+    }
 
     let select_instruction = GuacdInstruction::new("select".to_string(), vec![select_arg.clone()]);
     if unlikely!(should_log_connection(false)) {
@@ -2032,10 +2041,11 @@ where
                 })
         };
 
+        // Standard guacd size instruction: size,<width>,<height>;
+        // DPI is passed via connection parameters only, not in size instruction
         let size_parts: Vec<String> = width_for_new
             .split(',')
             .chain(height_for_new.split(','))
-            .chain(dpi_for_new.split(','))
             .map(String::from)
             .collect();
         if unlikely!(should_log_connection(false)) {
@@ -2047,8 +2057,8 @@ where
 
         // **HANDSHAKE SIZE INSTRUCTION DETECTION**: Log for debugging (no Python signal)
         let size_instruction = GuacdInstruction::new("size".to_string(), size_parts.clone());
-        if size_parts.len() >= 3 && unlikely!(should_log_connection(false)) {
-            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {})", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), size_parts.get(2).map(|s| s.as_str()).unwrap_or("96"));
+        if size_parts.len() >= 2 && unlikely!(should_log_connection(false)) {
+            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {})", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), dpi_for_new);
         }
 
         writer

@@ -133,9 +133,8 @@ pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Resul
 // Handle control frames (COLD PATH - infrequent)
 #[cold]
 pub async fn handle_control(channel: &mut Channel, frame: Frame) -> Result<()> {
-    // ALWAYS log control messages with error!() to ensure visibility
     if unlikely(frame.payload.len() < CTRL_NO_LEN) {
-        error!("DEBUG_CONTROL_ENTRY: Malformed control frame - too short!");
+        error!("Malformed control frame - too short!");
         return Err(anyhow!("Malformed control frame"));
     }
 

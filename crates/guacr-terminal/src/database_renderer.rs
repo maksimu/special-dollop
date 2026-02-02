@@ -221,13 +221,6 @@ impl DatabaseTerminal {
         self.terminal.clear_dirty();
     }
 
-    /// Format Guacamole img instructions for the rendered image
-    #[allow(deprecated)]
-    pub fn format_img_instructions(&self, jpeg_data: &[u8], stream_id: u32) -> Vec<String> {
-        self.renderer
-            .format_img_instructions(jpeg_data, stream_id, 0, 0, 0)
-    }
-
     /// Format sync instruction to tell client to display buffered instructions
     pub fn format_sync_instruction(&self, timestamp_ms: u64) -> String {
         self.renderer.format_sync_instruction(timestamp_ms)

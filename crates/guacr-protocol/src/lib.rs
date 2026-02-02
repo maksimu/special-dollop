@@ -42,7 +42,9 @@ pub use binary::{
 pub use drawing::*;
 pub use layers::*;
 pub use parser::{GuacamoleParser, Instruction, ParseError};
-pub use streams::*;
+pub use streams::{
+    format_audio, format_bell_audio, format_blob, format_chunked_blobs, format_end, format_video,
+};
 pub use text_optimized::TextProtocolEncoder;
 
 /// Format a Guacamole protocol instruction

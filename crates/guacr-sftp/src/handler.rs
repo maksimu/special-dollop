@@ -15,7 +15,7 @@ use guacr_handlers::{
     // Security
     SftpSecuritySettings,
 };
-use guacr_terminal::TerminalRenderer;
+use guacr_protocol::{format_chunked_blobs, TextProtocolEncoder};
 use log::{debug, error, info, warn};
 use russh::client;
 use russh_keys::key;
@@ -345,16 +345,24 @@ impl ProtocolHandler for SftpHandler {
             FileBrowser::new(current_path.to_string_lossy().to_string(), file_entries);
 
         // Render initial file browser
-        let renderer = TerminalRenderer::new()
-            .map_err(|e| HandlerError::ProtocolError(format!("Renderer creation failed: {}", e)))?;
+        let mut protocol_encoder = TextProtocolEncoder::new();
         let mut stream_id = 1u32;
         let browser_image = file_browser
             .render_to_png(1920, 1080)
             .map_err(|e| HandlerError::ProtocolError(format!("Render failed: {}", e)))?;
 
-        #[allow(deprecated)]
-        let img_instructions = renderer.format_img_instructions(&browser_image, stream_id, 0, 0, 0);
-        for instr in img_instructions {
+        // Base64 encode and send via modern zero-allocation protocol
+        let base64_data =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &browser_image);
+
+        let img_instr = protocol_encoder.format_img_instruction(stream_id, 0, 0, 0, "image/png");
+        to_client
+            .send(img_instr.freeze())
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+        let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+        for instr in blob_instructions {
             to_client
                 .send(Bytes::from(instr))
                 .await
@@ -462,10 +470,23 @@ impl ProtocolHandler for SftpHandler {
                                                             .render_to_png(1920, 1080)
                                                             .map_err(|e| HandlerError::ProtocolError(format!("Render failed: {}", e)))?;
 
-                                                        #[allow(deprecated)]
-                                                        let img_instructions = renderer.format_img_instructions(&browser_image, stream_id, 0, 0, 0);
-                                                        for instr in img_instructions {
-                                                            to_client.send(Bytes::from(instr)).await
+                                                        // Base64 encode and send via modern zero-allocation protocol
+                                                        let base64_data = base64::Engine::encode(
+                                                            &base64::engine::general_purpose::STANDARD,
+                                                            &browser_image,
+                                                        );
+
+                                                        let img_instr = protocol_encoder.format_img_instruction(stream_id, 0, 0, 0, "image/png");
+                                                        to_client
+                                                            .send(img_instr.freeze())
+                                                            .await
+                                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                                        let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                                        for instr in blob_instructions {
+                                                            to_client
+                                                                .send(Bytes::from(instr))
+                                                                .await
                                                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                                         }
                                                         stream_id += 1;
@@ -615,10 +636,23 @@ impl ProtocolHandler for SftpHandler {
                                                             .render_to_png(1920, 1080)
                                                             .map_err(|e| HandlerError::ProtocolError(format!("Render failed: {}", e)))?;
 
-                                                        #[allow(deprecated)]
-                                                        let img_instructions = renderer.format_img_instructions(&browser_image, stream_id, 0, 0, 0);
-                                                        for instr in img_instructions {
-                                                            to_client.send(Bytes::from(instr)).await
+                                                        // Base64 encode and send via modern zero-allocation protocol
+                                                        let base64_data = base64::Engine::encode(
+                                                            &base64::engine::general_purpose::STANDARD,
+                                                            &browser_image,
+                                                        );
+
+                                                        let img_instr = protocol_encoder.format_img_instruction(stream_id, 0, 0, 0, "image/png");
+                                                        to_client
+                                                            .send(img_instr.freeze())
+                                                            .await
+                                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                                        let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                                        for instr in blob_instructions {
+                                                            to_client
+                                                                .send(Bytes::from(instr))
+                                                                .await
                                                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                                         }
                                                         stream_id += 1;

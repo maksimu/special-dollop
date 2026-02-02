@@ -9,7 +9,9 @@
 // Feature flags:
 // - `guacd-compat`: Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
 
+mod adaptive_quality;
 mod connection;
+mod cursor;
 mod error;
 mod events;
 mod handler;
@@ -20,6 +22,8 @@ mod pipe;
 mod recording;
 mod registry;
 mod security;
+mod sync_control;
+mod throughput;
 
 #[cfg(feature = "guacd-compat")]
 mod handshake;
@@ -27,10 +31,12 @@ mod handshake;
 #[cfg(test)]
 mod mock;
 
+pub use adaptive_quality::AdaptiveQuality;
 pub use connection::{
     connect_tcp_with_timeout, spawn_keepalive_task, ConnectionOptions, KeepAliveManager,
     DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
+pub use cursor::{send_cursor_instructions, CursorManager, StandardCursor};
 pub use error::{send_error_and_abort, send_error_best_effort, HandlerError, Result};
 pub use events::{
     connect_with_event_adapter, EventBasedHandler, EventCallback, HandlerEvent, InstructionSender,
@@ -99,6 +105,8 @@ pub use security::{
     CLIPBOARD_MAX_SIZE,
     CLIPBOARD_MIN_SIZE,
 };
+pub use sync_control::SyncFlowControl;
+pub use throughput::ThroughputTracker;
 
 // guacd wire protocol compatibility exports
 #[cfg(feature = "guacd-compat")]

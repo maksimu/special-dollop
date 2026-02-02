@@ -32,7 +32,8 @@ use guacr_handlers::{
     PIPE_STREAM_STDOUT,
 };
 use guacr_protocol::{
-    format_error, STATUS_CLIENT_UNAUTHORIZED, STATUS_UPSTREAM_ERROR, STATUS_UPSTREAM_TIMEOUT,
+    format_chunked_blobs, format_error, TextProtocolEncoder, STATUS_CLIENT_UNAUTHORIZED,
+    STATUS_UPSTREAM_ERROR, STATUS_UPSTREAM_TIMEOUT,
 };
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, parse_clipboard_blob,
@@ -620,6 +621,13 @@ impl ProtocolHandler for SshHandler {
         )
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
+        // Adaptive quality for bandwidth optimization (like RDP handler)
+        // Starts at quality 65 (default for terminal rendering), adjusts based on throughput
+        let mut adaptive_quality = guacr_handlers::AdaptiveQuality::new(65);
+
+        // Zero-allocation protocol encoder (reused for all img instructions)
+        let mut protocol_encoder = TextProtocolEncoder::new();
+
         // Store backspace code for key handling (before terminal_config moves)
         let backspace_code = terminal_config.backspace_code;
 
@@ -673,6 +681,15 @@ impl ProtocolHandler for SshHandler {
             .await
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
+        // Send cursor instruction to show default cursor (enables cursor visibility)
+        use guacr_protocol::format_cursor;
+        debug!("SSH: Sending cursor instruction");
+        let cursor_instr = format_cursor(0, 0, 0, 0, 0, 0, 0); // Default cursor
+        to_client
+            .send(Bytes::from(cursor_instr))
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
         // CRITICAL: Send size instruction to initialize display dimensions
         // Browser needs this BEFORE any img/drawing operations!
         // Use character-aligned dimensions (not browser's exact request) to prevent scaling
@@ -695,15 +712,38 @@ impl ProtocolHandler for SshHandler {
             debug!("SSH: Banner collected, rendering immediately");
 
             // Render the banner at the initial size
+            let quality = adaptive_quality.calculate_quality();
             let jpeg = renderer
-                .render_screen(terminal.screen(), rows, cols)
+                .render_screen_with_quality(terminal.screen(), rows, cols, quality)
                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-            debug!("SSH: Banner render produced {} byte JPEG", jpeg.len());
+            adaptive_quality.track_frame_sent(jpeg.len());
+            debug!(
+                "SSH: Banner render produced {} byte JPEG (quality {})",
+                jpeg.len(),
+                quality
+            );
 
-            #[allow(deprecated)]
-            let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
-            for instr in img_instructions {
+            // Base64 encode JPEG
+            let base64_data =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
+
+            // Send img instruction (zero-allocation)
+            let img_instr = protocol_encoder.format_img_instruction(
+                stream_id,
+                0, // layer
+                0, // x
+                0, // y
+                "image/jpeg",
+            );
+            to_client
+                .send(img_instr.freeze())
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+            // Send blob chunks + end instruction
+            let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+            for instr in blob_instructions {
                 to_client
                     .send(Bytes::from(instr))
                     .await
@@ -783,18 +823,31 @@ impl ProtocolHandler for SshHandler {
                         debug!("SSH: Rendering initial screen");
 
                         // Force a full screen render to catch any SSH prompt that arrived
-                        let jpeg = renderer.render_screen(
+                        let quality = adaptive_quality.calculate_quality();
+                        let jpeg = renderer.render_screen_with_quality(
                             terminal.screen(),
                             terminal.size().0,
                             terminal.size().1,
+                            quality,
                         ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                        debug!("SSH: Initial render produced {} byte JPEG", jpeg.len());
+                        adaptive_quality.track_frame_sent(jpeg.len());
+                        debug!("SSH: Initial render produced {} byte JPEG (quality {})", jpeg.len(), quality);
 
-                        #[allow(deprecated)]
-                        let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
+                        // Base64 encode and send via modern zero-allocation protocol
+                        let base64_data = base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &jpeg,
+                        );
 
-                        for instr in img_instructions {
+                        let img_instr = protocol_encoder.format_img_instruction(
+                            stream_id, 0, 0, 0, "image/jpeg",
+                        );
+                        to_client.send(img_instr.freeze()).await
+                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                        let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                        for instr in blob_instructions {
                             to_client.send(Bytes::from(instr)).await
                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                         }
@@ -847,18 +900,31 @@ impl ProtocolHandler for SshHandler {
                                         .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
                                     // Render only the new line(s) at the bottom
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region(
+                                    let quality = adaptive_quality.calculate_quality();
+                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
                                         terminal.screen(),
                                         current_rows - scroll_lines,  // Start at line where new content begins
                                         current_rows,                 // End at bottom
                                         0,                            // Full width
                                         current_cols,
+                                        quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, x_px as i32, y_px as i32);
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
 
-                                    for instr in img_instructions {
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -882,18 +948,31 @@ impl ProtocolHandler for SshHandler {
                                         .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
                                     // Render only the new line(s) at the top
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region(
+                                    let quality = adaptive_quality.calculate_quality();
+                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
                                         terminal.screen(),
                                         0,              // Start at top
                                         scroll_lines,   // End at line N
                                         0,              // Full width
                                         current_cols,
+                                        quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, x_px as i32, y_px as i32);
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
 
-                                    for instr in img_instructions {
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -918,18 +997,31 @@ impl ProtocolHandler for SshHandler {
                                             dirty.min_row, dirty.max_row, dirty.min_col, dirty.max_col);
                                     }
 
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region(
+                                    let quality = adaptive_quality.calculate_quality();
+                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
                                         terminal.screen(),
                                         dirty.min_row,
                                         dirty.max_row,
                                         dirty.min_col,
                                         dirty.max_col,
+                                        quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, x_px as i32, y_px as i32);
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
 
-                                    for instr in img_instructions {
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -937,16 +1029,29 @@ impl ProtocolHandler for SshHandler {
                                     // Large region - render full screen
                                     trace!("SSH: Full screen ({}% dirty)", dirty_pct);
 
-                                    let jpeg = renderer.render_screen(
+                                    let quality = adaptive_quality.calculate_quality();
+                                    let jpeg = renderer.render_screen_with_quality(
                                         terminal.screen(),
                                         terminal.size().0,
                                         terminal.size().1,
+                                        quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
 
-                                    for instr in img_instructions {
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, 0, 0, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -966,18 +1071,31 @@ impl ProtocolHandler for SshHandler {
                             // Fall back to full screen render to prevent "one char behind" bug
                             debug!("SSH: Dirty tracker returned None, rendering full screen as fallback");
 
-                            let jpeg = renderer.render_screen(
+                            let quality = adaptive_quality.calculate_quality();
+                            let jpeg = renderer.render_screen_with_quality(
                                 terminal.screen(),
                                 terminal.size().0,
                                 terminal.size().1,
+                                quality,
                             ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                            debug!("SSH: Fallback render produced {} byte JPEG", jpeg.len());
+                            adaptive_quality.track_frame_sent(jpeg.len());
+                            debug!("SSH: Fallback render produced {} byte JPEG (quality {})", jpeg.len(), quality);
 
-                            #[allow(deprecated)]
-                            let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
+                            // Base64 encode and send via modern zero-allocation protocol
+                            let base64_data = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &jpeg,
+                            );
 
-                            for instr in img_instructions {
+                            let img_instr = protocol_encoder.format_img_instruction(
+                                stream_id, 0, 0, 0, "image/jpeg",
+                            );
+                            to_client.send(img_instr.freeze()).await
+                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                            let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                            for instr in blob_instructions {
                                 to_client.send(Bytes::from(instr)).await
                                     .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                             }
@@ -1076,18 +1194,31 @@ impl ProtocolHandler for SshHandler {
 
                                 if let Some(dirty) = dirty_opt {
                                     // Render only the changed region
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region(
+                                    let quality = adaptive_quality.calculate_quality();
+                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
                                         terminal.screen(),
                                         dirty.min_row,
                                         dirty.max_row,
                                         dirty.min_col,
                                         dirty.max_col,
+                                        quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, x_px as i32, y_px as i32);
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
 
-                                    for instr in img_instructions {
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -1106,16 +1237,29 @@ impl ProtocolHandler for SshHandler {
                                     // Dirty tracker returned None - fallback to full screen render
                                     debug!("SSH: Dirty tracker returned None, rendering full screen");
 
-                                    let jpeg = renderer.render_screen(
+                                    let quality = adaptive_quality.calculate_quality();
+                                    let jpeg = renderer.render_screen_with_quality(
                                         terminal.screen(),
                                         terminal.size().0,
                                         terminal.size().1,
+                                        quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    #[allow(deprecated)]
-                                    let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
+                                    // Base64 encode and send via modern zero-allocation protocol
+                                    let base64_data = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &jpeg,
+                                    );
 
-                                    for instr in img_instructions {
+                                    let img_instr = protocol_encoder.format_img_instruction(
+                                        stream_id, 0, 0, 0, "image/jpeg",
+                                    );
+                                    to_client.send(img_instr.freeze()).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                    for instr in blob_instructions {
                                         to_client.send(Bytes::from(instr)).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
@@ -1367,6 +1511,12 @@ impl ProtocolHandler for SshHandler {
                                             // Resize terminal emulator (preserves content via vt100's set_size)
                                             terminal.resize(new_rows, new_cols);
 
+                                            // CRITICAL: Wait for terminal to stabilize after resize
+                                            // The vt100 parser's set_size() reformats the screen content,
+                                            // and we need to ensure all content has settled before rendering.
+                                            // This prevents the banner from being lost during the reflow.
+                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
                                             // Update current dimensions
                                             current_rows = new_rows;
                                             current_cols = new_cols;
@@ -1393,17 +1543,31 @@ impl ProtocolHandler for SshHandler {
                                                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
                                             // Force full screen render after resize
-                                            let jpeg = renderer.render_screen(
+                                            let quality = adaptive_quality.calculate_quality();
+                                            let jpeg = renderer.render_screen_with_quality(
                                                 terminal.screen(),
                                                 new_rows,
                                                 new_cols,
+                                                quality,
                                             ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                                            debug!("SSH: Resize render produced {} byte JPEG", jpeg.len());
+                                            adaptive_quality.track_frame_sent(jpeg.len());
+                                            debug!("SSH: Resize render produced {} byte JPEG (quality {})", jpeg.len(), quality);
 
-                                            #[allow(deprecated)]
-                                            let img_instructions = renderer.format_img_instructions(&jpeg, stream_id, 0, 0, 0);
-                                            for instr in img_instructions {
+                                            // Base64 encode and send via modern zero-allocation protocol
+                                            let base64_data = base64::Engine::encode(
+                                                &base64::engine::general_purpose::STANDARD,
+                                                &jpeg,
+                                            );
+
+                                            let img_instr = protocol_encoder.format_img_instruction(
+                                                stream_id, 0, 0, 0, "image/jpeg",
+                                            );
+                                            to_client.send(img_instr.freeze()).await
+                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                            let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                            for instr in blob_instructions {
                                                 to_client.send(Bytes::from(instr)).await
                                                     .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                             }

@@ -343,20 +343,43 @@ impl RdpSettings {
             .ok_or_else(|| "Missing required parameter: password".to_string())?
             .clone();
 
-        let width = params
-            .get("width")
-            .and_then(|w| w.parse().ok())
-            .unwrap_or(defaults.default_width);
-
-        let height = params
-            .get("height")
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(defaults.default_height);
-
-        let dpi = params
-            .get("dpi")
-            .and_then(|d| d.parse().ok())
-            .unwrap_or(defaults.default_dpi);
+        // Parse width/height/dpi from connection parameters
+        // Client sends "size" as "width,height,dpi" (e.g., "1920,1080,96")
+        // If not provided, use defaults
+        let (width, height, dpi) = if let Some(size_str) = params.get("size") {
+            let parts: Vec<&str> = size_str.split(',').collect();
+            if parts.len() >= 3 {
+                let w = parts[0].parse().unwrap_or(defaults.default_width);
+                let h = parts[1].parse().unwrap_or(defaults.default_height);
+                let d = parts[2].parse().unwrap_or(defaults.default_dpi);
+                (w, h, d)
+            } else if parts.len() == 2 {
+                let w = parts[0].parse().unwrap_or(defaults.default_width);
+                let h = parts[1].parse().unwrap_or(defaults.default_height);
+                (w, h, defaults.default_dpi)
+            } else {
+                (
+                    defaults.default_width,
+                    defaults.default_height,
+                    defaults.default_dpi,
+                )
+            }
+        } else {
+            // Fallback to separate width/height/dpi params if size not present
+            let w = params
+                .get("width")
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(defaults.default_width);
+            let h = params
+                .get("height")
+                .and_then(|h| h.parse().ok())
+                .unwrap_or(defaults.default_height);
+            let d = params
+                .get("dpi")
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(defaults.default_dpi);
+            (w, h, d)
+        };
 
         info!("RDP: Display settings - {}x{} @ {} DPI", width, height, dpi);
 
@@ -611,6 +634,9 @@ struct IronRdpSession {
     // Sync flow control (prevents overwhelming slow clients)
     sync_control: guacr_handlers::SyncFlowControl,
 
+    // Track if first frame has been sent (skip sync wait on first frame)
+    first_frame_sent: bool,
+
     // Cursor manager for client-side cursor rendering (matches KCM behavior)
     cursor_manager: CursorManager,
 }
@@ -714,6 +740,9 @@ impl IronRdpSession {
 
             // Initialize sync flow control (15s timeout, 3 strikes - matches guacd)
             sync_control: guacr_handlers::SyncFlowControl::new(),
+
+            // Track first frame (skip sync wait to avoid blocking initial display)
+            first_frame_sent: false,
 
             // Initialize cursor manager for client-side cursor rendering
             cursor_manager: CursorManager::new(supports_jpeg, supports_webp, jpeg_quality),
@@ -1143,11 +1172,15 @@ impl IronRdpSession {
 
                                         self.send_graphics_update_with_rect(&image, rect).await?;
 
-                                        // Wait for client to acknowledge sync (flow control like guacd)
-                                        if let Some(ts) = self.sync_control.pending_timestamp() {
-                                            self.sync_control.wait_for_client_sync(&mut from_client, ts).await?;
-                                            self.sync_control.clear_pending();
-                                            trace!("RDP: Client acknowledged sync, ready for next frame");
+                                        // NOTE: Sync flow control disabled for now
+                                        // RBI handles sync acks in the main event loop without blocking
+                                        // RDP would need similar refactoring to avoid blocking here
+                                        // For now, just clear the pending sync and continue
+                                        self.sync_control.clear_pending();
+
+                                        if !self.first_frame_sent {
+                                            self.first_frame_sent = true;
+                                            debug!("RDP: First frame sent");
                                         }
                                     }
                                     ActiveStageOutput::PointerDefault => {
@@ -1294,6 +1327,20 @@ impl IronRdpSession {
         // InclusiveRectangle uses inclusive bounds (right/bottom are included)
         let x = rect.left as u32;
         let y = rect.top as u32;
+
+        // CRITICAL: Check for zero-rect (cursor-only updates or no-ops)
+        // IronRDP sends rect { left: 0, top: 0, right: 0, bottom: 0 } for cursor moves
+        // These should NOT be rendered as 1x1 pixel updates!
+        // Note: InclusiveRectangle where left==right and top==bottom is a 1x1 rect
+        // We want to skip when left==right==top==bottom==0 (zero-size, not 1x1)
+        if rect.left == rect.right && rect.top == rect.bottom && rect.left == 0 && rect.top == 0 {
+            trace!(
+                "RDP: Skipping zero-rect update (cursor-only or no-op): {:?}",
+                rect
+            );
+            return Ok(());
+        }
+
         let width = (rect.right - rect.left + 1) as u32;
         let height = (rect.bottom - rect.top + 1) as u32;
 
@@ -1457,6 +1504,23 @@ impl IronRdpSession {
         self.record_client_input(msg);
 
         match instr.opcode {
+            "sync" => {
+                // Client is acknowledging a sync instruction (flow control)
+                if let Some(ts_str) = instr.args.first() {
+                    if let Ok(client_ts) = ts_str.parse::<u64>() {
+                        if let Some(pending_ts) = self.sync_control.pending_timestamp() {
+                            if client_ts >= pending_ts {
+                                // Client caught up with our sync
+                                self.sync_control.clear_pending();
+                                self.sync_control.reset_timeout_count();
+                                trace!("RDP: Client acknowledged sync (ts={})", client_ts);
+                            }
+                        }
+                    }
+                }
+                // Sync acks are not processed further
+                return Ok(());
+            }
             "key" => {
                 if instr.args.len() >= 2 {
                     let keysym: u32 = instr.args[0].parse().map_err(|_| "Invalid keysym")?;
@@ -1632,15 +1696,17 @@ impl IronRdpSession {
                 }
             }
             "size" => {
-                if instr.args.len() >= 2 {
-                    let width: u32 = instr.args[0].parse().map_err(|_| "Invalid width")?;
-                    let height: u32 = instr.args[1].parse().map_err(|_| "Invalid height")?;
+                // Client size instruction format: size,<layer>,<width>,<height>;
+                // We ignore the layer (args[0]) and use width/height (args[1], args[2])
+                if instr.args.len() >= 3 {
+                    let width: u32 = instr.args[1].parse().map_err(|_| "Invalid width")?;
+                    let height: u32 = instr.args[2].parse().map_err(|_| "Invalid height")?;
 
                     // Standard guacd: DPI is set via connection parameters only, not dynamically updated
                     // Use the DPI value established during session initialization
                     info!(
-                        "RDP: Client resize request: {}x{} @ {} DPI (current: {}x{} @ {} DPI)",
-                        width, height, self.dpi, self.width, self.height, self.dpi
+                        "RDP: Client resize request: {}x{} @ {} DPI (layer: {}, current: {}x{} @ {} DPI)",
+                        width, height, self.dpi, instr.args[0], self.width, self.height, self.dpi
                     );
 
                     // Update internal state (DPI remains unchanged)

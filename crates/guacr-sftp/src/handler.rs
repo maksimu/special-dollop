@@ -21,6 +21,7 @@ use russh::client;
 use russh_keys::key;
 use russh_keys::PublicKeyBase64;
 use russh_sftp::client::SftpSession;
+use ssh_key::Certificate;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -197,12 +198,41 @@ impl ProtocolHandler for SftpHandler {
             let key = russh_keys::decode_secret_key(key_data, passphrase).map_err(|e| {
                 HandlerError::AuthenticationFailed(format!("Key decode failed: {}", e))
             })?;
-            session
-                .authenticate_publickey(username, Arc::new(key))
-                .await
-                .map_err(|e| {
-                    HandlerError::AuthenticationFailed(format!("Key auth failed: {}", e))
-                })?
+
+            // Check for certificate-based authentication
+            let public_key_cert = params.get("public-key");
+
+            if let Some(cert_str) = public_key_cert {
+                debug!("SFTP: Certificate provided, using certificate-based authentication");
+
+                // Parse OpenSSH certificate
+                let certificate = cert_str.trim().parse::<Certificate>().map_err(|e| {
+                    error!("SFTP: Failed to parse SSH certificate: {}", e);
+                    HandlerError::AuthenticationFailed(format!(
+                        "Invalid SSH certificate format: {}",
+                        e
+                    ))
+                })?;
+
+                debug!("SFTP: Certificate parsed successfully, authenticating with certificate");
+                session
+                    .authenticate_openssh_cert(username, Arc::new(key), certificate)
+                    .await
+                    .map_err(|e| {
+                        HandlerError::AuthenticationFailed(format!(
+                            "Certificate auth failed: {}",
+                            e
+                        ))
+                    })?
+            } else {
+                debug!("SFTP: Authenticating with public key");
+                session
+                    .authenticate_publickey(username, Arc::new(key))
+                    .await
+                    .map_err(|e| {
+                        HandlerError::AuthenticationFailed(format!("Key auth failed: {}", e))
+                    })?
+            }
         } else {
             return Err(HandlerError::MissingParameter(
                 "password or private_key required".to_string(),

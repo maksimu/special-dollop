@@ -189,6 +189,38 @@ impl SyncFlowControl {
     pub fn reset_timeout_count(&mut self) {
         self.sync_timeout_count = 0;
     }
+
+    /// Check if a sync timeout occurred and should disconnect
+    ///
+    /// Call this periodically (e.g., every second) to check if the pending sync has timed out.
+    /// Returns true if the connection should be closed due to too many consecutive timeouts.
+    pub fn check_timeout(&mut self, elapsed_since_sync: Duration) -> bool {
+        if self.pending_sync_timestamp.is_none() {
+            return false; // No pending sync
+        }
+
+        if elapsed_since_sync >= self.timeout_duration {
+            // Timeout occurred
+            self.sync_timeout_count += 1;
+            self.pending_sync_timestamp = None; // Clear pending so we don't count it again
+
+            if self.sync_timeout_count >= self.max_consecutive_timeouts {
+                log::error!(
+                    "Client not responding to sync ({} consecutive timeouts) - disconnecting",
+                    self.sync_timeout_count
+                );
+                return true; // Should disconnect
+            } else {
+                log::warn!(
+                    "Sync timeout {}/{} - continuing",
+                    self.sync_timeout_count,
+                    self.max_consecutive_timeouts
+                );
+            }
+        }
+
+        false // Continue
+    }
 }
 
 impl Default for SyncFlowControl {

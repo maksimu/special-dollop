@@ -21,6 +21,7 @@ log.workspace = true
 # SSH client
 russh = "0.45"
 russh-keys = "0.45"
+ssh-key = "0.6"
 
 # Utilities
 base64.workspace = true

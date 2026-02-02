@@ -2661,6 +2661,7 @@ dependencies = [
  "russh 0.46.0",
  "russh-keys 0.46.0",
  "russh-sftp",
+ "ssh-key",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2679,6 +2680,7 @@ dependencies = [
  "log",
  "russh 0.45.0",
  "russh-keys 0.45.0",
+ "ssh-key",
  "thiserror 2.0.18",
  "tokio",
 ]

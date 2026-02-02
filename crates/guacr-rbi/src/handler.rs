@@ -410,18 +410,41 @@ impl ProtocolHandler for RbiHandler {
         //
         // Reference: docs/guacr/RBI_SERVO_AND_DATABASE_OPTIONS.md
 
-        // IMPORTANT: Always use DEFAULT size during initialization (like guacd does)
-        // The client will send a resize instruction with actual browser dimensions after handshake
-        // This prevents "half screen" display issues
-        info!("RBI: Using default handshake size - will resize after client connects");
-        let _width = self.config.default_width;
-        let _height = self.config.default_height;
+        // Parse width/height from connection parameters
+        // Client sends "size" as "width,height,dpi" (e.g., "2102,1536,192")
+        // If not provided, use defaults (1920x1080)
+        let (width, height) = if let Some(size_str) = params.get("size") {
+            let parts: Vec<&str> = size_str.split(',').collect();
+            if parts.len() >= 2 {
+                let w = parts[0].parse().unwrap_or(self.config.default_width);
+                let h = parts[1].parse().unwrap_or(self.config.default_height);
+                (w, h)
+            } else {
+                (self.config.default_width, self.config.default_height)
+            }
+        } else {
+            // Fallback to separate width/height params if size not present
+            let w = params
+                .get("width")
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(self.config.default_width);
+            let h = params
+                .get("height")
+                .and_then(|h| h.parse().ok())
+                .unwrap_or(self.config.default_height);
+            (w, h)
+        };
+
+        info!(
+            "RBI: Using initial size {}x{} (from params or default)",
+            width, height
+        );
 
         // Use the appropriate backend
         #[cfg(feature = "chrome")]
         {
             use crate::browser_client::BrowserClient;
-            let mut browser_client = BrowserClient::new(_width, _height, self.config.clone());
+            let mut browser_client = BrowserClient::new(width, height, self.config.clone());
 
             // Connect and handle session
             browser_client

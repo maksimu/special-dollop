@@ -23,6 +23,7 @@ log.workspace = true
 russh = "0.46"
 russh-keys = "0.46"
 russh-sftp = "2.1"
+ssh-key = "0.6"
 
 # Image for file browser rendering
 image = "0.25"

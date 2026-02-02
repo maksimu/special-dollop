@@ -221,28 +221,37 @@ pub fn format_cursor_instruction(
     )
 }
 
-/// Format standard cursor using pre-defined cache
+/// Format standard cursor using Guacamole's built-in cursor names
 ///
-/// For standard cursors, we use layer 0 which contains cached cursor images.
+/// Guacamole clients have built-in cursors that can be referenced by name.
+/// Format: cursor,<hotspot-x>,<hotspot-y>,<cursor-name>,<src-x>,<src-y>,<width>,<height>;
 pub fn format_standard_cursor(cursor_type: CursorType) -> Option<String> {
-    // For standard cursors, send cursor instruction with 0x0 size
-    // This tells client to use its own standard cursor
-    match cursor_type {
-        CursorType::Default => {
-            // Default cursor: 0x0 at 0,0
-            Some(format_cursor_instruction(0, 0, 0, 0, 0, 0, 0))
-        }
-        CursorType::None => {
-            // Hidden cursor: 1x1 transparent at 0,0
-            Some(format_cursor_instruction(0, 0, 0, 0, 0, 1, 1))
-        }
+    let cursor_name = match cursor_type {
+        CursorType::Default | CursorType::Pointer => "pointer",
+        CursorType::Text => "text",
+        CursorType::Wait => "wait",
+        CursorType::Progress => "progress",
+        CursorType::NotAllowed => "not-allowed",
+        CursorType::Help => "help",
+        CursorType::Crosshair => "crosshair",
+        CursorType::Move => "move",
+        CursorType::ColResize => "col-resize",
+        CursorType::RowResize => "row-resize",
+        CursorType::None => "none",
         _ => {
-            // For other cursors, would need to draw custom cursor
-            // For now, fall back to default
-            debug!("RBI: Cursor {:?} falling back to default", cursor_type);
-            Some(format_cursor_instruction(0, 0, 0, 0, 0, 0, 0))
+            // For other cursors, fall back to pointer
+            debug!("RBI: Cursor {:?} falling back to pointer", cursor_type);
+            "pointer"
         }
-    }
+    };
+
+    // Format: cursor,<hotspot-x>,<hotspot-y>,<cursor-name>,<src-x>,<src-y>,<width>,<height>;
+    // All values are 0 for standard cursors (client renders them)
+    Some(format!(
+        "6.cursor,1.0,1.0,{}.{},1.0,1.0,1.0,1.0;",
+        cursor_name.len(),
+        cursor_name
+    ))
 }
 
 #[cfg(test)]

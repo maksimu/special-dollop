@@ -60,6 +60,7 @@ pub struct SshConfig {
     pub password: Option<String>,
     pub private_key: Option<String>,
     pub passphrase: Option<String>,
+    pub public_key: Option<String>,   // SSH certificate for certificate-based auth
     pub width: u32,                   // Default: 80 cols
     pub height: u32,                  // Default: 24 rows
     pub enable_recording: bool,
@@ -93,6 +94,24 @@ handler.connect(params, to_client, from_client).await?;
 params.insert("username".to_string(), "user".to_string());
 params.insert("private-key".to_string(), "-----BEGIN OPENSSH PRIVATE KEY-----\n...".to_string());
 params.insert("passphrase".to_string(), "key-passphrase".to_string()); // Optional
+```
+
+### SSH Certificate-Based Authentication
+
+For certificate-based authentication, provide both the private key and the SSH certificate (signed public key):
+
+```rust
+params.insert("username".to_string(), "user".to_string());
+params.insert("private-key".to_string(), "-----BEGIN OPENSSH PRIVATE KEY-----\n...".to_string());
+params.insert("passphrase".to_string(), "key-passphrase".to_string()); // Optional if key is encrypted
+params.insert("public-key".to_string(), "ssh-ed25519-cert-v01@openssh.com AAAA...== user@example.com".to_string());
+```
+
+The `public-key` parameter should contain an OpenSSH-format certificate. When provided, the handler uses `authenticate_openssh_cert()` for certificate-based authentication. Without it, standard public key authentication is used.
+
+Certificate format example:
+```
+ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAA...
 ```
 
 ### With Recording

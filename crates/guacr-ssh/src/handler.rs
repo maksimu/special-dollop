@@ -45,6 +45,7 @@ use log::{debug, error, info, trace, warn};
 use russh::client;
 use russh_keys::key;
 use russh_keys::PublicKeyBase64;
+use ssh_key::Certificate;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -410,16 +411,51 @@ impl ProtocolHandler for SshHandler {
                 }
             };
 
-            debug!("SSH handler: Private key decoded successfully, authenticating");
-            tokio::time::timeout(
-                auth_timeout,
-                sh.authenticate_publickey(username, Arc::new(key_pair)),
-            )
-            .await
-            .map_err(|_| {
-                error!("SSH handler: Authentication timed out");
-                HandlerError::AuthenticationFailed("Authentication timed out".to_string())
-            })
+            // Check for certificate-based authentication
+            let public_key_cert = params.get("public-key");
+
+            if let Some(cert_str) = public_key_cert {
+                debug!("SSH handler: Certificate provided, using certificate-based authentication");
+
+                // Parse OpenSSH certificate
+                let certificate = match cert_str.trim().parse::<Certificate>() {
+                    Ok(cert) => cert,
+                    Err(e) => {
+                        error!("SSH handler: Failed to parse SSH certificate: {}", e);
+                        let err = HandlerError::AuthenticationFailed(format!(
+                            "Invalid SSH certificate format: {}",
+                            e
+                        ));
+                        return Err(Self::send_error_and_return(&to_client, err).await);
+                    }
+                };
+
+                debug!(
+                    "SSH handler: Certificate parsed successfully, authenticating with certificate"
+                );
+                tokio::time::timeout(
+                    auth_timeout,
+                    sh.authenticate_openssh_cert(username, Arc::new(key_pair), certificate),
+                )
+                .await
+                .map_err(|_| {
+                    error!("SSH handler: Certificate authentication timed out");
+                    HandlerError::AuthenticationFailed("Authentication timed out".to_string())
+                })
+            } else {
+                debug!(
+                    "SSH handler: Private key decoded successfully, authenticating with public key"
+                );
+                tokio::time::timeout(
+                    auth_timeout,
+                    sh.authenticate_publickey(username, Arc::new(key_pair)),
+                )
+                .await
+                .map_err(|_| {
+                    error!("SSH handler: Authentication timed out");
+                    HandlerError::AuthenticationFailed("Authentication timed out".to_string())
+                })
+            }
         } else {
             error!("SSH handler: No authentication method provided");
             let err = HandlerError::MissingParameter("password or private_key".to_string());

@@ -13,7 +13,7 @@ use crate::scroll_detector::ScrollDetector;
 use crate::handler::{RbiBackend, RbiConfig};
 use crate::input::{KeyboardShortcut, RbiInputHandler};
 use bytes::Bytes;
-use guacr_protocol::{BinaryEncoder, GuacamoleParser};
+use guacr_protocol::GuacamoleParser;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 // Sync flow control (shared with RDP/VNC)
@@ -21,7 +21,6 @@ use guacr_handlers::SyncFlowControl;
 
 /// Browser client for RBI sessions
 pub struct BrowserClient {
-    binary_encoder: BinaryEncoder,
     stream_id: u32,
     width: u32,
     height: u32,
@@ -51,7 +50,6 @@ impl BrowserClient {
         };
 
         Self {
-            binary_encoder: BinaryEncoder::new(),
             stream_id: 1,
             width,
             height,
@@ -151,7 +149,88 @@ impl BrowserClient {
             }
         }
 
-        // Send ready instruction with proper LENGTH.VALUE format
+        // CRITICAL: Wait for client to send size instruction BEFORE sending ready
+        // Guacamole protocol handshake:
+        // 1. Server sends args (optional)
+        // 2. Client sends size with actual viewport dimensions
+        // 3. Server sends ready
+        // 4. Server sends layer size matching client's viewport
+        // 5. Server sends images
+        //
+        // If we send ready+size before receiving client's size, the layer dimensions
+        // won't match the client's viewport, causing scaling/positioning issues.
+
+        info!("RBI: Waiting for client size instruction before completing handshake");
+
+        // Wait for client size instruction (with 10 second timeout)
+        let client_size_result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match from_client.recv().await {
+                    Some(msg) => {
+                        if let Ok(msg_str) = std::str::from_utf8(&msg) {
+                            // Parse size instruction: size,<layer>,<width>,<height>;
+                            if msg_str.starts_with("4.size,") {
+                                let parts: Vec<&str> = msg_str.split(',').collect();
+                                if parts.len() >= 3 {
+                                    // Extract width and height (skip length prefixes)
+                                    if let Some(width_part) = parts.get(2) {
+                                        if let Some(height_part) = parts.get(3) {
+                                            // Parse "N.VALUE" format
+                                            if let Some(w_str) = width_part.split('.').nth(1) {
+                                                if let Some(h_str) = height_part
+                                                    .split('.')
+                                                    .nth(1)
+                                                    .and_then(|s| s.strip_suffix(';'))
+                                                {
+                                                    if let (Ok(w), Ok(h)) =
+                                                        (w_str.parse::<u32>(), h_str.parse::<u32>())
+                                                    {
+                                                        info!(
+                                                            "RBI: Client requested size: {}x{}",
+                                                            w, h
+                                                        );
+                                                        return Ok((w, h));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        return Err("Client channel closed before size instruction".to_string());
+                    }
+                }
+            }
+        })
+        .await;
+
+        // Update dimensions based on client's request (or keep initial if timeout)
+        match client_size_result {
+            Ok(Ok((w, h))) => {
+                info!("RBI: Using client-requested size: {}x{}", w, h);
+                self.width = w;
+                self.height = h;
+                // Resize Chrome to match client viewport
+                chrome_session.resize(w, h).await?;
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "RBI: Failed to get client size: {}, using initial size {}x{}",
+                    e, self.width, self.height
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "RBI: Timeout waiting for client size, using initial size {}x{}",
+                    self.width, self.height
+                );
+            }
+        }
+
+        // NOW send ready instruction (after we know the correct size)
         let ready_value = "rbi-ready";
         let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
         to_client
@@ -159,10 +238,32 @@ impl BrowserClient {
             .await
             .map_err(|e| format!("Failed to send ready: {}", e))?;
 
-        // Send size instruction
-        let size_instr = self.binary_encoder.encode_size(0, self.width, self.height);
+        // Send cursor instruction to show default pointer cursor (enables cursor visibility)
+        // CRITICAL: Use the correct Guacamole cursor format with cursor name, not coordinates!
+        // Format: cursor,<hotspot-x>,<hotspot-y>,<src-layer>,<src-x>,<src-y>,<width>,<height>;
+        // For standard cursors: cursor,0,0,<cursor-name>,0,0,0,0;
+        let cursor_instr = "6.cursor,1.0,1.0,7.pointer,1.0,1.0,1.0,1.0;";
+        info!("RBI: Sending initial cursor instruction (pointer)");
         to_client
-            .send(size_instr)
+            .send(Bytes::from(cursor_instr))
+            .await
+            .map_err(|e| format!("Failed to send cursor: {}", e))?;
+
+        // Send size instruction using TEXT protocol (must match ready instruction format)
+        // Format: size,<layer>,<width>,<height>;
+        // CRITICAL: This must match the screenshot dimensions or the client will scale/position incorrectly
+        use guacr_protocol::format_instruction;
+        let size_instr = format_instruction(
+            "size",
+            &["0", &self.width.to_string(), &self.height.to_string()],
+        );
+        info!(
+            "RBI: Sending size instruction: {}x{} (must match screenshot size)",
+            self.width, self.height
+        );
+        info!("RBI: Size instruction bytes: {}", size_instr);
+        to_client
+            .send(Bytes::from(size_instr))
             .await
             .map_err(|e| format!("Failed to send size: {}", e))?;
 
@@ -656,11 +757,16 @@ impl BrowserClient {
                 }
             }
             "size" => {
-                if instr.args.len() >= 2 {
+                // Client size instruction format: size,<layer>,<width>,<height>;
+                // We ignore the layer (args[0]) and use width/height (args[1], args[2])
+                if instr.args.len() >= 3 {
                     if let (Ok(w), Ok(h)) =
-                        (instr.args[0].parse::<u32>(), instr.args[1].parse::<u32>())
+                        (instr.args[1].parse::<u32>(), instr.args[2].parse::<u32>())
                     {
-                        info!("RBI: Resize requested: {}x{}", w, h);
+                        info!(
+                            "RBI: Resize requested: {}x{} (layer: {})",
+                            w, h, instr.args[0]
+                        );
                         self.width = w;
                         self.height = h;
                         chrome_session.resize(w, h).await?;
@@ -904,13 +1010,20 @@ impl BrowserClient {
         );
 
         // Send img instruction with metadata
+        // CRITICAL: x=0, y=0 means top-left corner. If client shows image in wrong position,
+        // check that the size instruction matches the screenshot dimensions.
         let mut text_encoder = TextProtocolEncoder::new();
         let img_instr = text_encoder.format_img_instruction(
             self.stream_id,
             0, // layer
-            0, // x
-            0, // y
+            0, // x (top-left)
+            0, // y (top-left)
             mimetype,
+        );
+
+        debug!(
+            "RBI: Sending img instruction - stream: {}, layer: 0, pos: (0,0), type: {}",
+            self.stream_id, mimetype
         );
 
         to_client

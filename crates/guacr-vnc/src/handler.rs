@@ -881,12 +881,19 @@ impl VncClient {
                 }
             }
             "size" => {
-                if let Some(width_str) = instr.args.first() {
-                    if let Some(height_str) = instr.args.get(1) {
+                // Client size instruction format: size,<layer>,<width>,<height>;
+                // We ignore the layer (args[0]) and use width/height (args[1], args[2])
+                if let Some(width_str) = instr.args.get(1) {
+                    if let Some(height_str) = instr.args.get(2) {
                         if let (Ok(w), Ok(h)) =
                             (width_str.parse::<u32>(), height_str.parse::<u32>())
                         {
-                            info!("VNC: Resize requested: {}x{}", w, h);
+                            info!(
+                                "VNC: Resize requested: {}x{} (layer: {})",
+                                w,
+                                h,
+                                instr.args.first().unwrap_or(&"0")
+                            );
 
                             // Reset scroll detector for new dimensions
                             self.scroll_detector.reset(w, h);

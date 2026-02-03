@@ -224,7 +224,7 @@ pub fn format_cursor_instruction(
 /// Format standard cursor using Guacamole's built-in cursor names
 ///
 /// Guacamole clients have built-in cursors that can be referenced by name.
-/// Format: cursor,<hotspot-x>,<hotspot-y>,<cursor-name>,<src-x>,<src-y>,<width>,<height>;
+/// Format: `cursor,<hotspot-x>,<hotspot-y>,<cursor-name>,<src-x>,<src-y>,<width>,<height>;`
 pub fn format_standard_cursor(cursor_type: CursorType) -> Option<String> {
     let cursor_name = match cursor_type {
         CursorType::Default | CursorType::Pointer => "pointer",

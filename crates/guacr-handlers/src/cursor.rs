@@ -3,10 +3,119 @@
 //! Provides client-side cursor rendering support for RDP, VNC, and RBI protocols.
 //! This matches Apache Guacamole's approach where cursor bitmaps are sent to the client
 //! and rendered locally in the browser for smooth 60fps cursor movement.
+//!
+//! Standard cursors (pointer, I-beam, dot, hidden) are embedded as RGBA bitmaps and
+//! sent via the same img/blob/end/cursor instruction sequence as custom cursors. This
+//! is required because the Guacamole `cursor` instruction expects a numeric layer index,
+//! not a cursor name string.
 
 use bytes::Bytes;
 use guacr_protocol::format_cursor;
 use log::{debug, warn};
+
+// --- Embedded cursor bitmaps (RGBA, 4 bytes per pixel) ---
+
+/// Standard pointer arrow cursor: 11x19 pixels, hotspot at (1, 1).
+/// Black arrow with white 1px outline, matching the Apache guacd default pointer.
+/// 11 * 19 * 4 = 836 bytes.
+#[rustfmt::skip]
+const POINTER_CURSOR_RGBA: &[u8] = &[
+    // Row 0 (y=0): tip of arrow
+    0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 1 (y=1)
+    0,0,0,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 2
+    0,0,0,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 3
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 4
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 5
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 6
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 7
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 8
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0,
+    // Row 9
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0,
+    // Row 10
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255,
+    // Row 11 - bottom of filled triangle, start of notch
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 12
+    0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 13
+    0,0,0,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 14
+    0,0,0,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 15
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0,
+    // Row 16
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 255,255,255,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0,
+    // Row 17
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 255,255,255,255, 0,0,0,255, 0,0,0,0, 0,0,0,0,
+    // Row 18
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+];
+
+/// Hidden cursor: 1x1 fully transparent pixel.
+const HIDDEN_CURSOR_RGBA: &[u8] = &[0, 0, 0, 0];
+
+/// I-beam (text) cursor: 7x16 pixels, hotspot at (3, 8).
+/// Thin vertical bar with serifs at top and bottom.
+#[rustfmt::skip]
+const IBEAM_CURSOR_RGBA: &[u8] = &[
+    // Row 0: top serif
+    0,0,0,0, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+    // Row 1
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 2
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 3
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 4
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 5
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 6
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 7
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 8
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 9
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 10
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 11
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 12
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 13
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 14
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // Row 15: bottom serif
+    0,0,0,0, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+];
+
+/// Dot cursor: 5x5 pixels, hotspot at (2, 2).
+/// Small filled circle for remote-controlled mode.
+#[rustfmt::skip]
+const DOT_CURSOR_RGBA: &[u8] = &[
+    // Row 0
+    0,0,0,0,   0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+    // Row 1
+    0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255,
+    // Row 2
+    0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255,
+    // Row 3
+    0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255,
+    // Row 4
+    0,0,0,0,   0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+];
 
 /// Cursor manager for client-side cursor rendering
 ///
@@ -101,14 +210,16 @@ impl CursorManager {
         let mut instructions = Vec::new();
 
         // 1. img instruction to load cursor into buffer layer
+        // Format: img <stream> <mask> <layer> <mimetype> <x> <y>
+        // mask=12 (0x0C) = GUAC_COMP_SRC (matches Apache guacd cursor.c)
         let img_instr = format!(
-            "3.img,{}.{},{}.{},{}.{},1.0,1.0;",
+            "3.img,{}.{},2.12,{}.{},{}.{},1.0,1.0;",
             stream_id.to_string().len(),
             stream_id,
-            mimetype.len(),
-            mimetype,
             cursor_layer.to_string().len(),
-            cursor_layer
+            cursor_layer,
+            mimetype.len(),
+            mimetype
         );
         instructions.push(img_instr);
 
@@ -145,8 +256,10 @@ impl CursorManager {
 
     /// Send a standard cursor type to the client
     ///
-    /// Sets the cursor to a standard type (pointer, I-beam, etc.) without
-    /// sending bitmap data.
+    /// Draws the cursor bitmap onto buffer layer -1 and sends a `cursor` instruction
+    /// referencing that layer. This is required because the Guacamole `cursor` instruction
+    /// expects a numeric layer index -- passing a cursor name string is invalid protocol
+    /// and will be silently ignored by the client.
     ///
     /// # Arguments
     ///
@@ -154,22 +267,17 @@ impl CursorManager {
     ///
     /// # Returns
     ///
-    /// Guacamole protocol instruction to send to client
-    pub fn send_standard_cursor(&self, cursor_type: StandardCursor) -> String {
-        let cursor_name = match cursor_type {
-            StandardCursor::Pointer => "pointer",
-            StandardCursor::IBeam => "text",
-            StandardCursor::None => "none",
-            StandardCursor::Dot => "dot",
-        };
-
-        // For standard cursors, we just send a cursor instruction with predefined values
-        // The client has these cursors built-in
-        format!(
-            "6.cursor,1.0,1.0,{}.{},1.0,1.0,1.0,1.0;",
-            cursor_name.len(),
-            cursor_name
-        )
+    /// Vector of Guacamole protocol instructions (img, blob, end, cursor)
+    pub fn send_standard_cursor(
+        &mut self,
+        cursor_type: StandardCursor,
+    ) -> Result<Vec<String>, String> {
+        match cursor_type {
+            StandardCursor::Pointer => self.send_custom_cursor(POINTER_CURSOR_RGBA, 11, 19, 1, 1),
+            StandardCursor::None => self.send_custom_cursor(HIDDEN_CURSOR_RGBA, 1, 1, 0, 0),
+            StandardCursor::IBeam => self.send_custom_cursor(IBEAM_CURSOR_RGBA, 7, 16, 3, 8),
+            StandardCursor::Dot => self.send_custom_cursor(DOT_CURSOR_RGBA, 5, 5, 2, 2),
+        }
     }
 
     /// Encode RGBA data as PNG
@@ -263,11 +371,47 @@ mod tests {
     }
 
     #[test]
-    fn test_send_standard_cursor() {
-        let mgr = CursorManager::new(false, false, 85);
-        let instr = mgr.send_standard_cursor(StandardCursor::Pointer);
-        assert!(instr.contains("pointer"));
-        assert!(instr.starts_with("6.cursor"));
+    fn test_send_standard_cursor_pointer() {
+        let mut mgr = CursorManager::new(false, false, 85);
+        let result = mgr.send_standard_cursor(StandardCursor::Pointer);
+        assert!(result.is_ok());
+        let instructions = result.unwrap();
+        assert_eq!(instructions.len(), 4); // img, blob, end, cursor
+        assert!(instructions[0].starts_with("3.img"));
+        assert!(instructions[1].starts_with("4.blob"));
+        assert!(instructions[2].starts_with("3.end"));
+        assert!(instructions[3].starts_with("6.cursor"));
+        // cursor instruction must reference layer -1 (numeric), not a name string
+        assert!(instructions[3].contains("-1"));
+    }
+
+    #[test]
+    fn test_send_standard_cursor_none() {
+        let mut mgr = CursorManager::new(false, false, 85);
+        let result = mgr.send_standard_cursor(StandardCursor::None);
+        assert!(result.is_ok());
+        let instructions = result.unwrap();
+        assert_eq!(instructions.len(), 4);
+        // Hidden cursor: 1x1 at hotspot (0,0)
+        assert!(instructions[3].starts_with("6.cursor"));
+    }
+
+    #[test]
+    fn test_send_standard_cursor_ibeam() {
+        let mut mgr = CursorManager::new(false, false, 85);
+        let result = mgr.send_standard_cursor(StandardCursor::IBeam);
+        assert!(result.is_ok());
+        let instructions = result.unwrap();
+        assert_eq!(instructions.len(), 4);
+    }
+
+    #[test]
+    fn test_send_standard_cursor_dot() {
+        let mut mgr = CursorManager::new(false, false, 85);
+        let result = mgr.send_standard_cursor(StandardCursor::Dot);
+        assert!(result.is_ok());
+        let instructions = result.unwrap();
+        assert_eq!(instructions.len(), 4);
     }
 
     #[test]

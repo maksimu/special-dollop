@@ -3,7 +3,6 @@
 
 use crate::adaptive_fps::AdaptiveFps;
 use crate::clipboard::RbiClipboard;
-use crate::cursor::format_standard_cursor;
 use crate::dirty_tracker::RbiDirtyTracker;
 use crate::file_upload::{format_upload_dialog_instruction, UploadEngine};
 use crate::js_dialog::{JsDialogConfig, JsDialogManager};
@@ -16,8 +15,12 @@ use bytes::Bytes;
 use guacr_protocol::GuacamoleParser;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
-// Sync flow control (shared with RDP/VNC)
-use guacr_handlers::SyncFlowControl;
+// Sync flow control (shared with RDP/VNC) and session lifecycle
+use guacr_handlers::{
+    send_cursor_instructions, send_disconnect, send_name, send_ready, CursorManager,
+    MultiFormatRecorder, RecordingConfig, RecordingDirection, StandardCursor, SyncFlowControl,
+};
+use std::collections::HashMap;
 
 /// Browser client for RBI sessions
 pub struct BrowserClient {
@@ -30,11 +33,19 @@ pub struct BrowserClient {
     upload_engine: UploadEngine,
     dialog_manager: JsDialogManager,
     sync_control: SyncFlowControl,
+    cursor_manager: CursorManager,
+    recorder: Option<MultiFormatRecorder>,
 }
 
 impl BrowserClient {
     /// Create a new browser client
-    pub fn new(width: u32, height: u32, config: RbiConfig) -> Self {
+    pub fn new(
+        width: u32,
+        height: u32,
+        config: RbiConfig,
+        recording_config: &RecordingConfig,
+        params: &HashMap<String, String>,
+    ) -> Self {
         let mut clipboard = RbiClipboard::new(config.clipboard_buffer_size);
         clipboard.set_restrictions(config.disable_copy, config.disable_paste);
 
@@ -49,6 +60,28 @@ impl BrowserClient {
             ..Default::default()
         };
 
+        // Initialize recording if enabled
+        let recorder = if recording_config.is_enabled() {
+            match MultiFormatRecorder::new(
+                recording_config,
+                params,
+                "rbi",
+                width as u16,
+                height as u16,
+            ) {
+                Ok(rec) => {
+                    info!("RBI: Session recording initialized");
+                    Some(rec)
+                }
+                Err(e) => {
+                    warn!("RBI: Failed to initialize recording: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             stream_id: 1,
             width,
@@ -58,7 +91,9 @@ impl BrowserClient {
             upload_engine: UploadEngine::new(upload_config),
             dialog_manager: JsDialogManager::new(dialog_config),
             sync_control: SyncFlowControl::new(),
+            cursor_manager: CursorManager::new(false, false, 85),
             config,
+            recorder,
         }
     }
 
@@ -149,103 +184,23 @@ impl BrowserClient {
             }
         }
 
-        // CRITICAL: Wait for client to send size instruction BEFORE sending ready
-        // Guacamole protocol handshake:
-        // 1. Server sends args (optional)
-        // 2. Client sends size with actual viewport dimensions
-        // 3. Server sends ready
-        // 4. Server sends layer size matching client's viewport
-        // 5. Server sends images
-        //
-        // If we send ready+size before receiving client's size, the layer dimensions
-        // won't match the client's viewport, causing scaling/positioning issues.
-
-        info!("RBI: Waiting for client size instruction before completing handshake");
-
-        // Wait for client size instruction (with 10 second timeout)
-        let client_size_result = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match from_client.recv().await {
-                    Some(msg) => {
-                        if let Ok(msg_str) = std::str::from_utf8(&msg) {
-                            // Parse size instruction: size,<layer>,<width>,<height>;
-                            if msg_str.starts_with("4.size,") {
-                                let parts: Vec<&str> = msg_str.split(',').collect();
-                                if parts.len() >= 3 {
-                                    // Extract width and height (skip length prefixes)
-                                    if let Some(width_part) = parts.get(2) {
-                                        if let Some(height_part) = parts.get(3) {
-                                            // Parse "N.VALUE" format
-                                            if let Some(w_str) = width_part.split('.').nth(1) {
-                                                if let Some(h_str) = height_part
-                                                    .split('.')
-                                                    .nth(1)
-                                                    .and_then(|s| s.strip_suffix(';'))
-                                                {
-                                                    if let (Ok(w), Ok(h)) =
-                                                        (w_str.parse::<u32>(), h_str.parse::<u32>())
-                                                    {
-                                                        info!(
-                                                            "RBI: Client requested size: {}x{}",
-                                                            w, h
-                                                        );
-                                                        return Ok((w, h));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        return Err("Client channel closed before size instruction".to_string());
-                    }
-                }
-            }
-        })
-        .await;
-
-        // Update dimensions based on client's request (or keep initial if timeout)
-        match client_size_result {
-            Ok(Ok((w, h))) => {
-                info!("RBI: Using client-requested size: {}x{}", w, h);
-                self.width = w;
-                self.height = h;
-                // Resize Chrome to match client viewport
-                chrome_session.resize(w, h).await?;
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    "RBI: Failed to get client size: {}, using initial size {}x{}",
-                    e, self.width, self.height
-                );
-            }
-            Err(_) => {
-                warn!(
-                    "RBI: Timeout waiting for client size, using initial size {}x{}",
-                    self.width, self.height
-                );
-            }
-        }
-
-        // NOW send ready instruction (after we know the correct size)
-        let ready_value = "rbi-ready";
-        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
-        to_client
-            .send(Bytes::from(ready_instr))
+        // Send ready and name instructions (client needs ready to start sending instructions)
+        // The client will send a size instruction after receiving ready, which we'll handle
+        // in the main event loop to dynamically resize Chrome
+        send_ready(&to_client, "rbi-ready")
             .await
-            .map_err(|e| format!("Failed to send ready: {}", e))?;
+            .map_err(|e| e.to_string())?;
+        send_name(&to_client, "RBI")
+            .await
+            .map_err(|e| e.to_string())?;
 
-        // Send cursor instruction to show default pointer cursor (enables cursor visibility)
-        // CRITICAL: Use the correct Guacamole cursor format with cursor name, not coordinates!
-        // Format: cursor,<hotspot-x>,<hotspot-y>,<src-layer>,<src-x>,<src-y>,<width>,<height>;
-        // For standard cursors: cursor,0,0,<cursor-name>,0,0,0,0;
-        let cursor_instr = "6.cursor,1.0,1.0,7.pointer,1.0,1.0,1.0,1.0;";
+        // Send initial pointer cursor using embedded bitmap (drawn on buffer layer -1)
+        let cursor_instrs = self
+            .cursor_manager
+            .send_standard_cursor(StandardCursor::Pointer)
+            .map_err(|e| format!("Failed to generate cursor: {}", e))?;
         info!("RBI: Sending initial cursor instruction (pointer)");
-        to_client
-            .send(Bytes::from(cursor_instr))
+        send_cursor_instructions(cursor_instrs, &to_client)
             .await
             .map_err(|e| format!("Failed to send cursor: {}", e))?;
 
@@ -366,6 +321,7 @@ impl BrowserClient {
             tokio::select! {
                 // Capture screenshots at adaptive FPS with dirty tracking
                 _ = capture_interval.tick() => {
+                    debug!("RBI: Capture interval tick - calling capture_screenshot()");
                     match chrome_session.capture_screenshot().await {
                         Ok(Some(screenshot)) => {
                             // Check if frame has changed (dirty tracking)
@@ -384,8 +340,10 @@ impl BrowserClient {
                                     .unwrap()
                                     .as_millis() as u64;
                                 let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
+                                let sync_bytes = Bytes::from(sync_instr);
+                                self.record_server_instruction(&sync_bytes);
 
-                                if let Err(e) = to_client.send(Bytes::from(sync_instr)).await {
+                                if let Err(e) = to_client.send(sync_bytes).await {
                                     warn!("RBI: Failed to send sync: {}", e);
                                     break;
                                 }
@@ -518,11 +476,20 @@ impl BrowserClient {
                     // Also poll for cursor changes
                     match chrome_session.poll_cursor().await {
                         Ok(Some(cursor_type)) => {
-                            // Send cursor instruction to client
-                            if let Some(cursor_instr) = format_standard_cursor(cursor_type) {
-                                if let Err(e) = to_client.send(Bytes::from(cursor_instr)).await {
-                                    warn!("RBI: Failed to send cursor: {}", e);
+                            use crate::cursor::CursorType;
+                            // Map RBI CursorType to shared StandardCursor for bitmap rendering
+                            let std_cursor = match cursor_type {
+                                CursorType::Text => StandardCursor::IBeam,
+                                CursorType::None => StandardCursor::None,
+                                _ => StandardCursor::Pointer, // Default/Pointer/Wait/etc -> pointer
+                            };
+                            match self.cursor_manager.send_standard_cursor(std_cursor) {
+                                Ok(instrs) => {
+                                    if let Err(e) = send_cursor_instructions(instrs, &to_client).await {
+                                        warn!("RBI: Failed to send cursor: {}", e);
+                                    }
                                 }
+                                Err(e) => warn!("RBI: Failed to generate cursor: {}", e),
                             }
                         }
                         Ok(None) => {
@@ -610,7 +577,13 @@ impl BrowserClient {
                 }
 
                 // Handle client input (including sync acknowledgments for flow control)
-                Some(msg) = from_client.recv() => {
+                msg = from_client.recv() => {
+                    let Some(msg) = msg else {
+                        info!("RBI: Client disconnected");
+                        break;
+                    };
+                    // Record client input (if recording is enabled)
+                    self.record_client_input(&msg);
                     // Check if this is a sync acknowledgment for flow control
                     if let Ok(msg_str) = std::str::from_utf8(&msg) {
                         if msg_str.starts_with("4.sync,") {
@@ -620,6 +593,52 @@ impl BrowserClient {
                                 debug!("RBI: Client acknowledged sync (ts={})", ts);
                             }
                             continue; // Don't process sync as input
+                        }
+
+                        // Check if this is a size instruction from client (dynamic resize)
+                        if msg_str.starts_with("4.size,") {
+                            let parts: Vec<&str> = msg_str.split(',').collect();
+                            if parts.len() >= 3 {
+                                // Extract width and height (skip length prefixes)
+                                if let Some(width_part) = parts.get(2) {
+                                    if let Some(height_part) = parts.get(3) {
+                                        // Parse "N.VALUE" format
+                                        if let Some(w_str) = width_part.split('.').nth(1) {
+                                            if let Some(h_str) = height_part
+                                                .split('.')
+                                                .nth(1)
+                                                .and_then(|s| s.strip_suffix(';'))
+                                            {
+                                                if let (Ok(w), Ok(h)) =
+                                                    (w_str.parse::<u32>(), h_str.parse::<u32>())
+                                                {
+                                                    info!(
+                                                        "RBI: Client requested size change: {}x{} (was {}x{})",
+                                                        w, h, self.width, self.height
+                                                    );
+                                                    self.width = w;
+                                                    self.height = h;
+                                                    // Resize Chrome to match client viewport
+                                                    if let Err(e) = chrome_session.resize(w, h).await {
+                                                        warn!("RBI: Failed to resize Chrome: {}", e);
+                                                    } else {
+                                                        // Send updated size instruction back to client
+                                                        use guacr_protocol::format_instruction;
+                                                        let size_instr = format_instruction(
+                                                            "size",
+                                                            &["0", &w.to_string(), &h.to_string()],
+                                                        );
+                                                        if let Err(e) = to_client.send(Bytes::from(size_instr)).await {
+                                                            warn!("RBI: Failed to send size confirmation: {}", e);
+                                                        }
+                                                    }
+                                                    continue; // Don't process size as regular input
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -635,6 +654,16 @@ impl BrowserClient {
             }
         }
 
+        // Finalize recording
+        if let Some(recorder) = self.recorder.take() {
+            if let Err(e) = recorder.finalize() {
+                warn!("RBI: Failed to finalize recording: {}", e);
+            } else {
+                info!("RBI: Session recording finalized");
+            }
+        }
+
+        send_disconnect(&to_client).await;
         info!("RBI: Chrome session ended");
         Ok(())
     }
@@ -1026,8 +1055,10 @@ impl BrowserClient {
             self.stream_id, mimetype
         );
 
+        let img_bytes = img_instr.freeze();
+        self.record_server_instruction(&img_bytes);
         to_client
-            .send(img_instr.freeze())
+            .send(img_bytes)
             .await
             .map_err(|e| format!("Failed to send img instruction: {}", e))?;
 
@@ -1040,13 +1071,37 @@ impl BrowserClient {
         );
 
         for (idx, instr) in blob_instructions.iter().enumerate() {
+            let bytes = Bytes::from(instr.clone());
+            self.record_server_instruction(&bytes);
             to_client
-                .send(Bytes::from(instr.clone()))
+                .send(bytes)
                 .await
                 .map_err(|e| format!("Failed to send instruction {}: {}", idx, e))?;
         }
 
         Ok(())
+    }
+
+    /// Record a server-to-client instruction (if recording is enabled)
+    fn record_server_instruction(&mut self, instruction: &Bytes) {
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) =
+                recorder.record_instruction(RecordingDirection::ServerToClient, instruction)
+            {
+                warn!("RBI: Failed to record instruction: {}", e);
+            }
+        }
+    }
+
+    /// Record a client-to-server instruction (if recording is enabled)
+    fn record_client_input(&mut self, instruction: &Bytes) {
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) =
+                recorder.record_instruction(RecordingDirection::ClientToServer, instruction)
+            {
+                warn!("RBI: Failed to record client input: {}", e);
+            }
+        }
     }
 }
 
@@ -1058,7 +1113,9 @@ mod tests {
     #[test]
     fn test_browser_client_new() {
         let config = RbiConfig::default();
-        let client = BrowserClient::new(1920, 1080, config);
+        let recording_config = RecordingConfig::default();
+        let params = HashMap::new();
+        let client = BrowserClient::new(1920, 1080, config, &recording_config, &params);
         assert_eq!(client.width, 1920);
         assert_eq!(client.height, 1080);
     }

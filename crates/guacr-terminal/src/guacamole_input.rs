@@ -3,7 +3,6 @@ use crate::{points_enclose_text, ColumnSide, SelectionPoint, TerminalEmulator};
 ///
 /// This module provides shared functionality for parsing and handling
 /// Guacamole input instructions (key, mouse, clipboard) for SSH, Telnet, etc.
-use base64::Engine;
 use std::time::{Duration, Instant};
 
 /// Mouse selection state tracking with side-aware selection points
@@ -413,34 +412,7 @@ pub fn parse_mouse_instruction(msg: &str) -> Option<MouseEvent> {
 ///
 /// Returns: Some(String) with decoded text, None if invalid/empty
 pub fn parse_clipboard_blob(msg: &str) -> Option<String> {
-    if !msg.contains(".blob,") {
-        return None;
-    }
-
-    let args_part = msg.split_once(".blob,")?.1;
-    let parts: Vec<&str> = args_part.split(',').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-
-    // parts[0] = "1.0" (stream ID)
-    // parts[1] = "44.base64data;" (length.data)
-    let (_, data_part) = parts[1].split_once('.')?;
-    let data_str = data_part.trim_end_matches(';');
-
-    // Decode base64 clipboard data
-    use base64::Engine;
-    let clipboard_data = base64::engine::general_purpose::STANDARD
-        .decode(data_str)
-        .ok()?;
-    let clipboard_text = String::from_utf8(clipboard_data).ok()?;
-
-    // Skip empty clipboard syncs (initial connection)
-    if clipboard_text.is_empty() {
-        None
-    } else {
-        Some(clipboard_text)
-    }
+    guacr_protocol::parse_clipboard_blob(msg)
 }
 
 /// Extract selected text from terminal emulator
@@ -830,27 +802,7 @@ pub fn format_clear_selection_instructions() -> Vec<String> {
 /// # Returns
 /// Vec of instruction strings ready to send
 pub fn format_clipboard_instructions(clipboard_text: &str, stream_id: u32) -> Vec<String> {
-    let clipboard_data =
-        base64::engine::general_purpose::STANDARD.encode(clipboard_text.as_bytes());
-
-    vec![
-        // Allocate clipboard stream
-        format!(
-            "9.clipboard,{}.{},10.text/plain;",
-            stream_id.to_string().len(),
-            stream_id
-        ),
-        // Send blob
-        format!(
-            "4.blob,{}.{},{}.{};",
-            stream_id.to_string().len(),
-            stream_id,
-            clipboard_data.len(),
-            clipboard_data
-        ),
-        // End stream
-        format!("3.end,{}.{};", stream_id.to_string().len(), stream_id),
-    ]
+    guacr_protocol::format_clipboard_text(stream_id, clipboard_text)
 }
 
 #[cfg(test)]

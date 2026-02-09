@@ -185,50 +185,9 @@ impl RbiClipboard {
             .map_err(|e| format!("Lock error: {}", e))?;
         let data = &buffer[..self.length];
 
-        // Convert to string for text mimetypes (kept for future use)
-        let _data_str = if self.mimetype.starts_with("text/") {
-            String::from_utf8_lossy(data).to_string()
-        } else {
-            // For binary data, use base64
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(data)
-        };
-
-        // Format: clipboard,<stream>,<mimetype>;
-        // Then: blob,<stream>,<base64_data>;
-        // Then: end,<stream>;
-        let stream_id = 10; // Use a fixed stream ID for clipboard
-
-        let mut instructions = String::new();
-
-        // Clipboard instruction
-        instructions.push_str(&format!(
-            "9.clipboard,{}.{},{}.{};",
-            stream_id.to_string().len(),
-            stream_id,
-            self.mimetype.len(),
-            self.mimetype
-        ));
-
-        // Blob instruction with base64-encoded data
-        use base64::Engine;
-        let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
-        instructions.push_str(&format!(
-            "4.blob,{}.{},{}.{};",
-            stream_id.to_string().len(),
-            stream_id,
-            base64_data.len(),
-            base64_data
-        ));
-
-        // End instruction
-        instructions.push_str(&format!(
-            "3.end,{}.{};",
-            stream_id.to_string().len(),
-            stream_id
-        ));
-
-        Ok(Bytes::from(instructions))
+        let stream_id = 10; // Fixed stream ID for clipboard
+        let instrs = guacr_protocol::format_clipboard(stream_id, &self.mimetype, data);
+        Ok(Bytes::from(instrs.join("")))
     }
 
     /// Reset clipboard state

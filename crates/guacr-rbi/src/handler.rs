@@ -116,15 +116,16 @@ impl RbiConfig {
     /// Auto-detect Chromium/Chrome installation path
     fn find_chromium_path() -> String {
         // Common Chromium/Chrome paths across different Linux distributions
+        // IMPORTANT: Rocky/RHEL use chromium-browser, check it BEFORE chromium
         let candidates = vec![
-            "/usr/bin/chromium",                                            // Debian/Ubuntu
-            "/usr/bin/chromium-browser",                                    // Rocky/RHEL/CentOS
-            "/usr/lib64/chromium-browser/chromium-browser",                 // Rocky/RHEL alternate
-            "/usr/bin/google-chrome",                                       // Google Chrome
-            "/usr/bin/google-chrome-stable",                                // Google Chrome stable
-            "/snap/bin/chromium",                                           // Snap package
+            "/usr/bin/chromium-browser", // Rocky/RHEL/CentOS (CHECKED FIRST)
+            "/usr/lib64/chromium-browser/chromium-browser", // Rocky/RHEL alternate
+            "/usr/bin/chromium",         // Debian/Ubuntu
+            "/usr/bin/google-chrome",    // Google Chrome
+            "/usr/bin/google-chrome-stable", // Google Chrome stable
+            "/snap/bin/chromium",        // Snap package
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", // macOS
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",           // macOS Chromium
+            "/Applications/Chromium.app/Contents/MacOS/Chromium", // macOS Chromium
         ];
 
         for path in candidates {
@@ -148,8 +149,8 @@ impl RbiConfig {
             }
         }
 
-        // Last resort: return default and let it fail with helpful error
-        "/usr/bin/chromium".to_string()
+        // Last resort: return chromium-browser (most common in containers)
+        "/usr/bin/chromium-browser".to_string()
     }
 }
 
@@ -444,7 +445,13 @@ impl ProtocolHandler for RbiHandler {
         #[cfg(feature = "chrome")]
         {
             use crate::browser_client::BrowserClient;
-            let mut browser_client = BrowserClient::new(width, height, self.config.clone());
+            let mut browser_client = BrowserClient::new(
+                width,
+                height,
+                self.config.clone(),
+                &recording_config,
+                &params,
+            );
 
             // Connect and handle session
             browser_client

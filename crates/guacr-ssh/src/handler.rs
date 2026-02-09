@@ -9,6 +9,12 @@ use guacr_handlers::{
     parse_end_instruction,
     parse_pipe_instruction,
     pipe_blob_bytes,
+    // Session lifecycle
+    send_bell,
+    send_disconnect,
+    send_error_best_effort,
+    send_name,
+    send_ready,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -32,8 +38,8 @@ use guacr_handlers::{
     PIPE_STREAM_STDOUT,
 };
 use guacr_protocol::{
-    format_chunked_blobs, format_error, TextProtocolEncoder, STATUS_CLIENT_UNAUTHORIZED,
-    STATUS_UPSTREAM_ERROR, STATUS_UPSTREAM_TIMEOUT,
+    format_chunked_blobs, TextProtocolEncoder, STATUS_CLIENT_UNAUTHORIZED, STATUS_UPSTREAM_ERROR,
+    STATUS_UPSTREAM_TIMEOUT,
 };
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, parse_clipboard_blob,
@@ -194,8 +200,7 @@ impl SshHandler {
             _ => (error.to_string(), STATUS_UPSTREAM_ERROR),
         };
 
-        let error_instr = format_error(&message, status_code);
-        let _ = to_client.send(Bytes::from(error_instr)).await;
+        send_error_best_effort(to_client, &message, status_code).await;
 
         error
     }
@@ -658,8 +663,8 @@ impl ProtocolHandler for SshHandler {
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
         // Adaptive quality for bandwidth optimization (like RDP handler)
-        // Starts at quality 65 (default for terminal rendering), adjusts based on throughput
-        let mut adaptive_quality = guacr_handlers::AdaptiveQuality::new(65);
+        // Terminal text needs higher quality to avoid JPEG artifacts on small fonts
+        let mut adaptive_quality = guacr_handlers::AdaptiveQuality::new(85).with_min_quality(70);
 
         // Zero-allocation protocol encoder (reused for all img instructions)
         let mut protocol_encoder = TextProtocolEncoder::new();
@@ -709,13 +714,9 @@ impl ProtocolHandler for SshHandler {
                 .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
         }
 
-        // Send ready instruction first to signal the connection is established
-        debug!("SSH: Sending ready instruction");
-        let ready_instr = TerminalRenderer::format_ready_instruction("ssh-ready");
-        to_client
-            .send(Bytes::from(ready_instr))
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        // Send ready and name instructions to signal the connection is established
+        send_ready(&to_client, "ssh-ready").await?;
+        send_name(&to_client, "SSH").await?;
 
         // Send cursor instruction to show default cursor (enables cursor visibility)
         use guacr_protocol::format_cursor;
@@ -1215,12 +1216,7 @@ impl ProtocolHandler for SshHandler {
                             // Check for BEL character (0x07) and send audio beep to client
                             if data.contains(&0x07) {
                                 debug!("SSH: BEL detected, sending audio beep");
-                                let bell_instrs = guacr_protocol::format_bell_audio(100);
-                                for instr in bell_instrs {
-                                    to_client.send(Bytes::from(instr))
-                                        .await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                                }
+                                send_bell(&to_client, 100).await?;
                             }
 
                             // Render immediately for responsive feedback
@@ -1316,19 +1312,15 @@ impl ProtocolHandler for SshHandler {
                         russh::ChannelMsg::ExitStatus { exit_status } => {
                             error!("SSH handler: SSH command exited with status: {}", exit_status);
 
-                            // Send error to client before breaking
                             let error_msg = format!("SSH session ended (exit status: {})", exit_status);
-                            let error_instr = format_error(&error_msg, 517); // RESOURCE_CLOSED
-                            let _ = to_client.send(Bytes::from(error_instr)).await;
+                            send_error_best_effort(&to_client, &error_msg, 517).await; // RESOURCE_CLOSED
 
                             break;
                         }
                         russh::ChannelMsg::Eof => {
                             error!("SSH handler: SSH channel EOF");
 
-                            // Send error to client before breaking
-                            let error_instr = format_error("SSH connection closed by server", 517); // RESOURCE_CLOSED
-                            let _ = to_client.send(Bytes::from(error_instr)).await;
+                            send_error_best_effort(&to_client, "SSH connection closed by server", 517).await; // RESOURCE_CLOSED
 
                             break;
                         }
@@ -1774,6 +1766,7 @@ impl ProtocolHandler for SshHandler {
             }
         }
 
+        send_disconnect(&to_client).await;
         info!("SSH handler connection ended");
         Ok(())
     }

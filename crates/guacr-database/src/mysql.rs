@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
-    RecordingConfig,
+    send_disconnect, EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus,
+    ProtocolHandler, RecordingConfig,
 };
 use guacr_terminal::QueryResult;
 use log::{debug, info, warn};
@@ -145,23 +145,9 @@ impl ProtocolHandler for MySqlHandler {
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "MySQL", cols, rows);
 
-        // Send display initialization instructions (ready + cursor + size)
-        let (ready_instr, cursor_instr, size_instr) =
-            QueryExecutor::create_display_init_instructions(width, height);
-        to_client
-            .send(ready_instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        to_client
-            .send(cursor_instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        to_client
-            .send(size_instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-
-        debug!("MySQL: Sent ready, cursor and size instructions");
+        // Send display initialization instructions (ready, name, cursor, size)
+        QueryExecutor::send_display_init(&to_client, width, height).await?;
+        debug!("MySQL: Sent display init instructions");
 
         // NOTE: Don't render initial screen yet - wait until after connection
         // This matches SSH behavior and prevents rendering at wrong dimensions
@@ -357,7 +343,11 @@ impl ProtocolHandler for MySqlHandler {
                 }
 
                 // Process input from client
-                Some(msg) = from_client.recv() => {
+                msg = from_client.recv() => {
+                    let Some(msg) = msg else {
+                        info!("MySQL: Client disconnected");
+                        break 'outer;
+                    };
                     match executor.process_input(&msg).await {
                 Ok((needs_render, instructions, pending_query)) => {
                     if let Some(query) = pending_query {
@@ -517,6 +507,7 @@ impl ProtocolHandler for MySqlHandler {
         // Finalize recording
         finalize_recording(recorder, "MySQL");
 
+        send_disconnect(&to_client).await;
         info!("MySQL handler ended");
         Ok(())
     }

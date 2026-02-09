@@ -3,12 +3,14 @@
 
 use crate::{DatabaseError, Result};
 use bytes::Bytes;
-use guacr_protocol::{format_chunked_blobs, GuacamoleParser, TextProtocolEncoder};
+use guacr_handlers::{send_name, send_ready, HandlerError};
+use guacr_protocol::{format_chunked_blobs, format_cursor, GuacamoleParser, TextProtocolEncoder};
 use guacr_terminal::{
     DatabaseTerminal, DirtyTracker, QueryResult, TerminalInputHandler, TerminalRenderer,
 };
 use std::collections::VecDeque;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 // Re-export QueryResult for convenience
 pub use guacr_terminal::QueryResult as QueryResultData;
@@ -95,22 +97,28 @@ impl QueryExecutor {
         &self.db_type
     }
 
-    /// Generate Guacamole protocol display initialization instructions
-    /// Returns (ready_instruction, cursor_instruction, size_instruction)
-    pub fn create_display_init_instructions(width: u32, height: u32) -> (Bytes, Bytes, Bytes) {
-        use guacr_protocol::format_cursor;
+    /// Send display initialization instructions (ready, name, cursor, size)
+    pub async fn send_display_init(
+        to_client: &mpsc::Sender<Bytes>,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<(), HandlerError> {
+        send_ready(to_client, "database").await?;
+        send_name(to_client, "Database").await?;
 
-        // Create ready instruction with protocol name (matches SSH approach)
-        let ready = Bytes::from(TerminalRenderer::format_ready_instruction("database"));
-
-        // Create cursor instruction to show default cursor (enables cursor visibility)
         let cursor = Bytes::from(format_cursor(0, 0, 0, 0, 0, 0, 0));
+        to_client
+            .send(cursor)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        // Create size instruction with layer 0 (matches SSH approach)
-        // This tells the client the dimensions of layer 0 where we'll render
         let size = Bytes::from(TerminalRenderer::format_size_instruction(0, width, height));
+        to_client
+            .send(size)
+            .await
+            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
-        (ready, cursor, size)
+        Ok(())
     }
 
     /// Get terminal size (rows, cols)

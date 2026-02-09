@@ -231,35 +231,27 @@ impl Tube {
 
         let status = self.status.clone();
 
-        let tube_arc_for_pc_state = Arc::clone(self);
-        let spawned_task_tx_for_pc_state =
-            Arc::clone(&tube_arc_for_pc_state.spawned_task_completion_tx);
-
         debug!("[TUBE_DEBUG] Tube {}: About to call setup_ice_candidate_handler. Callback token (used as conv_id before): {}", self.id, callback_token);
         connection_arc.setup_ice_candidate_handler();
 
-        // Set up comprehensive connection state monitoring with tube lifecycle management
-        let is_closing_for_tube = Arc::clone(&connection_arc.is_closing);
-        let connection_arc_for_signals = Arc::clone(&connection_arc); // Clone for signal sending
+        // Initial connection state handler - handles Connected state BEFORE start_monitoring()
+        // overwrites this handler with setup_connection_state_monitoring().
+        // After Connected fires and calls start_monitoring(), that method registers a new
+        // on_peer_connection_state_change handler that handles ALL subsequent states
+        // (Disconnected, Failed, Closed) with both ICE restart and tube lifecycle logic.
+        let connection_arc_for_signals = Arc::clone(&connection_arc);
         connection_arc.peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let status_clone = status.clone();
-            let tube_clone_for_closure = tube_arc_for_pc_state.clone();
-            let spawned_task_tx = Arc::clone(&spawned_task_tx_for_pc_state);
-            let is_closing_for_handler = Arc::clone(&is_closing_for_tube);
             let connection_for_signals = Arc::clone(&connection_arc_for_signals);
 
             Box::pin(async move {
-                let tube_id_log = tube_clone_for_closure.id.clone();
-                let state_str = format!("{state:?}");
-                // WebRTC monitoring with tube_id context
-                debug!("Connection state changed (tube_id: {}, state: {})", tube_id_log, state_str);
+                let tube_id_log = connection_for_signals.tube_id.clone();
+                debug!("Connection state changed (tube_id: {}, state: {:?})", tube_id_log, state);
 
                 match state {
                     RTCPeerConnectionState::Connected => {
                         debug!("Connection established (tube_id: {})", tube_id_log);
                         // Tube status update - only upgrade to Active, don't downgrade from Ready
-                        // This prevents race condition where on_data_channel sets Ready
-                        // but on_peer_connection_state_change(Connected) resets it to Active
                         {
                             let mut status_guard = status_clone.write().await;
                             if !matches!(*status_guard, TubeStatus::Ready) {
@@ -270,8 +262,9 @@ impl Tube {
                             }
                         }
 
-                        // Start monitoring and quality management
-                        if let Err(e) = connection_for_signals.start_monitoring().await {
+                        // Start monitoring - this REPLACES this handler with one that
+                        // handles Disconnected/Failed/Closed with tube lifecycle management
+                        if let Err(e) = connection_for_signals.start_monitoring(status_clone.clone()).await {
                             warn!("Failed to start monitoring (tube_id: {}, error: {})", tube_id_log, e);
                         }
 
@@ -286,140 +279,13 @@ impl Tube {
                         }
 
                         // Send connection state changed signal to Python
-                        debug!("Sending 'connected' signal to Python (tube_id: {})", tube_id_log);
                         connection_for_signals.send_connection_state_changed("connected");
                     },
-                    RTCPeerConnectionState::Failed => {
-                        // Update the closing flag (from comprehensive monitor)
-                        is_closing_for_handler.store(true, std::sync::atomic::Ordering::Release);
-                        debug!("Connection failed (tube_id: {}, state: {})", tube_id_log, state_str);
-
-                        // Send connection state changed signal to Python BEFORE closing
-                        // This allows Python to perform cleanup (e.g., release database proxy locks)
-                        debug!("Sending 'failed' signal to Python (tube_id: {})", tube_id_log);
-                        connection_for_signals.send_connection_state_changed("failed");
-
-                        // Report connection failure for adaptive learning
-                        let connection_error = crate::webrtc_errors::WebRTCError::IceConnectionFailed {
-                            tube_id: tube_id_log.clone(),
-                            reason: "Peer connection state failed".to_string(),
-                        };
-                        if let Err(e) = connection_for_signals.trigger_adaptive_recovery(&connection_error).await {
-                            warn!("Failed to trigger adaptive recovery (tube_id: {}, error: {})", tube_id_log, e);
-                        }
-
-                        // Tube lifecycle management
-                        let current_status = *status_clone.read().await;
-                        if current_status != TubeStatus::Closing &&
-                           current_status != TubeStatus::Closed &&
-                           current_status != TubeStatus::Failed &&
-                           current_status != TubeStatus::Disconnected {
-
-                            warn!("WebRTC peer connection failed. Initiating Tube close. (tube_id: {}, old_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
-                            *status_clone.write().await = TubeStatus::Failed;
-
-                            let runtime = get_runtime();
-                            let completion_tx = Arc::clone(&spawned_task_tx);
-                            runtime.spawn(async move {
-                                debug!("Spawning task to close tube due to peer connection failure. (tube_id: {})", tube_id_log);
-
-                                // LOCK-FREE: Close via actor (no deadlock possible!)
-                                if let Err(e) = crate::tube_registry::REGISTRY
-                                    .close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionFailed))
-                                    .await
-                                {
-                                    error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
-                                } else {
-                                    debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
-                                }
-
-                                // Signal completion (lock-free, non-blocking)
-                                let _ = completion_tx.send(());
-                            });
-                        } else {
-                            debug!("Peer connection failed, but tube already closing/closed. (tube_id: {}, current_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
-                            *status_clone.write().await = TubeStatus::Failed;
-                        }
-                    },
-                    RTCPeerConnectionState::Closed => {
-                        // Update the closing flag (from comprehensive monitor)
-                        is_closing_for_handler.store(true, std::sync::atomic::Ordering::Release);
-                        info!("Connection closed (tube_id: {}, state: {})", tube_id_log, state_str);
-
-                        // Tube lifecycle management
-                        let current_status = *status_clone.read().await;
-                        if current_status != TubeStatus::Closing &&
-                           current_status != TubeStatus::Closed &&
-                           current_status != TubeStatus::Failed &&
-                           current_status != TubeStatus::Disconnected {
-
-                            warn!("WebRTC peer connection closed. Initiating Tube close. (tube_id: {}, old_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
-                            *status_clone.write().await = TubeStatus::Closed;
-
-                            let runtime = get_runtime();
-                            let completion_tx = Arc::clone(&spawned_task_tx);
-                            runtime.spawn(async move {
-                                debug!("Spawning task to close tube due to peer connection closure. (tube_id: {})", tube_id_log);
-                                // LOCK-FREE: Close via actor (no deadlock possible!)
-                                if let Err(e) = crate::tube_registry::REGISTRY
-                                    .close_tube(&tube_id_log, Some(CloseConnectionReason::Normal))
-                                    .await
-                                {
-                                    error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
-                                } else {
-                                    debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
-                                }
-
-                                // Signal completion (lock-free, non-blocking)
-                                let _ = completion_tx.send(());
-                            });
-                        } else {
-                            debug!("Peer connection closed, but tube already closing/closed. (tube_id: {}, current_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
-                            *status_clone.write().await = TubeStatus::Closed;
-                        }
-                    },
-                    RTCPeerConnectionState::Disconnected => {
-                        debug!("Connection disconnected (tube_id: {}, state: {})", tube_id_log, state_str);
-
-                        // Send connection state changed signal to Python BEFORE closing
-                        // This allows Python to perform cleanup (e.g., release database proxy locks)
-                        debug!("Sending 'disconnected' signal to Python (tube_id: {})", tube_id_log);
-                        connection_for_signals.send_connection_state_changed("disconnected");
-
-                        // Tube lifecycle management
-                        let current_status = *status_clone.read().await;
-                        if current_status != TubeStatus::Closing &&
-                           current_status != TubeStatus::Closed &&
-                           current_status != TubeStatus::Failed &&
-                           current_status != TubeStatus::Disconnected {
-
-                            debug!("WebRTC peer connection disconnected. Initiating Tube close. (tube_id: {}, old_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
-                            *status_clone.write().await = TubeStatus::Disconnected;
-
-                            let runtime = get_runtime();
-                            let completion_tx = Arc::clone(&spawned_task_tx);
-                            runtime.spawn(async move {
-                                debug!("Spawning task to close tube due to peer connection disconnection. (tube_id: {})", tube_id_log);
-                                // LOCK-FREE: Close via actor (no deadlock possible!)
-                                if let Err(e) = crate::tube_registry::REGISTRY
-                                    .close_tube(&tube_id_log, Some(CloseConnectionReason::ConnectionLost))
-                                    .await
-                                {
-                                    error!("Error trying to close tube via registry: {} (tube_id: {})", e, tube_id_log);
-                                } else {
-                                    debug!("Successfully initiated tube closure via registry. (tube_id: {})", tube_id_log);
-                                }
-
-                                // Signal completion (lock-free, non-blocking)
-                                let _ = completion_tx.send(());
-                            });
-                        } else {
-                            debug!("Peer connection disconnected, but tube already closing/closed. (tube_id: {}, current_status: {:?}, new_state: {:?})", tube_id_log, current_status, state);
-                            *status_clone.write().await = TubeStatus::Disconnected;
-                        }
-                    },
                     _ => {
-                        debug!("Connection state changed to: {:?} (tube_id: {})", state, tube_id_log);
+                        // Before Connected fires, other states (Failed, Closed, Disconnected) can
+                        // occur during ICE negotiation. After Connected fires and overwrites this
+                        // handler, these arms are dead code. Log for diagnostic purposes.
+                        debug!("Pre-connected state change: {:?} (tube_id: {})", state, tube_id_log);
                     }
                 }
             })

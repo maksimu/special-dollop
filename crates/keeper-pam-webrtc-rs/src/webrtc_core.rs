@@ -1714,42 +1714,128 @@ impl WebRTCPeerConnection {
         format!("{:?}", self.peer_connection.connection_state())
     }
 
-    /// Setup connection state monitoring to trigger ICE restarts on connection issues
-    pub async fn setup_connection_state_monitoring(&self) -> Result<(), String> {
+    /// Setup connection state monitoring with tube lifecycle management.
+    ///
+    /// This is the SINGLE handler for on_peer_connection_state_change after Connected.
+    /// It handles both ICE restart (trickle_ice) AND tube lifecycle (close_tube, status
+    /// updates, Python signals). The initial handler in tube.rs fires for Connected,
+    /// then this handler replaces it via start_monitoring() and handles all subsequent
+    /// state transitions.
+    pub async fn setup_connection_state_monitoring(
+        &self,
+        status: Arc<tokio::sync::RwLock<crate::tube_and_channel_helpers::TubeStatus>>,
+    ) -> Result<(), String> {
+        use crate::tube_and_channel_helpers::TubeStatus;
+
         let network_integration = Arc::clone(&self.network_integration);
         let tube_id = self.tube_id.clone();
         let initial_scan_triggered = Arc::clone(&self.initial_network_scan_triggered);
+        let is_closing = Arc::clone(&self.is_closing);
+
+        // Clone self fields needed for signal sending
+        let signal_sender = self.signal_sender.clone();
+        let signal_tube_id = self.tube_id.clone();
+        let signal_trickle_ice = self.trickle_ice;
+        let signal_conversation_id = self.conversation_id.clone();
 
         // Monitor peer connection state changes
         let peer_connection = Arc::clone(&self.peer_connection);
-        let trickle_ice_for_state_handler = self.trickle_ice; // Capture trickle_ice state
+        let trickle_ice_for_state_handler = self.trickle_ice;
         peer_connection.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             let network_integration = Arc::clone(&network_integration);
             let tube_id = tube_id.clone();
             let initial_scan_triggered = Arc::clone(&initial_scan_triggered);
-            let trickle_ice = trickle_ice_for_state_handler; // Capture in closure
+            let trickle_ice = trickle_ice_for_state_handler;
+            let status = Arc::clone(&status);
+            let is_closing = Arc::clone(&is_closing);
+            let signal_sender = signal_sender.clone();
+            let signal_tube_id = signal_tube_id.clone();
+            let signal_conversation_id = signal_conversation_id.clone();
+
+            // Helper: send connection_state_changed signal to Python
+            // Resolve conversation_id once (use conversation_id if available, otherwise tube_id)
+            let resolved_conversation_id = signal_conversation_id
+                .unwrap_or_else(|| signal_tube_id.clone());
+            let send_signal = move |state_str: &str| {
+                if let Some(sender) = &signal_sender {
+                    let message = crate::tube_registry::SignalMessage {
+                        tube_id: signal_tube_id.clone(),
+                        kind: "connection_state_changed".to_string(),
+                        data: state_str.to_string(),
+                        conversation_id: resolved_conversation_id.clone(),
+                        progress_flag: Some(if signal_trickle_ice { 2 } else { 0 }),
+                        progress_status: Some("OK".to_string()),
+                        is_ok: Some(true),
+                    };
+                    let _ = sender.send(message);
+                }
+            };
 
             Box::pin(async move {
                 debug!("Peer connection state changed for tube {}: {:?}", tube_id, state);
 
-                // Trigger ICE restart for problematic states (only if trickle ICE is enabled)
                 match state {
                     RTCPeerConnectionState::Disconnected => {
                         if trickle_ice {
+                            // With trickle ICE, attempt recovery via ICE restart
                             info!("Connection disconnected for tube {}, considering ICE restart (trickle_ice enabled)", tube_id);
-                            // Wait a moment to see if connection recovers
                             tokio::time::sleep(crate::config::ice_disconnected_wait()).await;
                             network_integration.trigger_ice_restart(&tube_id, "connection disconnected");
                         } else {
-                            error!("Connection disconnected for tube {} - ICE restart is not available (trickle_ice disabled)", tube_id);
+                            // Without trickle ICE, disconnected is terminal - close the tube
+                            warn!("Connection disconnected for tube {} - closing tube (trickle_ice disabled)", tube_id);
+                            send_signal("disconnected");
+                            is_closing.store(true, Ordering::Release);
+
+                            let current_status = *status.read().await;
+                            if !matches!(current_status, TubeStatus::Closing | TubeStatus::Closed | TubeStatus::Failed | TubeStatus::Disconnected) {
+                                warn!("WebRTC disconnected. Initiating tube close. (tube_id: {}, old_status: {:?})", tube_id, current_status);
+                                *status.write().await = TubeStatus::Disconnected;
+
+                                let tube_id_for_close = tube_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::tube_registry::REGISTRY
+                                        .close_tube(&tube_id_for_close, Some(crate::tube_protocol::CloseConnectionReason::ConnectionLost))
+                                        .await
+                                    {
+                                        error!("Error closing tube via registry (tube_id: {}, error: {})", tube_id_for_close, e);
+                                    }
+                                });
+                            } else {
+                                debug!("Peer disconnected, but tube already terminal (tube_id: {}, status: {:?})", tube_id, current_status);
+                                *status.write().await = TubeStatus::Disconnected;
+                            }
                         }
                     },
                     RTCPeerConnectionState::Failed => {
                         if trickle_ice {
+                            // With trickle ICE, attempt recovery via ICE restart
                             warn!("Connection failed for tube {}, triggering immediate ICE restart (trickle_ice enabled)", tube_id);
                             network_integration.trigger_ice_restart(&tube_id, "connection failed");
                         } else {
-                            warn!("Connection failed for tube {} - ICE restart is not available (trickle_ice disabled)", tube_id);
+                            // Without trickle ICE, failed is terminal - close the tube
+                            warn!("Connection failed for tube {} - closing tube (trickle_ice disabled)", tube_id);
+                            send_signal("failed");
+                            is_closing.store(true, Ordering::Release);
+
+                            let current_status = *status.read().await;
+                            if !matches!(current_status, TubeStatus::Closing | TubeStatus::Closed | TubeStatus::Failed | TubeStatus::Disconnected) {
+                                warn!("WebRTC failed. Initiating tube close. (tube_id: {}, old_status: {:?})", tube_id, current_status);
+                                *status.write().await = TubeStatus::Failed;
+
+                                let tube_id_for_close = tube_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::tube_registry::REGISTRY
+                                        .close_tube(&tube_id_for_close, Some(crate::tube_protocol::CloseConnectionReason::ConnectionFailed))
+                                        .await
+                                    {
+                                        error!("Error closing tube via registry (tube_id: {}, error: {})", tube_id_for_close, e);
+                                    }
+                                });
+                            } else {
+                                debug!("Peer failed, but tube already terminal (tube_id: {}, status: {:?})", tube_id, current_status);
+                                *status.write().await = TubeStatus::Failed;
+                            }
                         }
                     },
                     RTCPeerConnectionState::Connected => {
@@ -1773,6 +1859,40 @@ impl WebRTCPeerConnection {
                                     }
                                 });
                             }
+
+                        // Update tube status - only upgrade to Active, don't downgrade from Ready
+                        {
+                            let mut status_guard = status.write().await;
+                            if !matches!(*status_guard, TubeStatus::Ready) {
+                                *status_guard = TubeStatus::Active;
+                                debug!("Tube connection state changed to Active (tube_id: {})", tube_id);
+                            }
+                        }
+
+                        send_signal("connected");
+                    },
+                    RTCPeerConnectionState::Closed => {
+                        info!("Connection closed for tube {}", tube_id);
+                        is_closing.store(true, Ordering::Release);
+
+                        let current_status = *status.read().await;
+                        if !matches!(current_status, TubeStatus::Closing | TubeStatus::Closed | TubeStatus::Failed | TubeStatus::Disconnected) {
+                            warn!("WebRTC closed. Initiating tube close. (tube_id: {}, old_status: {:?})", tube_id, current_status);
+                            *status.write().await = TubeStatus::Closed;
+
+                            let tube_id_for_close = tube_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::tube_registry::REGISTRY
+                                    .close_tube(&tube_id_for_close, Some(crate::tube_protocol::CloseConnectionReason::Normal))
+                                    .await
+                                {
+                                    error!("Error closing tube via registry (tube_id: {}, error: {})", tube_id_for_close, e);
+                                }
+                            });
+                        } else {
+                            debug!("Peer closed, but tube already terminal (tube_id: {}, status: {:?})", tube_id, current_status);
+                            *status.write().await = TubeStatus::Closed;
+                        }
                     },
                     _ => {
                         debug!("Peer connection state: {:?} for tube {}", state, tube_id);
@@ -1806,7 +1926,10 @@ impl WebRTCPeerConnection {
     }
 
     /// Start monitoring and quality management systems
-    pub async fn start_monitoring(&self) -> Result<(), String> {
+    pub async fn start_monitoring(
+        &self,
+        status: Arc<tokio::sync::RwLock<crate::tube_and_channel_helpers::TubeStatus>>,
+    ) -> Result<(), String> {
         // Start quality monitoring
         self.quality_manager
             .start_monitoring()
@@ -1870,8 +1993,8 @@ impl WebRTCPeerConnection {
             );
         }
 
-        // Enable connection state-based ICE restart triggers as backup
-        self.setup_connection_state_monitoring().await?;
+        // Enable connection state monitoring with tube lifecycle management
+        self.setup_connection_state_monitoring(status).await?;
 
         debug!("Monitoring systems started for tube {}", self.tube_id);
         Ok(())
@@ -2443,6 +2566,7 @@ impl WebRTCPeerConnection {
         let tube_id_clone = self.tube_id.clone();
         let pc_clone = self.peer_connection.clone();
         let keepalive_interval = self.keepalive_interval;
+        let trickle_ice_for_keepalive = self.trickle_ice;
 
         // Create a lightweight task that ensures periodic activity with quality-aware intervals
         // Quality-aware: More frequent keepalive when connection quality is degraded
@@ -2500,11 +2624,14 @@ impl WebRTCPeerConnection {
 
                 // Self-terminate if connection is in terminal state
                 // This prevents zombie keepalive tasks if explicit close somehow fails
-                // Failed/Closed are terminal states - no point keeping alive a dead connection
-                if matches!(
+                // Failed/Closed are always terminal. Disconnected is also terminal when
+                // trickle ICE is disabled (no ICE restart possible).
+                let is_terminal = matches!(
                     connection_state,
                     RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-                ) {
+                ) || (!trickle_ice_for_keepalive
+                    && matches!(connection_state, RTCPeerConnectionState::Disconnected));
+                if is_terminal {
                     info!(
                         "NAT timeout prevention stopping - connection {:?} is terminal (tube_id: {})",
                         connection_state, tube_id_clone

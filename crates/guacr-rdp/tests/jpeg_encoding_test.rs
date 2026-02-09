@@ -9,13 +9,16 @@ fn test_rdp_config_jpeg_defaults() {
     // JPEG should be enabled by default
     assert!(config.use_jpeg, "JPEG should be enabled by default");
     assert_eq!(
-        config.jpeg_quality, 85,
-        "JPEG quality should be 85 by default"
+        config.jpeg_quality, 92,
+        "JPEG quality should be 92 by default"
     );
 
     println!("✅ RDP JPEG defaults:");
     println!("   use_jpeg: {}", config.use_jpeg);
-    println!("   jpeg_quality: {}", config.jpeg_quality);
+    println!(
+        "   jpeg_quality: {} (high quality, minimal artifacts)",
+        config.jpeg_quality
+    );
 }
 
 #[test]
@@ -75,7 +78,7 @@ fn test_jpeg_bandwidth_savings() {
         }
     }
 
-    // Encode as JPEG (quality 85, RDP default)
+    // Encode as JPEG (quality 85 for comparison)
     let img =
         image::RgbaImage::from_raw(width, height, pixels.clone()).expect("Failed to create image");
     let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();

@@ -151,18 +151,10 @@ impl RdpClipboard {
             self.length, format
         );
 
-        // Format as Guacamole clipboard instruction
-        // Format: clipboard,<mimetype_len>.<mimetype>,<data_len>.<data>;
-        let data_str = String::from_utf8_lossy(&buffer[..self.length]);
-        let instr = format!(
-            "9.clipboard,{}.{},{}.{};",
-            mimetype.len(),
-            mimetype,
-            data_str.len(),
-            data_str
-        );
-
-        Ok(Bytes::from(instr))
+        // Format as Guacamole clipboard instruction sequence (clipboard + blob + end)
+        let stream_id = 10; // Fixed stream ID for RDP clipboard
+        let instrs = guacr_protocol::format_clipboard(stream_id, mimetype, &buffer[..self.length]);
+        Ok(Bytes::from(instrs.join("")))
     }
 
     /// Get current clipboard data

@@ -4,6 +4,10 @@ use guacr_handlers::{
     // Connection utilities
     connect_tcp_with_timeout,
     is_mouse_event_allowed_readonly,
+    // Session lifecycle
+    send_disconnect,
+    send_name,
+    send_ready,
     // Adaptive quality (bandwidth-aware quality adjustment, shared with RDP)
     AdaptiveQuality,
     // Cursor support
@@ -20,6 +24,7 @@ use guacr_handlers::{
     ProtocolHandler,
     // Recording
     RecordingConfig,
+    RecordingDirection,
     StandardCursor,
     // Sync flow control (prevents overwhelming slow clients, shared with RDP)
     SyncFlowControl,
@@ -424,11 +429,7 @@ struct VncClient {
     read_only: bool,
     /// Security settings (includes connection timeout)
     security: HandlerSecuritySettings,
-    /// Recording configuration
-    #[allow(dead_code)] // TODO: Use for .ses recording
-    recording_config: RecordingConfig,
     /// Active recorder
-    #[allow(dead_code)] // TODO: Use for .ses recording
     recorder: Option<MultiFormatRecorder>,
     /// Scroll detector for bandwidth optimization (shared with RDP)
     scroll_detector: ScrollDetector,
@@ -503,7 +504,6 @@ impl VncClient {
             height,
             read_only,
             security,
-            recording_config,
             recorder,
             scroll_detector: ScrollDetector::new(width, height),
             jpeg_quality,
@@ -613,6 +613,46 @@ impl VncClient {
     ///
     /// Helps with session recording playback timing and client-side frame synchronization.
     /// Also enables flow control to prevent overwhelming slow clients.
+    /// Send instruction to client and record it (if recording is enabled)
+    async fn send_and_record(&mut self, instruction: &str) -> Result<(), String> {
+        let bytes = Bytes::from(instruction.to_string());
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) = recorder.record_instruction(RecordingDirection::ServerToClient, &bytes)
+            {
+                warn!("VNC: Failed to record instruction: {}", e);
+            }
+        }
+        self.to_client
+            .send(bytes)
+            .await
+            .map_err(|e| format!("Failed to send: {}", e))
+    }
+
+    /// Send Bytes to client and record (if recording is enabled)
+    async fn send_and_record_bytes(&mut self, bytes: Bytes) -> Result<(), String> {
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) = recorder.record_instruction(RecordingDirection::ServerToClient, &bytes)
+            {
+                warn!("VNC: Failed to record instruction: {}", e);
+            }
+        }
+        self.to_client
+            .send(bytes)
+            .await
+            .map_err(|e| format!("Failed to send: {}", e))
+    }
+
+    /// Record client input instruction (if recording is enabled)
+    fn record_client_input(&mut self, instruction: &Bytes) {
+        if let Some(ref mut recorder) = self.recorder {
+            if let Err(e) =
+                recorder.record_instruction(RecordingDirection::ClientToServer, instruction)
+            {
+                warn!("VNC: Failed to record client input: {}", e);
+            }
+        }
+    }
+
     async fn send_sync(&mut self) -> Result<(), String> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -621,10 +661,7 @@ impl VncClient {
 
         let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
 
-        self.to_client
-            .send(Bytes::from(sync_instr))
-            .await
-            .map_err(|e| format!("Failed to send sync: {}", e))?;
+        self.send_and_record(&sync_instr).await?;
 
         // Store pending sync for flow control (prevents overwhelming slow clients)
         self.sync_control.set_pending_sync(timestamp);
@@ -669,29 +706,26 @@ impl VncClient {
         self.framebuffer = FrameBuffer::new(self.width, self.height);
         self.pixel_format = Some(pixel_format);
 
-        // Send ready instruction with proper LENGTH.VALUE format
-        let ready_value = "vnc-ready";
-        let ready_instr = format!("5.ready,{}.{};", ready_value.len(), ready_value);
-        self.to_client
-            .send(Bytes::from(ready_instr))
+        // Send ready and name instructions to client
+        send_ready(&self.to_client, "vnc-ready")
             .await
-            .map_err(|e| format!("Failed to send ready: {}", e))?;
+            .map_err(|e| e.to_string())?;
+        send_name(&self.to_client, "VNC")
+            .await
+            .map_err(|e| e.to_string())?;
 
         let size_instr = self.binary_encoder.encode_size(0, self.width, self.height);
-        self.to_client
-            .send(size_instr)
-            .await
-            .map_err(|e| format!("Failed to send size: {}", e))?;
+        self.send_and_record_bytes(size_instr).await?;
 
         // Set initial cursor to pointer (matches KCM/guacamole behavior)
         if !self.read_only {
-            let cursor_instr = self
+            let cursor_instrs = self
                 .cursor_manager
-                .send_standard_cursor(StandardCursor::Pointer);
-            self.to_client
-                .send(Bytes::from(cursor_instr))
-                .await
-                .map_err(|e| format!("Failed to send initial cursor: {}", e))?;
+                .send_standard_cursor(StandardCursor::Pointer)
+                .map_err(|e| format!("Failed to generate cursor: {}", e))?;
+            for instr in cursor_instrs {
+                self.send_and_record(&instr).await?;
+            }
             info!("VNC: Initial cursor set to pointer");
         }
 
@@ -789,7 +823,11 @@ impl VncClient {
                     }
                 }
 
-                Some(msg) = from_client.recv() => {
+                msg = from_client.recv() => {
+                    let Some(msg) = msg else {
+                        info!("VNC: Client disconnected");
+                        break;
+                    };
                     if let Err(e) = self.handle_client_input(&mut stream, &msg).await {
                         warn!("VNC: Error handling client input: {}", e);
                     }
@@ -801,6 +839,18 @@ impl VncClient {
                 }
             }
         }
+
+        // Finalize recording
+        if let Some(recorder) = self.recorder.take() {
+            if let Err(e) = recorder.finalize() {
+                warn!("VNC: Failed to finalize recording: {}", e);
+            } else {
+                info!("VNC: Session recording finalized");
+            }
+        }
+
+        // Send disconnect instruction to client (matches Apache guacd behavior)
+        send_disconnect(&self.to_client).await;
 
         info!("VNC: Connection ended");
         Ok(())
@@ -840,6 +890,9 @@ impl VncClient {
     where
         S: AsyncWrite + Unpin,
     {
+        // Record client input (if recording is enabled)
+        self.record_client_input(msg);
+
         let instr = GuacamoleParser::parse_instruction(msg)
             .map_err(|e| format!("Failed to parse instruction: {}", e))?;
 
@@ -965,10 +1018,7 @@ impl VncClient {
         )?;
 
         for instr in instructions {
-            self.to_client
-                .send(Bytes::from(instr))
-                .await
-                .map_err(|e| format!("Failed to send cursor instruction: {}", e))?;
+            self.send_and_record(&instr).await?;
         }
 
         debug!(
@@ -1052,10 +1102,7 @@ impl VncClient {
                         0,                              // dst x
                         0,                              // dst y (to top)
                     );
-                    self.to_client
-                        .send(Bytes::from(copy_instr))
-                        .await
-                        .map_err(|e| format!("Failed to send copy instruction: {}", e))?;
+                    self.send_and_record(&copy_instr).await?;
 
                     // Only render new content at bottom (bandwidth savings!)
                     let new_region_y = self.height - scroll_op.pixels;
@@ -1081,10 +1128,7 @@ impl VncClient {
                         Bytes::from(new_region_data),
                     );
 
-                    self.to_client
-                        .send(msg)
-                        .await
-                        .map_err(|e| format!("Failed to send image: {}", e))?;
+                    self.send_and_record_bytes(msg).await?;
 
                     // Send sync for frame timing
                     self.send_sync().await?;
@@ -1102,10 +1146,7 @@ impl VncClient {
                         0,                              // dst x
                         scroll_op.pixels,               // dst y (move down by N)
                     );
-                    self.to_client
-                        .send(Bytes::from(copy_instr))
-                        .await
-                        .map_err(|e| format!("Failed to send copy instruction: {}", e))?;
+                    self.send_and_record(&copy_instr).await?;
 
                     // Only render new content at top
                     let new_region_data = self.encode_region(guacr_terminal::FrameRect {
@@ -1130,10 +1171,7 @@ impl VncClient {
                         Bytes::from(new_region_data),
                     );
 
-                    self.to_client
-                        .send(msg)
-                        .await
-                        .map_err(|e| format!("Failed to send image: {}", e))?;
+                    self.send_and_record_bytes(msg).await?;
 
                     // Send sync for frame timing
                     self.send_sync().await?;
@@ -1177,10 +1215,7 @@ impl VncClient {
                     encoded_bytes,
                 );
 
-                self.to_client
-                    .send(msg)
-                    .await
-                    .map_err(|e| format!("Failed to send image: {}", e))?;
+                self.send_and_record_bytes(msg).await?;
             }
 
             // Track total bytes sent for adaptive quality calculation
@@ -1221,10 +1256,7 @@ impl VncClient {
                 encoded_bytes,
             );
 
-            self.to_client
-                .send(msg)
-                .await
-                .map_err(|e| format!("Failed to send image: {}", e))?;
+            self.send_and_record_bytes(msg).await?;
 
             // Track bytes sent for adaptive quality calculation
             self.adaptive_quality.track_frame_sent(total_bytes);

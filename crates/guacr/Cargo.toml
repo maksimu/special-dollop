@@ -38,5 +38,5 @@ rbi = ["guacr-rbi"]
 # This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
 guacd-compat = ["guacr-handlers/guacd-compat"]
 
-# All protocols (RDP requires FreeRDP system library)
+# All protocols
 all = ["ssh", "telnet", "rdp", "vnc", "sftp", "database", "rbi"]

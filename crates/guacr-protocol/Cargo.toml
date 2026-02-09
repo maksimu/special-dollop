@@ -6,4 +6,5 @@ license.workspace = true
 description = "Guacamole protocol instruction formatting and utilities"
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true

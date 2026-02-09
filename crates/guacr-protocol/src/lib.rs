@@ -43,7 +43,8 @@ pub use drawing::*;
 pub use layers::*;
 pub use parser::{GuacamoleParser, Instruction, ParseError};
 pub use streams::{
-    format_audio, format_bell_audio, format_blob, format_chunked_blobs, format_end, format_video,
+    format_audio, format_bell_audio, format_blob, format_chunked_blobs, format_clipboard,
+    format_clipboard_text, format_end, format_video, parse_clipboard_blob,
 };
 pub use text_optimized::TextProtocolEncoder;
 

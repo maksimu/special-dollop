@@ -69,28 +69,19 @@ impl RdpChannelHandler {
             return Ok(None);
         }
 
+        let stream_id = 10; // Fixed stream ID for RDP clipboard
         match format {
             CliprdrFormat::UnicodeText => {
-                // Convert RDP clipboard data to Guacamole clipboard instruction
-                let text = String::from_utf8(data.to_vec())
-                    .map_err(|e| format!("Invalid UTF-8 in clipboard: {}", e))?;
-
-                // Format as Guacamole clipboard instruction
-                let instr = format!("5.clipboard,{}.{};", 8, text);
-                Ok(Some(Bytes::from(instr)))
+                let instrs = guacr_protocol::format_clipboard(stream_id, "text/plain", data);
+                Ok(Some(Bytes::from(instrs.join(""))))
             }
             CliprdrFormat::Text => {
-                // ASCII text
-                let text = String::from_utf8_lossy(data);
-                let instr = format!("5.clipboard,{}.{};", 8, text);
-                Ok(Some(Bytes::from(instr)))
+                let instrs = guacr_protocol::format_clipboard(stream_id, "text/plain", data);
+                Ok(Some(Bytes::from(instrs.join(""))))
             }
             CliprdrFormat::Html => {
-                // HTML format - send as-is
-                use base64::{engine::general_purpose, Engine as _};
-                let base64_data = general_purpose::STANDARD.encode(data);
-                let instr = format!("5.clipboard,{}.{};", 8, base64_data);
-                Ok(Some(Bytes::from(instr)))
+                let instrs = guacr_protocol::format_clipboard(stream_id, "text/html", data);
+                Ok(Some(Bytes::from(instrs.join(""))))
             }
             CliprdrFormat::Bitmap => {
                 // Bitmap format - convert to PNG or send as base64

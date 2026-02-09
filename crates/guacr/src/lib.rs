@@ -7,7 +7,7 @@
 //!
 //! - **SSH** - Secure Shell protocol handler
 //! - **Telnet** - Telnet protocol handler
-//! - **RDP** - Remote Desktop Protocol handler (requires FreeRDP, optional)
+//! - **RDP** - Remote Desktop Protocol handler (IronRDP, optional)
 //! - **VNC** - Virtual Network Computing handler (optional)
 //! - **SFTP** - SSH File Transfer Protocol handler (optional)
 //! - **Database** - Database protocol handlers (MySQL, PostgreSQL, MongoDB, Redis, etc.) (optional)

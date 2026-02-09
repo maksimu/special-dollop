@@ -22,6 +22,7 @@ use crate::throughput::ThroughputTracker;
 /// to avoid quality thrashing.
 pub struct AdaptiveQuality {
     current_quality: u8,
+    min_quality: u8,
     max_quality: u8,
     throughput_tracker: ThroughputTracker,
     last_quality_adjustment: Instant,
@@ -38,12 +39,23 @@ impl AdaptiveQuality {
     pub fn new(max_quality: u8) -> Self {
         Self {
             current_quality: max_quality,
+            min_quality: 10,
             max_quality: max_quality.clamp(10, 100),
             throughput_tracker: ThroughputTracker::new(10),
             last_quality_adjustment: Instant::now(),
             adjustment_interval_secs: 1,
             max_adjustment_per_interval: 10,
         }
+    }
+
+    /// Set minimum quality floor (builder pattern)
+    ///
+    /// Prevents quality from dropping below this level, useful for text-heavy
+    /// protocols like SSH where low quality causes unreadable JPEG artifacts.
+    pub fn with_min_quality(mut self, min: u8) -> Self {
+        self.min_quality = min.clamp(10, self.max_quality);
+        self.current_quality = self.current_quality.max(self.min_quality);
+        self
     }
 
     /// Track a sent frame for throughput calculation
@@ -111,7 +123,7 @@ impl AdaptiveQuality {
                 .max(target_quality)
         };
 
-        self.current_quality = new_quality.clamp(10, self.max_quality);
+        self.current_quality = new_quality.clamp(self.min_quality, self.max_quality);
         self.last_quality_adjustment = now;
 
         self.current_quality

@@ -4,27 +4,27 @@ use fontdue::{Font, FontSettings};
 use guacr_protocol::{format_cfill, format_instruction, format_rect, format_transfer};
 use image::{Rgb, RgbImage};
 
-// Primary font: Noto Sans Mono (SIL Open Font License)
-// Good coverage for Latin, Cyrillic, Greek, and common symbols
-const FONT_DATA_PRIMARY: &[u8] = include_bytes!("../fonts/NotoSansMono-Regular.ttf");
+// Primary font: JetBrains Mono (SIL Open Font License 1.1)
+// Purpose-built for code/terminal: distinct l/1/I, 0/O, better hinting at small sizes.
+// ~267KB vs ~580KB for Noto Sans Mono.
+const FONT_DATA_PRIMARY: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 
 // Fallback font: DejaVu Sans Mono (Bitstream Vera license - permissive)
-// Broader Unicode coverage including mathematical/technical symbols
-// This matches guacd's behavior which requires dejavu-sans-mono-fonts
+// Broader Unicode coverage including mathematical/technical symbols and box drawing.
+// This matches guacd's behavior which requires dejavu-sans-mono-fonts.
 const FONT_DATA_FALLBACK: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
 
 /// Terminal renderer - converts terminal screen to JPEG images or Guacamole instructions
 ///
 /// Uses fontdue for actual text rendering with font fallback support.
-/// Primary font is Noto Sans Mono; falls back to DejaVu Sans Mono for missing glyphs.
-/// This matches guacd's behavior which requires dejavu-sans-mono-fonts package.
+/// Primary font is JetBrains Mono; falls back to DejaVu Sans Mono for missing glyphs.
 /// Character cell dimensions and font size are calculated dynamically based on screen size.
-/// JPEG encoding (quality 95) is used for fast rendering with minimal visual loss.
+/// JPEG encoding is used for fast rendering with minimal visual loss.
 pub struct TerminalRenderer {
     char_width: u32,
     char_height: u32,
     font_size: f32,
-    /// Primary font (Noto Sans Mono)
+    /// Primary font (JetBrains Mono)
     font_primary: Font,
     /// Fallback font (DejaVu Sans Mono) for broader Unicode coverage
     font_fallback: Font,
@@ -87,10 +87,12 @@ impl TerminalRenderer {
         font_size: f32,
         color_scheme: ColorScheme,
     ) -> Result<Self> {
+        // FontSettings::default() uses scale=40.0 which pre-hints at a common terminal
+        // size for sharper glyphs. Fontdue always applies TrueType hinting.
         let font_primary =
             Font::from_bytes(FONT_DATA_PRIMARY, FontSettings::default()).map_err(|e| {
                 crate::TerminalError::FontError(format!(
-                    "Failed to load primary font (Noto Sans Mono): {}",
+                    "Failed to load primary font (JetBrains Mono): {}",
                     e
                 ))
             })?;
@@ -149,9 +151,9 @@ impl TerminalRenderer {
     /// Render terminal screen to JPEG
     ///
     /// Renders at exact pixel dimensions, padding if necessary to match browser's layer size
-    /// Uses default quality of 65
+    /// Uses default quality of 85
     pub fn render_screen(&self, screen: &vt100::Screen, rows: u16, cols: u16) -> Result<Vec<u8>> {
-        self.render_screen_with_quality(screen, rows, cols, 65)
+        self.render_screen_with_quality(screen, rows, cols, 85)
     }
 
     /// Render terminal screen with adaptive quality (for bandwidth optimization)
@@ -177,7 +179,7 @@ impl TerminalRenderer {
     /// Render only a specific region of the terminal (dirty region optimization)
     ///
     /// This is the guacd optimization - only render changed portions of the screen
-    /// Uses default quality of 65
+    /// Uses default quality of 85
     pub fn render_region(
         &self,
         screen: &vt100::Screen,
@@ -186,7 +188,7 @@ impl TerminalRenderer {
         min_col: u16,
         max_col: u16,
     ) -> Result<(Vec<u8>, u32, u32, u32, u32)> {
-        self.render_region_with_quality(screen, min_row, max_row, min_col, max_col, 65)
+        self.render_region_with_quality(screen, min_row, max_row, min_col, max_col, 85)
     }
 
     /// Render region with adaptive quality (for bandwidth optimization)
@@ -245,7 +247,7 @@ impl TerminalRenderer {
     /// Render terminal screen to JPEG with exact pixel dimensions
     ///
     /// This version allows specifying exact output dimensions, useful for
-    /// matching browser layer size exactly. Uses default quality of 65.
+    /// matching browser layer size exactly. Uses default quality of 85.
     pub fn render_screen_with_size(
         &self,
         screen: &vt100::Screen,
@@ -254,7 +256,7 @@ impl TerminalRenderer {
         width_px: u32,
         height_px: u32,
     ) -> Result<Vec<u8>> {
-        self.render_screen_with_size_and_quality(screen, rows, cols, width_px, height_px, 65)
+        self.render_screen_with_size_and_quality(screen, rows, cols, width_px, height_px, 85)
     }
 
     /// Render terminal screen with exact dimensions and adaptive quality

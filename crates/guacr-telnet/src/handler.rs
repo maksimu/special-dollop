@@ -9,6 +9,12 @@ use guacr_handlers::{
     parse_end_instruction,
     parse_pipe_instruction,
     pipe_blob_bytes,
+    // Session lifecycle
+    send_bell,
+    send_disconnect,
+    send_error_best_effort,
+    send_name,
+    send_ready,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -27,7 +33,7 @@ use guacr_handlers::{
     PIPE_NAME_STDIN,
     PIPE_STREAM_STDOUT,
 };
-use guacr_protocol::{format_chunked_blobs, format_error, TextProtocolEncoder};
+use guacr_protocol::{format_chunked_blobs, TextProtocolEncoder};
 use guacr_terminal::{
     format_clipboard_instructions, handle_mouse_selection, mouse_event_to_x11_sequence,
     parse_clipboard_blob, parse_key_instruction, parse_mouse_instruction,
@@ -326,13 +332,9 @@ impl ProtocolHandler for TelnetHandler {
         #[cfg(feature = "threat-detection")]
         let username_for_threat = params.get("username").cloned().unwrap_or_default();
 
-        // Send ready instruction
-        info!("Telnet: Sending ready instruction");
-        let ready_instr = TerminalRenderer::format_ready_instruction("telnet-ready");
-        to_client
-            .send(Bytes::from(ready_instr))
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        // Send ready and name instructions
+        send_ready(&to_client, "telnet-ready").await?;
+        send_name(&to_client, "Telnet").await?;
 
         // CRITICAL: Send size instruction to initialize display dimensions
         // Browser needs this BEFORE any img/drawing operations!
@@ -386,9 +388,7 @@ impl ProtocolHandler for TelnetHandler {
                         Ok(0) => {
                             info!("Telnet connection closed");
 
-                            // Send error to client before breaking
-                            let error_instr = format_error("Telnet connection closed by server", 517); // RESOURCE_CLOSED
-                            let _ = to_client.send(Bytes::from(error_instr)).await;
+                            send_error_best_effort(&to_client, "Telnet connection closed by server", 517).await; // RESOURCE_CLOSED
 
                             break;
                         }
@@ -408,9 +408,8 @@ impl ProtocolHandler for TelnetHandler {
                                     Ok(threat) => {
                                         if threat.should_terminate() {
                                             error!("Telnet: TERMINATING SESSION due to threat in terminal output: {}", threat.description);
-                                            let error_msg = format!("error,0.Session terminated: {};", threat.description);
-                                            to_client.send(Bytes::from(error_msg)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            let msg = format!("Session terminated: {}", threat.description);
+                                            send_error_best_effort(&to_client, &msg, 517).await; // RESOURCE_CLOSED
                                             break;
                                         }
                                     }
@@ -432,12 +431,7 @@ impl ProtocolHandler for TelnetHandler {
                             // Check for BEL character (0x07) and send audio beep to client
                             if buf[..n].contains(&0x07) {
                                 debug!("Telnet: BEL detected, sending audio beep");
-                                let bell_instrs = guacr_protocol::format_bell_audio(100);
-                                for instr in bell_instrs {
-                                    to_client.send(Bytes::from(instr))
-                                        .await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                                }
+                                send_bell(&to_client, 100).await?;
                             }
 
                             // Dirty tracker updates automatically when find_dirty_region is called
@@ -445,10 +439,8 @@ impl ProtocolHandler for TelnetHandler {
                         Err(e) => {
                             warn!("Telnet read error: {}", e);
 
-                            // Send error to client before breaking
                             let error_msg = format!("Telnet connection error: {}", e);
-                            let error_instr = format_error(&error_msg, 512); // UPSTREAM_ERROR
-                            let _ = to_client.send(Bytes::from(error_instr)).await;
+                            send_error_best_effort(&to_client, &error_msg, 512).await; // UPSTREAM_ERROR
 
                             break;
                         }
@@ -456,7 +448,11 @@ impl ProtocolHandler for TelnetHandler {
                 }
 
                 // Client input -> Telnet
-                Some(msg) = from_client.recv() => {
+                msg = from_client.recv() => {
+                    let Some(msg) = msg else {
+                        info!("Telnet: Client disconnected");
+                        break;
+                    };
                     // Parse Guacamole instruction
                     let msg_str = String::from_utf8_lossy(&msg);
 
@@ -572,9 +568,8 @@ impl ProtocolHandler for TelnetHandler {
                                         Ok(threat) => {
                                             if threat.should_terminate() {
                                                 error!("Telnet: TERMINATING SESSION due to threat in keyboard input: {}", threat.description);
-                                                let error_msg = format!("error,0.Session terminated: {};", threat.description);
-                                                to_client.send(Bytes::from(error_msg)).await
-                                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                                let msg = format!("Session terminated: {}", threat.description);
+                                                send_error_best_effort(&to_client, &msg, 517).await; // RESOURCE_CLOSED
                                                 break;
                                             }
                                         }
@@ -910,6 +905,7 @@ impl ProtocolHandler for TelnetHandler {
             }
         }
 
+        send_disconnect(&to_client).await;
         info!("Telnet handler connection ended");
         Ok(())
     }

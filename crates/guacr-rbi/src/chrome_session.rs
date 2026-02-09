@@ -184,6 +184,7 @@ impl ChromeSession {
         // Build Chrome config with security flags
         let mut args = vec![
             format!("--window-size={},{}", self.width, self.height),
+            "--force-device-scale-factor=1".to_string(), // Ensure viewport matches window size
             "--headless=new".to_string(),
             "--disable-gpu".to_string(),
             "--disable-dev-shm-usage".to_string(),
@@ -344,7 +345,12 @@ impl ChromeSession {
     #[cfg(feature = "chrome")]
     pub async fn capture_screenshot(&mut self) -> Result<Option<Vec<u8>>, String> {
         // Check if enough time has passed since last capture
-        if self.last_capture_time.elapsed() < self.capture_interval {
+        let elapsed = self.last_capture_time.elapsed();
+        if elapsed < self.capture_interval {
+            debug!(
+                "RBI: Skipping capture (too soon: {:?} < {:?})",
+                elapsed, self.capture_interval
+            );
             return Ok(None);
         }
 
@@ -353,19 +359,38 @@ impl ChromeSession {
             .as_ref()
             .ok_or_else(|| "Page not initialized".to_string())?;
 
+        debug!("RBI: Attempting screenshot capture...");
+
         // Capture screenshot using chromiumoxide with JPEG compression
         use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
         use chromiumoxide::page::ScreenshotParams;
+        use tokio::time::{timeout, Duration};
 
-        let screenshot = page
-            .screenshot(
-                ScreenshotParams::builder()
-                    .format(CaptureScreenshotFormat::Jpeg)
-                    .quality(50) // Lower quality to fit within 64KB WebRTC limit (was 85)
-                    .build(),
-            )
+        let screenshot_params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Jpeg)
+            .quality(50) // Lower quality to fit within 64KB WebRTC limit (was 85)
+            .build();
+
+        debug!("RBI: Calling page.screenshot() with 10s timeout...");
+        let screenshot = match timeout(Duration::from_secs(10), page.screenshot(screenshot_params))
             .await
-            .map_err(|e| format!("Failed to capture screenshot: {}", e))?;
+        {
+            Ok(Ok(data)) => {
+                debug!(
+                    "RBI: Screenshot captured successfully ({} bytes)",
+                    data.len()
+                );
+                data
+            }
+            Ok(Err(e)) => {
+                warn!("RBI: Screenshot failed: {}", e);
+                return Err(format!("Failed to capture screenshot: {}", e));
+            }
+            Err(_) => {
+                warn!("RBI: Screenshot timeout after 10s - Chrome may be unresponsive or stuck");
+                return Err("Screenshot timeout after 10s".to_string());
+            }
+        };
 
         let screenshot_vec = screenshot;
 

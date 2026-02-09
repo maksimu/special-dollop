@@ -594,7 +594,9 @@ mod tests {
     #[test]
     fn test_browser_client_creation() {
         let config = RbiConfig::default();
-        let client = BrowserClient::new(1920, 1080, config);
+        let recording_config = guacr_handlers::RecordingConfig::default();
+        let params = std::collections::HashMap::new();
+        let client = BrowserClient::new(1920, 1080, config, &recording_config, &params);
         // Just verify it can be created without panic
         drop(client);
     }

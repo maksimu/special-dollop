@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
-    EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus, ProtocolHandler,
-    RecordingConfig,
+    send_disconnect, EventBasedHandler, EventCallback, HandlerError, HandlerStats, HealthStatus,
+    ProtocolHandler, RecordingConfig,
 };
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -146,23 +146,9 @@ impl ProtocolHandler for MongoDbHandler {
         // Initialize recording if enabled
         let mut recorder = init_recording(&recording_config, &params, "MongoDB", cols, rows);
 
-        // Send display initialization instructions (ready + size)
-        let (ready_instr, cursor_instr, size_instr) =
-            QueryExecutor::create_display_init_instructions(width, height);
-        to_client
-            .send(ready_instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        to_client
-            .send(cursor_instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        to_client
-            .send(size_instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-
-        debug!("MongoDB: Sent ready, cursor and size instructions");
+        // Send display initialization instructions (ready, name, cursor, size)
+        QueryExecutor::send_display_init(&to_client, width, height).await?;
+        debug!("MongoDB: Sent display init instructions");
 
         // NOTE: Don't render initial screen yet - wait until after connection
         // This matches SSH behavior and prevents rendering at wrong dimensions
@@ -407,7 +393,11 @@ impl ProtocolHandler for MongoDbHandler {
                 }
 
                 // Process input from client
-                Some(msg) = from_client.recv() => {
+                msg = from_client.recv() => {
+                    let Some(msg) = msg else {
+                        info!("MongoDB: Client disconnected");
+                        break 'outer;
+                    };
                     match executor.process_input(&msg).await {
                         Ok((needs_render, instructions, pending_query)) => {
                     if let Some(command) = pending_query {
@@ -549,6 +539,7 @@ impl ProtocolHandler for MongoDbHandler {
         // Finalize recording
         finalize_recording(recorder, "MongoDB");
 
+        send_disconnect(&to_client).await;
         info!("MongoDB handler ended");
         Ok(())
     }

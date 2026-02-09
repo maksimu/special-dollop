@@ -1,8 +1,35 @@
 // Drawing instruction formatting for Guacamole protocol
 //
-// Supports: rect, cfill, line, arc, curve, shade
+// Supports: rect, cfill, line, arc, curve, shade, img
 
 use crate::format_instruction;
+
+/// Format `img` instruction - Start image stream (modern protocol)
+///
+/// Format: `3.img,{stream},{mask},{layer},{mimetype},{x},{y};`
+///
+/// This starts a modern image stream. Must be followed by `blob` chunks and `end` instruction.
+/// Use `format_chunked_blobs` from the streams module to send the data.
+///
+/// # Arguments
+/// - `stream`: Stream ID (must be unique per image)
+/// - `mask`: Channel mask (15 = RGBA, 3 = RGB)
+/// - `layer`: Layer index
+/// - `mimetype`: MIME type (e.g., "image/jpeg", "image/png")
+/// - `x`: X coordinate
+/// - `y`: Y coordinate
+pub fn format_img(stream: u32, mask: u32, layer: i32, mimetype: &str, x: i32, y: i32) -> String {
+    let stream_str = stream.to_string();
+    let mask_str = mask.to_string();
+    let layer_str = layer.to_string();
+    let x_str = x.to_string();
+    let y_str = y.to_string();
+
+    format_instruction(
+        "img",
+        &[&stream_str, &mask_str, &layer_str, mimetype, &x_str, &y_str],
+    )
+}
 
 /// Format `rect` instruction - Draw rectangle
 ///
@@ -65,6 +92,84 @@ pub fn format_line(layer: i32, x1: u32, y1: u32, x2: u32, y2: u32) -> String {
     let y2_str = y2.to_string();
 
     format_instruction("line", &[&layer_str, &x1_str, &y1_str, &x2_str, &y2_str])
+}
+
+/// Format `jpeg` instruction - Display JPEG image (legacy format)
+///
+/// Format: `4.jpeg,{mask},{layer},{x},{y},{base64_data};`
+///
+/// # Arguments
+/// - `mask`: Channel mask (15 for RGBA, 7 for RGB)
+/// - `layer`: Layer index (typically 0 for default layer)
+/// - `x`: X coordinate in pixels
+/// - `y`: Y coordinate in pixels
+/// - `base64_data`: Base64-encoded JPEG image data
+///
+/// # Note
+/// This is the legacy format that passes the entire base64-encoded image
+/// directly in the instruction. Use this instead of img + blob + end for
+/// compatibility with older clients.
+pub fn format_jpeg(mask: u32, layer: i32, x: i32, y: i32, base64_data: &str) -> String {
+    let mask_str = mask.to_string();
+    let layer_str = layer.to_string();
+    let x_str = x.to_string();
+    let y_str = y.to_string();
+
+    format_instruction(
+        "jpeg",
+        &[&mask_str, &layer_str, &x_str, &y_str, base64_data],
+    )
+}
+
+/// Format `png` instruction - Display PNG image (legacy format)
+///
+/// Format: `3.png,{mask},{layer},{x},{y},{base64_data};`
+///
+/// # Arguments
+/// - `mask`: Channel mask (15 for RGBA, 7 for RGB)
+/// - `layer`: Layer index (typically 0 for default layer)
+/// - `x`: X coordinate in pixels
+/// - `y`: Y coordinate in pixels
+/// - `base64_data`: Base64-encoded PNG image data
+///
+/// # Note
+/// This is the legacy format that passes the entire base64-encoded image
+/// directly in the instruction. Use this instead of img + blob + end for
+/// compatibility with older clients.
+pub fn format_png(mask: u32, layer: i32, x: i32, y: i32, base64_data: &str) -> String {
+    let mask_str = mask.to_string();
+    let layer_str = layer.to_string();
+    let x_str = x.to_string();
+    let y_str = y.to_string();
+
+    format_instruction("png", &[&mask_str, &layer_str, &x_str, &y_str, base64_data])
+}
+
+/// Format `webp` instruction - Display WebP image (legacy format)
+///
+/// Format: `4.webp,{mask},{layer},{x},{y},{base64_data};`
+///
+/// # Arguments
+/// - `mask`: Channel mask (15 for RGBA, 7 for RGB)
+/// - `layer`: Layer index (typically 0 for default layer)
+/// - `x`: X coordinate in pixels
+/// - `y`: Y coordinate in pixels
+/// - `base64_data`: Base64-encoded WebP image data
+///
+/// # Note
+/// This is the legacy format that passes the entire base64-encoded image
+/// directly in the instruction. Use this instead of img + blob + end for
+/// compatibility with older clients.
+pub fn format_webp(mask: u32, layer: i32, x: i32, y: i32, base64_data: &str) -> String {
+    let mask_str = mask.to_string();
+    let layer_str = layer.to_string();
+    let x_str = x.to_string();
+    let y_str = y.to_string();
+
+    format_instruction(
+        "webp",
+        &[&mask_str, &layer_str, &x_str, &y_str, base64_data],
+    )
 }
 
 /// Format `arc` instruction - Draw arc/ellipse
@@ -284,5 +389,11 @@ mod tests {
         let instr = format_shade(0, 0, 0, 100, 50, 255, 0, 0, 255, 0, 0, 255, 255);
         assert!(instr.starts_with("5.shade,"));
         assert!(instr.contains("255"));
+    }
+
+    #[test]
+    fn test_format_img() {
+        let instr = format_img(42, 15, 0, "image/jpeg", 100, 200);
+        assert_eq!(instr, "3.img,2.42,2.15,1.0,10.image/jpeg,3.100,3.200;");
     }
 }

@@ -22,6 +22,7 @@ mod pipe;
 mod recording;
 mod registry;
 mod security;
+mod session;
 mod sync_control;
 mod throughput;
 
@@ -105,6 +106,7 @@ pub use security::{
     CLIPBOARD_MAX_SIZE,
     CLIPBOARD_MIN_SIZE,
 };
+pub use session::{send_bell, send_disconnect, send_name, send_ready};
 pub use sync_control::SyncFlowControl;
 pub use throughput::ThroughputTracker;
 

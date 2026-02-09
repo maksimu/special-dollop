@@ -32,6 +32,8 @@ impl TextProtocolEncoder {
         self.scratch.clear();
 
         // Format: img,<stream>,<mask>,<layer>,<mimetype>,<x>,<y>;
+        // CRITICAL: mask comes BEFORE mimetype (per Guacamole protocol spec)
+        // Client parses: a[0]=stream, a[1]=mask, a[2]=layer, a[3]=mimetype, a[4]=x, a[5]=y
         self.scratch.put_slice(b"3.img,");
 
         // Stream ID
@@ -42,8 +44,10 @@ impl TextProtocolEncoder {
         self.scratch.put_slice(stream_str.as_bytes());
         self.scratch.put_u8(b',');
 
-        // Mask (RGB = 0x07)
-        self.scratch.put_slice(b"1.7,");
+        // Mask (RGBA = 0x0F = 15)
+        // CRITICAL: Must include alpha channel (bit 3) for proper rendering
+        // RGB-only (0x07) causes black/transparent rendering issues
+        self.scratch.put_slice(b"2.15,");
 
         // Layer
         let layer_str = layer.to_string();
@@ -53,7 +57,7 @@ impl TextProtocolEncoder {
         self.scratch.put_slice(layer_str.as_bytes());
         self.scratch.put_u8(b',');
 
-        // MIME type
+        // MIME type (comes AFTER layer)
         self.scratch
             .put_slice(mimetype.len().to_string().as_bytes());
         self.scratch.put_u8(b'.');

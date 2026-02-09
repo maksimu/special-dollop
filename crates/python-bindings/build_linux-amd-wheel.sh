@@ -9,8 +9,9 @@ set -e
 #
 # This script handles:
 # - Mounting the entire workspace for access to all crates
-# - Building FreeRDP 3.x from source for RDP support
 # - SSL certificates for VPN environments
+#
+# Note: RDP uses IronRDP (pure Rust) - no C FreeRDP dependency needed.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -154,148 +155,11 @@ docker run --rm --platform linux/amd64 \
         fi
         source $HOME/.cargo/env
         
-        # manylinux_2_28 is based on AlmaLinux 8
-        # AlmaLinux 8 only has FreeRDP 2.x, so we build FreeRDP 3.x from source
+        # Install minimal system dependencies
+        # RDP uses IronRDP (pure Rust) so no C FreeRDP library is needed
         echo "Installing development packages..."
-        
-        # Enable EPEL and PowerTools for additional packages
-        dnf install -y epel-release
-        dnf config-manager --set-enabled powertools || dnf config-manager --set-enabled crb || true
-        
-        # Install OpenSSL (required by native-tls/openssl-sys)
-        dnf install -y openssl-devel
-        
-        # Install FreeRDP 3.x build dependencies (with audio support)
-        echo "Installing FreeRDP 3.x build dependencies..."
-        dnf install -y \
-            cmake3 \
-            ninja-build \
-            gcc \
-            gcc-c++ \
-            git \
-            pkgconfig \
-            openssl-devel \
-            libX11-devel \
-            libXcursor-devel \
-            libXext-devel \
-            libXi-devel \
-            libXinerama-devel \
-            libXrandr-devel \
-            libXv-devel \
-            libxkbfile-devel \
-            alsa-lib-devel \
-            pulseaudio-libs-devel \
-            cups-devel \
-            libjpeg-turbo-devel \
-            libusb-devel \
-            pam-devel \
-            systemd-devel \
-            wayland-devel \
-            libicu-devel \
-            fuse3-devel \
-            clang-devel \
-            llvm-devel
-        
-        # Create symlink for cmake if cmake3 was installed
-        if command -v cmake3 &> /dev/null && ! command -v cmake &> /dev/null; then
-            ln -sf /usr/bin/cmake3 /usr/bin/cmake
-        fi
-        
-        # Verify cmake and ninja are available
-        echo "Verifying build tools..."
-        cmake --version || { echo "ERROR: cmake not found"; exit 1; }
-        ninja --version || { echo "ERROR: ninja not found"; exit 1; }
-        
-        # Try to install FFmpeg if available - optional for audio codecs
-        echo "Attempting to install FFmpeg - optional for enhanced audio codecs..."
-        dnf install -y ffmpeg-free-devel || \
-        dnf install -y ffmpeg-devel || \
-        echo "FFmpeg not available - will build without FFmpeg codec support"
-        
-        # Build FreeRDP 3.x from source - optimized for speed
-        echo "Building FreeRDP 3.x from source - this takes 5-10 minutes..."
-        cd /tmp
-        
-        # Clone FreeRDP 3.x stable release
-        git clone --depth 1 --branch 3.10.2 https://github.com/FreeRDP/FreeRDP.git freerdp || {
-            echo "ERROR: Failed to clone FreeRDP"
-            exit 1
-        }
-        
-        cd freerdp
-        mkdir build
-        cd build
-        
-        # Configure FreeRDP with audio support enabled
-        # Check if FFmpeg is available
-        FFMPEG_OPTION=OFF
-        if pkg-config --exists libavcodec libavutil; then
-            echo "FFmpeg detected, enabling FFmpeg support"
-            FFMPEG_OPTION=ON
-        else
-            echo "FFmpeg not found, building without FFmpeg - ALSA/PulseAudio still enabled"
-        fi
-        
-        cmake .. \
-            -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DWITH_WAYLAND=OFF \
-            -DWITH_X11=ON \
-            -DWITH_CUPS=OFF \
-            -DWITH_FFMPEG=$FFMPEG_OPTION \
-            -DWITH_GSTREAMER_1_0=OFF \
-            -DWITH_PULSE=ON \
-            -DWITH_ALSA=ON \
-            -DWITH_OSS=OFF \
-            -DWITH_PCSC=OFF \
-            -DWITH_PKCS11=OFF \
-            -DWITH_SWSCALE=OFF \
-            -DWITH_SERVER=OFF \
-            -DWITH_SAMPLE=OFF \
-            -DWITH_SHADOW=OFF \
-            -DBUILD_TESTING=OFF \
-            -DWITH_MANPAGES=OFF \
-            -DWITH_KRB5=OFF \
-            -DWITH_CLIENT=OFF \
-            -DWITH_CLIENT_SDL=OFF \
-            || {
-            echo "ERROR: FreeRDP cmake configuration failed"
-            exit 1
-        }
-        
-        # Build with all available cores
-        NPROC=$(nproc)
-        echo "Compiling FreeRDP 3.x using $NPROC cores..."
-        ninja -j$NPROC || {
-            echo "ERROR: FreeRDP build failed"
-            exit 1
-        }
-        
-        # Install
-        echo "Installing FreeRDP 3.x..."
-        ninja install || {
-            echo "ERROR: FreeRDP install failed"
-            exit 1
-        }
-        
-        # Update library cache
-        ldconfig
-        
-        # Verify installation
-        echo "Verifying FreeRDP 3.x installation..."
-        export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
-        
-        if pkg-config --exists freerdp3; then
-            FREERDP_VER=$(pkg-config --modversion freerdp3)
-            echo "FreeRDP 3.x installed successfully! Version: $FREERDP_VER"
-        else
-            echo "ERROR: FreeRDP 3.x not found by pkg-config"
-            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-            ls -la /usr/local/lib*/pkgconfig/freerdp* || true
-            exit 1
-        fi
-        
+        dnf install -y openssl-devel git gcc gcc-c++ pkgconfig perl-IPC-Cmd
+
         # Verify workspace is mounted with guacr crate
         if [ ! -d /io/crates/guacr ]; then
             echo "ERROR: workspace not properly mounted at /io or guacr crate missing"
@@ -306,19 +170,11 @@ docker run --rm --platform linux/amd64 \
         echo "Available crates:"
         ls -la /io/crates/
         
-        echo "IronRDP will be fetched from git during build from https://github.com/miroberts/IronRDP.git"
-        
         # Install maturin
         echo "Installing maturin..."
         /opt/python/cp311-cp311/bin/pip install "maturin>=1.8,<1.9"
-        
-        # Build with handlers - use manylinux_2_28 (better compatibility than 2_34)
-        echo "Building wheel with handlers..."
 
-        # Ensure PKG_CONFIG_PATH is set for cargo to find FreeRDP 3.x
-        export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
-
-        # Navigate to python-bindings crate within workspace (matches CI approach)
+        echo "Building wheel..."
         cd /io/crates/python-bindings
         /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
 

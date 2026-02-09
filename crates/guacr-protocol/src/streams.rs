@@ -1,6 +1,29 @@
 // Stream instruction formatting for Guacamole protocol
 //
 // Supports: audio, video, blob, end
+//
+// ## Standard Pattern for Sending Images (ALL handlers should use this)
+//
+// ```rust
+// use guacr_protocol::{format_img, format_chunked_blobs};
+//
+// // 1. Encode image to JPEG/PNG/WebP and base64
+// let image_data: Vec<u8> = encode_jpeg(...);
+// let base64_data = base64::encode(&image_data);
+//
+// // 2. Send img instruction with metadata
+// let img_instr = format_img(stream_id, 15, 0, "image/jpeg", x, y);
+// to_client.send(img_instr).await?;
+//
+// // 3. Send blob chunks + end instruction (protocol crate handles chunking)
+// let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+// for instr in blob_instructions {
+//     to_client.send(instr).await?;
+// }
+//
+// // 4. Increment stream_id for next image
+// stream_id += 1;
+// ```
 
 use crate::format_instruction;
 
@@ -123,6 +146,71 @@ pub fn format_chunked_blobs(
     instructions
 }
 
+/// Format a `clipboard` instruction sequence: clipboard + blob + end
+///
+/// This is the standard pattern for sending clipboard data to the client.
+/// Supports any MIME type (text/plain, text/html, application/octet-stream, etc.)
+///
+/// # Arguments
+/// - `stream`: Stream index for this clipboard operation
+/// - `mimetype`: MIME type of the clipboard data (e.g., "text/plain")
+/// - `data`: Raw clipboard data bytes
+///
+/// # Returns
+/// Vector of 3 instructions: [clipboard, blob (base64-encoded), end]
+pub fn format_clipboard(stream: u32, mimetype: &str, data: &[u8]) -> Vec<String> {
+    use base64::Engine;
+    let stream_str = stream.to_string();
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
+
+    vec![
+        format_instruction("clipboard", &[&stream_str, mimetype]),
+        format_blob(stream, &base64_data),
+        format_end(stream),
+    ]
+}
+
+/// Format a text clipboard instruction sequence (convenience for text/plain)
+///
+/// Shortcut for `format_clipboard(stream, "text/plain", text.as_bytes())`
+pub fn format_clipboard_text(stream: u32, text: &str) -> Vec<String> {
+    format_clipboard(stream, "text/plain", text.as_bytes())
+}
+
+/// Parse clipboard blob data from a Guacamole blob instruction
+///
+/// Format: `4.blob,LENGTH.STREAM_ID,LENGTH.BASE64DATA;`
+///
+/// Returns the decoded text, or None if the instruction is not a blob
+/// or the data is empty.
+pub fn parse_clipboard_blob(msg: &str) -> Option<String> {
+    if !msg.contains(".blob,") {
+        return None;
+    }
+
+    let args_part = msg.split_once(".blob,")?.1;
+    let parts: Vec<&str> = args_part.split(',').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    // parts[0] = "1.0" (stream ID), parts[1] = "44.base64data;" (length.data)
+    let (_, data_part) = parts[1].split_once('.')?;
+    let data_str = data_part.trim_end_matches(';');
+
+    use base64::Engine;
+    let clipboard_data = base64::engine::general_purpose::STANDARD
+        .decode(data_str)
+        .ok()?;
+    let clipboard_text = String::from_utf8(clipboard_data).ok()?;
+
+    if clipboard_text.is_empty() {
+        None
+    } else {
+        Some(clipboard_text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +284,47 @@ mod tests {
         let data = "B".repeat(20000);
         let instrs = format_chunked_blobs(1, &data, None); // Use default
         assert_eq!(instrs.len(), 5); // 4 blobs + 1 end
+    }
+
+    #[test]
+    fn test_format_clipboard_text() {
+        let instrs = format_clipboard_text(10, "Hello");
+        assert_eq!(instrs.len(), 3);
+        assert!(instrs[0].contains("clipboard"));
+        assert!(instrs[0].contains("text/plain"));
+        assert!(instrs[1].contains("blob"));
+        assert!(instrs[2].contains("end"));
+    }
+
+    #[test]
+    fn test_format_clipboard_binary() {
+        let instrs = format_clipboard(5, "text/html", b"<b>bold</b>");
+        assert_eq!(instrs.len(), 3);
+        assert!(instrs[0].contains("clipboard"));
+        assert!(instrs[0].contains("text/html"));
+    }
+
+    #[test]
+    fn test_parse_clipboard_blob() {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(b"Hello World");
+        let msg = format!("4.blob,2.10,{}.{};", data.len(), data);
+        let result = parse_clipboard_blob(&msg);
+        assert_eq!(result, Some("Hello World".to_string()));
+    }
+
+    #[test]
+    fn test_parse_clipboard_blob_empty() {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(b"");
+        let msg = format!("4.blob,2.10,{}.{};", data.len(), data);
+        let result = parse_clipboard_blob(&msg);
+        assert_eq!(result, None); // Empty clipboard returns None
+    }
+
+    #[test]
+    fn test_parse_clipboard_blob_not_blob() {
+        let result = parse_clipboard_blob("3.key,2.65,1.1;");
+        assert_eq!(result, None);
     }
 }

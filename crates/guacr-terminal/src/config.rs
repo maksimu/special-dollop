@@ -15,7 +15,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
     /// Font name (guacd: font-name)
-    /// Currently only the embedded Noto Sans Mono is supported
+    /// Currently only the embedded JetBrains Mono is supported
     pub font_name: Option<String>,
 
     /// Font size in points (guacd: font-size, default: 12)

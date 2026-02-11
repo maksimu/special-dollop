@@ -10,6 +10,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::csv_export::{generate_csv_filename, CsvExporter};
+use crate::handler_helpers::{
+    handle_quit, parse_display_size, render_connection_error, render_connection_success,
+    render_help, send_render, HelpSection,
+};
 use crate::query_executor::QueryExecutor;
 use crate::recording::{
     finalize_recording, init_recording, record_error_output, record_query_input,
@@ -108,23 +112,7 @@ impl ProtocolHandler for RedisHandler {
         info!("Redis: Connecting to {}:{} db={}", hostname, port, database);
 
         // Parse display size from parameters (like SSH does)
-        let size_params = params
-            .get("size")
-            .map(|s| s.as_str())
-            .unwrap_or("1024,768,96");
-        let size_parts: Vec<&str> = size_params.split(',').collect();
-        let width: u32 = size_parts
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
-        let height: u32 = size_parts
-            .get(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(768);
-
-        // Calculate terminal dimensions (9x18 pixels per character cell)
-        let cols = (width / 9).max(80) as u16;
-        let rows = (height / 18).max(24) as u16;
+        let (width, height, cols, rows) = parse_display_size(&params);
 
         info!(
             "Redis: Display size {}x{} px → {}x{} chars",
@@ -197,16 +185,7 @@ impl ProtocolHandler for RedisHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                let (_, instructions) = executor
-                    .render_screen()
-                    .await
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                for instr in instructions {
-                    to_client
-                        .send(instr)
-                        .await
-                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                }
+                send_render(&mut executor, &to_client).await?;
 
                 while from_client.recv().await.is_some() {}
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -217,47 +196,14 @@ impl ProtocolHandler for RedisHandler {
             Ok(con) => {
                 info!("Redis: Connected successfully");
 
-                executor
-                    .terminal
-                    .write_line("")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line(&format!("Connected to Redis at {}:{}", hostname, port))
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line(&format!("Database: {}", database))
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("Type 'help' for available commands.")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_prompt()
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-                // Render the connection success screen
-                debug!("Redis: Rendering initial screen with prompt");
-                let (_, instructions) = executor
-                    .render_screen()
-                    .await
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                debug!(
-                    "Redis: Sending {} instructions to client",
-                    instructions.len()
-                );
-                for instr in instructions {
-                    to_client
-                        .send(instr)
-                        .await
-                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                }
+                let conn_line = format!("Connected to Redis at {}:{}", hostname, port);
+                let db_line = format!("Database: {}", database);
+                render_connection_success(
+                    &mut executor,
+                    &to_client,
+                    &[&conn_line, &db_line, "Type 'help' for available commands."],
+                )
+                .await?;
                 debug!("Redis: Initial screen sent successfully");
 
                 con
@@ -266,55 +212,19 @@ impl ProtocolHandler for RedisHandler {
                 let error_msg = format!("Redis connection failed: {}", e);
                 warn!("Redis: {}", error_msg);
 
-                executor
-                    .terminal
-                    .write_line("")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_error(&error_msg)
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("Troubleshooting:")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("  1. Check hostname and port")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("  2. Verify Redis server is running")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("  3. Check password if AUTH is required")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_line("  4. Check firewall rules")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                executor
-                    .terminal
-                    .write_prompt()
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-
-                let (_, instructions) = executor
-                    .render_screen()
-                    .await
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                for instr in instructions {
-                    to_client
-                        .send(instr)
-                        .await
-                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                }
-
-                while from_client.recv().await.is_some() {}
+                render_connection_error(
+                    &mut executor,
+                    &to_client,
+                    &mut from_client,
+                    &error_msg,
+                    &[
+                        "Check hostname and port",
+                        "Verify Redis server is running",
+                        "Check password if AUTH is required",
+                        "Check firewall rules",
+                    ],
+                )
+                .await?;
                 return Err(HandlerError::ConnectionFailed(error_msg));
             }
         };
@@ -403,16 +313,7 @@ impl ProtocolHandler for RedisHandler {
                                 .terminal
                                 .write_prompt()
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            let (_, result_instructions) = executor
-                                .render_screen()
-                                .await
-                                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            for instr in result_instructions {
-                                to_client
-                                    .send(instr)
-                                    .await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                            }
+                            send_render(&mut executor, &to_client).await?;
                             continue;
                         }
 
@@ -443,16 +344,7 @@ impl ProtocolHandler for RedisHandler {
                             .write_prompt()
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                        let (_, result_instructions) = executor
-                            .render_screen()
-                            .await
-                            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                        for instr in result_instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                        }
+                        send_render(&mut executor, &to_client).await?;
                         continue;
                     }
 
@@ -670,141 +562,52 @@ async fn handle_builtin_command(
 
     match command_lower.as_str() {
         "help" | "?" => {
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("Redis CLI - Available commands:")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("String commands:")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  GET key              Get value")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  SET key value        Set value")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  DEL key              Delete key")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("Key commands:")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  KEYS pattern         List keys")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  TYPE key             Get type")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  TTL key              Get TTL")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("Server commands:")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  INFO                 Server info")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  DBSIZE               Key count")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("  PING                 Test connection")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("Export/Import:")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            let mut sections = vec![
+                HelpSection {
+                    title: "String commands",
+                    commands: vec![
+                        ("GET key", "Get value"),
+                        ("SET key value", "Set value"),
+                        ("DEL key", "Delete key"),
+                    ],
+                },
+                HelpSection {
+                    title: "Key commands",
+                    commands: vec![
+                        ("KEYS pattern", "List keys"),
+                        ("TYPE key", "Get type"),
+                        ("TTL key", "Get TTL"),
+                    ],
+                },
+                HelpSection {
+                    title: "Server commands",
+                    commands: vec![
+                        ("INFO", "Server info"),
+                        ("DBSIZE", "Key count"),
+                        ("PING", "Test connection"),
+                    ],
+                },
+            ];
+
+            let mut export_cmds = Vec::new();
             if !security.disable_csv_export {
-                executor
-                    .terminal
-                    .write_line("  \\e <pattern>         Export keys as CSV")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                export_cmds.push(("\\e <pattern>", "Export keys as CSV"));
             }
             if !security.disable_csv_import && !security.base.read_only {
-                executor
-                    .terminal
-                    .write_line("  \\i                   Import key-value pairs from CSV")
-                    .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                export_cmds.push(("\\i", "Import key-value pairs from CSV"));
             }
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("Type 'quit' to disconnect")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_line("")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            executor
-                .terminal
-                .write_prompt()
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+            if !export_cmds.is_empty() {
+                sections.push(HelpSection {
+                    title: "Export/Import",
+                    commands: export_cmds,
+                });
+            }
 
-            let (_, instructions) = executor
-                .render_screen()
-                .await
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            for instr in instructions {
-                to_client
-                    .send(instr)
-                    .await
-                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-            }
+            render_help(executor, to_client, "Redis CLI", &sections).await?;
             return Ok(true);
         }
         "quit" | "exit" => {
-            executor
-                .terminal
-                .write_line("Bye")
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            let (_, instructions) = executor
-                .render_screen()
-                .await
-                .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-            for instr in instructions {
-                to_client
-                    .send(instr)
-                    .await
-                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-            }
-            return Err(HandlerError::Disconnected(
-                "User requested disconnect".to_string(),
-            ));
+            return Err(handle_quit(executor, to_client).await);
         }
         _ => {}
     }
@@ -833,16 +636,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+        send_render(executor, to_client).await?;
         return Ok(());
     }
 
@@ -852,16 +646,7 @@ async fn handle_csv_export(
         .terminal
         .write_line(&format!("Scanning keys matching '{}'...", scan_pattern))
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    let (_, instructions) = executor
-        .render_screen()
-        .await
-        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    for instr in instructions {
-        to_client
-            .send(instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-    }
+    send_render(executor, to_client).await?;
 
     // Get keys matching pattern
     let keys: Vec<String> = connection
@@ -878,16 +663,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+        send_render(executor, to_client).await?;
         return Ok(());
     }
 
@@ -957,16 +733,7 @@ async fn handle_csv_export(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    let (_, instructions) = executor
-        .render_screen()
-        .await
-        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    for instr in instructions {
-        to_client
-            .send(instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-    }
+    send_render(executor, to_client).await?;
 
     Ok(())
 }
@@ -990,16 +757,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+        send_render(executor, to_client).await?;
         return Ok(());
     }
 
@@ -1013,16 +771,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+        send_render(executor, to_client).await?;
         return Ok(());
     }
 
@@ -1066,16 +815,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        let (_, instructions) = executor
-            .render_screen()
-            .await
-            .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        for instr in instructions {
-            to_client
-                .send(instr)
-                .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-        }
+        send_render(executor, to_client).await?;
         return Ok(());
     }
 
@@ -1115,16 +855,7 @@ async fn handle_csv_import(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    let (_, instructions) = executor
-        .render_screen()
-        .await
-        .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    for instr in instructions {
-        to_client
-            .send(instr)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-    }
+    send_render(executor, to_client).await?;
 
     Ok(())
 }

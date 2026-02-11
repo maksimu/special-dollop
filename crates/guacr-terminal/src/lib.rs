@@ -23,11 +23,11 @@
 mod buffer_pool;
 mod clipboard;
 mod config;
+mod copy_detector;
 mod database_renderer;
 mod dirty_tracker;
 mod emulator;
 mod framebuffer;
-mod graphics_protocol;
 mod guacamole_input;
 mod input_handler;
 mod keysym;
@@ -42,11 +42,14 @@ mod terminal_input_handler;
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use clipboard::{RdpClipboard, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE};
 pub use config::{ColorScheme, TerminalConfig};
-pub use database_renderer::{DatabaseTerminal, QueryResult, SpreadsheetRenderer};
+pub use copy_detector::{CellOp, CopyDetector};
+pub use database_renderer::{
+    Action, Alignment, ColumnDef, DatabaseTerminal, GridEvent, GridMode, QueryResult,
+    SpreadsheetRenderer,
+};
 pub use dirty_tracker::{DirtyRect, DirtyTracker};
 pub use emulator::{Rect, ScrollbackLine, TerminalEmulator};
 pub use framebuffer::{FrameBuffer, FrameRect};
-pub use graphics_protocol::{GraphicsMode, GraphicsRenderer};
 pub use guacamole_input::{
     extract_selection_text, format_clear_selection_instructions, format_clipboard_instructions,
     format_selection_overlay_instructions, handle_mouse_selection, parse_clipboard_blob,

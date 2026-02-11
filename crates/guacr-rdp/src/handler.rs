@@ -11,6 +11,8 @@ use guacr_handlers::{
     send_ready,
     // Cursor support
     CursorManager,
+    // Drag detection (shared with VNC)
+    DragDetector,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -64,10 +66,9 @@ type TokioTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 use crate::channel_handler::RdpChannelHandler;
 
 // Import shared types from guacr-terminal
-use crate::window_detector::WindowMoveDetector;
 use guacr_terminal::{
-    FrameBuffer, GraphicsMode, GraphicsRenderer, RdpClipboard, RdpInputHandler, ScrollDetector,
-    ScrollDirection, CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE,
+    CopyDetector, FrameBuffer, RdpClipboard, RdpInputHandler, ScrollDetector, ScrollDirection,
+    CLIPBOARD_DEFAULT_SIZE, CLIPBOARD_MAX_SIZE, CLIPBOARD_MIN_SIZE,
 };
 
 /// RDP server type detection for compatibility
@@ -119,12 +120,6 @@ pub struct RdpConfig {
     pub supports_webp: bool,
     /// Client supports JPEG format
     pub supports_jpeg: bool,
-    /// Terminal graphics mode (None = normal Guacamole protocol)
-    pub terminal_mode: Option<GraphicsMode>,
-    /// Terminal columns (for terminal mode)
-    pub terminal_cols: u16,
-    /// Terminal rows (for terminal mode)
-    pub terminal_rows: u16,
 }
 
 impl Default for RdpConfig {
@@ -142,9 +137,6 @@ impl Default for RdpConfig {
             jpeg_quality: 92,     // High quality, minimal artifacts
             supports_webp: false, // Will be overridden by client capabilities
             supports_jpeg: false, // Will be overridden by client capabilities
-            terminal_mode: None,  // Default to normal Guacamole protocol
-            terminal_cols: 240,
-            terminal_rows: 60,
         }
     }
 }
@@ -194,9 +186,6 @@ impl ProtocolHandler for RdpHandler {
             settings.recording_config.clone(),
             to_client,
             &params,
-            self.config.terminal_mode,
-            self.config.terminal_cols,
-            self.config.terminal_rows,
             settings.use_jpeg,
             settings.jpeg_quality,
             settings.supports_webp,
@@ -609,8 +598,12 @@ struct IronRdpSession {
     channel_handler: RdpChannelHandler,
     /// Scroll detector for bandwidth optimization (90-99% savings on scrolling)
     scroll_detector: ScrollDetector,
-    /// Window move detector for outline optimization (50-100x savings during window moves)
-    window_detector: WindowMoveDetector,
+    /// Drag detector for copy optimization during window moves (shared with VNC)
+    drag_detector: DragDetector,
+    /// Cell-based copy detector for detecting moved pixel content (shared with VNC)
+    /// Currently disabled: tile fragmentation causes visual artifacts during drag.
+    #[allow(dead_code)]
+    copy_detector: CopyDetector,
     #[allow(dead_code)] // TODO: Used for clipboard policy
     disable_copy: bool,
     #[allow(dead_code)] // TODO: Used for clipboard policy
@@ -633,8 +626,6 @@ struct IronRdpSession {
     #[cfg(feature = "sftp")]
     sftp_session: Option<russh_sftp::client::SftpSession>,
     /// Terminal graphics renderer (for terminal-only environments)
-    terminal_renderer: Option<GraphicsRenderer>,
-
     // Adaptive quality tracking (Guacamole-style dynamic quality)
     adaptive_quality: guacr_handlers::AdaptiveQuality,
 
@@ -665,9 +656,6 @@ impl IronRdpSession {
         recording_config: RecordingConfig,
         to_client: mpsc::Sender<Bytes>,
         params: &HashMap<String, String>,
-        terminal_mode: Option<GraphicsMode>,
-        terminal_cols: u16,
-        terminal_rows: u16,
         use_jpeg: bool,
         jpeg_quality: u8,
         supports_webp: bool,
@@ -703,12 +691,6 @@ impl IronRdpSession {
             None
         };
 
-        // Initialize terminal renderer if terminal mode is enabled
-        let terminal_renderer = terminal_mode.map(|mode| {
-            info!("RDP: Terminal graphics mode enabled: {:?}", mode);
-            GraphicsRenderer::new(mode, terminal_cols, terminal_rows)
-        });
-
         Self {
             framebuffer: FrameBuffer::new(width, height),
             buffer_pool,
@@ -722,7 +704,8 @@ impl IronRdpSession {
             supports_jpeg,
             stream_id: 1,
             scroll_detector: ScrollDetector::new(width, height),
-            window_detector: WindowMoveDetector::new(),
+            drag_detector: DragDetector::new(width, height),
+            copy_detector: CopyDetector::new(width, height),
             channel_handler: RdpChannelHandler::new(
                 clipboard_buffer_size,
                 disable_copy,
@@ -741,7 +724,6 @@ impl IronRdpSession {
             use_hardware_encoding: false, // Hardware encoding disabled for now
             #[cfg(feature = "sftp")]
             sftp_session: None,
-            terminal_renderer,
 
             // Initialize adaptive quality at max configured quality
             adaptive_quality: guacr_handlers::AdaptiveQuality::new(jpeg_quality),
@@ -1158,12 +1140,6 @@ impl IronRdpSession {
                                             .map_err(|e| format!("Failed to write response: {}", e))?;
                                     }
                                     ActiveStageOutput::GraphicsUpdate(rect) => {
-                                        // Skip frame if waiting for client sync ack (flow control)
-                                        if self.sync_control.is_waiting_for_sync() {
-                                            trace!("RDP: Skipping frame - waiting for client sync ack");
-                                            continue;
-                                        }
-
                                         // Send graphics update to client
                                         debug!("RDP: GraphicsUpdate received - rect: {:?}, image size: {}x{}",
                                             rect, image.width(), image.height());
@@ -1250,11 +1226,9 @@ impl IronRdpSession {
                                     }
                                     ActiveStageOutput::FrameStart { frame_id } => {
                                         trace!("RDP: Frame {} start", frame_id);
-                                        self.window_detector.frame_start(frame_id);
                                     }
                                     ActiveStageOutput::FrameEnd { frame_id } => {
                                         trace!("RDP: Frame {} end", frame_id);
-                                        self.window_detector.frame_end(frame_id);
                                     }
                                     ActiveStageOutput::Terminate(reason) => {
                                         info!("RDP: Session terminated: {:?}", reason);
@@ -1392,50 +1366,85 @@ impl IronRdpSession {
         // NOTE: Alpha channel fix is now handled in framebuffer.update_region()
         // IronRDP doesn't set alpha=255, so we fix it during the copy to avoid extra allocation
 
-        // If terminal mode is enabled, render to terminal instead of Guacamole protocol
-        if let Some(renderer) = &self.terminal_renderer {
-            trace!("RDP: Rendering to terminal graphics");
-            let terminal_output = renderer.render(image_data, self.width, self.height);
+        // Notify drag detector of graphics update size
+        self.drag_detector.notify_graphics_update(width, height);
 
-            // Send terminal output directly to client
-            if let Err(e) = self.to_client.send(terminal_output).await {
-                return Err(format!("Failed to send terminal graphics: {}", e));
+        // Check for active drag (copy-based optimization)
+        if self.drag_detector.is_dragging() {
+            let (dx, dy) = self.drag_detector.drag_delta();
+            if dx != 0 || dy != 0 {
+                debug!(
+                    "RDP: Drag detected - sending copy delta ({}, {}) for {}x{}",
+                    dx, dy, self.width, self.height
+                );
+
+                // Calculate source and destination regions for the copy
+                let src_x = dx.max(0) as u32;
+                let src_y = dy.max(0) as u32;
+                let dst_x = (-dx).max(0) as u32;
+                let dst_y = (-dy).max(0) as u32;
+                let copy_w = self.width.saturating_sub(dx.unsigned_abs());
+                let copy_h = self.height.saturating_sub(dy.unsigned_abs());
+
+                if copy_w > 0 && copy_h > 0 {
+                    // Copy the overlapping region (GPU-accelerated on client)
+                    let copy_instr = guacr_protocol::format_copy(
+                        0, src_x, src_y, copy_w, copy_h, 12, // GUAC_COMP_SRC
+                        0, dst_x, dst_y,
+                    );
+                    self.send_and_record(&copy_instr).await?;
+                }
+
+                // Update framebuffer for the exposed strips
+                self.framebuffer
+                    .update_region_from_fullscreen(x, y, width, height, image_data, self.width);
+
+                // Encode only the exposed edge strips (not the full screen)
+                if dx.unsigned_abs() > 0 && copy_h > 0 {
+                    // Vertical strip exposed by horizontal movement
+                    let strip_x = if dx > 0 {
+                        self.width.saturating_sub(dx as u32)
+                    } else {
+                        0
+                    };
+                    let strip_w = dx.unsigned_abs().min(self.width);
+                    self.framebuffer.clear_dirty();
+                    self.framebuffer
+                        .mark_dirty(strip_x, 0, strip_w, self.height);
+                    self.encode_and_send_dirty_rects().await?;
+                }
+
+                if dy.unsigned_abs() > 0 {
+                    // Horizontal strip exposed by vertical movement
+                    let strip_y = if dy > 0 {
+                        self.height.saturating_sub(dy as u32)
+                    } else {
+                        0
+                    };
+                    let strip_h = dy.unsigned_abs().min(self.height);
+                    self.framebuffer.clear_dirty();
+                    self.framebuffer.mark_dirty(0, strip_y, self.width, strip_h);
+                    self.encode_and_send_dirty_rects().await?;
+                }
+
+                // Send sync
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
+                self.send_and_record(&sync_instr).await?;
+                self.sync_control.set_pending_sync(timestamp);
+                self.sync_sent_at = Some(std::time::Instant::now());
+
+                return Ok(());
             }
-
-            // Record if enabled
-            if let Some(_recorder) = &self.recorder {
-                // For terminal mode, we could record the terminal output
-                // For now, just skip recording or record as binary data
-                trace!("RDP: Terminal mode - recording not yet implemented");
-            }
-
-            return Ok(());
         }
 
-        // Check for window move operation first (50-100x bandwidth savings)
-        if self.window_detector.is_window_move(rect, image_data) {
-            debug!(
-                "RDP: Window move detected - sending outline for {}x{} at ({}, {})",
-                width, height, x, y
-            );
-
-            // Send rectangle outline instead of full content
-            let outline_instr = guacr_protocol::format_rect(0, x, y, width, height);
-            self.send_and_record(&outline_instr).await?;
-
-            // Send sync
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let sync_instr = format!("4.sync,{}.{};", timestamp.to_string().len(), timestamp);
-            self.send_and_record(&sync_instr).await?;
-
-            // Store pending sync for flow control
-            self.sync_control.set_pending_sync(timestamp);
-            self.sync_sent_at = Some(std::time::Instant::now());
-
-            return Ok(());
+        // If drag just ended, force full re-render to clean up artifacts
+        if self.drag_detector.drag_ended() {
+            debug!("RDP: Drag ended - forcing full re-render");
+            // Fall through to normal rendering path (will render full dirty rect)
         }
 
         // Check for scroll operation (90-99% bandwidth savings)
@@ -1509,18 +1518,14 @@ impl IronRdpSession {
             return Ok(());
         }
 
-        // Use the dirty rect from IronRDP instead of always rendering full screen
-        debug!(
-            "RDP: No scroll detected, using dirty rect {}x{} at ({}, {})",
-            width, height, x, y
-        );
-
-        // Update ONLY the dirty region from the full-screen image (efficient!)
-        // IronRDP gives us the full screen, but we only copy the changed region
+        // Update ONLY the dirty region from the full-screen image
         self.framebuffer
             .update_region_from_fullscreen(x, y, width, height, image_data, self.width);
 
-        // Encode and send the dirty region from framebuffer
+        // Encode and send the dirty region directly as a single image.
+        // CopyDetector cell-based tiling is disabled: it fragments large updates
+        // into hundreds of small PNG tiles, causing visual artifacts during drag
+        // and overwhelming the client with instruction volume.
         self.encode_and_send_dirty_rects().await
     }
 
@@ -1647,6 +1652,9 @@ impl IronRdpSession {
                         trace!("RDP: Mouse click blocked (read-only mode)");
                         return Ok(());
                     }
+
+                    // Feed mouse state to drag detector
+                    self.drag_detector.notify_mouse_event(x, y, mask);
 
                     let pointer_event = self.input_handler.handle_mouse(mask, x, y)?;
 

@@ -44,10 +44,11 @@ impl TextProtocolEncoder {
         self.scratch.put_slice(stream_str.as_bytes());
         self.scratch.put_u8(b',');
 
-        // Mask (RGBA = 0x0F = 15)
-        // CRITICAL: Must include alpha channel (bit 3) for proper rendering
-        // RGB-only (0x07) causes black/transparent rendering issues
-        self.scratch.put_slice(b"2.15,");
+        // Mask: GUAC_COMP_OVER (0x0E = 14) - standard alpha compositing
+        // Replaces destination with source where source is opaque.
+        // Do NOT use 15 (GUAC_COMP_PLUS / additive blending) - it adds pixel
+        // values instead of replacing, causing ghosting artifacts.
+        self.scratch.put_slice(b"2.14,");
 
         // Layer
         let layer_str = layer.to_string();

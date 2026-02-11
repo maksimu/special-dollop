@@ -15,6 +15,8 @@ use guacr_handlers::{
     send_error_best_effort,
     send_name,
     send_ready,
+    // Cursor
+    CursorManager,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -29,6 +31,7 @@ use guacr_handlers::{
     ProtocolHandler,
     // Recording
     RecordingConfig,
+    StandardCursor,
     DEFAULT_KEEPALIVE_INTERVAL_SECS,
     PIPE_NAME_STDIN,
     PIPE_STREAM_STDOUT,
@@ -335,6 +338,19 @@ impl ProtocolHandler for TelnetHandler {
         // Send ready and name instructions
         send_ready(&to_client, "telnet-ready").await?;
         send_name(&to_client, "Telnet").await?;
+
+        // Send I-beam cursor bitmap (standard text cursor for terminals)
+        let mut cursor_manager = CursorManager::new(false, false, 85);
+        debug!("Telnet: Sending IBeam cursor");
+        let cursor_instrs = cursor_manager
+            .send_standard_cursor(StandardCursor::IBeam)
+            .map_err(|e| HandlerError::ProtocolError(format!("Cursor error: {}", e)))?;
+        for instr in cursor_instrs {
+            to_client
+                .send(Bytes::from(instr))
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
 
         // CRITICAL: Send size instruction to initialize display dimensions
         // Browser needs this BEFORE any img/drawing operations!
@@ -761,12 +777,18 @@ impl ProtocolHandler for TelnetHandler {
                                         .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
 
                                     // Render only the new bottom line(s)
-                                    let (jpeg, _, _, _, _) = renderer.render_region(
+                                    // Expand by 1 cell in all directions for JPEG artifacts
+                                    let r_min_row = dirty.min_row.saturating_sub(1);
+                                    let r_max_row = (dirty.max_row + 1).min(rows - 1);
+                                    let r_min_col = dirty.min_col.saturating_sub(1);
+                                    let r_max_col = (dirty.max_col + 1).min(cols - 1);
+
+                                    let (jpeg, x_px, y_px, _, _) = renderer.render_region(
                                         terminal.screen(),
-                                        dirty.min_row,
-                                        dirty.max_row,
-                                        dirty.min_col,
-                                        dirty.max_col,
+                                        r_min_row,
+                                        r_max_row,
+                                        r_min_col,
+                                        r_max_col,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
                                     // Base64 encode and send via modern zero-allocation protocol
@@ -776,7 +798,7 @@ impl ProtocolHandler for TelnetHandler {
                                     );
 
                                     let img_instr = protocol_encoder.format_img_instruction(
-                                        stream_id, 0, 0, 0, "image/jpeg",
+                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                     );
                                     to_client.send(img_instr.freeze()).await
                                         .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
@@ -812,19 +834,51 @@ impl ProtocolHandler for TelnetHandler {
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
                                     }
                                 }
-                            } else {
+                            } else if dirty_pct < 30 {
                                 // Partial update: render only dirty region
                                 trace!("Telnet: Partial update: {}% dirty ({} cells)", dirty_pct, dirty_cells);
 
-                                let (jpeg, _, _, _, _) = renderer.render_region(
+                                // Expand by 1 cell in all directions for JPEG artifacts
+                                let r_min_row = dirty.min_row.saturating_sub(1);
+                                let r_max_row = (dirty.max_row + 1).min(rows - 1);
+                                let r_min_col = dirty.min_col.saturating_sub(1);
+                                let r_max_col = (dirty.max_col + 1).min(cols - 1);
+
+                                let (jpeg, x_px, y_px, _, _) = renderer.render_region(
                                     terminal.screen(),
-                                    dirty.min_row,
-                                    dirty.max_row,
-                                    dirty.min_col,
-                                    dirty.max_col,
+                                    r_min_row,
+                                    r_max_row,
+                                    r_min_col,
+                                    r_max_col,
                                 ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
                                 // Base64 encode and send via modern zero-allocation protocol
+                                let base64_data = base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &jpeg,
+                                );
+
+                                let img_instr = protocol_encoder.format_img_instruction(
+                                    stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
+                                );
+                                to_client.send(img_instr.freeze()).await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                for instr in blob_instructions {
+                                    to_client.send(Bytes::from(instr)).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            } else {
+                                // Large update (>= 30% dirty): render full screen
+                                trace!("Telnet: Full screen update: {}% dirty", dirty_pct);
+
+                                let jpeg = renderer.render_screen(
+                                    terminal.screen(),
+                                    terminal.size().0,
+                                    terminal.size().1,
+                                ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+
                                 let base64_data = base64::Engine::encode(
                                     &base64::engine::general_purpose::STANDARD,
                                     &jpeg,

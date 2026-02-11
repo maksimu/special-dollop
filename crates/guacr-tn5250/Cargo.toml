@@ -1,0 +1,11 @@
+[package]
+name = "guacr-tn5250"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TN5250 IBM AS/400 protocol parser"
+
+[dependencies]
+guacr-tn3270 = { path = "../guacr-tn3270" }  # Shared EBCDIC codec
+log.workspace = true
+thiserror.workspace = true

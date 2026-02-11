@@ -19,8 +19,8 @@ thiserror.workspace = true
 log.workspace = true
 
 # SSH client
-russh = "0.45"
-russh-keys = "0.45"
+russh = "0.46"
+russh-keys = "0.46"
 ssh-key = "0.6"
 
 # Utilities

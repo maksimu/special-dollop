@@ -3,13 +3,19 @@ name = "guacr-handlers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Protocol handler trait and registry for guacr remote desktop protocols"
+description = "Protocol handler trait, registry, and ResourceBrowser for guacr remote desktop and infrastructure protocols (features: guacd-compat, vsphere, docker, kubernetes)"
 
 [features]
 default = []
 # Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
 # This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
 guacd-compat = ["dep:uuid"]
+# Enable vSphere REST API client for VM management and console access
+vsphere = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+# Enable Docker container management via bollard
+docker = ["dep:bollard", "dep:futures", "dep:tokio-util", "dep:serde_json"]
+# Enable Kubernetes API client for pod management, exec, and log viewing
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:serde_yaml", "dep:tokio-util"]
 
 [dependencies]
 # Workspace dependencies
@@ -23,6 +29,10 @@ log.workspace = true
 
 # Protocol support
 guacr-protocol = { path = "../guacr-protocol", version = "2.0.0" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Stream trait for resource browser watch API
+futures-core = "0.3"
 
 # Additional dependencies
 parking_lot = "0.12"
@@ -40,6 +50,21 @@ hmac = "0.12"
 
 # Optional dependencies for guacd-compat feature
 uuid = { workspace = true, optional = true }
+
+# Optional dependencies for vsphere feature
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
+
+# Optional dependencies for docker feature
+bollard = { version = "0.18", features = ["ssl"], optional = true }
+futures = { workspace = true, optional = true }
+tokio-util = { workspace = true, features = ["io", "compat"], optional = true }
+
+# Optional dependencies for kubernetes feature
+kube = { version = "0.98", features = ["client", "runtime", "ws"], optional = true }
+k8s-openapi = { version = "0.24", features = ["v1_32"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

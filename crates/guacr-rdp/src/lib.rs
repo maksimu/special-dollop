@@ -19,7 +19,6 @@
 
 // Supporting modules (kept minimal - infrastructure only)
 mod channel_handler;
-mod window_detector;
 
 // Main handler (all logic in one file - SSH pattern)
 mod handler;

@@ -3,8 +3,8 @@
 
 use crate::{DatabaseError, Result};
 use bytes::Bytes;
-use guacr_handlers::{send_name, send_ready, HandlerError};
-use guacr_protocol::{format_chunked_blobs, format_cursor, GuacamoleParser, TextProtocolEncoder};
+use guacr_handlers::{send_name, send_ready, CursorManager, HandlerError, StandardCursor};
+use guacr_protocol::{format_chunked_blobs, GuacamoleParser, TextProtocolEncoder};
 use guacr_terminal::{
     DatabaseTerminal, DirtyTracker, QueryResult, TerminalInputHandler, TerminalRenderer,
 };
@@ -106,11 +106,17 @@ impl QueryExecutor {
         send_ready(to_client, "database").await?;
         send_name(to_client, "Database").await?;
 
-        let cursor = Bytes::from(format_cursor(0, 0, 0, 0, 0, 0, 0));
-        to_client
-            .send(cursor)
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        // Send I-beam cursor bitmap (standard text cursor for terminals)
+        let mut cursor_manager = CursorManager::new(false, false, 85);
+        let cursor_instrs = cursor_manager
+            .send_standard_cursor(StandardCursor::IBeam)
+            .map_err(|e| HandlerError::ProtocolError(format!("Cursor error: {}", e)))?;
+        for instr in cursor_instrs {
+            to_client
+                .send(Bytes::from(instr))
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
 
         let size = Bytes::from(TerminalRenderer::format_size_instruction(0, width, height));
         to_client
@@ -481,15 +487,22 @@ impl QueryExecutor {
             // For large changes (>= 30%), render the full screen (more efficient)
             if dirty_pct < 30 {
                 // Partial render - only changed region
+                // Expand by 1 cell in all directions to cover JPEG
+                // compression artifacts (DCT ringing at block boundaries)
+                let render_min_row = dirty.min_row.saturating_sub(1);
+                let render_max_row = (dirty.max_row + 1).min(rows - 1);
+                let render_min_col = dirty.min_col.saturating_sub(1);
+                let render_max_col = (dirty.max_col + 1).min(cols - 1);
+
                 let (jpeg_data, x_px, y_px, _width_px, _height_px) = self
                     .terminal
                     .renderer()
                     .render_region(
                         self.terminal.screen(),
-                        dirty.min_row,
-                        dirty.max_row,
-                        dirty.min_col,
-                        dirty.max_col,
+                        render_min_row,
+                        render_max_row,
+                        render_min_col,
+                        render_max_col,
                     )
                     .map_err(|e| DatabaseError::QueryError(format!("Render error: {}", e)))?;
 

@@ -109,7 +109,11 @@ CARGO_EOF
         echo 'Cargo SSL configuration complete.'
     fi
     rustc --version
-    
+
+    # Install system dependencies for native crate builds
+    echo 'Installing system dependencies...'
+    yum install -y unixODBC-devel
+
     # Install maturin
     /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
     

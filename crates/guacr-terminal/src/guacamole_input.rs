@@ -770,7 +770,7 @@ pub fn format_selection_overlay_instructions(
     // Blue: R=0, G=128 (0x80), B=255 (0xFF), A=200 (0xC8 = 78% opacity)
     // Increased from 160 (62.7%) to 200 (78%) for much better visibility
     // This matches guacd's selection overlay which is quite visible
-    instructions.push(guacr_protocol::format_cfill(layer, 0, 128, 255, 200));
+    instructions.push(guacr_protocol::format_cfill(14, layer, 0, 128, 255, 200));
 
     instructions
 }

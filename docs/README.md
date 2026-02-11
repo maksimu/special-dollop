@@ -9,6 +9,8 @@ This directory contains workspace-level documentation that applies to the entire
 **User-Facing Documentation:**
 - **[ARCHITECTURE_EXPLANATION.md](ARCHITECTURE_EXPLANATION.md)** - Python bindings architecture
 - **[TESTING_STRATEGY.md](TESTING_STRATEGY.md)** - Workspace testing strategy, CI vs manual tests
+- **[NEW_HANDLER_OPPORTUNITIES.md](NEW_HANDLER_OPPORTUNITIES.md)** - Protocol handler planning and implementation status tracker
+- **[CRATES_OVERVIEW.md](CRATES_OVERVIEW.md)** - All crates overview
 
 ### Crate-Specific Docs
 
@@ -38,6 +40,9 @@ This directory contains workspace-level documentation that applies to the entire
 - **[guacr-ssh](../crates/guacr-ssh/docs/)** - SSH protocol handler (production-ready)
 - **[guacr-rdp](../crates/guacr-rdp/docs/)** - RDP protocol handler (production-ready)
 - **[guacr-vnc](../crates/guacr-vnc/docs/)** - VNC protocol handler
+- **[guacr-database](../crates/guacr-database/)** - Database handlers (MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, Redis, Cassandra, Elasticsearch, DynamoDB, ODBC)
+- **[guacr-tn3270](../crates/guacr-tn3270/)** - IBM Mainframe TN3270 protocol layer
+- **[guacr-tn5250](../crates/guacr-tn5250/)** - IBM AS/400 TN5250 protocol layer
 - **[guacr-threat-detection](../crates/guacr-threat-detection/docs/)** - AI threat detection
 
 ## 🎯 Quick Links by Topic
@@ -61,6 +66,8 @@ This directory contains workspace-level documentation that applies to the entire
 5. SSH handler: [guacr-ssh docs](../crates/guacr-ssh/docs/)
 6. RDP handler: [guacr-rdp docs](../crates/guacr-rdp/docs/)
 7. VNC handler: [guacr-vnc docs](../crates/guacr-vnc/docs/)
+8. Database handlers: [guacr-database](../crates/guacr-database/) (MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, Redis, Cassandra, Elasticsearch, DynamoDB, ODBC)
+9. Mainframe protocols: [guacr-tn3270](../crates/guacr-tn3270/), [guacr-tn5250](../crates/guacr-tn5250/)
 
 ### For Contributors
 1. Workspace architecture: [Architecture Explanation](ARCHITECTURE_EXPLANATION.md)
@@ -143,5 +150,5 @@ grep -r "your-topic" docs/ crates/*/docs/
 
 ---
 
-**Last Updated**: January 28, 2026  
+**Last Updated**: February 11, 2026  
 **Maintainers**: Keeper Security Engineering <engineering@keeper.io>

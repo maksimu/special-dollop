@@ -12,6 +12,8 @@ use guacr_handlers::{
     AdaptiveQuality,
     // Cursor support
     CursorManager,
+    // Drag detection (shared with RDP)
+    DragDetector,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -31,7 +33,7 @@ use guacr_handlers::{
     DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
 use guacr_protocol::{BinaryEncoder, GuacamoleParser};
-use guacr_terminal::{FrameBuffer, ScrollDetector, ScrollDirection};
+use guacr_terminal::{CopyDetector, FrameBuffer, ScrollDetector, ScrollDirection};
 use image::{ImageEncoder, RgbaImage};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
@@ -433,6 +435,12 @@ struct VncClient {
     recorder: Option<MultiFormatRecorder>,
     /// Scroll detector for bandwidth optimization (shared with RDP)
     scroll_detector: ScrollDetector,
+    /// Drag detector for copy optimization during window moves (shared with RDP)
+    drag_detector: DragDetector,
+    /// Cell-based copy detector for detecting moved pixel content (shared with RDP)
+    /// Currently disabled: tile fragmentation causes visual artifacts during drag.
+    #[allow(dead_code)]
+    copy_detector: CopyDetector,
     /// JPEG quality (1-100) - max quality for adaptive quality manager
     #[allow(dead_code)] // Used only to initialize adaptive_quality
     jpeg_quality: u8,
@@ -506,6 +514,8 @@ impl VncClient {
             security,
             recorder,
             scroll_detector: ScrollDetector::new(width, height),
+            drag_detector: DragDetector::new(width, height),
+            copy_detector: CopyDetector::new(width, height),
             jpeg_quality,
             use_jpeg,
             supports_webp,
@@ -926,6 +936,9 @@ impl VncClient {
                             return Ok(());
                         }
 
+                        // Feed mouse state to drag detector
+                        self.drag_detector.notify_mouse_event(x, y, mask);
+
                         let x = x.max(0).min(self.width as i32 - 1) as u16;
                         let y = y.max(0).min(self.height as i32 - 1) as u16;
 
@@ -1072,10 +1085,103 @@ impl VncClient {
             &rgba_vec,
         );
 
+        // Notify drag detector of update size
+        let update_w = rect.width as u32;
+        let update_h = rect.height as u32;
+        self.drag_detector
+            .notify_graphics_update(update_w, update_h);
+
         self.framebuffer.optimize_dirty_rects();
         let dirty_rects: Vec<_> = self.framebuffer.dirty_rects().to_vec();
         if dirty_rects.is_empty() {
             return Ok(());
+        }
+
+        // Check for active drag (copy-based optimization, shared with RDP)
+        if self.drag_detector.is_dragging() {
+            let (dx, dy) = self.drag_detector.drag_delta();
+            if dx != 0 || dy != 0 {
+                debug!("VNC: Drag detected - sending copy delta ({}, {})", dx, dy);
+
+                let src_x = dx.max(0) as u32;
+                let src_y = dy.max(0) as u32;
+                let dst_x = (-dx).max(0) as u32;
+                let dst_y = (-dy).max(0) as u32;
+                let copy_w = self.width.saturating_sub(dx.unsigned_abs());
+                let copy_h = self.height.saturating_sub(dy.unsigned_abs());
+
+                if copy_w > 0 && copy_h > 0 {
+                    let copy_instr = guacr_protocol::format_copy(
+                        0, src_x, src_y, copy_w, copy_h, 12, // GUAC_COMP_SRC
+                        0, dst_x, dst_y,
+                    );
+                    self.send_and_record(&copy_instr).await?;
+                }
+
+                // Encode exposed edge strips
+                if dx.unsigned_abs() > 0 {
+                    let strip_x = if dx > 0 {
+                        self.width.saturating_sub(dx as u32)
+                    } else {
+                        0
+                    };
+                    let strip_w = dx.unsigned_abs().min(self.width);
+                    let strip_data = self.encode_region(guacr_terminal::FrameRect {
+                        x: strip_x,
+                        y: 0,
+                        width: strip_w,
+                        height: self.height,
+                    })?;
+                    self.adaptive_quality.track_frame_sent(strip_data.len());
+                    let msg = self.binary_encoder.encode_image(
+                        self.stream_id,
+                        0,
+                        strip_x as i32,
+                        0,
+                        strip_w as u16,
+                        self.height as u16,
+                        0,
+                        Bytes::from(strip_data),
+                    );
+                    self.send_and_record_bytes(msg).await?;
+                }
+
+                if dy.unsigned_abs() > 0 {
+                    let strip_y = if dy > 0 {
+                        self.height.saturating_sub(dy as u32)
+                    } else {
+                        0
+                    };
+                    let strip_h = dy.unsigned_abs().min(self.height);
+                    let strip_data = self.encode_region(guacr_terminal::FrameRect {
+                        x: 0,
+                        y: strip_y,
+                        width: self.width,
+                        height: strip_h,
+                    })?;
+                    self.adaptive_quality.track_frame_sent(strip_data.len());
+                    let msg = self.binary_encoder.encode_image(
+                        self.stream_id,
+                        0,
+                        0,
+                        strip_y as i32,
+                        self.width as u16,
+                        strip_h as u16,
+                        0,
+                        Bytes::from(strip_data),
+                    );
+                    self.send_and_record_bytes(msg).await?;
+                }
+
+                self.send_sync().await?;
+                self.framebuffer.clear_dirty();
+                return Ok(());
+            }
+        }
+
+        // If drag just ended, force full re-render (fall through to normal path)
+        if self.drag_detector.drag_ended() {
+            debug!("VNC: Drag ended - forcing full re-render");
         }
 
         // Check for scroll operation (shared with RDP)
@@ -1087,24 +1193,21 @@ impl VncClient {
                 scroll_op.pixels
             );
 
-            // Send copy instruction for scroll optimization
             match scroll_op.direction {
                 ScrollDirection::Up => {
-                    // Content moved up: copy existing content, render new bottom region
                     let copy_instr = guacr_protocol::format_transfer(
-                        0,                              // src layer
-                        0,                              // src x
-                        scroll_op.pixels,               // src y (from line N)
-                        self.width,                     // width
-                        self.height - scroll_op.pixels, // height (all except scrolled)
-                        12,                             // function: SRC (simple copy)
-                        0,                              // dst layer
-                        0,                              // dst x
-                        0,                              // dst y (to top)
+                        0,
+                        0,
+                        scroll_op.pixels,
+                        self.width,
+                        self.height - scroll_op.pixels,
+                        12,
+                        0,
+                        0,
+                        0,
                     );
                     self.send_and_record(&copy_instr).await?;
 
-                    // Only render new content at bottom (bandwidth savings!)
                     let new_region_y = self.height - scroll_op.pixels;
                     let new_region_data = self.encode_region(guacr_terminal::FrameRect {
                         x: 0,
@@ -1112,11 +1215,8 @@ impl VncClient {
                         width: self.width,
                         height: scroll_op.pixels,
                     })?;
-
-                    // Track bytes for adaptive quality
                     self.adaptive_quality
                         .track_frame_sent(new_region_data.len());
-
                     let msg = self.binary_encoder.encode_image(
                         self.stream_id,
                         0,
@@ -1127,39 +1227,31 @@ impl VncClient {
                         0,
                         Bytes::from(new_region_data),
                     );
-
                     self.send_and_record_bytes(msg).await?;
-
-                    // Send sync for frame timing
                     self.send_sync().await?;
                 }
                 ScrollDirection::Down => {
-                    // Content moved down: copy existing content, render new top region
                     let copy_instr = guacr_protocol::format_transfer(
-                        0,                              // src layer
-                        0,                              // src x
-                        0,                              // src y (from top)
-                        self.width,                     // width
-                        self.height - scroll_op.pixels, // height
-                        12,                             // function: SRC
-                        0,                              // dst layer
-                        0,                              // dst x
-                        scroll_op.pixels,               // dst y (move down by N)
+                        0,
+                        0,
+                        0,
+                        self.width,
+                        self.height - scroll_op.pixels,
+                        12,
+                        0,
+                        0,
+                        scroll_op.pixels,
                     );
                     self.send_and_record(&copy_instr).await?;
 
-                    // Only render new content at top
                     let new_region_data = self.encode_region(guacr_terminal::FrameRect {
                         x: 0,
                         y: 0,
                         width: self.width,
                         height: scroll_op.pixels,
                     })?;
-
-                    // Track bytes for adaptive quality
                     self.adaptive_quality
                         .track_frame_sent(new_region_data.len());
-
                     let msg = self.binary_encoder.encode_image(
                         self.stream_id,
                         0,
@@ -1170,101 +1262,40 @@ impl VncClient {
                         0,
                         Bytes::from(new_region_data),
                     );
-
                     self.send_and_record_bytes(msg).await?;
-
-                    // Send sync for frame timing
                     self.send_sync().await?;
                 }
             }
 
-            // Clear dirty rects since we handled the scroll
             self.framebuffer.clear_dirty();
             return Ok(());
         }
 
-        // No scroll detected - use smart dirty region strategy
-        // Calculate total dirty area to decide rendering approach
-        let total_dirty_pixels: u32 = dirty_rects.iter().map(|r| r.width * r.height).sum();
-        let total_pixels = self.width * self.height;
-        let dirty_percent = (total_dirty_pixels * 100) / total_pixels;
-
-        if dirty_percent < 30 {
-            // Small changes (<30%): Render each dirty rect separately
-            // This is more efficient for small updates (cursor movements, text edits)
-            trace!(
-                "VNC: Small update ({}%), rendering {} dirty rects",
-                dirty_percent,
-                dirty_rects.len()
-            );
-
-            let mut total_bytes = 0;
-            for dirty_rect in &dirty_rects {
-                let encoded_data = self.encode_region(*dirty_rect)?;
-                total_bytes += encoded_data.len();
-                let encoded_bytes = Bytes::from(encoded_data);
-
-                let msg = self.binary_encoder.encode_image(
-                    self.stream_id,
-                    0,
-                    dirty_rect.x as i32,
-                    dirty_rect.y as i32,
-                    dirty_rect.width as u16,
-                    dirty_rect.height as u16,
-                    0,
-                    encoded_bytes,
-                );
-
-                self.send_and_record_bytes(msg).await?;
-            }
-
-            // Track total bytes sent for adaptive quality calculation
-            self.adaptive_quality.track_frame_sent(total_bytes);
-
-            // Send sync after all dirty rects
-            self.send_sync().await?;
-        } else {
-            // Large changes (>=30%): Render full screen
-            // More efficient for large updates due to:
-            // 1. Better JPEG compression on larger images
-            // 2. Less protocol overhead (one image vs many)
-            // 3. Simpler client-side compositing
-            trace!(
-                "VNC: Large update ({}%), rendering full screen",
-                dirty_percent
-            );
-
-            let full_screen = guacr_terminal::FrameRect {
-                x: 0,
-                y: 0,
-                width: self.width,
-                height: self.height,
-            };
-
-            let encoded_data = self.encode_region(full_screen)?;
-            let total_bytes = encoded_data.len();
-            let encoded_bytes = Bytes::from(encoded_data);
-
+        // Encode dirty regions directly as images.
+        // CopyDetector cell-based tiling is disabled: it fragments large updates
+        // into hundreds of small tiles, causing visual artifacts during drag
+        // and overwhelming the client with instruction volume.
+        let mut total_bytes = 0;
+        for dirty in &dirty_rects {
+            let encoded_data = self.encode_region(*dirty)?;
+            total_bytes += encoded_data.len();
             let msg = self.binary_encoder.encode_image(
                 self.stream_id,
                 0,
+                dirty.x as i32,
+                dirty.y as i32,
+                dirty.width as u16,
+                dirty.height as u16,
                 0,
-                0,
-                self.width as u16,
-                self.height as u16,
-                0,
-                encoded_bytes,
+                Bytes::from(encoded_data),
             );
-
             self.send_and_record_bytes(msg).await?;
-
-            // Track bytes sent for adaptive quality calculation
-            self.adaptive_quality.track_frame_sent(total_bytes);
-
-            // Send sync after full screen
-            self.send_sync().await?;
         }
 
+        if total_bytes > 0 {
+            self.adaptive_quality.track_frame_sent(total_bytes);
+        }
+        self.send_sync().await?;
         self.framebuffer.clear_dirty();
 
         Ok(())

@@ -62,8 +62,8 @@ jobs:
 
           # Build the wheel inside the container (same approach as ARM64)
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_x86_64 bash -c "
-            # Install OpenSSL development packages
-            yum install -y openssl-devel
+            # Install system dependencies
+            yum install -y openssl-devel unixODBC-devel
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -75,7 +75,7 @@ jobs:
             # Build the wheel
             cd /io/crates/python-bindings
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
-            
+
             # Check if build succeeded
             if [ \$? -ne 0 ]; then
               echo \"ERROR: maturin build failed\"
@@ -205,9 +205,9 @@ jobs:
 
           # Build the wheel inside the container
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_aarch64 bash -c "
-            # Install OpenSSL development packages
-            yum install -y openssl-devel
-            
+            # Install system dependencies
+            yum install -y openssl-devel unixODBC-devel
+
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             source \$HOME/.cargo/env
@@ -218,7 +218,7 @@ jobs:
             # Build the wheel
             cd /io/crates/python-bindings
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
-            
+
             # Check if build succeeded
             if [ \$? -ne 0 ]; then
               echo \"ERROR: maturin build failed\"
@@ -333,6 +333,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew list openssl@3 &>/dev/null || brew install openssl@3
+          brew list unixodbc &>/dev/null || brew install unixodbc
 
       - name: Install maturin
         run: |
@@ -474,7 +475,7 @@ jobs:
           # Use root user inside the container but fix permissions after
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io alpine:3.16 sh -c "
             # Install build dependencies including patchelf, git, and OpenSSL
-            apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf git openssl-dev openssl-libs-static
+            apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf git openssl-dev openssl-libs-static unixodbc-dev
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

@@ -8,10 +8,14 @@
 //
 // Feature flags:
 // - `guacd-compat`: Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
+// - `vsphere`: Enable vSphere REST API client for VM management and console access
+// - `docker`: Enable Docker container management via bollard
+// - `kubernetes`: Enable Kubernetes API client for pod management, exec, and log viewing
 
 mod adaptive_quality;
 mod connection;
 mod cursor;
+mod drag_detector;
 mod error;
 mod events;
 mod handler;
@@ -21,6 +25,7 @@ mod multi_channel;
 mod pipe;
 mod recording;
 mod registry;
+pub mod resource_browser;
 mod security;
 mod session;
 mod sync_control;
@@ -28,6 +33,15 @@ mod throughput;
 
 #[cfg(feature = "guacd-compat")]
 mod handshake;
+
+#[cfg(feature = "vsphere")]
+mod vsphere;
+
+#[cfg(feature = "docker")]
+pub mod docker_handler;
+
+#[cfg(feature = "kubernetes")]
+pub mod kubernetes;
 
 #[cfg(test)]
 mod mock;
@@ -38,6 +52,7 @@ pub use connection::{
     DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_KEEPALIVE_INTERVAL_SECS,
 };
 pub use cursor::{send_cursor_instructions, CursorManager, StandardCursor};
+pub use drag_detector::DragDetector;
 pub use error::{send_error_and_abort, send_error_best_effort, HandlerError, Result};
 pub use events::{
     connect_with_event_adapter, EventBasedHandler, EventCallback, HandlerEvent, InstructionSender,
@@ -118,6 +133,25 @@ pub use handshake::{
     ConnectResult, GuacdHandshake, GuacdServer, HandshakeError, SelectResult,
     DEFAULT_HANDSHAKE_TIMEOUT_SECS, GUACAMOLE_PROTOCOL_VERSION, GUACD_DEFAULT_PORT,
     MAX_INSTRUCTION_SIZE,
+};
+
+// vSphere REST API client exports
+#[cfg(feature = "vsphere")]
+pub use vsphere::{
+    ConsoleTicket, DiskInfo, HostInfo, NicInfo, PowerState, VSphereClient, VmDetail, VmInfo,
+};
+
+// Docker container management exports
+#[cfg(feature = "docker")]
+pub use docker_handler::{
+    detect_connection_mode, ContainerInfo, DockerClient, DockerExecReader, DockerExecWriter,
+    DockerLogReader,
+};
+
+// Kubernetes API client exports
+#[cfg(feature = "kubernetes")]
+pub use kubernetes::{
+    detect_auth_method, AuthMethod, ExecReader, ExecWriter, KubernetesClient, LogReader, PodInfo,
 };
 
 #[cfg(test)]

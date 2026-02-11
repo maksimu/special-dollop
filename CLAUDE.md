@@ -22,7 +22,7 @@ This file provides comprehensive guidance to Claude Code (claude.ai/code) when w
 
 **2. Protocol Handlers** (`guacr` family of crates)
 - Ground-up rewrite of Apache Guacamole's guacd daemon in Rust
-- Translates RDP, VNC, SSH, Telnet, database protocols into Guacamole protocol
+- Translates RDP, VNC, SSH, Telnet, TN3270, TN5250, database, serial console protocols into Guacamole protocol
 - 10,000+ concurrent connections per instance (vs 500-1,000 in C guacd)
 - Zero-copy I/O, SIMD acceleration, lock-free concurrency
 - **Status**: SSH and RDP handlers production-ready
@@ -37,14 +37,16 @@ keeper-pam-connections/
 │   ├── keeper-pam-webrtc-rs/          # Core WebRTC library (rlib)
 │   ├── python-bindings/                # Unified Python package (cdylib)
 │   ├── guacr/                          # Protocol handlers (aggregator)
-│   ├── guacr-handlers/                 # Handler trait definitions
+│   ├── guacr-handlers/                 # Handler trait definitions + resource browser
 │   ├── guacr-protocol/                 # Guacamole protocol codec
 │   ├── guacr-terminal/                 # Terminal emulation
 │   ├── guacr-ssh/                      # SSH protocol handler
 │   ├── guacr-telnet/                   # Telnet protocol handler
 │   ├── guacr-rdp/                      # RDP protocol handler (IronRDP)
 │   ├── guacr-vnc/                      # VNC protocol handler
-│   ├── guacr-database/                 # Database protocol handlers
+│   ├── guacr-database/                 # Database protocol handlers (SQL, NoSQL, ODBC)
+│   ├── guacr-tn3270/                   # IBM Mainframe TN3270 protocol
+│   ├── guacr-tn5250/                   # IBM AS/400 TN5250 protocol
 │   ├── guacr-sftp/                     # SFTP file transfer
 │   ├── guacr-rbi/                      # Remote Browser Isolation
 │   └── guacr-threat-detection/         # AI threat detection
@@ -163,10 +165,15 @@ cd tests && python -m pytest -v
 4. **Protocol Crates**: Each protocol in separate crate (SSH, RDP, VNC, etc.)
 
 **Production-Ready Handlers:**
-- **SSH** (guacr-ssh): Password/key auth, JPEG rendering (60fps), clipboard (OSC 52)
-- **RDP** (guacr-rdp): IronRDP, 60fps, scroll detection (90-99% bandwidth reduction)
+- **SSH** (guacr-ssh): Password/key/cert auth, JPEG rendering (60fps, quality 85), clipboard (OSC 52), IBeam cursor, text selection overlay
+- **RDP** (guacr-rdp): IronRDP, 60fps, scroll detection, sync flow control
 - **VNC** (guacr-vnc): RFB 3.8 protocol support
-- **Telnet**, **Database**, **SFTP**, **RBI**: Complete implementations
+- **Telnet**, **SFTP**, **RBI**: Complete implementations (shared CursorManager, dirty region expansion, threshold-based rendering)
+- **Database** (guacr-database): MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, Redis, Cassandra, Elasticsearch, DynamoDB, Generic ODBC
+- **Serial Console** (guacr-telnet): RFC 2217 serial-over-IP, reuses VT100 terminal pipeline
+- **TN3270** (guacr-tn3270): IBM Mainframe protocol layer (EBCDIC codec, 3270 data stream parser)
+- **TN5250** (guacr-tn5250): IBM AS/400 protocol layer (5250 data stream parser, screen buffer)
+- **Infrastructure**: Kubernetes (via `kube` crate), Docker (via `bollard`), vSphere REST client -- behind feature flags in guacr-handlers
 
 **Handler Pattern:**
 ```rust
@@ -374,12 +381,16 @@ backend.write_all(payload).await?;  // Data sent immediately
 crates/
 ├── guacr/              Protocol handlers aggregator
 ├── guacr-protocol/     Guacamole protocol codec (Decoder/Encoder)
-├── guacr-handlers/     ProtocolHandler trait + registry
+├── guacr-handlers/     ProtocolHandler trait + registry + ResourceBrowser trait
 ├── guacr-ssh/          SSH handler (russh) - PRODUCTION READY
 ├── guacr-rdp/          RDP handler (ironrdp) - PRODUCTION READY
 ├── guacr-vnc/          VNC handler (async-vnc)
+├── guacr-telnet/       Telnet + Serial Console handler
 ├── guacr-terminal/     Shared terminal emulation (vt100 parser, PNG render)
-├── guacr-database/     MySQL/PostgreSQL/SQL Server (sqlx/tiberius)
+├── guacr-database/     MySQL/PostgreSQL/SQL Server/Oracle/MongoDB/Redis/Cassandra/Elasticsearch/DynamoDB/ODBC
+├── guacr-tn3270/       IBM Mainframe TN3270 (EBCDIC, block-mode terminal)
+├── guacr-tn5250/       IBM AS/400 TN5250 (EBCDIC, block-mode terminal)
+├── guacr-sftp/         SFTP file transfer
 ├── guacr-rbi/          Remote Browser Isolation (headless Chrome)
 └── guacr-threat-detection/  AI-powered security analysis
 ```
@@ -829,5 +840,5 @@ This is a **workspace monorepo** with:
 
 ---
 
-**Last Updated**: January 29, 2026
+**Last Updated**: February 11, 2026
 **Maintainers**: Keeper Security Engineering <engineering@keeper.io>

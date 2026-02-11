@@ -23,8 +23,10 @@
 // ```
 
 mod handler;
+mod serial;
 
 pub use handler::TelnetHandler;
+pub use serial::SerialConsoleHandler;
 
 use thiserror::Error;
 

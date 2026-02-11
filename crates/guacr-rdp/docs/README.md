@@ -46,7 +46,7 @@ IronRdpSession (ironrdp 0.13)
 ### Phase 3: Scroll/Copy Detection
 - Row hash matching algorithm
 - Copy instruction optimization for scrolling
-- 90-99% bandwidth savings for scroll operations
+- Frames are never dropped (sync flow control throttles without skipping)
 
 ### Phase 4: Dynamic Resize
 - Three resize methods: none, reconnect, display-update

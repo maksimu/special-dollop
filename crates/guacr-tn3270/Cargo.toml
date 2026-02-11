@@ -1,0 +1,12 @@
+[package]
+name = "guacr-tn3270"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TN3270 IBM mainframe protocol parser and EBCDIC codec"
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

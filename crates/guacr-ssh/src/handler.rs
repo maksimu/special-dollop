@@ -15,6 +15,8 @@ use guacr_handlers::{
     send_error_best_effort,
     send_name,
     send_ready,
+    // Cursor
+    CursorManager,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -33,6 +35,7 @@ use guacr_handlers::{
     ProtocolHandler,
     // Recording
     RecordingConfig,
+    StandardCursor,
     DEFAULT_KEEPALIVE_INTERVAL_SECS,
     PIPE_NAME_STDIN,
     PIPE_STREAM_STDOUT,
@@ -42,7 +45,8 @@ use guacr_protocol::{
     STATUS_UPSTREAM_TIMEOUT,
 };
 use guacr_terminal::{
-    format_clipboard_instructions, handle_mouse_selection, parse_clipboard_blob,
+    extract_selection_text, format_clear_selection_instructions, format_clipboard_instructions,
+    format_selection_overlay_instructions, handle_mouse_selection, parse_clipboard_blob,
     parse_key_instruction, parse_mouse_instruction, x11_keysym_to_bytes_with_modes,
     x11_keysym_to_kitty_sequence, DirtyTracker, ModifierState, MouseSelection, SelectionResult,
     TerminalConfig, TerminalEmulator, TerminalRenderer,
@@ -663,8 +667,11 @@ impl ProtocolHandler for SshHandler {
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
         // Adaptive quality for bandwidth optimization (like RDP handler)
-        // Terminal text needs higher quality to avoid JPEG artifacts on small fonts
-        let mut adaptive_quality = guacr_handlers::AdaptiveQuality::new(85).with_min_quality(70);
+        // Terminal text requires high quality - JPEG artifacts on rendered font glyphs
+        // make characters unreadable at lower quality levels. Unlike RDP/VNC where
+        // reduced quality is acceptable for photos/video, SSH renders small font glyphs
+        // that degrade severely below quality 85.
+        let mut adaptive_quality = guacr_handlers::AdaptiveQuality::new(85).with_min_quality(85);
 
         // Zero-allocation protocol encoder (reused for all img instructions)
         let mut protocol_encoder = TextProtocolEncoder::new();
@@ -718,14 +725,18 @@ impl ProtocolHandler for SshHandler {
         send_ready(&to_client, "ssh-ready").await?;
         send_name(&to_client, "SSH").await?;
 
-        // Send cursor instruction to show default cursor (enables cursor visibility)
-        use guacr_protocol::format_cursor;
-        debug!("SSH: Sending cursor instruction");
-        let cursor_instr = format_cursor(0, 0, 0, 0, 0, 0, 0); // Default cursor
-        to_client
-            .send(Bytes::from(cursor_instr))
-            .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        // Send I-beam cursor bitmap (standard text cursor for terminals)
+        let mut cursor_manager = CursorManager::new(false, false, 85);
+        debug!("SSH: Sending IBeam cursor");
+        let cursor_instrs = cursor_manager
+            .send_standard_cursor(StandardCursor::IBeam)
+            .map_err(|e| HandlerError::ProtocolError(format!("Cursor error: {}", e)))?;
+        for instr in cursor_instrs {
+            to_client
+                .send(Bytes::from(instr))
+                .await
+                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+        }
 
         // CRITICAL: Send size instruction to initialize display dimensions
         // Browser needs this BEFORE any img/drawing operations!
@@ -915,110 +926,12 @@ impl ProtocolHandler for SshHandler {
                             let dirty_cells = dirty.cell_count();
                             let dirty_pct = (dirty_cells * 100) / total_cells;
 
-                            // Check if this is a scroll operation (most common case)
-                            if let Some((scroll_dir, scroll_lines)) = dirty.is_scroll(current_rows, current_cols) {
-                                if scroll_dir == 1 {
-                                    // Scroll up: copy rows 1..N to rows 0..N-1, render new bottom line(s)
-                                    trace!("SSH: Scroll up {} lines (copy optimization)", scroll_lines);
-
-                                    // Send copy instruction to shift existing content up
-                                    let copy_instr = TerminalRenderer::format_copy_instruction(
-                                        scroll_lines,  // src_row: start from line N
-                                        0,             // src_col: from left edge
-                                        current_cols,  // width: full width
-                                        current_rows - scroll_lines, // height: all except scrolled lines
-                                        0,             // dst_row: to top
-                                        0,             // dst_col: to left edge
-                                        char_width,    // char_width: dynamic cell width
-                                        char_height,   // char_height: dynamic cell height
-                                        0,             // layer: default layer
-                                    );
-                                    to_client.send(Bytes::from(copy_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-
-                                    // Render only the new line(s) at the bottom
-                                    let quality = adaptive_quality.calculate_quality();
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
-                                        terminal.screen(),
-                                        current_rows - scroll_lines,  // Start at line where new content begins
-                                        current_rows,                 // End at bottom
-                                        0,                            // Full width
-                                        current_cols,
-                                        quality,
-                                    ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                                    adaptive_quality.track_frame_sent(jpeg.len());
-
-                                    // Base64 encode and send via modern zero-allocation protocol
-                                    let base64_data = base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        &jpeg,
-                                    );
-
-                                    let img_instr = protocol_encoder.format_img_instruction(
-                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
-                                    );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-
-                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
-                                    for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                                    }
-                                } else {
-                                    // Scroll down: copy rows 0..N-1 to rows 1..N, render new top line(s)
-                                    trace!("SSH: Scroll down {} lines (copy optimization)", scroll_lines);
-
-                                    // Send copy instruction to shift existing content down
-                                    let copy_instr = TerminalRenderer::format_copy_instruction(
-                                        0,             // src_row: start from top
-                                        0,             // src_col: from left edge
-                                        current_cols,  // width: full width
-                                        current_rows - scroll_lines, // height: all except scrolled lines
-                                        scroll_lines,  // dst_row: move down by N lines
-                                        0,             // dst_col: to left edge
-                                        char_width,    // char_width: dynamic cell width
-                                        char_height,   // char_height: dynamic cell height
-                                        0,             // layer: default layer
-                                    );
-                                    to_client.send(Bytes::from(copy_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-
-                                    // Render only the new line(s) at the top
-                                    let quality = adaptive_quality.calculate_quality();
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
-                                        terminal.screen(),
-                                        0,              // Start at top
-                                        scroll_lines,   // End at line N
-                                        0,              // Full width
-                                        current_cols,
-                                        quality,
-                                    ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                                    adaptive_quality.track_frame_sent(jpeg.len());
-
-                                    // Base64 encode and send via modern zero-allocation protocol
-                                    let base64_data = base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        &jpeg,
-                                    );
-
-                                    let img_instr = protocol_encoder.format_img_instruction(
-                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
-                                    );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-
-                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
-                                    for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
-                                    }
-                                }
-                            } else {
-                                // Not a scroll - use normal dirty region rendering
-
-                                // OPTIMIZATION: For very small updates (< 1%), use even more aggressive optimization
-                                // This handles cursor movement, single character edits, etc.
+                            // Render dirty region directly (no scroll copy optimization).
+                            // Apache guacd renders terminal updates as direct image patches,
+                            // not pixel-level copy instructions. Copy instructions can cause
+                            // visual artifacts because terminal scroll doesn't map cleanly
+                            // to canvas pixel shifts (reflow, wrapping, attributes change).
+                            {
                                 if dirty_pct == 0 {
                                     // Edge case: dirty region is empty (shouldn't happen but be safe)
                                     trace!("SSH: Empty dirty region (0%), skipping render");
@@ -1034,13 +947,21 @@ impl ProtocolHandler for SshHandler {
                                             dirty.min_row, dirty.max_row, dirty.min_col, dirty.max_col);
                                     }
 
+                                    // Expand by 1 cell in all directions to cover JPEG
+                                    // compression artifacts (DCT ringing at 8x8 block
+                                    // boundaries from cursor underline rendering)
+                                    let bp_min_row = dirty.min_row.saturating_sub(1);
+                                    let bp_max_row = (dirty.max_row + 1).min(current_rows - 1);
+                                    let bp_min_col = dirty.min_col.saturating_sub(1);
+                                    let bp_max_col = (dirty.max_col + 1).min(current_cols - 1);
+
                                     let quality = adaptive_quality.calculate_quality();
                                     let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
                                         terminal.screen(),
-                                        dirty.min_row,
-                                        dirty.max_row,
-                                        dirty.min_col,
-                                        dirty.max_col,
+                                        bp_min_row,
+                                        bp_max_row,
+                                        bp_min_col,
+                                        bp_max_col,
                                         quality,
                                     ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                                     adaptive_quality.track_frame_sent(jpeg.len());
@@ -1225,34 +1146,76 @@ impl ProtocolHandler for SshHandler {
                                 let dirty_opt = dirty_tracker.find_dirty_region(terminal.screen());
 
                                 if let Some(dirty) = dirty_opt {
-                                    // Render only the changed region
+                                    // Expand dirty region by 1 cell in all directions to
+                                    // cover JPEG compression artifacts from cursor underline
+                                    // rendering. The cursor's 3px white underline creates
+                                    // DCT ringing at 8x8 block boundaries.
+                                    let render_min_row = dirty.min_row.saturating_sub(1);
+                                    let render_max_row = (dirty.max_row + 1).min(current_rows - 1);
+                                    let render_min_col = dirty.min_col.saturating_sub(1);
+                                    let render_max_col = (dirty.max_col + 1).min(current_cols - 1);
+
+                                    // Check dirty percentage to decide partial vs full render
+                                    let total_cells = (current_rows as usize) * (current_cols as usize);
+                                    let dirty_cells = dirty.cell_count();
+                                    let dirty_pct = if total_cells > 0 { (dirty_cells * 100) / total_cells } else { 100 };
+
                                     let quality = adaptive_quality.calculate_quality();
-                                    let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
-                                        terminal.screen(),
-                                        dirty.min_row,
-                                        dirty.max_row,
-                                        dirty.min_col,
-                                        dirty.max_col,
-                                        quality,
-                                    ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                                    adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    // Base64 encode and send via modern zero-allocation protocol
-                                    let base64_data = base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        &jpeg,
-                                    );
+                                    if dirty_pct < 30 {
+                                        // Small change - render only the dirty region
+                                        let (jpeg, x_px, y_px, _w_px, _h_px) = renderer.render_region_with_quality(
+                                            terminal.screen(),
+                                            render_min_row,
+                                            render_max_row,
+                                            render_min_col,
+                                            render_max_col,
+                                            quality,
+                                        ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                        adaptive_quality.track_frame_sent(jpeg.len());
 
-                                    let img_instr = protocol_encoder.format_img_instruction(
-                                        stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
-                                    );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        let base64_data = base64::Engine::encode(
+                                            &base64::engine::general_purpose::STANDARD,
+                                            &jpeg,
+                                        );
 
-                                    let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
-                                    for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
+                                        let img_instr = protocol_encoder.format_img_instruction(
+                                            stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
+                                        );
+                                        to_client.send(img_instr.freeze()).await
                                             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                        let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                        for instr in blob_instructions {
+                                            to_client.send(Bytes::from(instr)).await
+                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        }
+                                    } else {
+                                        // Large change (e.g., scroll) - render full screen
+                                        let jpeg = renderer.render_screen_with_quality(
+                                            terminal.screen(),
+                                            terminal.size().0,
+                                            terminal.size().1,
+                                            quality,
+                                        ).map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
+                                        adaptive_quality.track_frame_sent(jpeg.len());
+
+                                        let base64_data = base64::Engine::encode(
+                                            &base64::engine::general_purpose::STANDARD,
+                                            &jpeg,
+                                        );
+
+                                        let img_instr = protocol_encoder.format_img_instruction(
+                                            stream_id, 0, 0, 0, "image/jpeg",
+                                        );
+                                        to_client.send(img_instr.freeze()).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+
+                                        let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
+                                        for instr in blob_instructions {
+                                            to_client.send(Bytes::from(instr)).await
+                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        }
                                     }
 
                                     let sync_instr = renderer.format_sync_instruction(
@@ -1433,6 +1396,62 @@ impl ProtocolHandler for SshHandler {
 
                         if is_copy {
                             debug!("SSH: Copy shortcut pressed - ignoring (selection already copies)");
+                            continue;
+                        }
+
+                        // Handle select-all shortcut (selects entire terminal + copies to clipboard)
+                        // - Ctrl+Shift+A (Linux/Windows): keysym 'A' (0x41) with ctrl+shift
+                        // - Cmd+A (Mac): keysym 'a' (0x61) with meta
+                        let is_select_all = key_event.pressed && (
+                            (key_event.keysym == 0x41 && modifier_state.control && modifier_state.shift) ||
+                            (key_event.keysym == 0x61 && modifier_state.meta)
+                        );
+
+                        if is_select_all {
+                            let last_row = current_rows.saturating_sub(1);
+                            let last_col = current_cols.saturating_sub(1);
+
+                            // Show selection overlay (entire terminal)
+                            let overlay = format_selection_overlay_instructions(
+                                (0, 0),
+                                (last_row, last_col),
+                                char_width,
+                                char_height,
+                                current_cols,
+                                current_rows,
+                            );
+                            for instr in overlay {
+                                to_client.send(Bytes::from(instr)).await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            }
+
+                            // Extract all text and send to clipboard
+                            let text = extract_selection_text(
+                                &terminal,
+                                (0, 0),
+                                (last_row, last_col),
+                                current_cols,
+                            );
+
+                            if !text.is_empty() {
+                                stored_clipboard = text.clone();
+                                info!("SSH: Select all - {} chars copied to clipboard", text.len());
+
+                                let clipboard_stream_id = 10;
+                                let clipboard_instructions = format_clipboard_instructions(&text, clipboard_stream_id);
+                                for instr in clipboard_instructions {
+                                    to_client.send(Bytes::from(instr)).await
+                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                }
+                            }
+
+                            // Clear overlay after a brief visual flash
+                            let clear = format_clear_selection_instructions();
+                            for instr in clear {
+                                to_client.send(Bytes::from(instr)).await
+                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            }
+
                             continue;
                         }
 
@@ -1664,10 +1683,12 @@ impl ProtocolHandler for SshHandler {
                                 current_rows,
                                 modifier_state.shift, // Pass shift key state for extend selection
                             ) {
-                                SelectionResult::InProgress(_overlay_instructions) => {
-                                    // Visual overlay disabled for performance
-                                    // Selection still works, just no blue highlight shown
-                                    debug!("SSH: Selection in progress (overlay disabled)");
+                                SelectionResult::InProgress(overlay_instructions) => {
+                                    // Send blue semi-transparent selection overlay
+                                    for instr in overlay_instructions {
+                                        to_client.send(Bytes::from(instr)).await
+                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    }
                                 }
                                 SelectionResult::Complete { text: selected_text, clear_instructions } => {
                                     info!("SSH: Selection complete - {} chars selected", selected_text.len());

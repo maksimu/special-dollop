@@ -19,7 +19,7 @@ Production-ready SSH handler with JPEG rendering, clipboard, recording, and thre
 - ✅ 16ms debounce (60fps smoothness)
 - ✅ Default handshake size (1024x768 @ 96 DPI, then resizes to browser)
 - ✅ Bidirectional clipboard (OSC 52 + bracketed paste)
-- ✅ Dirty region optimization with scroll detection
+- ✅ Dirty region optimization (partial <30%, full screen >=30%)
 - ✅ Control character handling (Ctrl+C, etc.)
 - ✅ Scrollback buffer (~150 lines)
 - ✅ Mouse events for vim/tmux (X11 mouse sequences)
@@ -133,15 +133,18 @@ params.insert("threat_detection_auto_terminate".to_string(), "true".to_string())
 
 ### Rendering
 - **Frame rate**: 60 FPS (16ms debounce)
-- **Encoding**: JPEG quality 95 (5-10x faster than PNG)
+- **Encoding**: JPEG quality 85 adaptive (5-10x faster than PNG)
 - **Latency**: <100ms for input events
 - **Memory**: ~10MB per connection
 
 ### Optimizations
 - Dirty region tracking (only render changed areas)
-- Scroll detection (copy + render only new lines)
-- Font rendering with fontdue (fast)
+- Dirty region expansion (1 cell in all directions for JPEG DCT artifact coverage)
+- Threshold-based rendering (<30% dirty = partial, >=30% = full screen)
+- Font rendering with fontdue (JetBrains Mono primary, DejaVu fallback)
 - JPEG encoding (faster than PNG)
+- IBeam cursor bitmap via shared CursorManager
+- Text selection overlay (blue semi-transparent highlight)
 
 ## Clipboard Integration
 

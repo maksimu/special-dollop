@@ -8,8 +8,6 @@
 # Individual databases can be started with:
 #   docker-compose -f docker-compose.test.yml up -d mysql postgres
 #
-version: '3.8'
-
 services:
   # MySQL 8.0
   mysql:
@@ -122,6 +120,85 @@ services:
     networks:
       - guacr-test-network
 
+  # DynamoDB Local
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: guacr-test-dynamodb
+    restart: unless-stopped
+    ports:
+      - "18000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # Cassandra 4.1
+  cassandra:
+    image: cassandra:4.1
+    container_name: guacr-test-cassandra
+    restart: unless-stopped
+    ports:
+      - "19042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: "TestCluster"
+      HEAP_NEWSIZE: "128M"
+      MAX_HEAP_SIZE: "256M"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - guacr-test-network
+
+  # PostgreSQL 16 for ODBC integration tests
+  # Note: The ODBC driver (psqlodbc) must be installed on the test machine.
+  # macOS: brew install psqlodbc
+  # Ubuntu: apt-get install odbc-postgresql
+  # The database itself runs in Docker; only the driver is needed on the host.
+  odbc-postgres:
+    image: postgres:16-alpine
+    container_name: guacr-test-odbc-postgres
+    restart: unless-stopped
+    ports:
+      - "15433:5432"
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # Elasticsearch 8.12
+  elasticsearch:
+    image: elasticsearch:8.12.0
+    container_name: guacr-test-elasticsearch
+    restart: unless-stopped
+    ports:
+      - "19200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - guacr-test-network
+
   # Redis 7.2
   redis:
     image: redis:7.2-alpine
@@ -146,6 +223,9 @@ volumes:
   postgres-data:
   sqlserver-data:
   mongodb-data:
+  cassandra-data:
+  elasticsearch-data:
+  odbc-postgres-data:
   redis-data:
 
 networks:

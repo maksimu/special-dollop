@@ -54,24 +54,29 @@ pub fn format_rect(layer: i32, x: u32, y: u32, width: u32, height: u32) -> Strin
     )
 }
 
-/// Format `cfill` instruction - Fill with color
+/// Format `cfill` instruction - Fill current path with color
 ///
-/// Format: `5.cfill,{layer},{r},{g},{b},{a};`
+/// Format: `5.cfill,{mask},{layer},{r},{g},{b},{a};`
 ///
 /// # Arguments
+/// - `mask`: Compositing operation (14 = GUAC_COMP_OVER, 12 = GUAC_COMP_SRC)
 /// - `layer`: Layer index
 /// - `r`: Red component (0-255)
 /// - `g`: Green component (0-255)
 /// - `b`: Blue component (0-255)
 /// - `a`: Alpha component (0-255, typically 255 for opaque)
-pub fn format_cfill(layer: i32, r: u8, g: u8, b: u8, a: u8) -> String {
+pub fn format_cfill(mask: u32, layer: i32, r: u8, g: u8, b: u8, a: u8) -> String {
+    let mask_str = mask.to_string();
     let layer_str = layer.to_string();
     let r_str = r.to_string();
     let g_str = g.to_string();
     let b_str = b.to_string();
     let a_str = a.to_string();
 
-    format_instruction("cfill", &[&layer_str, &r_str, &g_str, &b_str, &a_str])
+    format_instruction(
+        "cfill",
+        &[&mask_str, &layer_str, &r_str, &g_str, &b_str, &a_str],
+    )
 }
 
 /// Format `line` instruction - Draw line
@@ -295,6 +300,61 @@ pub fn format_shade(
     )
 }
 
+/// Format `copy` instruction - Copy pixels between layers
+///
+/// Format: `4.copy,{srclayer},{srcx},{srcy},{srcw},{srch},{mask},{dstlayer},{dstx},{dsty};`
+///
+/// The JS client handles this as a canvas drawImage operation, which is GPU-accelerated.
+/// This is extremely cheap (~50 bytes) compared to re-encoding and transmitting image data.
+///
+/// # Arguments
+/// - `src_layer`: Source layer index (0 = default layer)
+/// - `src_x`: Source X coordinate
+/// - `src_y`: Source Y coordinate
+/// - `width`: Width of region to copy
+/// - `height`: Height of region to copy
+/// - `mask`: Compositing operation (12 = GUAC_COMP_SRC, 14 = GUAC_COMP_OVER)
+/// - `dst_layer`: Destination layer index (0 = default layer)
+/// - `dst_x`: Destination X coordinate
+/// - `dst_y`: Destination Y coordinate
+#[allow(clippy::too_many_arguments)]
+pub fn format_copy(
+    src_layer: i32,
+    src_x: u32,
+    src_y: u32,
+    width: u32,
+    height: u32,
+    mask: u32,
+    dst_layer: i32,
+    dst_x: u32,
+    dst_y: u32,
+) -> String {
+    let src_layer_str = src_layer.to_string();
+    let src_x_str = src_x.to_string();
+    let src_y_str = src_y.to_string();
+    let width_str = width.to_string();
+    let height_str = height.to_string();
+    let mask_str = mask.to_string();
+    let dst_layer_str = dst_layer.to_string();
+    let dst_x_str = dst_x.to_string();
+    let dst_y_str = dst_y.to_string();
+
+    format_instruction(
+        "copy",
+        &[
+            &src_layer_str,
+            &src_x_str,
+            &src_y_str,
+            &width_str,
+            &height_str,
+            &mask_str,
+            &dst_layer_str,
+            &dst_x_str,
+            &dst_y_str,
+        ],
+    )
+}
+
 /// Format `cursor` instruction - Set client cursor
 ///
 /// Format: `6.cursor,{x},{y},{srclayer},{srcx},{srcy},{srcwidth},{srcheight};`
@@ -361,8 +421,8 @@ mod tests {
 
     #[test]
     fn test_format_cfill() {
-        let instr = format_cfill(0, 255, 0, 0, 255);
-        assert_eq!(instr, "5.cfill,1.0,3.255,1.0,1.0,3.255;");
+        let instr = format_cfill(14, 0, 255, 0, 0, 255);
+        assert_eq!(instr, "5.cfill,2.14,1.0,3.255,1.0,1.0,3.255;");
     }
 
     #[test]
@@ -389,6 +449,12 @@ mod tests {
         let instr = format_shade(0, 0, 0, 100, 50, 255, 0, 0, 255, 0, 0, 255, 255);
         assert!(instr.starts_with("5.shade,"));
         assert!(instr.contains("255"));
+    }
+
+    #[test]
+    fn test_format_copy() {
+        let instr = format_copy(0, 10, 20, 100, 50, 12, 0, 30, 40);
+        assert_eq!(instr, "4.copy,1.0,2.10,2.20,3.100,2.50,2.12,1.0,2.30,2.40;");
     }
 
     #[test]

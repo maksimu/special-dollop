@@ -27,18 +27,19 @@ guac_common_surface_draw(display, x, y, surface);       // Send as PNG
 
 ## Three Rendering Approaches
 
-### 1. PNG Images with Fonts (What guacd Does - What We Do)
-**How it works:** Render text with font library to bitmap, encode as PNG, send via `img/blob/end`
+### 1. JPEG Images with Fonts (What guacd Does - What We Do)
+**How it works:** Render text with font library to bitmap, encode as JPEG, send via `img/blob/end`
 **Bandwidth:** ~7-13KB per frame full screen, ~200 bytes for single character (with dirty regions)
 **Quality:** Real fonts with anti-aliasing, full Unicode support
 **Compatibility:** Universal - works with all Guacamole clients
-**What Apache guacd uses:** Pango + Cairo → PNG (we use fontdue + image crate → PNG)
+**What Apache guacd uses:** Pango + Cairo → PNG (we use fontdue + JPEG encoding for speed)
 
 **Our implementation:**
-- Font: Noto Sans Mono (582KB embedded TTF)
+- Font: JetBrains Mono (274KB embedded TTF, DejaVu Sans Mono fallback for missing glyphs)
 - Rendering: fontdue for glyph rasterization
-- Image: image crate for PNG encoding
-- Optimization: Dirty region tracking (<30% dirty → region only)
+- Image: JPEG encoding (faster than PNG, 5-10x)
+- Optimization: Dirty region tracking (<30% dirty = partial region, >=30% = full screen)
+- Optimization: Dirty region expansion (1 cell in all 4 directions to cover JPEG DCT block artifacts)
 
 ### 2. Drawing Instructions (Colored Blocks - NOT what guacd uses)
 **How it works:** Send `rect` and `cfill` instructions to draw colored rectangles

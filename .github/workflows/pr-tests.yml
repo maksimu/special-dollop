@@ -43,6 +43,11 @@ jobs:
         with:
           cache-on-failure: false
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -80,6 +85,11 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           cache-on-failure: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
 
       - name: Run workspace unit tests
         run: |
@@ -131,11 +141,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev
+          sudo apt-get install -y build-essential pkg-config libssl-dev unixodbc-dev
 
       - name: Install dependencies (macOS)
         if: matrix.os == 'macos-latest'
-        run: brew install openssl@3
+        run: brew install openssl@3 unixodbc
 
       - name: Install Python dependencies
         run: |
@@ -203,21 +213,22 @@ jobs:
         with:
           cache-on-failure: false
 
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install unixodbc
+
       - name: Build all crates
         run: |
           # Build keeper-pam-webrtc-rs without Python support
-          cargo build -p keeper-pam-webrtc-rs --lib --no-default-features
-          # Build all other workspace crates (excluding python-bindings which needs maturin)
-          cargo build --workspace --all-targets --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
-      - name: Build release
-        run: |
-          # Build keeper-pam-webrtc-rs without Python support
           cargo build -p keeper-pam-webrtc-rs --lib --no-default-features --release
-          # Build all other workspace crates
-          cargo build --workspace --release --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+          # Build all other workspace crates (excluding python-bindings which needs maturin)
+          cargo build --workspace --all-targets --release --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 

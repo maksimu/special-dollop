@@ -10,7 +10,7 @@
 //! not a cursor name string.
 
 use bytes::Bytes;
-use guacr_protocol::format_cursor;
+use guacr_protocol::{format_cursor, format_size};
 use log::{debug, warn};
 
 // --- Embedded cursor bitmaps (RGBA, 4 bytes per pixel) ---
@@ -64,57 +64,59 @@ const POINTER_CURSOR_RGBA: &[u8] = &[
 const HIDDEN_CURSOR_RGBA: &[u8] = &[0, 0, 0, 0];
 
 /// I-beam (text) cursor: 7x16 pixels, hotspot at (3, 8).
-/// Thin vertical bar with serifs at top and bottom.
+/// White thin vertical bar with serifs at top and bottom.
+/// White color ensures visibility on dark terminal backgrounds.
 #[rustfmt::skip]
 const IBEAM_CURSOR_RGBA: &[u8] = &[
     // Row 0: top serif
-    0,0,0,0, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+    0,0,0,0, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,0,
     // Row 1
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 2
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 3
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 4
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 5
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 6
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 7
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 8
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 9
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 10
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 11
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 12
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 13
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 14
-    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 255,255,255,255, 0,0,0,0, 0,0,0,0, 0,0,0,0,
     // Row 15: bottom serif
-    0,0,0,0, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+    0,0,0,0, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,0,
 ];
 
 /// Dot cursor: 5x5 pixels, hotspot at (2, 2).
-/// Small filled circle for remote-controlled mode.
+/// Small filled white circle for remote-controlled mode.
+/// White color ensures visibility on dark backgrounds.
 #[rustfmt::skip]
 const DOT_CURSOR_RGBA: &[u8] = &[
     // Row 0
-    0,0,0,0,   0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+    0,0,0,0,         255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,0,
     // Row 1
-    0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255,
+    255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255,
     // Row 2
-    0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255,
+    255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255,
     // Row 3
-    0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255,
+    255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255, 255,255,255,255,
     // Row 4
-    0,0,0,0,   0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,0,
+    0,0,0,0,         255,255,255,255, 255,255,255,255, 255,255,255,255, 0,0,0,0,
 ];
 
 /// Cursor manager for client-side cursor rendering
@@ -209,7 +211,13 @@ impl CursorManager {
         // Build instruction sequence
         let mut instructions = Vec::new();
 
-        // 1. img instruction to load cursor into buffer layer
+        // 1. size instruction to set cursor buffer layer dimensions
+        // Required by Guacamole protocol: buffer layer must be sized before drawing.
+        // Apache guacd sends size before png/img for all cursor updates.
+        let size_instr = format_size(cursor_layer, width, height);
+        instructions.push(size_instr);
+
+        // 3. img instruction to load cursor into buffer layer
         // Format: img <stream> <mask> <layer> <mimetype> <x> <y>
         // mask=12 (0x0C) = GUAC_COMP_SRC (matches Apache guacd cursor.c)
         let img_instr = format!(
@@ -223,7 +231,7 @@ impl CursorManager {
         );
         instructions.push(img_instr);
 
-        // 2. blob instruction with base64 data
+        // 4. blob instruction with base64 data
         let blob_instr = format!(
             "4.blob,{}.{},{}.{};",
             stream_id.to_string().len(),
@@ -233,11 +241,11 @@ impl CursorManager {
         );
         instructions.push(blob_instr);
 
-        // 3. end instruction to close stream
+        // 5. end instruction to close stream
         let end_instr = format!("3.end,{}.{};", stream_id.to_string().len(), stream_id);
         instructions.push(end_instr);
 
-        // 4. cursor instruction to set the cursor
+        // 6. cursor instruction to set the cursor
         let cursor_instr = format_cursor(hotspot_x, hotspot_y, cursor_layer, 0, 0, width, height);
         instructions.push(cursor_instr);
 
@@ -376,13 +384,14 @@ mod tests {
         let result = mgr.send_standard_cursor(StandardCursor::Pointer);
         assert!(result.is_ok());
         let instructions = result.unwrap();
-        assert_eq!(instructions.len(), 4); // img, blob, end, cursor
-        assert!(instructions[0].starts_with("3.img"));
-        assert!(instructions[1].starts_with("4.blob"));
-        assert!(instructions[2].starts_with("3.end"));
-        assert!(instructions[3].starts_with("6.cursor"));
+        assert_eq!(instructions.len(), 5); // size, img, blob, end, cursor
+        assert!(instructions[0].starts_with("4.size"));
+        assert!(instructions[1].starts_with("3.img"));
+        assert!(instructions[2].starts_with("4.blob"));
+        assert!(instructions[3].starts_with("3.end"));
+        assert!(instructions[4].starts_with("6.cursor"));
         // cursor instruction must reference layer -1 (numeric), not a name string
-        assert!(instructions[3].contains("-1"));
+        assert!(instructions[4].contains("-1"));
     }
 
     #[test]
@@ -391,9 +400,9 @@ mod tests {
         let result = mgr.send_standard_cursor(StandardCursor::None);
         assert!(result.is_ok());
         let instructions = result.unwrap();
-        assert_eq!(instructions.len(), 4);
-        // Hidden cursor: 1x1 at hotspot (0,0)
-        assert!(instructions[3].starts_with("6.cursor"));
+        assert_eq!(instructions.len(), 5); // size, img, blob, end, cursor
+                                           // Hidden cursor: 1x1 at hotspot (0,0)
+        assert!(instructions[4].starts_with("6.cursor"));
     }
 
     #[test]
@@ -402,7 +411,7 @@ mod tests {
         let result = mgr.send_standard_cursor(StandardCursor::IBeam);
         assert!(result.is_ok());
         let instructions = result.unwrap();
-        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions.len(), 5); // size, img, blob, end, cursor
     }
 
     #[test]
@@ -411,7 +420,7 @@ mod tests {
         let result = mgr.send_standard_cursor(StandardCursor::Dot);
         assert!(result.is_ok());
         let instructions = result.unwrap();
-        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions.len(), 5); // size, img, blob, end, cursor
     }
 
     #[test]
@@ -430,10 +439,11 @@ mod tests {
         assert!(result.is_ok());
 
         let instructions = result.unwrap();
-        assert_eq!(instructions.len(), 4); // img, blob, end, cursor
-        assert!(instructions[0].starts_with("3.img"));
-        assert!(instructions[1].starts_with("4.blob"));
-        assert!(instructions[2].starts_with("3.end"));
-        assert!(instructions[3].starts_with("6.cursor"));
+        assert_eq!(instructions.len(), 5); // size, img, blob, end, cursor
+        assert!(instructions[0].starts_with("4.size"));
+        assert!(instructions[1].starts_with("3.img"));
+        assert!(instructions[2].starts_with("4.blob"));
+        assert!(instructions[3].starts_with("3.end"));
+        assert!(instructions[4].starts_with("6.cursor"));
     }
 }

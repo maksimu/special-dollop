@@ -3,7 +3,7 @@ name = "guacr-database"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Database protocol handlers (MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, Redis) for guacr"
+description = "Database protocol handlers (MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, Redis, Cassandra, Elasticsearch, DynamoDB, Generic ODBC) for guacr"
 
 [dependencies]
 # Local dependencies
@@ -38,6 +38,21 @@ mongodb = { version = "3.1" }
 
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# DynamoDB
+aws-sdk-dynamodb = "1.54"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-types = "1.3"
+
+# Cassandra/ScyllaDB
+scylla = "0.14"
+
+# Generic ODBC access (covers DB2, SAP HANA, Teradata, Informix, Vertica, Greenplum, etc.)
+# Note: Requires unixODBC (Linux/macOS) or ODBC Driver Manager (Windows) at build and runtime.
+odbc-api = "20"
+
+# Elasticsearch (HTTP REST API)
+reqwest.workspace = true
 
 # Oracle
 # Note: Requires Oracle Instant Client libraries at runtime.
@@ -74,3 +89,4 @@ urlencoding = "2.1"
 
 # Lock primitives (no poisoning)
 parking_lot = "0.12"
+

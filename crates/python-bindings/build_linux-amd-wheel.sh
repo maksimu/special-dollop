@@ -158,7 +158,7 @@ docker run --rm --platform linux/amd64 \
         # Install minimal system dependencies
         # RDP uses IronRDP (pure Rust) so no C FreeRDP library is needed
         echo "Installing development packages..."
-        dnf install -y openssl-devel git gcc gcc-c++ pkgconfig perl-IPC-Cmd
+        dnf install -y openssl-devel git gcc gcc-c++ pkgconfig perl-IPC-Cmd unixODBC-devel
 
         # Verify workspace is mounted with guacr crate
         if [ ! -d /io/crates/guacr ]; then

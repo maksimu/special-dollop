@@ -3,6 +3,19 @@ set -e  # Exit on any error
 
 # WORKSPACE BUILD SCRIPT
 # This script builds and tests the unified keeper-pam-connections Python package
+#
+# Prerequisites:
+#   - Rust toolchain (rustup, cargo, rustfmt, clippy)
+#   - Python 3.7+ with pip and maturin
+#   - unixODBC (for guacr-database ODBC handler):
+#       macOS:  brew install unixodbc
+#       Ubuntu: apt-get install unixodbc-dev
+#       RHEL:   dnf install unixODBC-devel
+#   - Oracle Instant Client (optional, for Oracle DB handler)
+#   - Docker (optional, for database integration tests):
+#       docker compose -f crates/guacr-database/docker-compose.test.yml up -d
+#       Starts: MySQL, MariaDB, PostgreSQL, SQL Server, MongoDB, DynamoDB,
+#               Cassandra, Elasticsearch, Redis, ODBC-PostgreSQL
 
 echo "Building keeper-pam-connections (unified Python package)"
 echo ""

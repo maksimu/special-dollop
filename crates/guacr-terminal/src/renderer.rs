@@ -716,7 +716,7 @@ impl TerminalRenderer {
             cols as u32 * self.char_width,
             rows as u32 * self.char_height,
         ));
-        instructions.push(format_cfill(0, 0, 0, 0, 255)); // Black background
+        instructions.push(format_cfill(14, 0, 0, 0, 0, 255)); // Black background
 
         // Render each cell as colored rectangle (simplified)
         for row in 0..rows {
@@ -728,7 +728,7 @@ impl TerminalRenderer {
                     let bg = self.vt100_color_to_rgb(cell.bgcolor(), false);
 
                     instructions.push(format_rect(0, x, y, self.char_width, self.char_height));
-                    instructions.push(format_cfill(0, bg.0[0], bg.0[1], bg.0[2], 255));
+                    instructions.push(format_cfill(14, 0, bg.0[0], bg.0[1], bg.0[2], 255));
                 }
             }
         }
@@ -803,7 +803,7 @@ impl TerminalRenderer {
 
         vec![
             format_rect(0, x, y, width_px, height_px),
-            format_cfill(0, 0, 0, 0, 255), // Black background
+            format_cfill(14, 0, 0, 0, 0, 255), // Black background
         ]
     }
 }

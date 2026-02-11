@@ -479,6 +479,14 @@ impl FrameBuffer {
         });
     }
 
+    /// Get a reference to the raw RGBA pixel data.
+    ///
+    /// This avoids allocation (unlike `get_all_pixels()` which clones).
+    /// Used by CopyDetector for cell hashing and pixel verification.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }

@@ -840,7 +840,7 @@ impl ProtocolHandler for ElasticsearchHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                send_render(&mut executor, &to_client).await?;
+                send_render(&mut executor, &to_client, &mut recorder).await?;
 
                 while from_client.recv().await.is_some() {}
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -881,6 +881,7 @@ impl ProtocolHandler for ElasticsearchHandler {
                         &cluster_info,
                         "Type 'help' for available commands.",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 debug!("Elasticsearch: Initial screen sent successfully");
@@ -901,6 +902,7 @@ impl ProtocolHandler for ElasticsearchHandler {
                         "Check TLS settings (use-tls parameter)",
                         "Check firewall rules",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -927,7 +929,7 @@ impl ProtocolHandler for ElasticsearchHandler {
                             .await
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in instructions {
-                            if to_client.send(instr).await.is_err() {
+                            if crate::recording::send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("Elasticsearch: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -966,6 +968,7 @@ impl ProtocolHandler for ElasticsearchHandler {
                                     &mut executor,
                                     &to_client,
                                     &security,
+                                    &mut recorder,
                                 )
                                 .await?
                                 {
@@ -1104,16 +1107,13 @@ impl ProtocolHandler for ElasticsearchHandler {
                             .write_prompt()
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                        send_render(&mut executor, &to_client).await?;
+                        send_render(&mut executor, &to_client, &mut recorder).await?;
                         continue;
                     }
 
                     if needs_render {
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            let _ = crate::recording::send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                 }
@@ -1153,6 +1153,7 @@ async fn handle_builtin_command(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<bool> {
     let command_lower = command.to_lowercase();
 
@@ -1200,11 +1201,18 @@ async fn handle_builtin_command(
                 },
             ];
 
-            render_help(executor, to_client, "Elasticsearch CLI", &sections).await?;
+            render_help(
+                executor,
+                to_client,
+                "Elasticsearch CLI",
+                &sections,
+                recorder,
+            )
+            .await?;
             return Ok(true);
         }
         "quit" | "exit" => {
-            return Err(handle_quit(executor, to_client).await);
+            return Err(handle_quit(executor, to_client, recorder).await);
         }
         _ => {}
     }
@@ -1251,7 +1259,7 @@ async fn handle_shortcut_command(
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }

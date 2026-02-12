@@ -8,6 +8,7 @@ mod binary;
 mod drawing;
 mod layers;
 mod parser;
+pub mod streaming;
 mod streams;
 mod text_optimized;
 
@@ -42,6 +43,11 @@ pub use binary::{
 pub use drawing::*;
 pub use layers::*;
 pub use parser::{GuacamoleParser, Instruction, ParseError};
+pub use streaming::{
+    GuacdInstruction, GuacdParser, GuacdParserError, OpcodeAction, OwnedInstruction, PeekError,
+    PeekedInstruction, SpecialOpcode, StreamingParser, StreamingParserError, ARG_SEP,
+    DISCONNECT_OPCODE, ELEM_SEP, ERROR_OPCODE, INST_TERM, SIZE_OPCODE,
+};
 pub use streams::{
     format_audio, format_bell_audio, format_blob, format_chunked_blobs, format_clipboard,
     format_clipboard_text, format_end, format_video, parse_clipboard_blob,
@@ -54,15 +60,15 @@ pub use text_optimized::TextProtocolEncoder;
 pub fn format_instruction(opcode: &str, args: &[&str]) -> String {
     let mut result = String::new();
 
-    // Opcode with length prefix
-    result.push_str(&opcode.len().to_string());
+    // Opcode with length prefix (character count, not byte count per Guacamole spec)
+    result.push_str(&opcode.chars().count().to_string());
     result.push('.');
     result.push_str(opcode);
 
-    // Arguments with length prefixes
+    // Arguments with length prefixes (character count, not byte count per Guacamole spec)
     for arg in args {
         result.push(',');
-        result.push_str(&arg.len().to_string());
+        result.push_str(&arg.chars().count().to_string());
         result.push('.');
         result.push_str(arg);
     }

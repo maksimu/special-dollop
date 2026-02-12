@@ -200,10 +200,13 @@ mod tests {
     fn test_approval_decision_from_threat_result() {
         let threat = ThreatResult {
             level: ThreatLevel::Critical,
+            risk_score: ThreatLevel::Critical.to_risk_score(),
             confidence: 0.95,
             description: "Dangerous command".to_string(),
             action: "terminate".to_string(),
+            should_terminate_session: true,
             metadata: serde_json::Value::Null,
+            ..Default::default()
         };
 
         let decision = ApprovalDecision::from_threat_result(threat);
@@ -214,10 +217,13 @@ mod tests {
     fn test_approval_decision_approved() {
         let threat = ThreatResult {
             level: ThreatLevel::Low,
+            risk_score: ThreatLevel::Low.to_risk_score(),
             confidence: 0.1,
             description: "Safe command".to_string(),
             action: "continue".to_string(),
+            should_terminate_session: false,
             metadata: serde_json::Value::Null,
+            ..Default::default()
         };
 
         let decision = ApprovalDecision::from_threat_result(threat);

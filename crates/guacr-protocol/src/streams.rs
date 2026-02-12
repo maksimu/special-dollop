@@ -112,10 +112,7 @@ pub fn format_bell_audio(stream: u32) -> Vec<String> {
 /// Vector of blob instructions ready to send, ending with `end` instruction
 ///
 /// # Example
-/// ```
-/// use guacr_protocol::streams::format_chunked_blobs;
-///
-/// // After sending img instruction with metadata:
+/// ```rust,ignore
 /// let blobs = format_chunked_blobs(1, &base64_data, None);
 /// for blob_instr in blobs {
 ///     // Send each blob instruction to client

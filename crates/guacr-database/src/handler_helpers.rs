@@ -9,11 +9,12 @@
 //   - Render-and-send shorthand
 
 use bytes::Bytes;
-use guacr_handlers::HandlerError;
+use guacr_handlers::{HandlerError, MultiFormatRecorder};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::query_executor::QueryExecutor;
+use crate::recording::send_and_record;
 
 /// Parse display size from connection params and calculate terminal dimensions.
 ///
@@ -55,6 +56,7 @@ pub async fn render_connection_error(
     from_client: &mut mpsc::Receiver<Bytes>,
     error_msg: &str,
     tips: &[&str],
+    recorder: &mut Option<MultiFormatRecorder>,
 ) -> Result<(), HandlerError> {
     executor
         .terminal
@@ -83,7 +85,7 @@ pub async fn render_connection_error(
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     // Drain remaining client messages so the handler can exit cleanly
     while from_client.recv().await.is_some() {}
@@ -100,6 +102,7 @@ pub async fn render_connection_success(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     info_lines: &[&str],
+    recorder: &mut Option<MultiFormatRecorder>,
 ) -> Result<(), HandlerError> {
     executor
         .terminal
@@ -120,7 +123,7 @@ pub async fn render_connection_success(
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }
@@ -141,6 +144,7 @@ pub async fn render_help(
     to_client: &mpsc::Sender<Bytes>,
     handler_name: &str,
     sections: &[HelpSection],
+    recorder: &mut Option<MultiFormatRecorder>,
 ) -> Result<(), HandlerError> {
     executor
         .terminal
@@ -185,7 +189,7 @@ pub async fn render_help(
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }
@@ -193,20 +197,23 @@ pub async fn render_help(
 /// Handle quit/exit command -- render "Bye" and return a Disconnected error.
 ///
 /// The caller should propagate the returned error to terminate the handler.
+/// Each instruction is also recorded to the session file via the recorder.
 pub async fn handle_quit(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
+    recorder: &mut Option<MultiFormatRecorder>,
 ) -> HandlerError {
     let _ = executor.terminal.write_line("Bye");
     if let Ok((_, instructions)) = executor.render_screen().await {
         for instr in instructions {
-            let _ = to_client.send(instr).await;
+            let _ = send_and_record(to_client, recorder, instr).await;
         }
     }
     HandlerError::Disconnected("User requested disconnect".to_string())
 }
 
-/// Render the screen and send all resulting instructions to the client.
+/// Render the screen, send all resulting instructions to the client, and record
+/// each instruction to the session file.
 ///
 /// This is a shorthand for the pattern that appears dozens of times across
 /// all database handlers:
@@ -214,23 +221,23 @@ pub async fn handle_quit(
 /// let (_, instructions) = executor.render_screen().await
 ///     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 /// for instr in instructions {
-///     to_client.send(instr).await
-///         .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+///     send_and_record(to_client, recorder, instr).await
+///         .map_err(HandlerError::ChannelError)?;
 /// }
 /// ```
 pub async fn send_render(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
+    recorder: &mut Option<MultiFormatRecorder>,
 ) -> Result<(), HandlerError> {
     let (_, instructions) = executor
         .render_screen()
         .await
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
     for instr in instructions {
-        to_client
-            .send(instr)
+        send_and_record(to_client, recorder, instr)
             .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            .map_err(HandlerError::ChannelError)?;
     }
     Ok(())
 }

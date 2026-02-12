@@ -4,6 +4,9 @@ use guacr_handlers::{
     // Connection utilities
     connect_tcp_with_timeout,
     is_mouse_event_allowed_readonly,
+    // Recording helpers
+    record_client_input as shared_record_client_input,
+    send_and_record as shared_send_and_record,
     // Session lifecycle
     send_disconnect,
     send_name,
@@ -26,7 +29,6 @@ use guacr_handlers::{
     ProtocolHandler,
     // Recording
     RecordingConfig,
-    RecordingDirection,
     StandardCursor,
     // Sync flow control (prevents overwhelming slow clients, shared with RDP)
     SyncFlowControl,
@@ -625,42 +627,22 @@ impl VncClient {
     /// Also enables flow control to prevent overwhelming slow clients.
     /// Send instruction to client and record it (if recording is enabled)
     async fn send_and_record(&mut self, instruction: &str) -> Result<(), String> {
-        let bytes = Bytes::from(instruction.to_string());
-        if let Some(ref mut recorder) = self.recorder {
-            if let Err(e) = recorder.record_instruction(RecordingDirection::ServerToClient, &bytes)
-            {
-                warn!("VNC: Failed to record instruction: {}", e);
-            }
-        }
-        self.to_client
-            .send(bytes)
-            .await
-            .map_err(|e| format!("Failed to send: {}", e))
+        shared_send_and_record(
+            &self.to_client,
+            &mut self.recorder,
+            Bytes::from(instruction.to_string()),
+        )
+        .await
     }
 
     /// Send Bytes to client and record (if recording is enabled)
     async fn send_and_record_bytes(&mut self, bytes: Bytes) -> Result<(), String> {
-        if let Some(ref mut recorder) = self.recorder {
-            if let Err(e) = recorder.record_instruction(RecordingDirection::ServerToClient, &bytes)
-            {
-                warn!("VNC: Failed to record instruction: {}", e);
-            }
-        }
-        self.to_client
-            .send(bytes)
-            .await
-            .map_err(|e| format!("Failed to send: {}", e))
+        shared_send_and_record(&self.to_client, &mut self.recorder, bytes).await
     }
 
     /// Record client input instruction (if recording is enabled)
     fn record_client_input(&mut self, instruction: &Bytes) {
-        if let Some(ref mut recorder) = self.recorder {
-            if let Err(e) =
-                recorder.record_instruction(RecordingDirection::ClientToServer, instruction)
-            {
-                warn!("VNC: Failed to record client input: {}", e);
-            }
-        }
+        shared_record_client_input(&mut self.recorder, instruction);
     }
 
     async fn send_sync(&mut self) -> Result<(), String> {

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::csv_export::{generate_csv_filename, CsvExporter};
 use crate::query_executor::QueryExecutor;
 use crate::recording::{
-    finalize_recording, init_recording, record_error_output, record_query_input,
+    finalize_recording, init_recording, record_error_output, record_query_input, send_and_record,
 };
 use crate::security::DatabaseSecuritySettings;
 
@@ -384,7 +384,7 @@ impl ProtocolHandler for MongoDbHandler {
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in instructions {
                             // Break if send fails (client disconnected)
-                            if to_client.send(instr).await.is_err() {
+                            if send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("MongoDB: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -466,10 +466,9 @@ impl ProtocolHandler for MongoDbHandler {
                                 .await
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                             for instr in result_instructions {
-                                to_client
-                                    .send(instr)
+                                send_and_record(&to_client, &mut recorder, instr)
                                     .await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    .map_err(HandlerError::ChannelError)?;
                             }
                             continue;
                         }
@@ -506,20 +505,16 @@ impl ProtocolHandler for MongoDbHandler {
                             .await
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in result_instructions {
-                            to_client
-                                .send(instr)
+                            send_and_record(&to_client, &mut recorder, instr)
                                 .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                .map_err(HandlerError::ChannelError)?;
                         }
                         continue;
                     }
 
                     if needs_render {
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            let _ = send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                 }

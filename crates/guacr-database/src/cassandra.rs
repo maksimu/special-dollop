@@ -174,7 +174,8 @@ impl ProtocolHandler for CassandraHandler {
                     info_lines.push(ks_l);
                 }
                 info_lines.push("Type 'help' for available commands.");
-                render_connection_success(&mut executor, &to_client, &info_lines).await?;
+                render_connection_success(&mut executor, &to_client, &info_lines, &mut recorder)
+                    .await?;
                 debug!("Cassandra: Initial screen sent successfully");
 
                 session
@@ -194,6 +195,7 @@ impl ProtocolHandler for CassandraHandler {
                         "Check authentication credentials",
                         "Check firewall rules",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -214,7 +216,7 @@ impl ProtocolHandler for CassandraHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                send_render(&mut executor, &to_client).await?;
+                send_render(&mut executor, &to_client, &mut recorder).await?;
 
                 while from_client.recv().await.is_some() {}
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -249,7 +251,7 @@ impl ProtocolHandler for CassandraHandler {
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in instructions {
                             // Break if send fails (client disconnected)
-                            if to_client.send(instr).await.is_err() {
+                            if crate::recording::send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("Cassandra: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -277,6 +279,7 @@ impl ProtocolHandler for CassandraHandler {
                             &mut executor,
                             &to_client,
                             &security,
+                            &mut recorder,
                         )
                         .await?
                         {
@@ -292,6 +295,7 @@ impl ProtocolHandler for CassandraHandler {
                                 &mut executor,
                                 &to_client,
                                 &security,
+                                &mut recorder,
                             )
                             .await?;
                             continue;
@@ -307,6 +311,7 @@ impl ProtocolHandler for CassandraHandler {
                                 &to_client,
                                 &security,
                                 &current_keyspace,
+                                &mut recorder,
                             )
                             .await?;
                             continue;
@@ -356,7 +361,7 @@ impl ProtocolHandler for CassandraHandler {
                                     .map_err(|e| {
                                         HandlerError::ProtocolError(e.to_string())
                                     })?;
-                                send_render(&mut executor, &to_client).await?;
+                                send_render(&mut executor, &to_client, &mut recorder).await?;
                                 continue;
                             }
                         }
@@ -377,17 +382,7 @@ impl ProtocolHandler for CassandraHandler {
                                 .map_err(|e| {
                                     HandlerError::ProtocolError(e.to_string())
                                 })?;
-                            let (_, result_instructions) = executor
-                                .render_screen()
-                                .await
-                                .map_err(|e| {
-                                    HandlerError::ProtocolError(e.to_string())
-                                })?;
-                            for instr in result_instructions {
-                                to_client.send(instr).await.map_err(|e| {
-                                    HandlerError::ChannelError(e.to_string())
-                                })?;
-                            }
+                            send_render(&mut executor, &to_client, &mut recorder).await?;
                             continue;
                         }
 
@@ -430,17 +425,7 @@ impl ProtocolHandler for CassandraHandler {
                                 .map_err(|e| {
                                     HandlerError::ProtocolError(e.to_string())
                                 })?;
-                            let (_, result_instructions) = executor
-                                .render_screen()
-                                .await
-                                .map_err(|e| {
-                                    HandlerError::ProtocolError(e.to_string())
-                                })?;
-                            for instr in result_instructions {
-                                to_client.send(instr).await.map_err(|e| {
-                                    HandlerError::ChannelError(e.to_string())
-                                })?;
-                            }
+                            send_render(&mut executor, &to_client, &mut recorder).await?;
                             continue;
                         }
 
@@ -475,18 +460,13 @@ impl ProtocolHandler for CassandraHandler {
                             .write_prompt()
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                        send_render(&mut executor, &to_client).await?;
+                        send_render(&mut executor, &to_client, &mut recorder).await?;
                         continue;
                     }
 
                     if needs_render {
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| {
-                                    HandlerError::ChannelError(e.to_string())
-                                })?;
+                            let _ = crate::recording::send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                 }
@@ -983,6 +963,7 @@ async fn handle_builtin_command(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<bool> {
     let command_lower = command.to_lowercase();
     let command_trimmed = command_lower.trim().trim_end_matches(';');
@@ -1026,11 +1007,11 @@ async fn handle_builtin_command(
                 });
             }
 
-            render_help(executor, to_client, "CQL Shell", &sections).await?;
+            render_help(executor, to_client, "CQL Shell", &sections, recorder).await?;
             return Ok(true);
         }
         "quit" | "exit" => {
-            return Err(handle_quit(executor, to_client).await);
+            return Err(handle_quit(executor, to_client, recorder).await);
         }
         _ => {}
     }
@@ -1045,6 +1026,7 @@ async fn handle_csv_export(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -1058,7 +1040,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1071,7 +1053,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1079,7 +1061,7 @@ async fn handle_csv_export(
         .terminal
         .write_line(&format!("Executing query for export: {}...", query))
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     // Execute query and get result
     let result = match execute_cql_query_as_result(session, query).await {
@@ -1116,7 +1098,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1160,7 +1142,7 @@ async fn handle_csv_export(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }
@@ -1173,6 +1155,7 @@ async fn handle_csv_import(
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
     current_keyspace: &Option<String>,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     // Check if import is allowed
     if security.disable_csv_import {
@@ -1184,7 +1167,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1198,7 +1181,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1212,7 +1195,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1263,7 +1246,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1350,7 +1333,7 @@ async fn handle_csv_import(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }

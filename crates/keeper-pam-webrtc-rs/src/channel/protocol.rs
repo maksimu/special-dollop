@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::core::Channel;
-use crate::tube_protocol::{CloseConnectionReason, ControlMessage, CONN_NO_LEN, PORT_LENGTH};
+use crate::tube_protocol::{CloseConnectionReason, ControlMessage, CONN_NO_LEN};
 
 // Import from the new connect_as module
 use super::connect_as::decrypt_connect_as_payload;
@@ -17,9 +17,9 @@ const CONNECT_AS_DETAILS_LEN_FIELD_BYTES: usize = 4;
 const CONNECT_AS_PUBLIC_KEY_BYTES: usize = 65; // As per Python: 65-byte public key
 const CONNECT_AS_NONCE_BYTES: usize = 12; // As per Python: 12 byte nonce
 
-// Compile-time SOCKS5 success response constant for zero-allocation response
-pub(crate) const SOCKS5_SUCCESS_RESPONSE: [u8; 10] =
-    [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+// Re-export SOCKS5 success response constant from pam-socks5 crate (used by tests)
+#[cfg(test)]
+pub(crate) const SOCKS5_SUCCESS_RESPONSE: [u8; 10] = pam_socks5::SOCKS5_SUCCESS_RESPONSE;
 use p256::pkcs8::DecodePrivateKey; // Trait for from_pkcs8_pem
 use p256::SecretKey as P256SecretKey;
 
@@ -731,92 +731,64 @@ impl Channel {
                 }
             }
             super::types::ActiveProtocol::Socks5 => {
-                // SOCKS5 parsing
+                // SOCKS5 parsing via tunnel protocol trait
                 if !self.server_mode && self.network_checker.is_some() {
-                    // Client mode with network checker - parse SOCKS5 target from data
+                    if let Some(ref protocol) = self.tunnel_protocol {
+                        let remaining = &data[std::mem::size_of::<u32>()..]; // Skip conn_no already consumed
+                        let target = protocol.parse_open_connection(remaining)?;
 
-                    if cursor.remaining() >= CONN_NO_LEN {
-                        let target_host_length = cursor.get_u32() as usize; // CONNECTION_NO_LENGTH = CONN_NO_LEN
-
-                        if cursor.remaining() >= target_host_length + PORT_LENGTH {
-                            let mut host_buffer = self.buffer_pool.acquire();
-                            host_buffer.clear();
-                            host_buffer.resize(target_host_length, 0);
-                            cursor.copy_to_slice(&mut host_buffer[..target_host_length]);
-                            let target_host = String::from_utf8(host_buffer.to_vec())
-                                .map_err(|e| anyhow!("Invalid UTF-8 in SOCKS host: {}", e))?;
-                            self.buffer_pool.release(host_buffer);
-
-                            let target_port = cursor.get_u16(); // PORT_LENGTH = 2 (standard u16)
-
-                            if let Some(ref checker) = self.network_checker {
-                                // **PERFORMANCE OPTIMIZED**: Single DNS lookup + permission check
-                                match checker.resolve_if_allowed(&target_host).await {
-                                    Some(resolved_ips) => {
-                                        // Host is allowed and resolved, check port
-                                        if !checker.is_port_allowed(target_port) {
-                                            error!(
-                                                "SOCKS5 port {} not allowed (channel_id: {})",
-                                                target_port, self.channel_id
-                                            );
-                                            return Err(anyhow!(
-                                                "SOCKS5 port {} not allowed",
-                                                target_port
-                                            ));
-                                        }
-
-                                        debug!(
-                                            "SOCKS5 connection allowed to {}:{} (channel_id: {})",
-                                            target_host, target_port, self.channel_id
+                        if let Some(ref checker) = self.network_checker {
+                            match checker.resolve_if_allowed(&target.host).await {
+                                Some(resolved_ips) => {
+                                    if !checker.is_port_allowed(target.port) {
+                                        error!(
+                                            "SOCKS5 port {} not allowed (channel_id: {})",
+                                            target.port, self.channel_id
                                         );
-
-                                        // **ZERO-ALLOCATION**: Use first resolved IP directly (no second DNS lookup)
-                                        if let Some(&first_ip) = resolved_ips.first() {
-                                            let socket_addr =
-                                                std::net::SocketAddr::new(first_ip, target_port);
-                                            super::connections::open_backend(
-                                                self,
-                                                target_connection_no,
-                                                socket_addr,
-                                                super::types::ActiveProtocol::Socks5,
-                                            )
-                                            .await
-                                        } else {
-                                            Err(anyhow!(
-                                                "SOCKS5 host {} resolved to empty IP list",
-                                                target_host
-                                            ))
-                                        }
+                                        return Err(anyhow!(
+                                            "SOCKS5 port {} not allowed",
+                                            target.port
+                                        ));
                                     }
-                                    None => {
-                                        // Host was not allowed or DNS resolution failed
-                                        error!("SOCKS5 destination {} not allowed or unresolvable (channel_id: {})", target_host, self.channel_id);
+
+                                    debug!(
+                                        "SOCKS5 connection allowed to {}:{} (channel_id: {})",
+                                        target.host, target.port, self.channel_id
+                                    );
+
+                                    if let Some(&first_ip) = resolved_ips.first() {
+                                        let socket_addr =
+                                            std::net::SocketAddr::new(first_ip, target.port);
+                                        super::connections::open_backend(
+                                            self,
+                                            target_connection_no,
+                                            socket_addr,
+                                            super::types::ActiveProtocol::Socks5,
+                                        )
+                                        .await
+                                    } else {
                                         Err(anyhow!(
-                                            "SOCKS5 destination {} not allowed or unresolvable",
-                                            target_host
+                                            "SOCKS5 host {} resolved to empty IP list",
+                                            target.host
                                         ))
                                     }
                                 }
-                            } else {
-                                Err(anyhow!("SOCKS5 network checker not configured"))
+                                None => {
+                                    error!("SOCKS5 destination {} not allowed or unresolvable (channel_id: {})", target.host, self.channel_id);
+                                    Err(anyhow!(
+                                        "SOCKS5 destination {} not allowed or unresolvable",
+                                        target.host
+                                    ))
+                                }
                             }
                         } else {
-                            error!(
-                                "SOCKS5 payload too short for host and port data (channel_id: {})",
-                                self.channel_id
-                            );
-                            Err(anyhow!("SOCKS5 payload too short for host and port data"))
+                            Err(anyhow!("SOCKS5 network checker not configured"))
                         }
                     } else {
-                        error!(
-                            "SOCKS5 payload missing host length (channel_id: {})",
-                            self.channel_id
-                        );
-                        Err(anyhow!("SOCKS5 payload missing host length"))
+                        Err(anyhow!("SOCKS5 tunnel protocol not configured"))
                     }
                 } else {
-                    // Server mode or no network checker - not supported in client mode
-                    warn!(            "SOCKS5 OpenConnection received but not in client mode with network checker (channel_id: {})", self.channel_id);
+                    warn!("SOCKS5 OpenConnection received but not in client mode with network checker (channel_id: {})", self.channel_id);
                     Err(anyhow!("SOCKS5 OpenConnection not supported in this mode"))
                 }
             }
@@ -1167,35 +1139,34 @@ impl Channel {
 
         // Get the connection
         if let Some(conn_ref) = self.conns.get(&connection_no) {
-            // If it's a SOCKS5 connection, send a success response to the client
-            if self.active_protocol == super::types::ActiveProtocol::Socks5 {
-                if unlikely!(crate::logger::is_verbose_logging()) {
-                    debug!(
-                        "SOCKS5 Connection opened (channel_id: {}, conn_no: {})",
-                        self.channel_id, connection_no
-                    );
-                }
-
-                if unlikely!(crate::logger::is_verbose_logging()) {
-                    debug!("Endpoint Sending SOCKS5 success response to connection {} (channel_id: {})", connection_no, self.channel_id);
-                }
-
-                // Send SOCKS5 response via the connection's data channel using zero-allocation constant
-                let response_bytes = bytes::Bytes::from_static(&SOCKS5_SUCCESS_RESPONSE);
-                match conn_ref
-                    .data_tx
-                    .send(crate::models::ConnectionMessage::Data(response_bytes))
-                {
-                    Ok(_) => {
-                        if unlikely!(crate::logger::is_verbose_logging()) {
-                            debug!("Endpoint SOCKS5 success response queued for connection {} (channel_id: {})", connection_no, self.channel_id);
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Endpoint Failed to queue SOCKS5 success response: {} (channel_id: {})",
-                            e, self.channel_id
+            // If the tunnel protocol has a deferred response, send it now
+            if let Some(ref protocol) = self.tunnel_protocol {
+                if let Some(response_bytes) = protocol.deferred_response() {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "{} Connection opened, sending deferred response (channel_id: {}, conn_no: {})",
+                            protocol.name(), self.channel_id, connection_no
                         );
+                    }
+
+                    match conn_ref
+                        .data_tx
+                        .send(crate::models::ConnectionMessage::Data(response_bytes))
+                    {
+                        Ok(_) => {
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!(
+                                    "Endpoint {} deferred response queued for connection {} (channel_id: {})",
+                                    protocol.name(), connection_no, self.channel_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Endpoint Failed to queue {} deferred response: {} (channel_id: {})",
+                                protocol.name(), e, self.channel_id
+                            );
+                        }
                     }
                 }
             }

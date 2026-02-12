@@ -8,10 +8,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 
-use crate::channel::guacd_parser::{
-    GuacdInstruction, GuacdParser, PeekError, ARG_SEP, ELEM_SEP, INST_TERM,
-};
 use crate::webrtc_data_channel::WebRTCDataChannel;
+use guacr_protocol::{GuacdInstruction, GuacdParser, PeekError, ARG_SEP, ELEM_SEP, INST_TERM};
 
 // --- Mock RTCDataChannel for testing ---
 use crate::channel::Channel;
@@ -412,18 +410,14 @@ async fn test_guacd_handshake_successful() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
-    let dc_clone = channel.webrtc.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &dc_clone,
         ),
     )
     .await;
@@ -522,17 +516,14 @@ async fn test_guacd_handshake_join_existing_connection_readonly() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &channel.webrtc,
         ),
     )
     .await;
@@ -626,17 +617,14 @@ async fn test_guacd_handshake_join_existing_connection_not_readonly() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &channel.webrtc,
         ),
     )
     .await;
@@ -705,17 +693,14 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_args() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &channel.webrtc,
         ),
     )
     .await;
@@ -892,17 +877,14 @@ async fn test_guacd_handshake_failure_wrong_opcode_instead_of_ready() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &channel.webrtc,
         ),
     )
     .await;
@@ -989,17 +971,14 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_args() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &channel.webrtc,
         ),
     )
     .await;
@@ -1230,17 +1209,14 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
     let handshake_timeout_duration = channel.timeouts.guacd_handshake;
     let channel_id_clone = channel.channel_id.clone();
     let guacd_params_clone = channel.guacd_params.clone();
-    let buffer_pool_clone = channel.buffer_pool.clone();
     let handshake_result = timeout(
         handshake_timeout_duration,
-        crate::channel::connections::perform_guacd_handshake(
+        guacr_guacd::client::perform_guacd_handshake(
             &mut client_reader,
             &mut client_writer,
             &channel_id_clone,
             conn_no,
             guacd_params_clone,
-            buffer_pool_clone,
-            &channel.webrtc,
         ),
     )
     .await;

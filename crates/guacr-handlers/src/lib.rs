@@ -31,9 +31,6 @@ mod session;
 mod sync_control;
 mod throughput;
 
-#[cfg(feature = "guacd-compat")]
-mod handshake;
-
 #[cfg(feature = "vsphere")]
 mod vsphere;
 
@@ -57,8 +54,6 @@ pub use error::{send_error_and_abort, send_error_best_effort, HandlerError, Resu
 pub use events::{
     connect_with_event_adapter, EventBasedHandler, EventCallback, HandlerEvent, InstructionSender,
 };
-#[cfg(feature = "guacd-compat")]
-pub use handler::HandlerArg;
 pub use handler::{HandlerStats, HealthStatus, ProtocolHandler};
 pub use host_key::{calculate_fingerprint, HostKeyConfig, HostKeyResult, HostKeyVerifier};
 pub use integration::handle_guacd_with_handlers;
@@ -121,19 +116,11 @@ pub use security::{
     CLIPBOARD_MAX_SIZE,
     CLIPBOARD_MIN_SIZE,
 };
-pub use session::{send_bell, send_disconnect, send_name, send_ready};
+pub use session::{
+    record_client_input, send_and_record, send_bell, send_disconnect, send_name, send_ready,
+};
 pub use sync_control::SyncFlowControl;
 pub use throughput::ThroughputTracker;
-
-// guacd wire protocol compatibility exports
-#[cfg(feature = "guacd-compat")]
-pub use handshake::{
-    get_protocol_arg_names, get_protocol_args, handle_guacd_connection,
-    handle_guacd_connection_with_timeout, protocol_args, run_guacd_server, status, ArgDescriptor,
-    ConnectResult, GuacdHandshake, GuacdServer, HandshakeError, SelectResult,
-    DEFAULT_HANDSHAKE_TIMEOUT_SECS, GUACAMOLE_PROTOCOL_VERSION, GUACD_DEFAULT_PORT,
-    MAX_INSTRUCTION_SIZE,
-};
 
 // vSphere REST API client exports
 #[cfg(feature = "vsphere")]

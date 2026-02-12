@@ -73,12 +73,63 @@ pub use guacr_database as database;
 #[cfg(feature = "rbi")]
 pub use guacr_rbi as rbi;
 
+use std::sync::Arc;
+
+/// Create a protocol handler registry with all available built-in handlers registered.
+///
+/// Registers handlers for all protocols enabled via feature flags (SSH, Telnet,
+/// RDP, VNC, Database, SFTP, RBI). Handlers remain dormant until actually invoked.
+pub fn create_default_registry() -> Arc<ProtocolHandlerRegistry> {
+    let registry = Arc::new(ProtocolHandlerRegistry::new());
+
+    #[cfg(feature = "ssh")]
+    registry.register(ssh::SshHandler::with_defaults());
+
+    #[cfg(feature = "telnet")]
+    registry.register(telnet::TelnetHandler::with_defaults());
+
+    #[cfg(feature = "rdp")]
+    registry.register(rdp::RdpHandler::with_defaults());
+
+    #[cfg(feature = "vnc")]
+    registry.register(vnc::VncHandler::with_defaults());
+
+    #[cfg(feature = "database")]
+    {
+        registry.register(database::MySqlHandler::with_defaults());
+        registry.register(database::PostgreSqlHandler::with_defaults());
+        registry.register(database::SqlServerHandler::with_defaults());
+        registry.register(database::MongoDbHandler::with_defaults());
+        registry.register(database::RedisHandler::with_defaults());
+        registry.register(database::OracleHandler::with_defaults());
+        registry.register(database::MariaDbHandler::with_defaults());
+    }
+
+    #[cfg(feature = "rbi")]
+    registry.register(rbi::RbiHandler::with_defaults());
+
+    registry
+}
+
 // guacd wire protocol compatibility (select/args/connect/ready handshake)
+// Now provided by guacr-guacd crate (previously in guacr-handlers behind feature flag)
 #[cfg(feature = "guacd-compat")]
-pub use guacr_handlers::{
+pub use guacr_guacd::{
     get_protocol_arg_names, get_protocol_args, handle_guacd_connection,
     handle_guacd_connection_with_timeout, protocol_args, run_guacd_server, status, ArgDescriptor,
-    ConnectResult, GuacdHandshake, GuacdServer, HandlerArg, HandshakeError, SelectResult,
+    ConnectResult, GuacdHandshake, GuacdServer, HandshakeError, SelectResult,
     DEFAULT_HANDSHAKE_TIMEOUT_SECS, GUACAMOLE_PROTOCOL_VERSION, GUACD_DEFAULT_PORT,
     MAX_INSTRUCTION_SIZE,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_default_registry() {
+        let registry = create_default_registry();
+        // With default features (ssh, telnet), at least those two should be registered
+        assert!(registry.count() >= 2);
+    }
+}

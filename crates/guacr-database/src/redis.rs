@@ -185,7 +185,7 @@ impl ProtocolHandler for RedisHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                send_render(&mut executor, &to_client).await?;
+                send_render(&mut executor, &to_client, &mut recorder).await?;
 
                 while from_client.recv().await.is_some() {}
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -202,6 +202,7 @@ impl ProtocolHandler for RedisHandler {
                     &mut executor,
                     &to_client,
                     &[&conn_line, &db_line, "Type 'help' for available commands."],
+                    &mut recorder,
                 )
                 .await?;
                 debug!("Redis: Initial screen sent successfully");
@@ -223,6 +224,7 @@ impl ProtocolHandler for RedisHandler {
                         "Check password if AUTH is required",
                         "Check firewall rules",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -253,7 +255,7 @@ impl ProtocolHandler for RedisHandler {
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in instructions {
                             // Break if send fails (client disconnected)
-                            if to_client.send(instr).await.is_err() {
+                            if crate::recording::send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("Redis: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -276,7 +278,7 @@ impl ProtocolHandler for RedisHandler {
                         record_query_input(&mut recorder, &recording_config, &command);
 
                         // Handle built-in commands
-                        if handle_builtin_command(&command, &mut executor, &to_client, &security)
+                        if handle_builtin_command(&command, &mut executor, &to_client, &security, &mut recorder)
                             .await?
                         {
                             continue;
@@ -291,6 +293,7 @@ impl ProtocolHandler for RedisHandler {
                                 &mut executor,
                                 &to_client,
                                 &security,
+                                &mut recorder,
                             )
                             .await?;
                             continue;
@@ -298,7 +301,7 @@ impl ProtocolHandler for RedisHandler {
 
                         // Check for import command: \i (imports key-value pairs from CSV)
                         if command.to_lowercase().starts_with("\\i") {
-                            handle_csv_import(&mut con, &mut executor, &to_client, &security)
+                            handle_csv_import(&mut con, &mut executor, &to_client, &security, &mut recorder)
                                 .await?;
                             continue;
                         }
@@ -313,7 +316,7 @@ impl ProtocolHandler for RedisHandler {
                                 .terminal
                                 .write_prompt()
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            send_render(&mut executor, &to_client).await?;
+                            send_render(&mut executor, &to_client, &mut recorder).await?;
                             continue;
                         }
 
@@ -344,16 +347,13 @@ impl ProtocolHandler for RedisHandler {
                             .write_prompt()
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                        send_render(&mut executor, &to_client).await?;
+                        send_render(&mut executor, &to_client, &mut recorder).await?;
                         continue;
                     }
 
                     if needs_render {
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            let _ = crate::recording::send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                 }
@@ -557,6 +557,7 @@ async fn handle_builtin_command(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<bool> {
     let command_lower = command.to_lowercase();
 
@@ -603,11 +604,11 @@ async fn handle_builtin_command(
                 });
             }
 
-            render_help(executor, to_client, "Redis CLI", &sections).await?;
+            render_help(executor, to_client, "Redis CLI", &sections, recorder).await?;
             return Ok(true);
         }
         "quit" | "exit" => {
-            return Err(handle_quit(executor, to_client).await);
+            return Err(handle_quit(executor, to_client, recorder).await);
         }
         _ => {}
     }
@@ -622,6 +623,7 @@ async fn handle_csv_export(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     use redis::AsyncCommands;
     use std::sync::atomic::Ordering;
@@ -636,7 +638,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -646,7 +648,7 @@ async fn handle_csv_export(
         .terminal
         .write_line(&format!("Scanning keys matching '{}'...", scan_pattern))
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     // Get keys matching pattern
     let keys: Vec<String> = connection
@@ -663,7 +665,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -733,7 +735,7 @@ async fn handle_csv_export(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }
@@ -744,6 +746,7 @@ async fn handle_csv_import(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     use redis::AsyncCommands;
 
@@ -757,7 +760,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -771,7 +774,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -815,7 +818,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -855,7 +858,7 @@ async fn handle_csv_import(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }

@@ -82,6 +82,9 @@ pub fn record_error_output(recorder: &mut Option<MultiFormatRecorder>, error: &s
     }
 }
 
+// Re-export shared send_and_record so existing `use crate::recording::send_and_record` keeps working
+pub use guacr_handlers::send_and_record;
+
 /// Format query result as text for recording
 ///
 /// Produces a text representation of the query result suitable for

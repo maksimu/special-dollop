@@ -28,6 +28,5 @@ pub use assembler::{
     DEFAULT_MAX_FRAGMENTS, FRAGMENT_HEADER_SIZE,
 };
 
-pub(crate) mod guacd_parser;
 pub(crate) mod protocol;
-pub(crate) mod socks5;
+pub(crate) mod tunnel_protocol;

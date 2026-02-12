@@ -7,9 +7,6 @@ description = "Protocol handler trait, registry, and ResourceBrowser for guacr r
 
 [features]
 default = []
-# Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
-# This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
-guacd-compat = ["dep:uuid"]
 # Enable vSphere REST API client for VM management and console access
 vsphere = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # Enable Docker container management via bollard
@@ -29,6 +26,7 @@ log.workspace = true
 
 # Protocol support
 guacr-protocol = { path = "../guacr-protocol", version = "2.0.0" }
+guacr-recording = { path = "../guacr-recording" }
 guacr-terminal = { path = "../guacr-terminal" }
 
 # Stream trait for resource browser watch API
@@ -47,9 +45,6 @@ webp = "0.3"
 sha2 = "0.10"
 sha1 = "0.10"
 hmac = "0.12"
-
-# Optional dependencies for guacd-compat feature
-uuid = { workspace = true, optional = true }
 
 # Optional dependencies for vsphere feature
 reqwest = { workspace = true, optional = true }

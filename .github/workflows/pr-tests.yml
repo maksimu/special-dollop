@@ -231,6 +231,9 @@ jobs:
           cargo build --workspace --all-targets --release --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # Override fat LTO for CI - production LTO is only needed for wheel builds
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
   # ============================================================================
   # Security Audit

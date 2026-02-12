@@ -1,9 +1,15 @@
 use std::time::{Duration, Instant};
 
+/// Maximum buffer size in bytes (prevents unbounded memory growth)
+const MAX_BUFFER_SIZE: usize = 10_000;
+
 /// Command buffer for proactive threat detection
 ///
 /// Accumulates keystrokes until a complete command is detected (Enter key pressed).
 /// Used to buffer commands before sending to AI for approval.
+///
+/// Bounded: buffer is capped at MAX_BUFFER_SIZE bytes to prevent unbounded memory growth
+/// from malicious or buggy clients sending continuous input without Enter.
 #[derive(Debug, Clone)]
 pub struct CommandBuffer {
     /// Accumulated keystrokes for current command
@@ -42,6 +48,11 @@ impl CommandBuffer {
     /// Converts bytes to UTF-8 string (lossy) and appends to buffer.
     /// Starts the buffer timer if this is the first character.
     pub fn append(&mut self, bytes: &[u8]) {
+        // Cap buffer size to prevent unbounded memory growth
+        if self.buffer.len() >= MAX_BUFFER_SIZE {
+            return;
+        }
+
         if self.buffer.is_empty() {
             self.started_at = Some(Instant::now());
         }
@@ -53,14 +64,22 @@ impl CommandBuffer {
             let s = String::from_utf8_lossy(bytes);
             self.buffer.push_str(&s);
         }
+
+        // Truncate if we went over (multi-byte append)
+        self.buffer.truncate(MAX_BUFFER_SIZE);
     }
 
     /// Append a string to the buffer
     pub fn append_str(&mut self, s: &str) {
+        if self.buffer.len() >= MAX_BUFFER_SIZE {
+            return;
+        }
+
         if self.buffer.is_empty() {
             self.started_at = Some(Instant::now());
         }
         self.buffer.push_str(s);
+        self.buffer.truncate(MAX_BUFFER_SIZE);
     }
 
     /// Handle backspace - remove last character

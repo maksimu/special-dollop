@@ -35,6 +35,7 @@ png = "0.17"  # Streaming PNG encoder for zero-copy encoding
 
 # Protocol support
 guacr-protocol = { path = "../guacr-protocol" }
+guacr-recording = { path = "../guacr-recording" }
 
 # Zero-copy buffer pooling
 crossbeam-queue = "0.3"

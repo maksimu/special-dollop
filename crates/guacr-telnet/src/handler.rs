@@ -9,6 +9,9 @@ use guacr_handlers::{
     parse_end_instruction,
     parse_pipe_instruction,
     pipe_blob_bytes,
+    // Recording helpers
+    record_client_input,
+    send_and_record,
     // Session lifecycle
     send_bell,
     send_disconnect,
@@ -245,10 +248,9 @@ impl ProtocolHandler for TelnetHandler {
         if enable_pipe {
             info!("Telnet: Pipe streams enabled - opening STDOUT pipe for native terminal display");
             let pipe_instr = pipe_manager.enable_stdout();
-            to_client
-                .send(Bytes::from(pipe_instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(pipe_instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
         }
 
         // Initialize threat detection if enabled
@@ -304,6 +306,15 @@ impl ProtocolHandler for TelnetHandler {
                         .get("threat_detection_auto_approve_safe_commands")
                         .map(|s| s == "true")
                         .unwrap_or(true),
+                    config_allow_ai_session_terminate: params
+                        .get("threat_detection_config_allow_ai_session_terminate")
+                        .map(|s| s == "true")
+                        .unwrap_or(true),
+                    resource_ai_session_terminate_enabled: params
+                        .get("threat_detection_resource_ai_session_terminate_enabled")
+                        .map(|s| s == "true")
+                        .unwrap_or(true),
+                    level_terminate_flags: HashMap::new(),
                 };
 
                 match ThreatDetector::new(config) {
@@ -346,10 +357,9 @@ impl ProtocolHandler for TelnetHandler {
             .send_standard_cursor(StandardCursor::IBeam)
             .map_err(|e| HandlerError::ProtocolError(format!("Cursor error: {}", e)))?;
         for instr in cursor_instrs {
-            to_client
-                .send(Bytes::from(instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
         }
 
         // CRITICAL: Send size instruction to initialize display dimensions
@@ -360,10 +370,9 @@ impl ProtocolHandler for TelnetHandler {
             width_px, height_px, cols, rows
         );
         let size_instr = TerminalRenderer::format_size_instruction(0, width_px, height_px);
-        to_client
-            .send(Bytes::from(size_instr))
+        send_and_record(&to_client, &mut recorder, Bytes::from(size_instr))
             .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            .map_err(HandlerError::ChannelError)?;
 
         // Bidirectional forwarding
         let mut buf = vec![0u8; 4096];
@@ -413,8 +422,8 @@ impl ProtocolHandler for TelnetHandler {
                             // This enables native terminal display (with ANSI escape codes)
                             if pipe_manager.is_stdout_enabled() {
                                 let blob = pipe_blob_bytes(PIPE_STREAM_STDOUT, &buf[..n]);
-                                to_client.send(blob).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, blob).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
 
                             // Threat detection: Analyze live terminal output from server
@@ -469,6 +478,8 @@ impl ProtocolHandler for TelnetHandler {
                         info!("Telnet: Client disconnected");
                         break;
                     };
+                    // Record client-to-server instruction
+                    record_client_input(&mut recorder, &msg);
                     // Parse Guacamole instruction
                     let msg_str = String::from_utf8_lossy(&msg);
 
@@ -664,8 +675,8 @@ impl ProtocolHandler for TelnetHandler {
                                     // Send visual feedback (blue overlay) to client
                                     trace!("Telnet: Selection in progress, sending {} overlay instructions", overlay_instructions.len());
                                     for instr in overlay_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                                 SelectionResult::Complete { text: selected_text, clear_instructions } => {
@@ -675,8 +686,8 @@ impl ProtocolHandler for TelnetHandler {
 
                                         // Still clear the overlay even if copy is blocked
                                         for instr in clear_instructions {
-                                            to_client.send(Bytes::from(instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
                                         }
                                         continue;
                                     }
@@ -692,8 +703,8 @@ impl ProtocolHandler for TelnetHandler {
 
                                     // Clear the overlay
                                     for instr in clear_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
 
                                     // Send to client as clipboard
@@ -701,8 +712,8 @@ impl ProtocolHandler for TelnetHandler {
                                     let clipboard_instructions = format_clipboard_instructions(&selected_text, clipboard_stream_id);
 
                                     for instr in clipboard_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                                 SelectionResult::None => {
@@ -773,8 +784,8 @@ impl ProtocolHandler for TelnetHandler {
                                         CHAR_H,        // char_height
                                         0,             // layer
                                     );
-                                    to_client.send(Bytes::from(copy_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(copy_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     // Render only the new bottom line(s)
                                     // Expand by 1 cell in all directions for JPEG artifacts
@@ -800,13 +811,13 @@ impl ProtocolHandler for TelnetHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 } else {
                                     // Scroll down: render full screen
@@ -825,13 +836,13 @@ impl ProtocolHandler for TelnetHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, 0, 0, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                             } else if dirty_pct < 30 {
@@ -861,13 +872,13 @@ impl ProtocolHandler for TelnetHandler {
                                 let img_instr = protocol_encoder.format_img_instruction(
                                     stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                 );
-                                to_client.send(img_instr.freeze()).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                    .map_err(HandlerError::ChannelError)?;
 
                                 let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                 for instr in blob_instructions {
-                                    to_client.send(Bytes::from(instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
                                 }
                             } else {
                                 // Large update (>= 30% dirty): render full screen
@@ -887,13 +898,13 @@ impl ProtocolHandler for TelnetHandler {
                                 let img_instr = protocol_encoder.format_img_instruction(
                                     stream_id, 0, 0, 0, "image/jpeg",
                                 );
-                                to_client.send(img_instr.freeze()).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                    .map_err(HandlerError::ChannelError)?;
 
                                 let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                 for instr in blob_instructions {
-                                    to_client.send(Bytes::from(instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
                                 }
                             }
                         } else {
@@ -913,13 +924,13 @@ impl ProtocolHandler for TelnetHandler {
                             let img_instr = protocol_encoder.format_img_instruction(
                                 stream_id, 0, 0, 0, "image/jpeg",
                             );
-                            to_client.send(img_instr.freeze()).await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                .map_err(HandlerError::ChannelError)?;
 
                             let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                             for instr in blob_instructions {
-                                to_client.send(Bytes::from(instr)).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
                         }
 
@@ -930,8 +941,8 @@ impl ProtocolHandler for TelnetHandler {
                                 .unwrap()
                                 .as_millis() as u64
                         );
-                        to_client.send(Bytes::from(sync_instr)).await
-                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                        send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                            .map_err(HandlerError::ChannelError)?;
 
                         terminal.clear_dirty();
                     }

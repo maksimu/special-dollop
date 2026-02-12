@@ -2081,6 +2081,12 @@ impl WebRTCPeerConnection {
             "Fetched fresh TURN credentials for ICE restart (tube_id: {}, username: {})",
             self.tube_id, username
         );
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "ICE restart TURN credentials (tube_id: {}, username: {}, password: {})",
+                self.tube_id, username, password
+            );
+        }
 
         // Get current configuration
         let mut config = self.peer_connection.get_configuration().await;

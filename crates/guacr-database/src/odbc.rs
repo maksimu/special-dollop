@@ -614,7 +614,8 @@ impl ProtocolHandler for OdbcHandler {
                 }
                 info_lines.push("Type 'help' for available commands.");
 
-                render_connection_success(&mut executor, &to_client, &info_lines).await?;
+                render_connection_success(&mut executor, &to_client, &info_lines, &mut recorder)
+                    .await?;
                 debug!("ODBC: Initial screen sent successfully");
             }
             Err(e) => {
@@ -633,6 +634,7 @@ impl ProtocolHandler for OdbcHandler {
                         "Check credentials are correct",
                         "Ensure the database server is running",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -663,7 +665,7 @@ impl ProtocolHandler for OdbcHandler {
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in instructions {
                             // Break if send fails (client disconnected)
-                            if to_client.send(instr).await.is_err() {
+                            if crate::recording::send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("ODBC: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -692,6 +694,7 @@ impl ProtocolHandler for OdbcHandler {
                             &to_client,
                             &security,
                             &connection_string,
+                            &mut recorder,
                         )
                         .await?
                         {
@@ -707,6 +710,7 @@ impl ProtocolHandler for OdbcHandler {
                                 &mut executor,
                                 &to_client,
                                 &security,
+                                &mut recorder,
                             )
                             .await?;
                             continue;
@@ -721,6 +725,7 @@ impl ProtocolHandler for OdbcHandler {
                                 &mut executor,
                                 &to_client,
                                 &security,
+                                &mut recorder,
                             )
                             .await?;
                             continue;
@@ -731,7 +736,7 @@ impl ProtocolHandler for OdbcHandler {
                             executor
                                 .write_error(&msg)
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            send_render(&mut executor, &to_client).await?;
+                            send_render(&mut executor, &to_client, &mut recorder).await?;
                             continue;
                         }
 
@@ -741,7 +746,7 @@ impl ProtocolHandler for OdbcHandler {
                             executor
                                 .write_error("Command blocked: read-only mode is enabled.")
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            send_render(&mut executor, &to_client).await?;
+                            send_render(&mut executor, &to_client, &mut recorder).await?;
                             continue;
                         }
 
@@ -769,17 +774,14 @@ impl ProtocolHandler for OdbcHandler {
                             }
                         }
 
-                        send_render(&mut executor, &to_client).await?;
+                        send_render(&mut executor, &to_client, &mut recorder).await?;
                         continue;
                     }
 
                     if needs_render {
                         // Render immediately for special cases (Enter, Escape, etc.)
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            let _ = crate::recording::send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                     // For regular keystrokes, debounce timer will handle rendering
@@ -821,6 +823,7 @@ async fn handle_builtin_command(
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
     connection_string: &str,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<bool> {
     let command_lower = command.to_lowercase();
     let command_trimmed = command_lower.trim();
@@ -869,11 +872,18 @@ async fn handle_builtin_command(
                 commands: sql_cmds,
             });
 
-            render_help(executor, to_client, "ODBC SQL Terminal", &sections).await?;
+            render_help(
+                executor,
+                to_client,
+                "ODBC SQL Terminal",
+                &sections,
+                recorder,
+            )
+            .await?;
             return Ok(true);
         }
         "quit" | "exit" | "\\q" => {
-            return Err(handle_quit(executor, to_client).await);
+            return Err(handle_quit(executor, to_client, recorder).await);
         }
         "\\tables" => {
             let conn_str = connection_string.to_string();
@@ -889,7 +899,7 @@ async fn handle_builtin_command(
                         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                 }
             }
-            send_render(executor, to_client).await?;
+            send_render(executor, to_client, recorder).await?;
             return Ok(true);
         }
         "\\drivers" => {
@@ -905,7 +915,7 @@ async fn handle_builtin_command(
                         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                 }
             }
-            send_render(executor, to_client).await?;
+            send_render(executor, to_client, recorder).await?;
             return Ok(true);
         }
         "\\dsns" => {
@@ -921,7 +931,7 @@ async fn handle_builtin_command(
                         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                 }
             }
-            send_render(executor, to_client).await?;
+            send_render(executor, to_client, recorder).await?;
             return Ok(true);
         }
         _ => {}
@@ -970,7 +980,7 @@ async fn handle_builtin_command(
             }
         }
 
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(true);
     }
 
@@ -984,6 +994,7 @@ async fn handle_csv_export(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -997,7 +1008,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1005,7 +1016,7 @@ async fn handle_csv_export(
         .terminal
         .write_line("Executing query for export...")
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     // Execute the query via ODBC
     let conn_str = connection_string.to_string();
@@ -1067,7 +1078,7 @@ async fn handle_csv_export(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }
@@ -1079,6 +1090,7 @@ async fn handle_csv_import(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     // Check if import is allowed
     if let Err(msg) = check_csv_import_allowed(security) {
@@ -1090,7 +1102,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1104,7 +1116,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1117,7 +1129,7 @@ async fn handle_csv_import(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1185,7 +1197,7 @@ async fn handle_csv_import(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }

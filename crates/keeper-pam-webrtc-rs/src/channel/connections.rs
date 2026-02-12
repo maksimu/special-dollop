@@ -4,9 +4,6 @@ use crate::buffer_pool::BufferPool;
 use crate::channel::assembler::{
     fragment_frame, DEFAULT_FRAGMENT_THRESHOLD, DEFAULT_MAX_FRAGMENTS,
 };
-use crate::channel::guacd_parser::{
-    GuacdInstruction, GuacdParser, OpcodeAction, PeekError, SpecialOpcode,
-};
 use crate::channel::types::ActiveProtocol;
 use crate::models::Conn;
 use crate::tube_protocol::{Capabilities, CloseConnectionReason, ControlMessage, Frame};
@@ -14,7 +11,8 @@ use crate::unlikely; // Branch prediction optimization
 use crate::webrtc_data_channel::{EventDrivenSender, STANDARD_BUFFER_THRESHOLD};
 use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
-use log::{debug, error, info, warn};
+use guacr_protocol::{GuacdInstruction, GuacdParser, OpcodeAction, PeekError, SpecialOpcode};
+use log::{debug, error, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,19 +159,16 @@ pub async fn setup_outbound_task(
 
         let channel_id_clone = channel_id_for_task.clone(); // Already have channel_id_for_task
         let guacd_params_clone = channel.guacd_params.clone();
-        let buffer_pool_clone = buffer_pool.clone(); // Use the already cloned buffer_pool
         let handshake_timeout_duration = channel.timeouts.guacd_handshake;
 
         match timeout(
             handshake_timeout_duration,
-            perform_guacd_handshake(
+            guacr_guacd::client::perform_guacd_handshake(
                 &mut backend_reader,
                 &mut backend_writer,
                 &channel_id_clone,
                 conn_no,
                 guacd_params_clone,
-                buffer_pool_clone,
-                &dc, // NEW: for sending CloseConnection on EOF
             ),
         )
         .await
@@ -225,6 +220,7 @@ pub async fn setup_outbound_task(
                             .record_error(&channel_id_clone, "handshake_error_send_failed");
                     }
                 }
+                dc.drain(Duration::from_millis(500)).await;
                 return Err(e);
             }
             Err(_) => {
@@ -266,6 +262,7 @@ pub async fn setup_outbound_task(
                             .record_error(&channel_id_clone, "handshake_timeout_send_failed");
                     }
                 }
+                dc.drain(Duration::from_millis(500)).await;
                 return Err(anyhow::anyhow!("Guacd handshake timed out"));
             }
         }
@@ -351,6 +348,7 @@ pub async fn setup_outbound_task(
                         );
                     }
                 }
+                dc.drain(Duration::from_millis(500)).await;
                 return Err(e);
             }
             Err(_) => {
@@ -390,6 +388,7 @@ pub async fn setup_outbound_task(
                         );
                     }
                 }
+                dc.drain(Duration::from_millis(500)).await;
                 return Err(anyhow::anyhow!("DatabaseProxy handshake timed out"));
             }
         }
@@ -894,26 +893,37 @@ pub async fn setup_outbound_task(
                                             let guacd_error_message: Option<String> =
                                                 match GuacdParser::peek_instruction(current_slice) {
                                                     Ok(instr) => {
-                                                        if instr.opcode == crate::channel::guacd_parser::DISCONNECT_OPCODE {
-                                                        // Guacd sent disconnect instruction - clean connection closure
-                                                        clean_disconnect_received = true;  // Mark as clean disconnect
-                                                        warn!("Guacd sent disconnect instruction - closing connection cleanly (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
-                                                        Some("Guacd disconnect".to_string())
-                                                    } else if instr.opcode == crate::channel::guacd_parser::ERROR_OPCODE {
-                                                        // Guacd sent error instruction - error condition
-                                                        // Extract error message from args (typically args[0] is the error text)
-                                                        let error_msg = if !instr.args.is_empty() {
-                                                            format!("Guacd error: {}", instr.args.join(", "))
+                                                        if instr.opcode
+                                                            == guacr_protocol::DISCONNECT_OPCODE
+                                                        {
+                                                            // Guacd sent disconnect instruction - clean connection closure
+                                                            clean_disconnect_received = true; // Mark as clean disconnect
+                                                            warn!("Guacd sent disconnect instruction - closing connection cleanly (channel_id: {}, conn_no: {})", channel_id_for_task, conn_no);
+                                                            Some("Guacd disconnect".to_string())
+                                                        } else if instr.opcode
+                                                            == guacr_protocol::ERROR_OPCODE
+                                                        {
+                                                            // Guacd sent error instruction - error condition
+                                                            // Extract error message from args (typically args[0] is the error text)
+                                                            let error_msg =
+                                                                if !instr.args.is_empty() {
+                                                                    format!(
+                                                                        "Guacd error: {}",
+                                                                        instr.args.join(", ")
+                                                                    )
+                                                                } else {
+                                                                    "Guacd error".to_string()
+                                                                };
+                                                            error!("Guacd sent error opcode - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
+                                                            Some(error_msg)
                                                         } else {
-                                                            "Guacd error".to_string()
-                                                        };
-                                                        error!("Guacd sent error opcode - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
-                                                        Some(error_msg)
-                                                    } else {
-                                                        // Unknown close opcode
-                                                        warn!("Guacd sent close instruction - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
-                                                        Some(format!("Guacd close: {}", instr.opcode))
-                                                    }
+                                                            // Unknown close opcode
+                                                            warn!("Guacd sent close instruction - closing connection (channel_id: {}, conn_no: {}, opcode: {}, args: {:?})", channel_id_for_task, conn_no, instr.opcode, instr.args);
+                                                            Some(format!(
+                                                                "Guacd close: {}",
+                                                                instr.opcode
+                                                            ))
+                                                        }
                                                     }
                                                     Err(_) => {
                                                         // Failed to parse - assume error
@@ -1561,628 +1571,6 @@ pub async fn setup_outbound_task(
         );
     }
 
-    Ok(())
-}
-
-// --- Helper function for Guacd Handshake ---
-// A stateless GuacdParser that manages its own BytesMut buffer for reading from the socket,
-/// Send CloseConnection with error message during handshake failure
-/// This ensures the UI receives error notification even when guacd closes without sending error instructions
-async fn send_handshake_error_close(
-    dc: &crate::webrtc_data_channel::WebRTCDataChannel,
-    conn_no: u32,
-    reason: CloseConnectionReason,
-    error_message: &str,
-    buffer_pool: &BufferPool,
-    channel_id: &str,
-) {
-    // Build CloseConnection frame with error message
-    let mut control_buf = buffer_pool.acquire();
-    control_buf.clear();
-    control_buf.extend_from_slice(&conn_no.to_be_bytes());
-    control_buf.put_u8(reason as u8);
-
-    // Add error message (backward compatible extension)
-    let error_bytes = error_message.as_bytes();
-    let error_len = error_bytes.len().min(1024) as u16;
-    control_buf.put_u16(error_len);
-    control_buf.extend_from_slice(&error_bytes[..error_len as usize]);
-
-    let close_frame =
-        Frame::new_control_with_buffer(ControlMessage::CloseConnection, &mut control_buf);
-    buffer_pool.release(control_buf);
-    let encoded_frame = close_frame.encode_with_pool(buffer_pool);
-
-    // Send immediately (handshake context - no event_sender available)
-    match dc.send(encoded_frame).await {
-        Ok(_) => {
-            if unlikely!(should_log_connection(false)) {
-                debug!(
-                    "Sent handshake error CloseConnection (channel_id: {}, conn_no: {})",
-                    channel_id, conn_no
-                );
-            }
-        }
-        Err(e) => {
-            error!("Failed to send handshake error CloseConnection (channel_id: {}, conn_no: {}, error: {})", channel_id, conn_no, e);
-        }
-    }
-
-    // CRITICAL: Drain buffer to ensure CloseConnection transmits.
-    // We wait up to 500ms to allow the CloseConnection control message to be sent
-    // over the network before the connection is torn down. This is necessary because
-    // without draining, the message may remain buffered and never reach the client,
-    // especially if the underlying transport is unreliable or slow. The 500ms timeout
-    // is chosen as a balance between giving the message a reasonable chance to transmit
-    // and not delaying shutdown excessively.
-    dc.drain(Duration::from_millis(500)).await;
-}
-
-// then passes slices of this buffer to GuacdParser::peek_instruction and GuacdParser::parse_instruction_content.
-pub(crate) async fn perform_guacd_handshake<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    channel_id: &str,
-    conn_no: u32,
-    guacd_params_arc: Arc<Mutex<HashMap<String, String>>>,
-    buffer_pool: BufferPool,
-    dc: &crate::webrtc_data_channel::WebRTCDataChannel, // NEW: for sending CloseConnection on EOF
-) -> Result<()>
-where
-    R: AsyncRead + Unpin + Send + ?Sized,
-    W: AsyncWriteExt + Unpin + Send + ?Sized,
-{
-    let mut handshake_buffer = buffer_pool.acquire();
-    let mut current_handshake_buffer_len = 0;
-
-    #[allow(clippy::too_many_arguments)]
-    async fn read_expected_instruction_stateless<'a, SHelper>(
-        reader: &'a mut SHelper,
-        handshake_buffer: &'a mut BytesMut,
-        current_buffer_len: &'a mut usize,
-        channel_id: &'a str,
-        conn_no: u32,
-        expected_opcode: &'a str,
-        dc: &'a crate::webrtc_data_channel::WebRTCDataChannel, // NEW: for sending CloseConnection
-        buffer_pool: &'a BufferPool,                           // NEW: for frame encoding
-    ) -> Result<GuacdInstruction>
-    where
-        SHelper: AsyncRead + Unpin + Send + ?Sized,
-    {
-        loop {
-            // Process a peek result and extract what we need
-            let process_result = {
-                let peek_result =
-                    GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len]);
-
-                match peek_result {
-                    Ok(peeked_instr) => {
-                        let instruction_total_len = peeked_instr.total_length_in_buffer;
-                        if instruction_total_len == 0 || instruction_total_len > *current_buffer_len
-                        {
-                            error!(
-                                "Invalid instruction length peeked ({}) vs buffer len ({}). Opcode: '{}'. Buffer (approx): {:?} (channel_id: {}, conn_no: {})",
-                                instruction_total_len, *current_buffer_len, peeked_instr.opcode, &handshake_buffer[..std::cmp::min(*current_buffer_len, 100)], channel_id, conn_no
-                            );
-                            return Err(anyhow::anyhow!(
-                                "Peeked instruction length is invalid or exceeds buffer."
-                            ));
-                        }
-                        let content_slice = &handshake_buffer[..instruction_total_len - 1];
-
-                        let instruction = GuacdParser::parse_instruction_content(content_slice).map_err(|e|
-                            anyhow::anyhow!("Handshake: Conn {}: Failed to parse peeked Guacd instruction (opcode: '{}'): {}. Content: {:?}", conn_no, peeked_instr.opcode, e, content_slice)
-                        )?;
-
-                        // Extract what we need from peeked_instr before it goes out of scope
-                        let expected_opcode_check = peeked_instr.opcode == expected_opcode;
-
-                        // Return the instruction and advance amount
-                        Some((instruction, instruction_total_len, expected_opcode_check))
-                    }
-                    Err(PeekError::Incomplete) => {
-                        // Need more data
-                        None
-                    }
-                    Err(err) => {
-                        let err_msg = format!("Error peeking Guacd instruction while expecting '{}': {:?}. Buffer content (approx): {:?}", expected_opcode, err, &handshake_buffer[..std::cmp::min(*current_buffer_len, 100)]);
-                        error!(
-                            "Error during handshake (channel_id: {}, conn_no: {}, error: {})",
-                            channel_id, conn_no, err_msg
-                        );
-                        return Err(anyhow::anyhow!(err_msg));
-                    }
-                }
-            }; // peek_result is dropped here
-
-            // Now we can safely mutate handshake_buffer
-            if let Some((instruction, advance_len, expected_opcode_check)) = process_result {
-                handshake_buffer.advance(advance_len);
-                *current_buffer_len -= advance_len;
-
-                if instruction.opcode == "error" {
-                    error!("Guacd sent error during handshake (channel_id: {}, error_opcode: {}, expected_opcode: {}, error_args: {:?})", channel_id, instruction.opcode, expected_opcode, instruction.args);
-                    return Err(anyhow::anyhow!(
-                        "Guacd sent error '{}' ({:?}) during handshake (expected '{}')",
-                        instruction.opcode,
-                        instruction.args,
-                        expected_opcode
-                    ));
-                }
-                return if expected_opcode_check {
-                    Ok(instruction)
-                } else {
-                    error!("Unexpected Guacd opcode (channel_id: {}, expected_opcode: {}, received_opcode: {}, received_args: {:?})", channel_id, expected_opcode, instruction.opcode, instruction.args);
-                    Err(anyhow::anyhow!(
-                        "Expected Guacd opcode '{}', got '{}' with args {:?}",
-                        expected_opcode,
-                        instruction.opcode,
-                        instruction.args
-                    ))
-                };
-            }
-
-            // Handle the incomplete case - read more data
-            let mut temp_read_buf = [0u8; 1024];
-            match reader.read(&mut temp_read_buf).await {
-                Ok(0) => {
-                    // EOF received - check if there's any remaining instruction in buffer
-                    // (especially an error instruction that arrived just before connection close)
-                    if *current_buffer_len > 0 {
-                        if let Ok(peeked) =
-                            GuacdParser::peek_instruction(&handshake_buffer[..*current_buffer_len])
-                        {
-                            if peeked.total_length_in_buffer <= *current_buffer_len {
-                                // Try to parse the instruction
-                                let content_slice =
-                                    &handshake_buffer[..peeked.total_length_in_buffer - 1];
-                                if let Ok(instruction) =
-                                    GuacdParser::parse_instruction_content(content_slice)
-                                {
-                                    if instruction.opcode == "error" {
-                                        // Extract the actual error from guacd
-                                        let guacd_error_msg = instruction
-                                            .args
-                                            .first()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("Unknown guacd error");
-                                        let error_code = instruction
-                                            .args
-                                            .get(1)
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("");
-                                        error!("Guacd sent error during handshake (channel_id: {}, error_msg: {}, error_code: {})", channel_id, guacd_error_msg, error_code);
-
-                                        // Send CloseConnection to UI before returning error
-                                        let close_msg = format!(
-                                            "Guacd error: {} (code: {})",
-                                            guacd_error_msg, error_code
-                                        );
-                                        send_handshake_error_close(
-                                            dc,
-                                            conn_no,
-                                            CloseConnectionReason::GuacdError,
-                                            &close_msg,
-                                            buffer_pool,
-                                            channel_id,
-                                        )
-                                        .await;
-
-                                        return Err(anyhow::anyhow!(
-                                            "Guacd error: {} (code: {})",
-                                            guacd_error_msg,
-                                            error_code
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let error_msg = format!(
-                        "Connection closed during handshake (expected: {}, buffer_len: {})",
-                        expected_opcode, *current_buffer_len
-                    );
-                    error!(
-                        "EOF during Guacd handshake (channel_id: {}, conn_no: {}, error: {})",
-                        channel_id, conn_no, error_msg
-                    );
-
-                    // Send CloseConnection to UI before returning error
-                    send_handshake_error_close(
-                        dc,
-                        conn_no,
-                        CloseConnectionReason::GuacdError,
-                        &error_msg,
-                        buffer_pool,
-                        channel_id,
-                    )
-                    .await;
-
-                    return Err(anyhow::anyhow!("EOF during Guacd handshake while waiting for '{}' (incomplete data in buffer)", expected_opcode));
-                }
-                Ok(n_read) => {
-                    if handshake_buffer.capacity() < *current_buffer_len + n_read {
-                        handshake_buffer
-                            .reserve(*current_buffer_len + n_read - handshake_buffer.capacity());
-                    }
-                    handshake_buffer.put_slice(&temp_read_buf[..n_read]);
-                    *current_buffer_len += n_read;
-                    if unlikely!(should_log_connection(false)) {
-                        debug!("Read more data for handshake, waiting for '{}' (channel_id: {}, conn_no: {}, bytes_read: {}, new_buffer_len: {})", expected_opcode, channel_id, conn_no, n_read, *current_buffer_len);
-                    }
-                }
-                Err(e) => {
-                    error!("Read error waiting for Guacd instruction (channel_id: {}, expected_opcode: {}, error: {})", channel_id, expected_opcode, e);
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-    let mut guacd_params_locked = guacd_params_arc.lock().await;
-
-    // --- RDP username/domain splitting logic ---
-    if let Some(protocol) = guacd_params_locked.get("protocol") {
-        if protocol.eq_ignore_ascii_case("rdp") {
-            if let Some(username) = guacd_params_locked.get("username").cloned() {
-                // Only split on backslash if it's NOT Azure AD format
-                if username.starts_with("AzureAD\\") || username.starts_with(".\\AzureAD\\") {
-                    if unlikely!(should_log_connection(false)) {
-                        debug!("Azure AD format detected - setting security to aad (channel_id: {}, conn_no: {}, username: {})", channel_id, conn_no, username);
-                    }
-                    guacd_params_locked.insert("security".to_string(), "aad".to_string());
-                } else if let Some(pos) = username.find('\\') {
-                    let domain = &username[..pos];
-                    let user = &username[pos + 1..];
-                    if unlikely!(should_log_connection(false)) {
-                        debug!("Traditional domain found - splitting (channel_id: {}, conn_no: {}, domain: {}, username: {})", channel_id, conn_no, domain, user);
-                    }
-                    guacd_params_locked.insert("username".to_string(), user.to_string());
-                    guacd_params_locked.insert("domain".to_string(), domain.to_string());
-                }
-            }
-        }
-    }
-
-    let protocol_name_from_params = guacd_params_locked.get("protocol").cloned().unwrap_or_else(|| {
-        warn!("Guacd 'protocol' missing in guacd_params, defaulting to 'rdp' for select fallback. (channel_id: {})", channel_id);
-        "rdp".to_string()
-    });
-
-    let join_connection_id_key = "connectionid";
-    let join_connection_id_opt = guacd_params_locked.get(join_connection_id_key).cloned();
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Checked for join connection ID in guacd_params (channel_id: {}, key_looked_up: {})",
-            channel_id, join_connection_id_key
-        );
-    }
-
-    let select_arg: String;
-    if let Some(id_to_join) = &join_connection_id_opt {
-        if unlikely!(should_log_connection(false)) {
-            debug!("Guacd Handshake: Preparing to join existing session. (channel_id: {}, session_to_join: {})", channel_id, id_to_join);
-        }
-        select_arg = id_to_join.clone();
-    } else {
-        if unlikely!(should_log_connection(false)) {
-            debug!("Guacd Handshake: Preparing for new session with protocol. (channel_id: {}, protocol: {})", channel_id, protocol_name_from_params);
-        }
-        select_arg = protocol_name_from_params;
-    }
-
-    let readonly_param_key = "readonly";
-    let readonly_param_value_from_map = guacd_params_locked.get(readonly_param_key).cloned();
-    if unlikely!(should_log_connection(false)) {
-        debug!("Initial 'readonly' value from guacd_params_locked for join attempt. (channel_id: {}, readonly_param_value_from_map: {:?})", channel_id, readonly_param_value_from_map);
-    }
-
-    let readonly_str_for_join =
-        readonly_param_value_from_map.unwrap_or_else(|| "false".to_string());
-    if unlikely!(should_log_connection(false)) {
-        debug!("Effective 'readonly_str_for_join' (after unwrap_or_else) for join attempt. (channel_id: {}, readonly_str_for_join: {})", channel_id, readonly_str_for_join);
-    }
-
-    let is_readonly = readonly_str_for_join.eq_ignore_ascii_case("true");
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Final 'is_readonly' boolean for join attempt. (channel_id: {}, is_readonly_bool: {})",
-            channel_id, is_readonly
-        );
-    }
-
-    let width_for_new = guacd_params_locked
-        .get("width")
-        .cloned()
-        .unwrap_or_else(|| "1024".to_string());
-    let height_for_new = guacd_params_locked
-        .get("height")
-        .cloned()
-        .unwrap_or_else(|| "768".to_string());
-    let dpi_for_new = guacd_params_locked
-        .get("dpi")
-        .cloned()
-        .unwrap_or_else(|| "96".to_string());
-    let audio_mimetypes_str_for_new = guacd_params_locked
-        .get("audio")
-        .cloned()
-        .unwrap_or_default();
-    let video_mimetypes_str_for_new = guacd_params_locked
-        .get("video")
-        .cloned()
-        .unwrap_or_default();
-    let image_mimetypes_str_for_new = guacd_params_locked
-        .get("image")
-        .cloned()
-        .unwrap_or_default();
-
-    let mut connect_params_for_new_conn: HashMap<String, String> =
-        if join_connection_id_opt.is_none() {
-            guacd_params_locked.clone()
-        } else {
-            HashMap::new()
-        };
-    drop(guacd_params_locked);
-
-    // Ensure width, height, and dpi are in connect params (needed for guacd connect instruction)
-    // These may have been extracted with defaults if not originally in guacd_params
-    if join_connection_id_opt.is_none() {
-        connect_params_for_new_conn.insert("width".to_string(), width_for_new.clone());
-        connect_params_for_new_conn.insert("height".to_string(), height_for_new.clone());
-        connect_params_for_new_conn.insert("dpi".to_string(), dpi_for_new.clone());
-    }
-
-    let select_instruction = GuacdInstruction::new("select".to_string(), vec![select_arg.clone()]);
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd Handshake: Sending 'select' (channel_id: {}, instruction: {:?})",
-            channel_id, select_instruction
-        );
-    }
-    writer
-        .write_all(&GuacdParser::guacd_encode_instruction(&select_instruction))
-        .await?;
-    writer.flush().await?;
-
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd Handshake: Waiting for 'args' (channel_id: {})",
-            channel_id
-        );
-    }
-    let args_instruction = read_expected_instruction_stateless(
-        reader,
-        &mut handshake_buffer,
-        &mut current_handshake_buffer_len,
-        channel_id,
-        conn_no,
-        "args",
-        dc,
-        &buffer_pool,
-    )
-    .await?;
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd Handshake: Received 'args' from Guacd server (channel_id: {}, received_args: {:?})",
-            channel_id, args_instruction.args
-        );
-    }
-
-    const EXPECTED_GUACD_VERSION: &str = "VERSION_1_5_0";
-    let connect_version_arg = args_instruction.args.first().cloned().unwrap_or_else(|| {
-        warn!(
-            "'args' instruction missing version, defaulting to {} (channel_id: {}, conn_no: {})",
-            EXPECTED_GUACD_VERSION, channel_id, conn_no
-        );
-        EXPECTED_GUACD_VERSION.to_string()
-    });
-    if connect_version_arg != EXPECTED_GUACD_VERSION {
-        warn!("Guacd version mismatch. Expected: '{}', Received: '{}'. Proceeding with received version for connect. (channel_id: {}, conn_no: {})", EXPECTED_GUACD_VERSION, connect_version_arg, channel_id, conn_no);
-    }
-
-    let mut connect_args: Vec<String> = Vec::new();
-    connect_args.push(connect_version_arg);
-
-    if join_connection_id_opt.is_some() {
-        info!(
-            "Guacd Handshake: Preparing 'connect' for JOINING session. (channel_id: {})",
-            channel_id
-        );
-        let is_readonly = readonly_str_for_join.eq_ignore_ascii_case("true");
-        if unlikely!(should_log_connection(false)) {
-            debug!("Readonly status for join. (channel_id: {}, requested_readonly_param: {}, is_readonly_for_connect: {})", channel_id, readonly_str_for_join, is_readonly);
-        }
-
-        for (idx, arg_name_from_guacd) in args_instruction.args.iter().enumerate() {
-            if idx == 0 {
-                continue;
-            }
-
-            let is_readonly_arg_name_literal = "read-only";
-            let is_current_arg_readonly_keyword =
-                arg_name_from_guacd == is_readonly_arg_name_literal;
-
-            if unlikely!(should_log_connection(false)) {
-                debug!("Looping for connect_args (join). Comparing '{}' with '{}' (channel_id: {}, conn_no: {}, current_arg_name_from_guacd: {}, is_readonly_param_from_config: {}, is_current_arg_the_readonly_keyword: {})", arg_name_from_guacd, is_readonly_arg_name_literal, channel_id, conn_no, arg_name_from_guacd, is_readonly, is_current_arg_readonly_keyword);
-            }
-
-            if is_current_arg_readonly_keyword {
-                let value_to_push = if is_readonly {
-                    "true".to_string()
-                } else {
-                    "".to_string()
-                };
-                if unlikely!(should_log_connection(false)) {
-                    debug!("Pushing to connect_args for 'read-only' keyword (channel_id: {}, conn_no: {}, arg_name_being_processed: {}, is_readonly_flag_for_push: {}, value_being_pushed_for_readonly_arg: {})", channel_id, conn_no, arg_name_from_guacd, is_readonly, value_to_push);
-                }
-                connect_args.push(value_to_push);
-            } else {
-                connect_args.push("".to_string());
-            }
-        }
-    } else {
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Guacd Handshake: Preparing 'connect' for NEW session. (channel_id: {})",
-                channel_id
-            );
-        }
-
-        let parse_mimetypes = |mimetype_str: &str| -> Vec<String> {
-            if mimetype_str.is_empty() {
-                return Vec::new();
-            }
-            serde_json::from_str::<Vec<String>>(mimetype_str)
-                .unwrap_or_else(|e| {
-                    if unlikely!(should_log_connection(false)) {
-                        debug!("Failed to parse mimetype string '{}' as JSON array, splitting by comma as fallback. (channel_id: {}, conn_no: {}, error: {})", mimetype_str, channel_id, conn_no, e);
-                    }
-                    mimetype_str.split(',').map(String::from).filter(|s| !s.is_empty()).collect()
-                })
-        };
-
-        // Standard guacd size instruction: size,<width>,<height>;
-        // DPI is passed via connection parameters only, not in size instruction
-        let size_parts: Vec<String> = width_for_new
-            .split(',')
-            .chain(height_for_new.split(','))
-            // DPI is sent in the connect instruction as a parameter, not in the size instruction
-            .map(String::from)
-            .collect();
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Guacd Handshake (new): Sending 'size' (channel_id: {})",
-                channel_id
-            );
-        }
-
-        // **HANDSHAKE SIZE INSTRUCTION DETECTION**: Log for debugging (no Python signal)
-        let size_instruction = GuacdInstruction::new("size".to_string(), size_parts.clone());
-        if size_parts.len() >= 2 && unlikely!(should_log_connection(false)) {
-            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {}) - DPI will be sent separately in connect instruction", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), dpi_for_new);
-        }
-
-        writer
-            .write_all(&GuacdParser::guacd_encode_instruction(&size_instruction))
-            .await?;
-        writer.flush().await?;
-
-        let audio_mimetypes = parse_mimetypes(&audio_mimetypes_str_for_new);
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Guacd Handshake (new): Sending 'audio' (channel_id: {})",
-                channel_id
-            );
-        }
-        writer
-            .write_all(&GuacdParser::guacd_encode_instruction(
-                &GuacdInstruction::new("audio".to_string(), audio_mimetypes),
-            ))
-            .await?;
-        writer.flush().await?;
-
-        let video_mimetypes = parse_mimetypes(&video_mimetypes_str_for_new);
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Guacd Handshake (new): Sending 'video' (channel_id: {})",
-                channel_id
-            );
-        }
-        writer
-            .write_all(&GuacdParser::guacd_encode_instruction(
-                &GuacdInstruction::new("video".to_string(), video_mimetypes),
-            ))
-            .await?;
-        writer.flush().await?;
-
-        let image_mimetypes = parse_mimetypes(&image_mimetypes_str_for_new);
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Guacd Handshake (new): Sending 'image' (channel_id: {})",
-                channel_id
-            );
-        }
-        writer
-            .write_all(&GuacdParser::guacd_encode_instruction(
-                &GuacdInstruction::new("image".to_string(), image_mimetypes),
-            ))
-            .await?;
-        writer.flush().await?;
-
-        // Pre-normalize config keys once for efficient lookup
-        let normalized_config_map: HashMap<String, String> = connect_params_for_new_conn
-            .iter()
-            .map(|(key, value)| {
-                let normalized_key = key.replace(&['-', '_'][..], "").to_ascii_lowercase();
-                (normalized_key, value.clone())
-            })
-            .collect();
-
-        for arg_name_from_guacd in args_instruction.args.iter().skip(1) {
-            // Normalize the guacd parameter name by removing hyphens/underscores and converting to lowercase
-            let normalized_guacd_param = arg_name_from_guacd
-                .replace(&['-', '_'][..], "")
-                .to_ascii_lowercase();
-
-            // Look up the parameter value using the normalized key
-            let param_value = normalized_config_map
-                .get(&normalized_guacd_param)
-                .cloned()
-                .unwrap_or_else(String::new);
-
-            connect_args.push(param_value);
-        }
-    }
-
-    let connect_instruction = GuacdInstruction::new("connect".to_string(), connect_args.clone());
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd Handshake: Sending 'connect' (channel_id: {})",
-            channel_id
-        );
-    }
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd Handshake: params (channel_id: {}, instruction: {:?})",
-            channel_id, connect_instruction
-        );
-    }
-    writer
-        .write_all(&GuacdParser::guacd_encode_instruction(&connect_instruction))
-        .await?;
-    writer.flush().await?;
-
-    if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd Handshake: Waiting for 'ready' (channel_id: {})",
-            channel_id
-        );
-    }
-    let ready_instruction = read_expected_instruction_stateless(
-        reader,
-        &mut handshake_buffer,
-        &mut current_handshake_buffer_len,
-        channel_id,
-        conn_no,
-        "ready",
-        dc,
-        &buffer_pool,
-    )
-    .await?;
-    if let Some(client_id_from_ready) = ready_instruction.args.first() {
-        if unlikely!(should_log_connection(false)) {
-            debug!(
-                "Guacd handshake completed. (channel_id: {}, guacd_client_id: {})",
-                channel_id, client_id_from_ready
-            );
-        }
-    } else if unlikely!(should_log_connection(false)) {
-        debug!(
-            "Guacd handshake completed. No client ID received with 'ready'. (channel_id: {})",
-            channel_id
-        );
-    }
-    buffer_pool.release(handshake_buffer);
     Ok(())
 }
 

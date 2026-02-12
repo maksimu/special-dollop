@@ -1,7 +1,7 @@
-use crate::channel::guacd_parser::{GuacdInstruction, GuacdParser, GuacdParserError, PeekError};
 use anyhow::anyhow;
 use bytes::Bytes;
 use bytes::BytesMut;
+use guacr_protocol::{GuacdInstruction, GuacdParser, GuacdParserError, PeekError};
 
 #[test]
 fn test_guacd_decode_simple() {
@@ -1327,7 +1327,7 @@ fn test_peek_instruction_multiple_empty_args() {
 
 #[test]
 fn test_expandable_opcode_detection() {
-    use crate::channel::guacd_parser::{GuacdParser, OpcodeAction, SpecialOpcode};
+    use guacr_protocol::{GuacdParser, OpcodeAction, SpecialOpcode};
 
     // Test size instruction detection
     let size_instruction = b"4.size,2.10,3.720,3.480;";
@@ -1694,7 +1694,7 @@ fn test_validate_and_detect_special_with_utf8() {
     match GuacdParser::validate_and_detect_special(utf8_instruction.as_bytes()) {
         Ok((len, action)) => {
             assert_eq!(len, utf8_instruction.len());
-            assert_eq!(action, crate::channel::guacd_parser::OpcodeAction::Normal);
+            assert_eq!(action, guacr_protocol::OpcodeAction::Normal);
         }
         Err(e) => panic!("UTF-8 validate_and_detect_special failed: {:?}", e),
     }
@@ -1706,9 +1706,7 @@ fn test_validate_and_detect_special_with_utf8() {
             assert_eq!(len, size_instruction.len());
             assert_eq!(
                 action,
-                crate::channel::guacd_parser::OpcodeAction::ProcessSpecial(
-                    crate::channel::guacd_parser::SpecialOpcode::Size
-                )
+                guacr_protocol::OpcodeAction::ProcessSpecial(guacr_protocol::SpecialOpcode::Size)
             );
         }
         Err(e) => panic!("UTF-8 size validate_and_detect_special failed: {:?}", e),

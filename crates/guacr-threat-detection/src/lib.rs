@@ -9,6 +9,8 @@
 
 mod approval;
 mod baml_client;
+#[cfg(feature = "onnx-classifier")]
+mod classifier;
 mod command_buffer;
 mod detector;
 mod proactive;
@@ -19,14 +21,19 @@ mod threat;
 pub use approval::{ApprovalDecision, ApprovalManager};
 pub use baml_client::{Analysis, CommandSummaryResponse, KeystrokeAnalysisResponse};
 pub use command_buffer::CommandBuffer;
-pub use detector::{ThreatDetector, ThreatDetectorConfig};
+pub use detector::{should_trigger_analysis, ThreatDetector, ThreatDetectorConfig};
 pub use proactive::{
     handle_proactive_input, parse_proactive_config, ProactiveConfig, ProactiveResult,
     KEYSYM_BACKSPACE, KEYSYM_CTRL_C, KEYSYM_CTRL_D, KEYSYM_CTRL_Z, KEYSYM_DELETE, KEYSYM_RETURN,
 };
 pub use session_guard::SessionGuard;
 pub use terminal_state::{TerminalStateContext, TerminalStateExtractor, UserBehaviorMetrics};
-pub use threat::{ThreatLevel, ThreatResult};
+pub use threat::{
+    AnalysisRecord, RiskSource, TagMatch, TagMatches, TerminationPolicy, ThreatLevel, ThreatResult,
+};
+
+#[cfg(feature = "onnx-classifier")]
+pub use classifier::ActionEffectClassifier;
 
 use thiserror::Error;
 

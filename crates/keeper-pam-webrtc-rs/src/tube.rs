@@ -65,7 +65,7 @@ pub struct Tube {
     pub(crate) client_version: Arc<TokioRwLock<Option<String>>>,
 
     // Protocol handler registry (for built-in guacr handlers)
-    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    pub(crate) handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
 
     // ============================================================================
     // RAII PATTERN: Lifecycle-bound resources owned by Tube
@@ -131,7 +131,7 @@ impl Tube {
         signal_sender: Option<UnboundedSender<SignalMessage>>,
         custom_tube_id: Option<String>,
         capabilities: crate::tube_protocol::Capabilities,
-        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+        handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
     ) -> Result<Arc<Self>> {
         let id = custom_tube_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let runtime = get_runtime();

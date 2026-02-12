@@ -4,7 +4,8 @@
 // the EventCallback pattern. Falls back to channel-based interface for backwards
 // compatibility if handlers don't support EventBasedHandler trait yet.
 
-use guacr::{async_trait, EventCallback, HandlerError, HandlerEvent, ProtocolHandlerRegistry};
+use async_trait::async_trait;
+use guacr_handlers::{EventCallback, HandlerError, HandlerEvent, ProtocolHandlerRegistry};
 
 use crate::channel::core::Channel;
 use crate::models::ConversationType;

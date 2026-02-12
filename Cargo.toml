@@ -16,6 +16,9 @@ members = [
     "crates/guacr-threat-detection",
     "crates/guacr-tn3270",
     "crates/guacr-tn5250",
+    "crates/guacr-recording",
+    "crates/guacr-guacd",
+    "crates/pam-socks5",
 ]
 resolver = "2"
 

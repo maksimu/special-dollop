@@ -17,8 +17,9 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 // Sync flow control (shared with RDP/VNC) and session lifecycle
 use guacr_handlers::{
-    send_cursor_instructions, send_disconnect, send_name, send_ready, CursorManager,
-    MultiFormatRecorder, RecordingConfig, RecordingDirection, StandardCursor, SyncFlowControl,
+    record_client_input as shared_record_client_input, send_cursor_instructions, send_disconnect,
+    send_name, send_ready, CursorManager, MultiFormatRecorder, RecordingConfig, RecordingDirection,
+    StandardCursor, SyncFlowControl,
 };
 use std::collections::HashMap;
 
@@ -459,6 +460,7 @@ impl BrowserClient {
                                 if let Some(instr) = self.clipboard.handle_browser_clipboard(
                                     text.as_bytes(), "text/plain"
                                 ).ok().flatten() {
+                                    self.record_server_instruction(&instr);
                                     if let Err(e) = to_client.send(instr).await {
                                         warn!("RBI: Failed to send clipboard: {}", e);
                                     }
@@ -553,6 +555,7 @@ impl BrowserClient {
                                 info!("RBI: File chooser opened - multiple={}", request.multiple);
                                 // Send upload dialog request to client
                                 let instr = format_upload_dialog_instruction(&request);
+                                self.record_server_instruction(&instr);
                                 if let Err(e) = to_client.send(instr).await {
                                     warn!("RBI: Failed to send upload dialog: {}", e);
                                 }
@@ -628,7 +631,9 @@ impl BrowserClient {
                                                             "size",
                                                             &["0", &w.to_string(), &h.to_string()],
                                                         );
-                                                        if let Err(e) = to_client.send(Bytes::from(size_instr)).await {
+                                                        let size_bytes = Bytes::from(size_instr);
+                                                        self.record_server_instruction(&size_bytes);
+                                                        if let Err(e) = to_client.send(size_bytes).await {
                                                             warn!("RBI: Failed to send size confirmation: {}", e);
                                                         }
                                                     }
@@ -888,7 +893,9 @@ impl BrowserClient {
                                 stream_id.len(),
                                 stream_id
                             );
-                            let _ = to_client.send(Bytes::from(ack)).await;
+                            let ack_bytes = Bytes::from(ack);
+                            self.record_server_instruction(&ack_bytes);
+                            let _ = to_client.send(ack_bytes).await;
                         }
                     }
                 }
@@ -1095,13 +1102,7 @@ impl BrowserClient {
 
     /// Record a client-to-server instruction (if recording is enabled)
     fn record_client_input(&mut self, instruction: &Bytes) {
-        if let Some(ref mut recorder) = self.recorder {
-            if let Err(e) =
-                recorder.record_instruction(RecordingDirection::ClientToServer, instruction)
-            {
-                warn!("RBI: Failed to record client input: {}", e);
-            }
-        }
+        shared_record_client_input(&mut self.recorder, instruction);
     }
 }
 

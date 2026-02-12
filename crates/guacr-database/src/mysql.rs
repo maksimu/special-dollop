@@ -15,7 +15,7 @@ use crate::csv_import::CsvImporter;
 use crate::query_executor::{execute_with_timing, QueryExecutor};
 use crate::recording::{
     finalize_recording, init_recording, record_error_output, record_query_input,
-    record_query_output,
+    record_query_output, send_and_record,
 };
 use crate::security::{
     check_csv_export_allowed, check_csv_import_allowed, check_query_allowed, is_mysql_export_query,
@@ -334,7 +334,7 @@ impl ProtocolHandler for MySqlHandler {
                         debug!("MySQL: Sending {} instructions from debounce", instructions.len());
                         for instr in instructions {
                             // Break if send fails (client disconnected)
-                            if to_client.send(instr).await.is_err() {
+                            if send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("MySQL: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -472,10 +472,9 @@ impl ProtocolHandler for MySqlHandler {
                             .await
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in result_instructions {
-                            to_client
-                                .send(instr)
+                            send_and_record(&to_client, &mut recorder, instr)
                                 .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                .map_err(HandlerError::ChannelError)?;
                         }
                         continue;
                     }
@@ -483,10 +482,7 @@ impl ProtocolHandler for MySqlHandler {
                     if needs_render {
                         // Render immediately for special cases (Enter, Escape, etc.)
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            let _ = send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                     // For regular keystrokes, debounce timer will handle rendering

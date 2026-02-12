@@ -9,6 +9,9 @@ use guacr_handlers::{
     parse_end_instruction,
     parse_pipe_instruction,
     pipe_blob_bytes,
+    // Recording helpers
+    record_client_input,
+    send_and_record,
     // Session lifecycle
     send_bell,
     send_disconnect,
@@ -715,10 +718,9 @@ impl ProtocolHandler for SshHandler {
         if enable_pipe {
             info!("SSH: Pipe streams enabled - opening STDOUT pipe for native terminal display");
             let pipe_instr = pipe_manager.enable_stdout();
-            to_client
-                .send(Bytes::from(pipe_instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(pipe_instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
         }
 
         // Send ready and name instructions to signal the connection is established
@@ -732,10 +734,9 @@ impl ProtocolHandler for SshHandler {
             .send_standard_cursor(StandardCursor::IBeam)
             .map_err(|e| HandlerError::ProtocolError(format!("Cursor error: {}", e)))?;
         for instr in cursor_instrs {
-            to_client
-                .send(Bytes::from(instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
         }
 
         // CRITICAL: Send size instruction to initialize display dimensions
@@ -746,10 +747,9 @@ impl ProtocolHandler for SshHandler {
             width_px, height_px, cols, rows
         );
         let size_instr = TerminalRenderer::format_size_instruction(0, width_px, height_px);
-        to_client
-            .send(Bytes::from(size_instr))
+        send_and_record(&to_client, &mut recorder, Bytes::from(size_instr))
             .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            .map_err(HandlerError::ChannelError)?;
 
         debug!("SSH: Display initialized");
 
@@ -784,18 +784,16 @@ impl ProtocolHandler for SshHandler {
                 0, // y
                 "image/jpeg",
             );
-            to_client
-                .send(img_instr.freeze())
+            send_and_record(&to_client, &mut recorder, img_instr.freeze())
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
 
             // Send blob chunks + end instruction
             let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
             for instr in blob_instructions {
-                to_client
-                    .send(Bytes::from(instr))
+                send_and_record(&to_client, &mut recorder, Bytes::from(instr))
                     .await
-                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                    .map_err(HandlerError::ChannelError)?;
             }
 
             let sync_instr = renderer.format_sync_instruction(
@@ -804,10 +802,9 @@ impl ProtocolHandler for SshHandler {
                     .unwrap()
                     .as_millis() as u64,
             );
-            to_client
-                .send(Bytes::from(sync_instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
 
             terminal.clear_dirty();
             debug!("SSH: Banner rendered immediately at initial size");
@@ -891,13 +888,13 @@ impl ProtocolHandler for SshHandler {
                         let img_instr = protocol_encoder.format_img_instruction(
                             stream_id, 0, 0, 0, "image/jpeg",
                         );
-                        to_client.send(img_instr.freeze()).await
-                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                        send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                            .map_err(HandlerError::ChannelError)?;
 
                         let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                         for instr in blob_instructions {
-                            to_client.send(Bytes::from(instr)).await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                .map_err(HandlerError::ChannelError)?;
                         }
 
                         let sync_instr = renderer.format_sync_instruction(
@@ -906,8 +903,8 @@ impl ProtocolHandler for SshHandler {
                                 .unwrap()
                                 .as_millis() as u64
                         );
-                        to_client.send(Bytes::from(sync_instr)).await
-                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                        send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                            .map_err(HandlerError::ChannelError)?;
 
                         terminal.clear_dirty();
                     } else {
@@ -975,13 +972,13 @@ impl ProtocolHandler for SshHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 } else {
                                     // Large region - render full screen
@@ -1005,13 +1002,13 @@ impl ProtocolHandler for SshHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, 0, 0, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                             }
@@ -1022,8 +1019,8 @@ impl ProtocolHandler for SshHandler {
                                     .unwrap()
                                     .as_millis() as u64
                             );
-                            to_client.send(Bytes::from(sync_instr)).await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                                .map_err(HandlerError::ChannelError)?;
                         } else {
                             // Dirty tracker failed to find changes (cursor movement, small updates)
                             // Fall back to full screen render to prevent "one char behind" bug
@@ -1049,13 +1046,13 @@ impl ProtocolHandler for SshHandler {
                             let img_instr = protocol_encoder.format_img_instruction(
                                 stream_id, 0, 0, 0, "image/jpeg",
                             );
-                            to_client.send(img_instr.freeze()).await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                .map_err(HandlerError::ChannelError)?;
 
                             let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                             for instr in blob_instructions {
-                                to_client.send(Bytes::from(instr)).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
 
                             let sync_instr = renderer.format_sync_instruction(
@@ -1064,8 +1061,8 @@ impl ProtocolHandler for SshHandler {
                                     .unwrap()
                                     .as_millis() as u64
                             );
-                            to_client.send(Bytes::from(sync_instr)).await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                                .map_err(HandlerError::ChannelError)?;
                         }
 
                         terminal.clear_dirty();
@@ -1083,8 +1080,8 @@ impl ProtocolHandler for SshHandler {
                             // This enables native terminal display (with ANSI escape codes)
                             if pipe_manager.is_stdout_enabled() {
                                 let blob = pipe_blob_bytes(PIPE_STREAM_STDOUT, data);
-                                to_client.send(blob).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, blob).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
 
                             // Check for OSC 52 clipboard sequences before processing
@@ -1104,8 +1101,8 @@ impl ProtocolHandler for SshHandler {
                                         "9.clipboard,1.{},10.text/plain;",
                                         clipboard_stream_id
                                     );
-                                    to_client.send(Bytes::from(clipboard_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(clipboard_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     // 2. Send data as blob on the stream
                                     let blob_instr = format!(
@@ -1114,13 +1111,13 @@ impl ProtocolHandler for SshHandler {
                                         clipboard_data.len(),
                                         clipboard_data
                                     );
-                                    to_client.send(Bytes::from(blob_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(blob_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     // 3. Close the stream
                                     let end_instr = format!("3.end,1.{};", clipboard_stream_id);
-                                    to_client.send(Bytes::from(end_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(end_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
                                 }
                             }
 
@@ -1182,13 +1179,13 @@ impl ProtocolHandler for SshHandler {
                                         let img_instr = protocol_encoder.format_img_instruction(
                                             stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                         );
-                                        to_client.send(img_instr.freeze()).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                            .map_err(HandlerError::ChannelError)?;
 
                                         let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                         for instr in blob_instructions {
-                                            to_client.send(Bytes::from(instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
                                         }
                                     } else {
                                         // Large change (e.g., scroll) - render full screen
@@ -1208,13 +1205,13 @@ impl ProtocolHandler for SshHandler {
                                         let img_instr = protocol_encoder.format_img_instruction(
                                             stream_id, 0, 0, 0, "image/jpeg",
                                         );
-                                        to_client.send(img_instr.freeze()).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                            .map_err(HandlerError::ChannelError)?;
 
                                         let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                         for instr in blob_instructions {
-                                            to_client.send(Bytes::from(instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
                                         }
                                     }
 
@@ -1224,8 +1221,8 @@ impl ProtocolHandler for SshHandler {
                                             .unwrap()
                                             .as_millis() as u64
                                     );
-                                    to_client.send(Bytes::from(sync_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     terminal.clear_dirty();
                                 } else {
@@ -1250,13 +1247,13 @@ impl ProtocolHandler for SshHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, 0, 0, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
 
                                     let sync_instr = renderer.format_sync_instruction(
@@ -1265,8 +1262,8 @@ impl ProtocolHandler for SshHandler {
                                             .unwrap()
                                             .as_millis() as u64
                                     );
-                                    to_client.send(Bytes::from(sync_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     terminal.clear_dirty();
                                 }
@@ -1300,6 +1297,9 @@ impl ProtocolHandler for SshHandler {
                         // No need to send error - client already disconnected
                         break;
                     };
+
+                    // Record client-to-server instruction in .ses file
+                    record_client_input(&mut recorder, &msg);
 
                     // Parse Guacamole instruction
                     let msg_str = String::from_utf8_lossy(&msg);
@@ -1421,8 +1421,8 @@ impl ProtocolHandler for SshHandler {
                                 current_rows,
                             );
                             for instr in overlay {
-                                to_client.send(Bytes::from(instr)).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
 
                             // Extract all text and send to clipboard
@@ -1440,16 +1440,16 @@ impl ProtocolHandler for SshHandler {
                                 let clipboard_stream_id = 10;
                                 let clipboard_instructions = format_clipboard_instructions(&text, clipboard_stream_id);
                                 for instr in clipboard_instructions {
-                                    to_client.send(Bytes::from(instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
                                 }
                             }
 
                             // Clear overlay after a brief visual flash
                             let clear = format_clear_selection_instructions();
                             for instr in clear {
-                                to_client.send(Bytes::from(instr)).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
 
                             continue;
@@ -1586,8 +1586,8 @@ impl ProtocolHandler for SshHandler {
 
                                             // Send size instruction to client
                                             let size_instr = TerminalRenderer::format_size_instruction(0, aligned_width, aligned_height);
-                                            to_client.send(Bytes::from(size_instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(size_instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
 
                                             // Force full screen render after resize
                                             let quality = adaptive_quality.calculate_quality();
@@ -1610,13 +1610,13 @@ impl ProtocolHandler for SshHandler {
                                             let img_instr = protocol_encoder.format_img_instruction(
                                                 stream_id, 0, 0, 0, "image/jpeg",
                                             );
-                                            to_client.send(img_instr.freeze()).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                                .map_err(HandlerError::ChannelError)?;
 
                                             let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                             for instr in blob_instructions {
-                                                to_client.send(Bytes::from(instr)).await
-                                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                                send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                                    .map_err(HandlerError::ChannelError)?;
                                             }
 
                                             let sync_instr = renderer.format_sync_instruction(
@@ -1625,8 +1625,8 @@ impl ProtocolHandler for SshHandler {
                                                     .unwrap()
                                                     .as_millis() as u64
                                             );
-                                            to_client.send(Bytes::from(sync_instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
 
                                             terminal.clear_dirty();
                                         }
@@ -1686,8 +1686,8 @@ impl ProtocolHandler for SshHandler {
                                 SelectionResult::InProgress(overlay_instructions) => {
                                     // Send blue semi-transparent selection overlay
                                     for instr in overlay_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                                 SelectionResult::Complete { text: selected_text, clear_instructions } => {
@@ -1699,8 +1699,8 @@ impl ProtocolHandler for SshHandler {
 
                                         // Still clear the overlay even if copy is blocked
                                         for instr in clear_instructions {
-                                            to_client.send(Bytes::from(instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
                                         }
                                         continue;
                                     }
@@ -1716,8 +1716,8 @@ impl ProtocolHandler for SshHandler {
 
                                     // Clear the overlay
                                     for instr in clear_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
 
                                     // Send to client as clipboard using shared formatter
@@ -1727,8 +1727,8 @@ impl ProtocolHandler for SshHandler {
                                     info!("SSH: Sending {} clipboard instructions for {} chars to UI", clipboard_instructions.len(), selected_text.len());
                                     for instr in clipboard_instructions {
                                         debug!("SSH: Sending clipboard instruction: {}", instr);
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                     info!("SSH: Clipboard instructions sent successfully to UI");
                                 }
@@ -1775,7 +1775,7 @@ impl ProtocolHandler for SshHandler {
         // Close any open pipe streams
         let end_instructions = pipe_manager.close_all();
         for instr in end_instructions {
-            let _ = to_client.send(Bytes::from(instr)).await;
+            let _ = send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await;
         }
 
         // Finalize recording

@@ -42,6 +42,9 @@ sha2 = "0.10"
 # Secure temp directory creation for session isolation
 tempfile = "3"
 
+# Threat detection (optional)
+guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }
+
 # Unix system calls for profile locking and DBus isolation
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -53,3 +56,4 @@ default = ["chrome"]
 # Build with: cargo build --features chrome
 # Requires Chrome/Chromium installed on the system at runtime
 chrome = ["chromiumoxide", "reqwest"]
+threat-detection = ["guacr-threat-detection"]

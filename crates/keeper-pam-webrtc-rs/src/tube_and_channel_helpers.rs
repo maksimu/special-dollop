@@ -51,7 +51,7 @@ pub(crate) async fn setup_channel_for_data_channel(
     client_version: String,
     capabilities: crate::tube_protocol::Capabilities,
     python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
-    handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
     spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> anyhow::Result<Channel> {
     // Create a channel to receive messages from the data channel

@@ -124,7 +124,7 @@ struct RegistryActor {
     stale_tubes_removed: Arc<AtomicUsize>,
     close_timeouts: Arc<AtomicUsize>,
     /// Protocol handler registry (for built-in guacr handlers)
-    handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
 }
 
 // ============================================================================
@@ -343,7 +343,7 @@ impl RegistryActor {
     fn new(
         command_rx: mpsc::UnboundedReceiver<RegistryCommand>,
         max_concurrent: usize,
-        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+        handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
     ) -> Self {
         Self {
             tubes: Arc::new(DashMap::new()),
@@ -866,6 +866,12 @@ impl RegistryActor {
                             "Reusing pooled TURN connection (tube_id: {}, username: {})",
                             tube_id, existing_conn.username
                         );
+                        if unlikely!(crate::logger::is_verbose_logging()) {
+                            debug!(
+                                "Pooled TURN credentials (tube_id: {}, username: {}, password: {})",
+                                tube_id, existing_conn.username, existing_conn.password
+                            );
+                        }
                         ice_servers.push(RTCIceServer {
                             urls: vec![format!("turn:{}", krelay_server)],
                             username: existing_conn.username,
@@ -910,6 +916,12 @@ impl RegistryActor {
 
                                     debug!("Created new TURN connection in pool (tube_id: {}, username: {})",
                                            tube_id, username);
+                                    if unlikely!(crate::logger::is_verbose_logging()) {
+                                        debug!(
+                                            "Fresh TURN credentials (tube_id: {}, username: {}, password: {})",
+                                            tube_id, username, password
+                                        );
+                                    }
                                     ice_servers.push(RTCIceServer {
                                         urls: vec![format!("turn:{}", krelay_server)],
                                         username: username.to_string(),
@@ -974,7 +986,7 @@ pub struct RegistryHandle {
     conversations: Arc<DashMap<String, String>>,
     /// Protocol handler registry (for built-in guacr handlers)
     #[allow(dead_code)] // Used by Tube through RegistryActor
-    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    pub(crate) handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
 }
 
 impl RegistryHandle {
@@ -982,7 +994,7 @@ impl RegistryHandle {
         command_tx: mpsc::UnboundedSender<RegistryCommand>,
         tubes: Arc<DashMap<String, Arc<Tube>>>,
         conversations: Arc<DashMap<String, String>>,
-        handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+        handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
     ) -> Self {
         Self {
             command_tx,
@@ -1245,7 +1257,10 @@ pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     );
 
     // Initialize protocol handler registry (handlers remain dormant until use_guacr=true)
+    #[cfg(feature = "builtin-handlers")]
     let handler_registry = Some(crate::handler_integration::create_handler_registry());
+    #[cfg(not(feature = "builtin-handlers"))]
+    let handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>> = None;
 
     let actor = RegistryActor::new(command_rx, max_concurrent, handler_registry.clone());
     let tubes = Arc::clone(&actor.tubes);

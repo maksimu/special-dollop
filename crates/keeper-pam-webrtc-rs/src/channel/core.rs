@@ -31,10 +31,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 // Import from sibling modules
 use super::assembler::{has_fragment_header, FragmentBuffer, FragmentHeader, FRAGMENT_HEADER_SIZE};
 use super::frame_handling::handle_incoming_frame;
-use super::guacd_parser::{GuacdInstruction, GuacdParser};
 use super::utils::handle_ping_timeout;
 use crate::tube_protocol::Capabilities;
 use crate::tube_protocol::CloseConnectionReason as TubeCloseReason;
+use guacr_protocol::{GuacdInstruction, GuacdParser};
 
 /// Message types sent from Channel to Python handler
 #[derive(Debug, Clone)]
@@ -156,6 +156,8 @@ pub struct Channel {
     // Protocol handling integrated into Channel
     pub(crate) active_protocol: ActiveProtocol,
     pub(crate) protocol_state: ProtocolLogicState,
+    /// Tunnel protocol handler (SOCKS5 or PortForward) for trait-based dispatch
+    pub(crate) tunnel_protocol: Option<Arc<dyn super::tunnel_protocol::TunnelProtocol>>,
 
     // New fields for Guacd and ConnectAs specific settings
     pub(crate) guacd_host: Option<String>,
@@ -168,7 +170,7 @@ pub struct Channel {
     pub(crate) db_params: Arc<AsyncMutex<HashMap<String, String>>>,
 
     // Protocol handler registry and conversation type (for built-in handlers)
-    pub(crate) handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    pub(crate) handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
     #[allow(dead_code)]
     pub(crate) conversation_type: Option<ConversationType>,
 
@@ -229,7 +231,7 @@ pub struct ChannelParams {
     pub capabilities: Capabilities,
     /// Optional Python handler channel for PythonHandler protocol mode
     pub python_handler_tx: Option<mpsc::Sender<PythonHandlerMessage>>,
-    pub handler_registry: Option<Arc<guacr::ProtocolHandlerRegistry>>,
+    pub handler_registry: Option<Arc<guacr_handlers::ProtocolHandlerRegistry>>,
     /// Task completion tracking from Tube (for handler task monitoring)
     pub spawned_task_completion_tx: Arc<tokio::sync::mpsc::UnboundedSender<()>>,
 }
@@ -699,6 +701,41 @@ impl Channel {
             debug!("'connect_as_settings' key not found in protocol_settings. Using default. (channel_id: {})", channel_id);
         }
 
+        // Construct the tunnel protocol handler based on the determined protocol
+        let tunnel_protocol: Option<Arc<dyn super::tunnel_protocol::TunnelProtocol>> =
+            match determined_protocol {
+                ActiveProtocol::Socks5 => {
+                    Some(Arc::new(super::tunnel_protocol::Socks5TunnelProtocol))
+                }
+                ActiveProtocol::PortForward => {
+                    // Extract target from protocol state for client-mode PortForward
+                    if let ProtocolLogicState::PortForward(ref pf) = initial_protocol_state {
+                        if let (Some(ref host), Some(port)) = (&pf.target_host, pf.target_port) {
+                            Some(Arc::new(
+                                super::tunnel_protocol::PortForwardTunnelProtocol {
+                                    target_host: host.clone(),
+                                    target_port: port,
+                                },
+                            ))
+                        } else if server_mode {
+                            // Server-mode PortForward: target is resolved on the client side
+                            // Still use PortForwardTunnelProtocol for server_handshake (just splits stream)
+                            Some(Arc::new(
+                                super::tunnel_protocol::PortForwardTunnelProtocol {
+                                    target_host: String::new(),
+                                    target_port: 0,
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None, // Guacd, PythonHandler, DatabaseProxy don't use tunnel protocol
+            };
+
         let new_channel = Self {
             webrtc,
             conns: Arc::new(DashMap::new()),
@@ -726,6 +763,7 @@ impl Channel {
 
             active_protocol: determined_protocol,
             protocol_state: initial_protocol_state,
+            tunnel_protocol,
 
             guacd_host: guacd_host_setting,
             guacd_port: guacd_port_setting,

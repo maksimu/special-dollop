@@ -41,6 +41,7 @@ bitflags! {
 
 pub(crate) const CONN_NO_LEN: usize = 4;
 pub(crate) const CTRL_NO_LEN: usize = 2;
+#[cfg(test)]
 pub(crate) const PORT_LENGTH: usize = 2; // Standard u16 port numbers
 const TS_LEN: usize = 8;
 const LEN_LEN: usize = 4;

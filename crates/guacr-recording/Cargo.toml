@@ -1,0 +1,19 @@
+[package]
+name = "guacr-recording"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session recording for Guacamole protocol handlers"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,11 +3,11 @@ use bytes::Bytes;
 use guacr_handlers::{
     connect_tcp_with_timeout, is_keyboard_event_allowed_readonly, is_mouse_event_allowed_readonly,
     parse_blob_instruction, parse_end_instruction, parse_pipe_instruction, pipe_blob_bytes,
-    send_bell, send_disconnect, send_error_best_effort, send_name, send_ready, CursorManager,
-    EventBasedHandler, EventCallback, HandlerError, HandlerSecuritySettings, HandlerStats,
-    HealthStatus, KeepAliveManager, MultiFormatRecorder, PipeStreamManager, ProtocolHandler,
-    RecordingConfig, StandardCursor, DEFAULT_KEEPALIVE_INTERVAL_SECS, PIPE_NAME_STDIN,
-    PIPE_STREAM_STDOUT,
+    record_client_input, send_and_record, send_bell, send_disconnect, send_error_best_effort,
+    send_name, send_ready, CursorManager, EventBasedHandler, EventCallback, HandlerError,
+    HandlerSecuritySettings, HandlerStats, HealthStatus, KeepAliveManager, MultiFormatRecorder,
+    PipeStreamManager, ProtocolHandler, RecordingConfig, StandardCursor,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, PIPE_NAME_STDIN, PIPE_STREAM_STDOUT,
 };
 use guacr_protocol::{format_chunked_blobs, TextProtocolEncoder};
 use guacr_terminal::{
@@ -503,10 +503,9 @@ impl ProtocolHandler for SerialConsoleHandler {
         if enable_pipe {
             info!("Serial: Pipe streams enabled - opening STDOUT pipe for native terminal display");
             let pipe_instr = pipe_manager.enable_stdout();
-            to_client
-                .send(Bytes::from(pipe_instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(pipe_instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
         }
 
         // Send ready and name instructions
@@ -520,10 +519,9 @@ impl ProtocolHandler for SerialConsoleHandler {
             .send_standard_cursor(StandardCursor::IBeam)
             .map_err(|e| HandlerError::ProtocolError(format!("Cursor error: {}", e)))?;
         for instr in cursor_instrs {
-            to_client
-                .send(Bytes::from(instr))
+            send_and_record(&to_client, &mut recorder, Bytes::from(instr))
                 .await
-                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                .map_err(HandlerError::ChannelError)?;
         }
 
         // Send size instruction to initialize display dimensions
@@ -532,10 +530,9 @@ impl ProtocolHandler for SerialConsoleHandler {
             width_px, height_px, cols, rows
         );
         let size_instr = TerminalRenderer::format_size_instruction(0, width_px, height_px);
-        to_client
-            .send(Bytes::from(size_instr))
+        send_and_record(&to_client, &mut recorder, Bytes::from(size_instr))
             .await
-            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+            .map_err(HandlerError::ChannelError)?;
 
         // Bidirectional forwarding state
         let mut buf = vec![0u8; 4096];
@@ -579,8 +576,8 @@ impl ProtocolHandler for SerialConsoleHandler {
                             // If STDOUT pipe is enabled, send raw data to client
                             if pipe_manager.is_stdout_enabled() {
                                 let blob = pipe_blob_bytes(PIPE_STREAM_STDOUT, &buf[..n]);
-                                to_client.send(blob).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, blob).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
 
                             // Record output if recording is enabled
@@ -619,6 +616,8 @@ impl ProtocolHandler for SerialConsoleHandler {
                         info!("Serial: Client disconnected");
                         break;
                     };
+                    // Record client-to-server instruction
+                    record_client_input(&mut recorder, &msg);
 
                     let msg_str = String::from_utf8_lossy(&msg);
 
@@ -763,16 +762,16 @@ impl ProtocolHandler for SerialConsoleHandler {
                                 SelectionResult::InProgress(overlay_instructions) => {
                                     trace!("Serial: Selection in progress, sending {} overlay instructions", overlay_instructions.len());
                                     for instr in overlay_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                                 SelectionResult::Complete { text: selected_text, clear_instructions } => {
                                     if !security.is_copy_allowed() {
                                         debug!("Serial: Selection copy blocked (copy disabled)");
                                         for instr in clear_instructions {
-                                            to_client.send(Bytes::from(instr)).await
-                                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                            send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                                .map_err(HandlerError::ChannelError)?;
                                         }
                                         continue;
                                     }
@@ -781,15 +780,15 @@ impl ProtocolHandler for SerialConsoleHandler {
                                     stored_clipboard = selected_text.clone();
 
                                     for instr in clear_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
 
                                     let clipboard_stream_id = 10;
                                     let clipboard_instructions = format_clipboard_instructions(&selected_text, clipboard_stream_id);
                                     for instr in clipboard_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                                 SelectionResult::None => {}
@@ -841,8 +840,8 @@ impl ProtocolHandler for SerialConsoleHandler {
                                         scroll_lines, 0, cols, rows - scroll_lines, 0, 0,
                                         CHAR_W, CHAR_H, 0,
                                     );
-                                    to_client.send(Bytes::from(copy_instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(copy_instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     // Render only the new bottom line(s)
                                     // Expand by 1 cell in all directions for JPEG artifacts
@@ -862,13 +861,13 @@ impl ProtocolHandler for SerialConsoleHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 } else {
                                     // Scroll down: render full screen
@@ -883,13 +882,13 @@ impl ProtocolHandler for SerialConsoleHandler {
                                     let img_instr = protocol_encoder.format_img_instruction(
                                         stream_id, 0, 0, 0, "image/jpeg",
                                     );
-                                    to_client.send(img_instr.freeze()).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                        .map_err(HandlerError::ChannelError)?;
 
                                     let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                     for instr in blob_instructions {
-                                        to_client.send(Bytes::from(instr)).await
-                                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                        send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                            .map_err(HandlerError::ChannelError)?;
                                     }
                                 }
                             } else if dirty_pct < 30 {
@@ -913,13 +912,13 @@ impl ProtocolHandler for SerialConsoleHandler {
                                 let img_instr = protocol_encoder.format_img_instruction(
                                     stream_id, 0, x_px as i32, y_px as i32, "image/jpeg",
                                 );
-                                to_client.send(img_instr.freeze()).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                    .map_err(HandlerError::ChannelError)?;
 
                                 let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                 for instr in blob_instructions {
-                                    to_client.send(Bytes::from(instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
                                 }
                             } else {
                                 // Large update (>= 30% dirty): render full screen
@@ -936,13 +935,13 @@ impl ProtocolHandler for SerialConsoleHandler {
                                 let img_instr = protocol_encoder.format_img_instruction(
                                     stream_id, 0, 0, 0, "image/jpeg",
                                 );
-                                to_client.send(img_instr.freeze()).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                    .map_err(HandlerError::ChannelError)?;
 
                                 let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                                 for instr in blob_instructions {
-                                    to_client.send(Bytes::from(instr)).await
-                                        .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                    send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                        .map_err(HandlerError::ChannelError)?;
                                 }
                             }
                         } else {
@@ -958,13 +957,13 @@ impl ProtocolHandler for SerialConsoleHandler {
                             let img_instr = protocol_encoder.format_img_instruction(
                                 stream_id, 0, 0, 0, "image/jpeg",
                             );
-                            to_client.send(img_instr.freeze()).await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            send_and_record(&to_client, &mut recorder, img_instr.freeze()).await
+                                .map_err(HandlerError::ChannelError)?;
 
                             let blob_instructions = format_chunked_blobs(stream_id, &base64_data, None);
                             for instr in blob_instructions {
-                                to_client.send(Bytes::from(instr)).await
-                                    .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                                send_and_record(&to_client, &mut recorder, Bytes::from(instr)).await
+                                    .map_err(HandlerError::ChannelError)?;
                             }
                         }
 
@@ -975,8 +974,8 @@ impl ProtocolHandler for SerialConsoleHandler {
                                 .unwrap()
                                 .as_millis() as u64
                         );
-                        to_client.send(Bytes::from(sync_instr)).await
-                            .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                        send_and_record(&to_client, &mut recorder, Bytes::from(sync_instr)).await
+                            .map_err(HandlerError::ChannelError)?;
 
                         terminal.clear_dirty();
                     }

@@ -9,12 +9,12 @@ use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use super::core::Channel;
-use super::socks5::{self, SOCKS5_AUTH_FAILED, SOCKS5_FAIL, SOCKS5_VERSION};
+use super::tunnel_protocol::TunnelProtocol;
 use super::types::ActiveProtocol;
 
 impl Channel {
@@ -94,6 +94,7 @@ impl Channel {
         let listener_clone = listener_arc;
         // Clone task tracking for proper resource management
         let server_connection_tasks = self.server_connection_tasks.clone();
+        let tunnel_protocol = self.tunnel_protocol.clone();
 
         let server_task = tokio::spawn(async move {
             // Signal that we're ready to accept connections
@@ -140,117 +141,98 @@ impl Channel {
                         };
 
                         if !is_localhost {
-                            if active_protocol == ActiveProtocol::Socks5 {
-                                // Split the stream to send a rejection response
-                                let (mut reader, mut writer) = stream.into_split();
-
-                                // Read the initial greeting to determine the SOCKS version
-                                let mut buf = [0u8; 2];
-                                if reader.read_exact(&mut buf).await.is_ok() {
-                                    // Send connection didn't allow response
-                                    let version = buf[0];
-                                    if version == SOCKS5_VERSION {
-                                        // For SOCKS5, send auth failed first
-                                        if let Err(e) = writer
-                                            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_FAILED])
-                                            .await
-                                        {
-                                            error!("Channel({}): Failed to send SOCKS5 auth failure: {}", channel_id, e);
-                                        }
-                                    } else {
-                                        // For other versions, send general failure
-                                        if let Err(e) = socks5::send_socks5_response(
-                                            &mut writer,
-                                            SOCKS5_FAIL,
-                                            &[0, 0, 0, 0],
-                                            0,
-                                            &buffer_pool,
-                                        )
-                                        .await
-                                        {
-                                            error!("Channel({}): Failed to send SOCKS5 failure response: {}", channel_id, e);
-                                        }
-                                    }
+                            // Delegate rejection to the tunnel protocol (if present)
+                            if let Some(ref protocol) = tunnel_protocol {
+                                if let Err(e) = protocol.reject_non_localhost(stream).await {
+                                    error!(
+                                        "Channel({}): Error sending rejection: {}",
+                                        channel_id, e
+                                    );
                                 }
+                            } else {
+                                drop(stream);
                             }
 
                             error!(
                                 "Channel({}): Connection from non-localhost address rejected",
                                 channel_id
                             );
-                            continue; // Continue to the next connection attempt
+                            continue;
                         }
 
-                        // Handle based on protocol
-                        match active_protocol {
-                            ActiveProtocol::Socks5 => {
-                                let conn_tx_clone = connection_tx.clone();
-                                let webrtc_clone = webrtc.clone();
-                                let buffer_pool_clone = buffer_pool.clone();
-                                let task_channel_id = channel_id.clone();
-                                let error_log_channel_id = channel_id.clone();
-                                let current_conn_no = next_conn_no;
-                                next_conn_no += 1;
+                        // Dispatch based on protocol
+                        if let Some(ref protocol) = tunnel_protocol {
+                            // SOCKS5 and PortForward: use trait-based dispatch
+                            let conn_tx_clone = connection_tx.clone();
+                            let webrtc_clone = webrtc.clone();
+                            let buffer_pool_clone = buffer_pool.clone();
+                            let task_channel_id = channel_id.clone();
+                            let error_log_channel_id = channel_id.clone();
+                            let protocol_clone = protocol.clone();
+                            let protocol_name = protocol.name().to_string();
+                            let current_conn_no = next_conn_no;
+                            next_conn_no += 1;
 
-                                // Proper resource handling: Store AbortHandle for explicit lifecycle management
-                                let handle = tokio::spawn(async move {
-                                    if let Err(e) = socks5::handle_socks5_connection(
-                                        stream,
-                                        current_conn_no,
-                                        conn_tx_clone,
-                                        webrtc_clone,
-                                        buffer_pool_clone,
-                                        task_channel_id,
-                                    )
-                                    .await
-                                    {
-                                        error!(
-                                            "Channel({}): SOCKS5 connection error: {}",
-                                            error_log_channel_id, e
-                                        );
-                                    }
-                                });
+                            let handle = tokio::spawn(async move {
+                                if let Err(e) = handle_tunnel_server_connection(
+                                    stream,
+                                    current_conn_no,
+                                    protocol_clone,
+                                    conn_tx_clone,
+                                    webrtc_clone,
+                                    buffer_pool_clone,
+                                    task_channel_id,
+                                )
+                                .await
+                                {
+                                    error!(
+                                        "Channel({}): {} connection error: {}",
+                                        error_log_channel_id, protocol_name, e
+                                    );
+                                }
+                            });
 
-                                // Store abort handle for explicit cancellation on shutdown
-                                let abort_handle = handle.abort_handle();
-                                server_connection_tasks.lock().push(abort_handle);
-                            }
-                            ActiveProtocol::PortForward
-                            | ActiveProtocol::Guacd
-                            | ActiveProtocol::DatabaseProxy => {
-                                let conn_tx_clone = connection_tx.clone();
-                                let webrtc_clone = webrtc.clone();
-                                let buffer_pool_clone = buffer_pool.clone();
-                                let task_channel_id = channel_id.clone();
-                                let error_log_channel_id = channel_id.clone();
-                                let current_conn_no = next_conn_no;
-                                next_conn_no += 1;
+                            let abort_handle = handle.abort_handle();
+                            server_connection_tasks.lock().push(abort_handle);
+                        } else {
+                            match active_protocol {
+                                ActiveProtocol::Guacd | ActiveProtocol::DatabaseProxy => {
+                                    let conn_tx_clone = connection_tx.clone();
+                                    let webrtc_clone = webrtc.clone();
+                                    let buffer_pool_clone = buffer_pool.clone();
+                                    let task_channel_id = channel_id.clone();
+                                    let error_log_channel_id = channel_id.clone();
+                                    let current_conn_no = next_conn_no;
+                                    next_conn_no += 1;
 
-                                // Proper resource handling: Store AbortHandle for explicit lifecycle management
-                                let handle = tokio::spawn(async move {
-                                    if let Err(e) = handle_generic_server_connection(
-                                        stream,
-                                        current_conn_no,
-                                        active_protocol,
-                                        conn_tx_clone,
-                                        webrtc_clone,
-                                        buffer_pool_clone,
-                                        task_channel_id,
-                                    )
-                                    .await
-                                    {
-                                        error!("Channel({}): Generic server connection error for {:?}: {}", error_log_channel_id, active_protocol, e);
-                                    }
-                                });
+                                    let handle = tokio::spawn(async move {
+                                        if let Err(e) = handle_generic_server_connection(
+                                            stream,
+                                            current_conn_no,
+                                            active_protocol,
+                                            conn_tx_clone,
+                                            webrtc_clone,
+                                            buffer_pool_clone,
+                                            task_channel_id,
+                                        )
+                                        .await
+                                        {
+                                            error!("Channel({}): Generic server connection error for {:?}: {}", error_log_channel_id, active_protocol, e);
+                                        }
+                                    });
 
-                                // Store abort handle for explicit cancellation on shutdown
-                                let abort_handle = handle.abort_handle();
-                                server_connection_tasks.lock().push(abort_handle);
-                            }
-                            ActiveProtocol::PythonHandler => {
-                                // PythonHandler doesn't use the server mode for accepting connections
-                                // All data flows through the WebRTC data channel to Python
-                                warn!("Channel({}): PythonHandler protocol does not support server mode", channel_id);
+                                    let abort_handle = handle.abort_handle();
+                                    server_connection_tasks.lock().push(abort_handle);
+                                }
+                                ActiveProtocol::PythonHandler => {
+                                    warn!("Channel({}): PythonHandler protocol does not support server mode", channel_id);
+                                }
+                                _ => {
+                                    warn!(
+                                        "Channel({}): No tunnel protocol configured for {:?}",
+                                        channel_id, active_protocol
+                                    );
+                                }
                             }
                         }
                     }
@@ -300,7 +282,203 @@ impl Channel {
     }
 }
 
-/// Handle a generic server-side accepted TCP connection (for PortForward, Guacd server mode)
+/// Handle a tunnel server connection using the TunnelProtocol trait.
+/// Used for SOCKS5 and PortForward protocols.
+/// Performs the protocol handshake, sends OpenConnection over WebRTC,
+/// then spawns a read loop with EventDrivenSender for backpressure.
+async fn handle_tunnel_server_connection(
+    stream: TcpStream,
+    conn_no: u32,
+    protocol: Arc<dyn TunnelProtocol>,
+    conn_tx: tokio::sync::mpsc::Sender<(
+        u32,
+        tokio::net::tcp::OwnedWriteHalf,
+        tokio::task::JoinHandle<()>,
+    )>,
+    webrtc: WebRTCDataChannel,
+    buffer_pool: crate::buffer_pool::BufferPool,
+    channel_id: String,
+) -> Result<()> {
+    debug!(
+        "Channel({}): New {} connection {}",
+        channel_id,
+        protocol.name(),
+        conn_no
+    );
+
+    // 1. Perform protocol-specific handshake (SOCKS5 greeting/auth/request, or no-op for PortForward)
+    let (mut reader, writer, handshake_result) = protocol
+        .server_handshake(stream, conn_no, &buffer_pool)
+        .await?;
+
+    // 2. Send OpenConnection control message over WebRTC
+    let open_frame = Frame::new_control_with_pool(
+        ControlMessage::OpenConnection,
+        &handshake_result.open_connection_payload,
+        &buffer_pool,
+    );
+    // Release the buffer pool buffer used for the payload (if acquired from pool)
+    buffer_pool.release(handshake_result.open_connection_payload);
+
+    webrtc
+        .send(open_frame.encode_with_pool(&buffer_pool))
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to send OpenConnection for {} stream {}: {}",
+                protocol.name(),
+                conn_no,
+                e
+            )
+        })?;
+
+    debug!(
+        "Channel({}): Sent OpenConnection for {} stream {}",
+        channel_id,
+        protocol.name(),
+        conn_no
+    );
+
+    // 3. Spawn read loop with EventDrivenSender for proper backpressure
+    let dc_clone = webrtc.clone();
+    let buffer_pool_clone = buffer_pool.clone();
+    let channel_id_clone = channel_id.clone();
+    let protocol_name = protocol.name().to_string();
+
+    let read_task = tokio::spawn(async move {
+        let mut read_buffer = buffer_pool_clone.acquire();
+        let mut encode_buffer = buffer_pool_clone.acquire();
+
+        const MAX_READ_SIZE: usize = 64 * 1024;
+
+        let event_sender =
+            EventDrivenSender::new(Arc::new(dc_clone.clone()), STANDARD_BUFFER_THRESHOLD);
+
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Server-side TCP reader task started for conn_no: {} ({}) with EventDrivenSender",
+                conn_no, protocol_name
+            );
+        }
+
+        loop {
+            read_buffer.clear();
+            if read_buffer.capacity() < MAX_READ_SIZE {
+                read_buffer.reserve(MAX_READ_SIZE - read_buffer.capacity());
+            }
+
+            let max_to_read = std::cmp::min(read_buffer.capacity(), MAX_READ_SIZE);
+
+            let ptr = read_buffer.chunk_mut().as_mut_ptr();
+            let current_chunk_len = read_buffer.chunk_mut().len();
+            let slice_len = std::cmp::min(current_chunk_len, max_to_read);
+            let read_slice = unsafe { std::slice::from_raw_parts_mut(ptr, slice_len) };
+
+            match reader.read(read_slice).await {
+                Ok(0) => {
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "Channel({}): Client on server port (conn_no {}, {}) sent EOF.",
+                            channel_id_clone, conn_no, protocol_name
+                        );
+                    }
+                    let eof_payload = conn_no.to_be_bytes();
+                    let eof_frame = Frame::new_control_with_pool(
+                        ControlMessage::SendEOF,
+                        &eof_payload,
+                        &buffer_pool_clone,
+                    );
+                    if let Err(e) = event_sender
+                        .send_with_natural_backpressure(
+                            eof_frame.encode_with_pool(&buffer_pool_clone),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Channel({}): Failed to send EOF via EventDrivenSender for conn_no {}: {}",
+                            channel_id_clone, conn_no, e
+                        );
+                    }
+                    break;
+                }
+                Ok(n) if n > 0 => {
+                    unsafe {
+                        read_buffer.advance_mut(n);
+                    }
+
+                    if unlikely!(crate::logger::is_verbose_logging()) {
+                        debug!(
+                            "Server-side TCP reader received {} bytes for conn_no: {}",
+                            n, conn_no
+                        );
+                    }
+
+                    let data_frame =
+                        Frame::new_data_with_pool(conn_no, &read_buffer[0..n], &buffer_pool_clone);
+
+                    encode_buffer.clear();
+                    let bytes_written = data_frame.encode_into(&mut encode_buffer);
+                    let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
+
+                    let send_start = std::time::Instant::now();
+                    match event_sender
+                        .send_with_natural_backpressure(encoded_frame_bytes.clone())
+                        .await
+                    {
+                        Ok(_) => {
+                            let send_latency = send_start.elapsed();
+                            crate::metrics::METRICS_COLLECTOR.record_message_sent(
+                                &channel_id_clone,
+                                encoded_frame_bytes.len() as u64,
+                                Some(send_latency),
+                            );
+                        }
+                        Err(e) => {
+                            crate::metrics::METRICS_COLLECTOR
+                                .record_error(&channel_id_clone, "webrtc_send_failed");
+                            if unlikely!(crate::logger::is_verbose_logging()) {
+                                debug!("Failed to send data frame via EventDrivenSender for conn_no {}: {}", conn_no, e);
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "Channel({}): Error reading from client on server port (conn_no {}): {}",
+                        channel_id_clone, conn_no, e
+                    );
+                    break;
+                }
+            }
+        }
+        buffer_pool_clone.release(read_buffer);
+        buffer_pool_clone.release(encode_buffer);
+        if unlikely!(crate::logger::is_verbose_logging()) {
+            debug!(
+                "Channel({}): Server-side TCP reader task for conn_no {} ({}) exited.",
+                channel_id_clone, conn_no, protocol_name
+            );
+        }
+    });
+
+    // 4. Send the writer half and reader task to the channel's main loop
+    conn_tx
+        .send((conn_no, writer, read_task))
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to send new server connection {} to channel: {}",
+                conn_no,
+                e
+            )
+        })?;
+
+    Ok(())
+}
+
+/// Handle a generic server-side accepted TCP connection (for Guacd, DatabaseProxy server mode)
 async fn handle_generic_server_connection(
     stream: TcpStream,
     conn_no: u32,
@@ -318,12 +496,6 @@ async fn handle_generic_server_connection(
         "Channel({}): New generic {:?} connection {}",
         channel_id, active_protocol, conn_no
     );
-
-    // 1. Send OpenConnection control message over WebRTC to the other side.
-    // The payload of OpenConnection should just be the conn_no for now.
-    // The other side, upon receiving this, will know it needs to prepare for a new stream on this conn_no.
-    // For PortForward server mode, the other side will connect to its pre-configured target.
-    // For Guacd server mode, the other side will expect Guacamole data on this conn_no from a Guacd client (which is this accepted stream).
 
     let open_conn_payload = conn_no.to_be_bytes();
     let open_frame = Frame::new_control_with_pool(
@@ -347,10 +519,8 @@ async fn handle_generic_server_connection(
         channel_id, conn_no, active_protocol
     );
 
-    // 2. Split the accepted TCP stream.
     let (mut reader, writer) = stream.into_split();
 
-    // 3. Spawn a task to read from this accepted TCP stream and send data frames over WebRTC.
     let dc_clone = webrtc.clone();
     let buffer_pool_clone = buffer_pool.clone();
     let channel_id_clone = channel_id.clone();
@@ -359,19 +529,11 @@ async fn handle_generic_server_connection(
         let mut read_buffer = buffer_pool_clone.acquire();
         let mut encode_buffer = buffer_pool_clone.acquire();
 
-        // Use 64KB max read size - maximum safe size under webrtc-rs limits
-        // 64KB payload + 17 byte frame overhead = 65,553 bytes total
-        // Safely under webrtc-rs hard limit (~96KB message size)
-        // Larger frames = fewer frames = less overhead = higher throughput
-        // Tested: 98KB+ frames fail with "outbound packet larger than maximum message size"
         const MAX_READ_SIZE: usize = 64 * 1024;
 
-        // Create EventDrivenSender for proper backpressure management
-        // This prevents overwhelming WebRTC buffers and provides natural flow control
         let event_sender =
             EventDrivenSender::new(Arc::new(dc_clone.clone()), STANDARD_BUFFER_THRESHOLD);
 
-        // Add a print statement to see the conn_no being used
         if unlikely!(crate::logger::is_verbose_logging()) {
             debug!(
                 "Server-side TCP reader task started for conn_no: {} with EventDrivenSender",
@@ -379,19 +541,14 @@ async fn handle_generic_server_connection(
             );
         }
 
-        // **BOLD WARNING: ENTERING HOT PATH - TCP→WEBRTC FORWARDING LOOP**
-        // **NO STRING ALLOCATIONS, NO UNNECESSARY OBJECT CREATION**
-        // **USE BUFFER POOLS AND ZERO-COPY TECHNIQUES**
         loop {
             read_buffer.clear();
             if read_buffer.capacity() < MAX_READ_SIZE {
                 read_buffer.reserve(MAX_READ_SIZE - read_buffer.capacity());
             }
 
-            // Limit read size to prevent SCTP issues
             let max_to_read = std::cmp::min(read_buffer.capacity(), MAX_READ_SIZE);
 
-            // Correctly create a mutable slice for reading
             let ptr = read_buffer.chunk_mut().as_mut_ptr();
             let current_chunk_len = read_buffer.chunk_mut().len();
             let slice_len = std::cmp::min(current_chunk_len, max_to_read);
@@ -400,10 +557,6 @@ async fn handle_generic_server_connection(
             match reader.read(read_slice).await {
                 Ok(0) => {
                     if unlikely!(crate::logger::is_verbose_logging()) {
-                        debug!(
-                            "Server-side TCP reader received EOF for conn_no: {}",
-                            conn_no
-                        );
                         debug!(
                             "Channel({}): Client on server port (conn_no {}) sent EOF.",
                             channel_id_clone, conn_no
@@ -429,7 +582,6 @@ async fn handle_generic_server_connection(
                     break;
                 }
                 Ok(n) if n > 0 => {
-                    // Advance the buffer by the number of bytes read
                     unsafe {
                         read_buffer.advance_mut(n);
                     }
@@ -440,7 +592,6 @@ async fn handle_generic_server_connection(
                             n, conn_no
                         );
 
-                        // Print part of the data for debugging
                         if n <= 100 {
                             debug!("Data: {:?}", &read_buffer[0..n]);
                         } else {
@@ -450,14 +601,12 @@ async fn handle_generic_server_connection(
 
                     let current_payload_bytes_slice = &read_buffer[0..n];
 
-                    // Directly create a single data frame with the connection number
                     let data_frame = Frame::new_data_with_pool(
                         conn_no,
                         current_payload_bytes_slice,
                         &buffer_pool_clone,
                     );
 
-                    // Encode it into a separate buffer
                     encode_buffer.clear();
                     let bytes_written = data_frame.encode_into(&mut encode_buffer);
 
@@ -466,10 +615,8 @@ async fn handle_generic_server_connection(
                             conn_no, n, bytes_written);
                     }
 
-                    // Freeze to get a Bytes instance we can send
                     let encoded_frame_bytes = encode_buffer.split_to(bytes_written).freeze();
 
-                    // Use EventDrivenSender for proper backpressure management
                     let send_start = std::time::Instant::now();
                     match event_sender
                         .send_with_natural_backpressure(encoded_frame_bytes.clone())
@@ -478,7 +625,6 @@ async fn handle_generic_server_connection(
                         Ok(_) => {
                             let send_latency = send_start.elapsed();
 
-                            // Record metrics for message sent (using channel_id as conversation_id)
                             crate::metrics::METRICS_COLLECTOR.record_message_sent(
                                 &channel_id_clone,
                                 encoded_frame_bytes.len() as u64,
@@ -490,7 +636,6 @@ async fn handle_generic_server_connection(
                             }
                         }
                         Err(e) => {
-                            // Record error metrics
                             crate::metrics::METRICS_COLLECTOR
                                 .record_error(&channel_id_clone, "webrtc_send_failed");
 
@@ -501,8 +646,7 @@ async fn handle_generic_server_connection(
                         }
                     }
                 }
-                Ok(_) => { /* n == 0 but not EOF, should not happen with read_buf if it doesn't return Ok(0) */
-                }
+                Ok(_) => {}
                 Err(e) => {
                     if unlikely!(crate::logger::is_verbose_logging()) {
                         debug!(
@@ -514,13 +658,12 @@ async fn handle_generic_server_connection(
                         "Channel({}): Error reading from client on server port (conn_no {}): {}",
                         channel_id_clone, conn_no, e
                     );
-                    break; // Exit read task
+                    break;
                 }
             }
         }
         buffer_pool_clone.release(read_buffer);
         buffer_pool_clone.release(encode_buffer);
-        // Add a print statement to see the conn_no being used
         if unlikely!(crate::logger::is_verbose_logging()) {
             debug!("Server-side TCP reader task for conn_no {} exited", conn_no);
             debug!(
@@ -530,7 +673,6 @@ async fn handle_generic_server_connection(
         }
     });
 
-    // 4. Send the writer half and the reader_task handle to the main Channel loop via conn_tx.
     conn_tx
         .send((conn_no, writer, read_task))
         .await

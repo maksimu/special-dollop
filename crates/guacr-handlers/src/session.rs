@@ -5,10 +5,10 @@
 
 use bytes::Bytes;
 use guacr_protocol::{format_bell_audio, format_instruction};
-use log::debug;
+use log::{debug, warn};
 use tokio::sync::mpsc;
 
-use crate::{HandlerError, Result};
+use crate::{HandlerError, MultiFormatRecorder, RecordingDirection, Result};
 
 /// Send a `ready` instruction to the client.
 ///
@@ -59,6 +59,38 @@ pub async fn send_bell(to_client: &mpsc::Sender<Bytes>, stream_id: u32) -> Resul
             .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
     }
     Ok(())
+}
+
+/// Send a Guacamole instruction to the client and record it (if recording is enabled).
+///
+/// This is the shared implementation used by all protocol handlers (SSH, Telnet,
+/// Serial, Database, RDP, VNC). Records the instruction as server-to-client
+/// direction before sending.
+pub async fn send_and_record(
+    to_client: &mpsc::Sender<Bytes>,
+    recorder: &mut Option<MultiFormatRecorder>,
+    instruction: Bytes,
+) -> std::result::Result<(), String> {
+    if let Some(ref mut rec) = recorder {
+        if let Err(e) = rec.record_instruction(RecordingDirection::ServerToClient, &instruction) {
+            warn!("Failed to record server instruction: {}", e);
+        }
+    }
+    to_client
+        .send(instruction)
+        .await
+        .map_err(|e| format!("Send failed: {}", e))
+}
+
+/// Record a client-to-server instruction (if recording is enabled).
+///
+/// Shared implementation used by all protocol handlers. Only records; does not send.
+pub fn record_client_input(recorder: &mut Option<MultiFormatRecorder>, instruction: &Bytes) {
+    if let Some(ref mut rec) = recorder {
+        if let Err(e) = rec.record_instruction(RecordingDirection::ClientToServer, instruction) {
+            warn!("Failed to record client input: {}", e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +155,31 @@ mod tests {
         drop(rx);
         // Should not panic, just log debug
         send_disconnect(&tx).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_and_record_without_recorder() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut recorder: Option<MultiFormatRecorder> = None;
+        let instr = Bytes::from("5.ready,4.test;");
+        send_and_record(&tx, &mut recorder, instr).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(&msg[..], b"5.ready,4.test;");
+    }
+
+    #[tokio::test]
+    async fn test_send_and_record_closed_channel() {
+        let (tx, rx) = mpsc::channel(16);
+        drop(rx);
+        let mut recorder: Option<MultiFormatRecorder> = None;
+        let result = send_and_record(&tx, &mut recorder, Bytes::from("test")).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_client_input_without_recorder() {
+        let mut recorder: Option<MultiFormatRecorder> = None;
+        // Should not panic when recorder is None
+        record_client_input(&mut recorder, &Bytes::from("3.key,1.1,5.65536;"));
     }
 }

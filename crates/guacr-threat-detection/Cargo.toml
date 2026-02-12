@@ -8,6 +8,7 @@ description = "AI threat detection using BAML REST API"
 [features]
 default = []
 terminal-state = ["guacr-terminal"]
+onnx-classifier = ["ort", "ndarray", "tokenizers"]
 
 [dependencies]
 # Workspace dependencies
@@ -35,3 +36,8 @@ parking_lot = "0.12"
 
 # Terminal emulator for state extraction (optional)
 guacr-terminal = { path = "../guacr-terminal", optional = true }
+
+# ONNX Runtime for local action effect classifier (optional)
+ort = { version = "2.0.0-rc.11", features = ["download-binaries"], optional = true }
+ndarray = { version = "0.17", optional = true }
+tokenizers = { version = "0.19", default-features = false, features = ["onig"], optional = true }

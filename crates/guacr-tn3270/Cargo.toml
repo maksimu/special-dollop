@@ -8,5 +8,10 @@ description = "TN3270 IBM mainframe protocol parser and EBCDIC codec"
 [dependencies]
 log.workspace = true
 thiserror.workspace = true
+guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }
+
+[features]
+default = []
+threat-detection = ["guacr-threat-detection"]
 
 [dev-dependencies]

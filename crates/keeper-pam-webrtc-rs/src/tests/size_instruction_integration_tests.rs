@@ -2,8 +2,8 @@
 // Tests the complete pipeline from GuacdParser detection to background processing
 
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
-use crate::channel::guacd_parser::{GuacdParser, OpcodeAction, SpecialOpcode};
 use bytes::BytesMut;
+use guacr_protocol::{GuacdParser, OpcodeAction, SpecialOpcode};
 use log::{debug, info, warn};
 use std::time::Duration;
 use tokio::sync::mpsc;

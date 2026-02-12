@@ -3,7 +3,7 @@
 // This module provides the glue between keeper-webrtc Channel and guacr protocol handlers,
 // allowing direct handler invocation instead of connecting to external guacd server.
 
-use guacr::{handle_guacd_with_handlers, ProtocolHandlerRegistry};
+use guacr_handlers::{handle_guacd_with_handlers, ProtocolHandlerRegistry};
 
 use crate::models::ConversationType;
 use anyhow::Result;
@@ -15,31 +15,10 @@ use tokio::sync::mpsc;
 
 /// Initialize the global protocol handler registry
 ///
-/// This should be called once at application startup to register all available handlers.
+/// Delegates to `guacr::create_default_registry()` which registers all handlers
+/// enabled via guacr feature flags.
 pub fn create_handler_registry() -> Arc<ProtocolHandlerRegistry> {
-    let registry = Arc::new(ProtocolHandlerRegistry::new());
-
-    // Register all available handlers from guacr crate
-    registry.register(guacr::ssh::SshHandler::with_defaults());
-    registry.register(guacr::telnet::TelnetHandler::with_defaults());
-    registry.register(guacr::rdp::RdpHandler::with_defaults());
-    registry.register(guacr::vnc::VncHandler::with_defaults());
-    registry.register(guacr::database::MySqlHandler::with_defaults());
-    registry.register(guacr::database::PostgreSqlHandler::with_defaults());
-    registry.register(guacr::database::SqlServerHandler::with_defaults());
-    registry.register(guacr::database::MongoDbHandler::with_defaults());
-    registry.register(guacr::database::RedisHandler::with_defaults());
-    registry.register(guacr::database::OracleHandler::with_defaults());
-    registry.register(guacr::database::MariaDbHandler::with_defaults());
-
-    // RBI (Remote Browser Isolation) - registers as "http" protocol
-    // Requires Chrome/Chromium to be installed at runtime
-    registry.register(guacr::rbi::RbiHandler::with_defaults());
-
-    // Handler registry initialized silently - handlers remain dormant until use_guacr=true
-    // Logs will only appear when handlers are actually invoked
-
-    registry
+    guacr::create_default_registry()
 }
 
 /// Invoke a protocol handler for a guacd session

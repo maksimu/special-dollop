@@ -160,7 +160,7 @@ impl ProtocolHandler for DynamoDbHandler {
                     .write_prompt()
                     .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                send_render(&mut executor, &to_client).await?;
+                send_render(&mut executor, &to_client, &mut recorder).await?;
 
                 while from_client.recv().await.is_some() {}
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -185,6 +185,7 @@ impl ProtocolHandler for DynamoDbHandler {
                         &region_line,
                         "Type 'help' for available commands.",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 debug!("DynamoDB: Initial screen sent successfully");
@@ -204,6 +205,7 @@ impl ProtocolHandler for DynamoDbHandler {
                         "Check region setting",
                         "For DynamoDB Local, ensure the service is running",
                     ],
+                    &mut recorder,
                 )
                 .await?;
                 return Err(HandlerError::ConnectionFailed(error_msg));
@@ -230,7 +232,7 @@ impl ProtocolHandler for DynamoDbHandler {
                             .await
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
                         for instr in instructions {
-                            if to_client.send(instr).await.is_err() {
+                            if crate::recording::send_and_record(&to_client, &mut recorder, instr).await.is_err() {
                                 debug!("DynamoDB: Client channel closed during debounce, stopping");
                                 break 'outer;
                             }
@@ -253,7 +255,7 @@ impl ProtocolHandler for DynamoDbHandler {
                         record_query_input(&mut recorder, &recording_config, &command);
 
                         // Handle built-in commands
-                        if handle_builtin_command(&command, &mut executor, &to_client, &security)
+                        if handle_builtin_command(&command, &mut executor, &to_client, &security, &mut recorder)
                             .await?
                         {
                             continue;
@@ -268,6 +270,7 @@ impl ProtocolHandler for DynamoDbHandler {
                                 &mut executor,
                                 &to_client,
                                 &security,
+                                &mut recorder,
                             )
                             .await?;
                             continue;
@@ -280,6 +283,7 @@ impl ProtocolHandler for DynamoDbHandler {
                             &mut executor,
                             &to_client,
                             &security,
+                            &mut recorder,
                         )
                         .await?
                         {
@@ -298,7 +302,7 @@ impl ProtocolHandler for DynamoDbHandler {
                                 .terminal
                                 .write_prompt()
                                 .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-                            send_render(&mut executor, &to_client).await?;
+                            send_render(&mut executor, &to_client, &mut recorder).await?;
                             continue;
                         }
 
@@ -327,16 +331,13 @@ impl ProtocolHandler for DynamoDbHandler {
                             .write_prompt()
                             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
 
-                        send_render(&mut executor, &to_client).await?;
+                        send_render(&mut executor, &to_client, &mut recorder).await?;
                         continue;
                     }
 
                     if needs_render {
                         for instr in instructions {
-                            to_client
-                                .send(instr)
-                                .await
-                                .map_err(|e| HandlerError::ChannelError(e.to_string()))?;
+                            let _ = crate::recording::send_and_record(&to_client, &mut recorder, instr).await;
                         }
                     }
                 }
@@ -771,6 +772,7 @@ async fn handle_dynamodb_command(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<Option<bool>> {
     let command_lower = command.trim().to_lowercase();
 
@@ -797,7 +799,7 @@ async fn handle_dynamodb_command(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(Some(true));
     }
 
@@ -837,7 +839,7 @@ async fn handle_dynamodb_command(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(Some(true));
     }
 
@@ -884,7 +886,7 @@ async fn handle_dynamodb_command(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(Some(true));
     }
 
@@ -932,7 +934,7 @@ async fn handle_dynamodb_command(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(Some(true));
     }
 
@@ -1041,6 +1043,7 @@ async fn handle_builtin_command(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<bool> {
     let command_lower = command.to_lowercase();
 
@@ -1086,11 +1089,11 @@ async fn handle_builtin_command(
                 });
             }
 
-            render_help(executor, to_client, "DynamoDB CLI", &sections).await?;
+            render_help(executor, to_client, "DynamoDB CLI", &sections, recorder).await?;
             return Ok(true);
         }
         "quit" | "exit" => {
-            return Err(handle_quit(executor, to_client).await);
+            return Err(handle_quit(executor, to_client, recorder).await);
         }
         _ => {}
     }
@@ -1105,6 +1108,7 @@ async fn handle_csv_export(
     executor: &mut QueryExecutor,
     to_client: &mpsc::Sender<Bytes>,
     security: &DatabaseSecuritySettings,
+    recorder: &mut Option<guacr_handlers::MultiFormatRecorder>,
 ) -> guacr_handlers::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -1117,7 +1121,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1125,7 +1129,7 @@ async fn handle_csv_export(
         .terminal
         .write_line(&format!("Executing query: {}...", query))
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     // Paginate through all result pages (DynamoDB returns max 1MB per call)
     let mut all_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
@@ -1170,7 +1174,7 @@ async fn handle_csv_export(
             .terminal
             .write_prompt()
             .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-        send_render(executor, to_client).await?;
+        send_render(executor, to_client, recorder).await?;
         return Ok(());
     }
 
@@ -1254,7 +1258,7 @@ async fn handle_csv_export(
         .terminal
         .write_prompt()
         .map_err(|e| HandlerError::ProtocolError(e.to_string()))?;
-    send_render(executor, to_client).await?;
+    send_render(executor, to_client, recorder).await?;
 
     Ok(())
 }

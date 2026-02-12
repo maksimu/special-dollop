@@ -9,3 +9,8 @@ description = "TN5250 IBM AS/400 protocol parser"
 guacr-tn3270 = { path = "../guacr-tn3270" }  # Shared EBCDIC codec
 log.workspace = true
 thiserror.workspace = true
+guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }
+
+[features]
+default = []
+threat-detection = ["guacr-threat-detection"]

@@ -35,8 +35,6 @@ mod concurrent_close_tests;
 #[cfg(test)]
 pub mod guacd_handshake_tests;
 #[cfg(test)]
-mod guacd_parser_tests;
-#[cfg(test)]
 mod misc_tests;
 #[cfg(test)]
 mod nat_keepalive_tests;

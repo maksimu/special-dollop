@@ -773,10 +773,10 @@ async fn generate_cli_tests(
     results: &mut HashMap<String, serde_json::Value>,
     krelay_server: &str,
     use_turn: bool,
-    ksm_config: Option<&str>,
-    client_version: Option<&str>,
-    username: Option<&str>,
-    password: Option<&str>,
+    _ksm_config: Option<&str>,
+    _client_version: Option<&str>,
+    _username: Option<&str>,
+    _password: Option<&str>,
 ) {
     let mut cli_tests = Vec::new();
 
@@ -802,31 +802,7 @@ async fn generate_cli_tests(
         cli_tests.push("".to_string());
         cli_tests.push("# TURN server testing (requires credentials):".to_string());
 
-        // Try to use actual credentials if available
-        if let (Some(ksm_cfg), Some(client_ver)) = (ksm_config, client_version) {
-            if !ksm_cfg.is_empty() && !ksm_cfg.starts_with("TEST_MODE_KSM_CONFIG") {
-                match get_relay_access_creds(ksm_cfg, None, client_ver).await {
-                    Ok(creds) => {
-                        if let (Some(username), Some(password)) = (
-                            creds.get("username").and_then(|v| v.as_str()),
-                            creds.get("password").and_then(|v| v.as_str()),
-                        ) {
-                            cli_tests.push(format!(
-                                "turnutils_uclient -t -u {username} -w {password} {krelay_server}  # Test TURN with router credentials"
-                            ));
-                        }
-                    }
-                    Err(_) => {
-                        cli_tests.push(format!("turnutils_uclient -t -u USERNAME -w PASSWORD {krelay_server}  # Replace with actual credentials"));
-                    }
-                }
-            }
-        } else if let (Some(user), Some(pass)) = (username, password) {
-            // Use passed credentials for CLI test
-            cli_tests.push(format!(
-                "turnutils_uclient -t -u {user} -w {pass} {krelay_server}"
-            ));
-        }
+        cli_tests.push(format!("turnutils_uclient -t -u USERNAME -w PASSWORD {krelay_server}  # Replace with actual credentials"));
     }
 
     results.insert("suggested_cli_tests".to_string(), json!(cli_tests));

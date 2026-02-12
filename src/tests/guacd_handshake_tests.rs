@@ -323,9 +323,8 @@ async fn test_guacd_handshake_successful() {
                                         Ok(instr) => {
                                             println!("Server (success_new): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
                                             if instr.opcode == "size" {
-                                                // Standard guacd protocol: size instruction has only 2 args (width, height)
-                                                // DPI is sent separately in the connect instruction
-                                                assert_eq!(instr.args, vec!["1024", "768"]);
+                                                // Standard guacd protocol: size instruction has 3 args (width, height, dpi)
+                                                assert_eq!(instr.args, vec!["1024", "768", "96"]);
                                             } else if instr.opcode == "audio"
                                                 || instr.opcode == "video"
                                                 || instr.opcode == "image"
@@ -1133,9 +1132,8 @@ async fn test_guacd_handshake_failure_timeout_waiting_for_ready() {
                                         Ok(instr) => {
                                             println!("Server (timeout_ready): V2: Parsed: {{opcode: '{}', args: {:?}}}", instr.opcode, instr.args);
                                             if instr.opcode == "size" {
-                                                // Standard guacd protocol: size instruction has only 2 args (width, height)
-                                                // DPI is sent separately in the connect instruction
-                                                assert_eq!(instr.args, vec!["1024", "768"]);
+                                                // Standard guacd protocol: size instruction has 3 args (width, height, dpi)
+                                                assert_eq!(instr.args, vec!["1024", "768", "96"]);
                                             } else if instr.opcode == "audio"
                                                 || instr.opcode == "video"
                                                 || instr.opcode == "image"

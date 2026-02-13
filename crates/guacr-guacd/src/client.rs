@@ -381,9 +381,13 @@ where
                 })
         };
 
+        // Standard guacd size instruction: size,<width>,<height>,<dpi>;
+        // DPI must be included for terminal protocols (SSH, Telnet, etc.) where
+        // guacd uses it for Pango font scaling: effective_size = font_size * dpi / 96
         let size_parts: Vec<String> = width_for_new
             .split(',')
             .chain(height_for_new.split(','))
+            .chain(std::iter::once(dpi_for_new.as_str()))
             .map(String::from)
             .collect();
         debug!(
@@ -393,7 +397,7 @@ where
 
         let size_instruction = GuacdInstruction::new("size".to_string(), size_parts.clone());
         if size_parts.len() >= 2 {
-            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {}) - DPI will be sent separately in connect instruction", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), dpi_for_new);
+            debug!("HANDSHAKE: Client initial size instruction (channel_id: {}, conn_no: {}, width: {}, height: {}, dpi: {}) - DPI included in size instruction", channel_id, conn_no, size_parts.first().map(|s| s.as_str()).unwrap_or("1024"), size_parts.get(1).map(|s| s.as_str()).unwrap_or("768"), dpi_for_new);
         }
 
         writer

@@ -1,16 +1,15 @@
-# HOW TO PUBLISH A NEW VERSION:
+# HOW TO RELEASE A NEW VERSION:
 # 1. Update the version in Cargo.toml (e.g., from 0.1.4 to 0.1.5)
-# 2. Commit and push the version change: 
+# 2. Commit and push the version change:
 #    git commit -am "Bump version to x.y.z" && git push origin main
 # 3. Create and push a tag for the new version:
 #    git tag -a vx.y.z -m "Release version x.y.z" && git push origin vx.y.z
 # 4. This workflow will automatically:
 #    - Build wheels for all supported platforms
 #    - Run tests to verify the build
-#    - Create a GitHub release with the tag
-#    - Publish the wheels to PyPI (if PYPI_API_TOKEN is configured)
+#    - Create a GitHub release with all wheels attached
 
-name: Build, Release and Publish 🛞Wheels🛞
+name: Build and Release Wheels
 
 on:
   push:
@@ -138,7 +137,7 @@ jobs:
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
           python -c "import keeper_pam_connections; print('Import successful')"
-          cd tests && python -m pytest -v
+          cd crates/python-bindings && python -m pytest -v
         shell: bash
 
       - uses: actions/upload-artifact@v4
@@ -284,7 +283,7 @@ jobs:
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
           python -c "import keeper_pam_connections; print('Import successful')"
-          cd tests && python -m pytest -v
+          cd crates/python-bindings && python -m pytest -v
         shell: bash
 
       # Verify the wheel compatibility with glibc 2.28
@@ -344,18 +343,19 @@ jobs:
       - name: Build wheels (x86_64 and arm64)
         run: |
           export OPENSSL_DIR=$(brew --prefix openssl@3)
+          cd crates/python-bindings
 
           # Build x86_64 wheel
           echo "Building for macOS x86_64"
-          maturin build --release --target x86_64-apple-darwin
+          maturin build --release --target x86_64-apple-darwin --out ../../target/wheels
 
           # Build arm64 wheel
           echo "Building for macOS ARM64"
-          maturin build --release --target aarch64-apple-darwin
+          maturin build --release --target aarch64-apple-darwin --out ../../target/wheels
 
           # Debug - list the wheels that were built
           echo "Wheels built for macOS:"
-          find target/wheels -name "*.whl" -type f | sort
+          find ../../target/wheels -name "*.whl" -type f | sort
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -394,12 +394,12 @@ jobs:
         run: |
           echo "Building for Windows x86_64"
           python -m pip show maturin
-          Get-ChildItem target -ErrorAction SilentlyContinue
-          maturin build --release --target x86_64-pc-windows-msvc
+          Set-Location crates/python-bindings
+          maturin build --release --target x86_64-pc-windows-msvc --out ../../target/wheels
 
           # Debug - list the wheels that were built
           echo "Wheels built for Windows x86_64:"
-          Get-ChildItem target/wheels -Filter "*.whl" -ErrorAction SilentlyContinue | Sort-Object Name
+          Get-ChildItem ../../target/wheels -Filter "*.whl" -ErrorAction SilentlyContinue | Sort-Object Name
         shell: pwsh
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -431,7 +431,7 @@ jobs:
           Write-Host "Installing wheel: $($wheel.FullName)"
           pip install $wheel.FullName
           python -c "import keeper_pam_connections; print('Import successful')"
-          cd tests && python -m pytest -v
+          cd crates/python-bindings && python -m pytest -v
         shell: pwsh
 
       - uses: actions/upload-artifact@v4
@@ -606,8 +606,9 @@ jobs:
       - name: Build source distribution
         run: |
           echo "Building source distribution"
-          maturin sdist
-          ls -la target/wheels/
+          cd crates/python-bindings
+          maturin sdist --out ../../target/wheels
+          ls -la ../../target/wheels/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -651,7 +652,7 @@ jobs:
             ls -la "$dir"
           done
           
-          # Ensure wheels and sdist are in the correct location for twine
+          # Collect all wheels and sdist into a single directory for the release
           mkdir -p dist/wheels
           find dist -type f -name "*.whl" -exec cp {} dist/wheels/ \;
           find dist -type f -name "*.tar.gz" -exec cp {} dist/wheels/ \;
@@ -673,39 +674,38 @@ jobs:
             This release includes:
             - Wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64), Windows (x86_64), Alpine Linux (x86_64)
             - Source distribution (sdist) for building from source
-            
+
             Built with abi3 for maximum Python version compatibility (Python 3.7+).
-            
+
             **Note:** Building from source requires Rust toolchain to be installed.
           tag_name: v${{ env.VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check PyPI Secrets
-        id: check_secrets
-        run: |
-          if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
-            echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_OUTPUT
-            echo "PyPI secrets are available, will publish to PyPI"
-          else
-            echo "PYPI_SECRETS_AVAILABLE=false" >> $GITHUB_OUTPUT
-            echo "PyPI secrets are NOT available, skipping publishing"
-          fi
-        shell: bash
-
-        # https://stackoverflow.com/questions/79408101/what-is-the-correct-way-of-specifying-the-license-in-pyproject-toml-file-for-a-n
-      - name: Install PyPI tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install twine==6.0.1
-        shell: bash
-
-      - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags/v') && steps.check_secrets.outputs.PYPI_SECRETS_AVAILABLE == 'true'
+      - name: Delete existing latest release
+        run: gh release delete latest --yes || true
         env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          echo "Publishing wheels and source distribution to PyPI..."
-          twine upload dist/wheels/*
-        shell: bash
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete existing latest tag
+        run: git push origin :refs/tags/latest || true
+
+      - name: Create latest release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          tag_name: latest
+          name: "Latest (v${{ env.VERSION }})"
+          body: |
+            Points to: **v${{ env.VERSION }}**
+
+            This release includes:
+            - Wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64), Windows (x86_64), Alpine Linux (x86_64)
+            - Source distribution (sdist) for building from source
+          files: |
+            dist/wheels/*.whl
+            dist/wheels/*.tar.gz
+          prerelease: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

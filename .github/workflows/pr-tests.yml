@@ -248,8 +248,37 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Run security audit
-        run: cargo audit
-        continue-on-error: true  # Don't fail PR on audit warnings
+        # RUSTSEC-2023-0071: rsa Marvin Attack - no upstream fix available.
+        # Ignored here because cargo audit cannot suppress per-advisory like cargo-deny.
+        # Full justification is documented in deny.toml.
+        # Remove this ignore once the rsa crate ships a fix.
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+  # ============================================================================
+  deny:
+    name: Dependency Policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo-deny
+        run: cargo deny check bans advisories sources
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
   # ============================================================================
   # Documentation

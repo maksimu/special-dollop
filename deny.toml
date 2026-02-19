@@ -1,0 +1,57 @@
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # --- Vulnerabilities: no upstream fix available ---
+
+    # rsa Marvin Attack timing sidechannel. No fix in the rsa crate.
+    # In this codebase RSA is only used for signing (SSH auth) and encrypting
+    # with the server's public key (MySQL auth). The vulnerable RSA decryption
+    # path is never exercised. Remove once the rsa crate ships a fix.
+    { id = "RUSTSEC-2023-0071", reason = "No upstream fix. Vulnerable RSA decryption path not reached in our SSH/MySQL code paths." },
+
+    # --- Unmaintained transitive dependencies we cannot replace ---
+
+    # async-std: pulled in by chromiumoxide -> async-tungstenite
+    { id = "RUSTSEC-2025-0052", reason = "Transitive dep via chromiumoxide. No maintained alternative available in that dep chain." },
+
+    # atomic-polyfill: transitive dep in embedded/no-std crates
+    { id = "RUSTSEC-2023-0089", reason = "Transitive dep; no action available upstream." },
+
+    # backoff: transitive dep via google-cloud or similar
+    { id = "RUSTSEC-2025-0012", reason = "Transitive dep; no action available upstream." },
+
+    # bincode 1.x: transitive dep; bincode 2.x is a full rewrite with breaking changes
+    { id = "RUSTSEC-2025-0141", reason = "Transitive dep; upstream has not migrated to bincode 2." },
+
+    # instant: transitive dep; superseded by std::time on modern targets
+    { id = "RUSTSEC-2024-0384", reason = "Transitive dep; no action available upstream." },
+
+    # paste: transitive dep; upstream has archived the crate
+    { id = "RUSTSEC-2024-0436", reason = "Transitive dep; no action available upstream." },
+
+    # rustls-pemfile 1.x and 2.x: transitive via tiberius, mysql_async, kube
+    { id = "RUSTSEC-2025-0134", reason = "Transitive dep via tiberius/mysql_async/kube. Awaiting upstream migration." },
+
+    # --- Unsound transitive dependencies ---
+
+    # lru IterMut unsoundness: transitive via mysql_async 0.36
+    { id = "RUSTSEC-2026-0002", reason = "Transitive dep via mysql_async. Awaiting mysql_async to update lru." },
+]
+
+[bans]
+multiple-versions = "warn"
+deny = [
+    { name = "native-tls", reason = "Use rustls; native-tls links OpenSSL dynamically on Linux and gets bundled by auditwheel" },
+    { name = "openssl", reason = "Use rustls instead" },
+    { name = "openssl-sys", reason = "Use rustls instead" },
+    { name = "tokio-native-tls", reason = "Pulled in by native-tls; use tokio-rustls instead" },
+    { name = "hyper-tls", reason = "Pulled in by native-tls; use hyper-rustls instead" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/miroberts/IronRDP",
+]

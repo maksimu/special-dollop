@@ -1,0 +1,45 @@
+[package]
+name = "guacr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Protocol handlers for remote desktop access (SSH, RDP, VNC, Telnet, Database protocols, RBI)"
+repository = "https://github.com/Keeper-Security/keeper-pam-webrtc-rs"
+homepage = "https://github.com/Keeper-Security/keeper-pam-webrtc-rs/tree/main/crates/guacr"
+
+[dependencies]
+# Core handler traits and registry
+guacr-handlers = { path = "../guacr-handlers", version = "2.0.0" }
+
+# Re-export async_trait for EventCallback implementations
+async-trait.workspace = true
+
+# Protocol handlers
+guacr-ssh = { path = "../guacr-ssh", version = "2.0.0", optional = true }
+guacr-telnet = { path = "../guacr-telnet", version = "2.0.0", optional = true }
+guacr-rdp = { path = "../guacr-rdp", version = "2.0.0", optional = true }
+guacr-vnc = { path = "../guacr-vnc", version = "2.0.0", optional = true }
+guacr-sftp = { path = "../guacr-sftp", version = "2.0.0", optional = true }
+guacr-database = { path = "../guacr-database", version = "2.0.0", optional = true }
+guacr-rbi = { path = "../guacr-rbi", version = "2.0.0", optional = true }
+
+# guacd wire protocol (server-side handshake, protocol args, TCP listener)
+guacr-guacd = { path = "../guacr-guacd", version = "2.0.0", optional = true }
+
+[features]
+default = ["ssh", "telnet"]
+ssh = ["guacr-ssh"]
+telnet = ["guacr-telnet"]
+rdp = ["guacr-rdp"]
+vnc = ["guacr-vnc"]
+sftp = ["guacr-sftp"]
+database = ["guacr-database"]
+rbi = ["guacr-rbi"]
+
+# Enable guacd wire protocol compatibility (select/args/connect/ready handshake)
+# This allows guacr to act as a drop-in replacement for guacd on TCP port 4822
+guacd-compat = ["guacr-guacd"]
+
+# All protocols
+all = ["ssh", "telnet", "rdp", "vnc", "sftp", "database", "rbi"]

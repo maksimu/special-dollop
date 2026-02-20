@@ -1,14 +1,23 @@
 #!/bin/bash
 set -e  # Exit on any error
 
-# TUBE LIFECYCLE NOTES:
-# - Multiple "Drop called for tube" messages are NORMAL and expected
-# - They represent Arc reference drops, not premature tube destruction
-# - Tubes remain fully functional after these drops
-# - The actual tube cleanup only happens when marked Closed and removed from registry
-# - Look for "TUBE CLEANUP COMPLETE" message to confirm full cleanup
+# WORKSPACE BUILD SCRIPT
+# This script builds and tests the unified keeper-pam-connections Python package
+#
+# Prerequisites:
+#   - Rust toolchain (rustup, cargo, rustfmt, clippy)
+#   - Python 3.7+ with pip and maturin
+#   - unixODBC (for guacr-database ODBC handler):
+#       macOS:  brew install unixodbc
+#       Ubuntu: apt-get install unixodbc-dev
+#       RHEL:   dnf install unixODBC-devel
+#   - Oracle Instant Client (optional, for Oracle DB handler)
+#   - Docker (optional, for database integration tests):
+#       docker compose -f crates/guacr-database/docker-compose.test.yml up -d
+#       Starts: MySQL, MariaDB, PostgreSQL, SQL Server, MongoDB, DynamoDB,
+#               Cassandra, Elasticsearch, Redis, ODBC-PostgreSQL
 
-echo "Building with protocol handlers (SSH, Telnet, VNC, RDP, etc) - always included"
+echo "Building keeper-pam-connections (unified Python package)"
 echo ""
 
 echo "========================================"
@@ -21,14 +30,23 @@ echo "✓ Formatting check passed"
 echo ""
 
 echo "Running clippy..."
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 echo "✓ Clippy check passed"
 echo ""
 
 echo "Running Rust unit tests..."
-cargo test --lib --no-default-features
+# Test keeper-pam-webrtc-rs without Python support (pure Rust tests)
+cargo test -p keeper-pam-webrtc-rs --lib --no-default-features
+# Test all other workspace crates with all features (excluding python-bindings which needs maturin)
+cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
 echo "✓ Rust tests passed"
 echo ""
+
+echo "========================================"
+echo "Building Python package..."
+echo "========================================"
+
+cd crates/python-bindings
 
 echo "Cleaning previous builds..."
 # Clean Rust build artifacts
@@ -36,7 +54,6 @@ cargo clean
 
 # Make sure to remove any cached wheels, but don't error if none exist
 rm -rf target/wheels && mkdir -p target/wheels
-# Alternatively: if [ -d "target/wheels" ]; then rm -rf target/wheels/*; fi
 
 echo "Building wheel..."
 # Detect platform and build accordingly
@@ -46,7 +63,6 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     maturin build --release --auditwheel skip
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     # Linux build - check if we want manylinux compliance
-    # Use explicit check to only enable when BUILD_MANYLINUX=1 (not just any non-empty value)
     if [ "$BUILD_MANYLINUX" = "1" ]; then
         echo "Building Linux wheel with manylinux_2_28 compliance (using Docker)..."
         docker run --rm -v "$(pwd)":/io ghcr.io/pyo3/maturin:v1.8.1 build --release --manylinux 2_28
@@ -61,17 +77,32 @@ else
     maturin build --release --auditwheel skip
 fi
 
-# Find the newly built wheel
-WHEEL=$(find target/wheels -name "*.whl" | head -1)
+# Find the newly built wheel (maturin puts it in workspace root target/wheels)
+WHEEL=$(find ../../target/wheels -name "*.whl" 2>/dev/null | head -1)
+
+if [ -z "$WHEEL" ]; then
+    echo "ERROR: No wheel found in ../../target/wheels/"
+    ls -la ../../target/wheels/ || echo "../../target/wheels/ directory not found"
+    exit 1
+fi
+
 echo "Installing wheel: $WHEEL"
 
 # Force reinstall to ensure the latest version is used
-pip uninstall -y keeper_pam_webrtc_rs || true
+pip uninstall -y keeper_pam_connections || true
 pip install "$WHEEL" --force-reinstall
 
-echo "Running tests..."
+echo "========================================"
+echo "Running Python tests..."
+echo "========================================"
+
 cd tests
 
 # Run all tests
 export RUST_BACKTRACE=1
 python3 -m pytest -v --log-cli-level=DEBUG
+
+echo ""
+echo "========================================"
+echo "✓ All checks passed!"
+echo "========================================"

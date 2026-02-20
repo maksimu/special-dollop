@@ -1,0 +1,93 @@
+[package]
+name = "keeper-pam-webrtc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Keeper WebRTC tube abstraction - secure WebRTC tunneling core library"
+
+[lib]
+name = "keeper_pam_webrtc_rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["builtin-handlers"]
+builtin-handlers = ["dep:guacr"]
+python-support = ["pyo3"]
+profiling = []
+
+[dependencies]
+# Protocol handler traits and registry (always available for trait-based code)
+guacr-handlers = { path = "../guacr-handlers" }
+
+# Concrete protocol handlers (optional, provides built-in handler registry)
+# Includes: SSH, Telnet, VNC, SFTP, RDP, Database, RBI (Remote Browser Isolation)
+guacr = { path = "../guacr", optional = true, features = ["ssh", "telnet", "vnc", "sftp", "rbi", "rdp", "database"] }
+
+# Guacamole protocol codec (streaming parser, instruction types)
+guacr-protocol = { path = "../guacr-protocol" }
+
+# Guacd wire protocol (client-side handshake)
+guacr-guacd = { path = "../guacr-guacd" }
+
+# Tunnel protocol crate (SOCKS5)
+pam-socks5 = { path = "../pam-socks5" }
+
+# Async trait (for EventCallback impl in handler_connections)
+async-trait.workspace = true
+
+# Core async
+tokio.workspace = true
+tokio-util.workspace = true
+
+# Data structures
+bytes.workspace = true
+crossbeam-queue.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+
+# WebRTC
+webrtc.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+log.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+uuid.workspace = true
+base64.workspace = true
+lazy_static.workspace = true
+once_cell.workspace = true
+arc-swap.workspace = true
+bitflags.workspace = true
+
+# Crate-specific dependencies
+aes-gcm.workspace = true
+chrono.workspace = true
+futures.workspace = true
+heapless.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+if-addrs.workspace = true
+ipnet.workspace = true
+p256.workspace = true
+pyo3 = { workspace = true, optional = true }
+reqwest.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+ctor = "0.6.2"  # For test initialization (rustls crypto provider setup)
+
+# IronRDP patches are now at workspace level

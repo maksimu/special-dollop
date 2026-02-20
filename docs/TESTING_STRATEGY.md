@@ -1,8 +1,8 @@
-# Testing Strategy for WebRTC Connection Management
+# Testing Strategy for keeper-pam-connections Workspace
 
 ## Overview
 
-This document outlines our comprehensive testing strategy that separates CI-friendly automated tests from resource-intensive manual stress tests.
+This document outlines our comprehensive testing strategy for the entire workspace, covering both CI automation and manual testing approaches.
 
 ## 🎯 **Testing Philosophy**
 
@@ -20,30 +20,46 @@ This document outlines our comprehensive testing strategy that separates CI-frie
 
 ## 📁 **Test Categories**
 
-### **1. Rust Unit Tests** (`src/tests/*.rs`)
-- **Purpose**: Core functionality verification
+### **1. Workspace-Wide Quality Checks**
+- **Purpose**: Code quality and consistency across all crates
+- **CI Status**: ✅ **Always run in CI**
+- **Commands**:
+  ```bash
+  cargo fmt --all -- --check                              # Format all crates
+  cargo clippy --workspace --all-targets --all-features   # Lint all crates
+  ```
+
+### **2. Rust Unit Tests** (`crates/*/src/tests/*.rs`)
+- **Purpose**: Core functionality verification in each crate
 - **Characteristics**: Fast, deterministic, comprehensive
 - **CI Status**: ✅ **Always run in CI**
+- **Command**: `cargo test --workspace --lib`
 - **Examples**:
   - Keepalive start/stop mechanisms
   - ICE restart generation
   - Activity tracking accuracy
   - Resource limit enforcement
+  - Registry actor coordination
+  - Frame parsing and routing
 
-### **2. Python CI Tests** (`tests/test_*.py`)
-- **Purpose**: Integration and business logic testing  
+### **3. Python Integration Tests** (`crates/python-bindings/tests/test_*.py`)
+- **Purpose**: End-to-end testing of unified Python package
 - **Characteristics**: Fast, deterministic, CI-safe
 - **CI Status**: ✅ **Always run in CI**
+- **Command**: `cd crates/python-bindings/tests && python -m pytest -v`
 - **Examples**:
   - ICE restart policy logic
   - Connection manager lifecycle
   - Network change handling
   - State transitions
+  - Metrics collection
+  - Thread monitoring
 
-### **3. Manual Stress Tests** (`tests/manual_stress_tests.py`)
+### **4. Manual Stress Tests** (`crates/python-bindings/tests/manual_stress_tests.py`)
 - **Purpose**: High-load resource cleanup verification
 - **Characteristics**: Resource-intensive, non-deterministic, environment-dependent
 - **CI Status**: ❌ **NEVER run in CI** - Manual development only
+- **Command**: `python manual_stress_tests.py --light`
 - **Examples**:
   - Concurrent registry operations under load
   - Memory leak detection with thousands of connections
@@ -123,22 +139,30 @@ max_connections = min(100, available_resources() // 2)
 ### **Continuous Integration Pipeline**
 ```bash
 # Phase 1: Quick validation (< 1 minute)
-cargo check
-cargo clippy -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Phase 2: Unit testing (< 2 minutes)  
-cargo test --no-default-features
-python3 -m pytest tests/test_*.py -v
+cargo test --workspace --lib
 
-# Phase 3: Integration testing (< 2 minutes)
-python3 manual_test.py  # Light integration scenarios
-python3 network_simulator.py --quick
+# Phase 3: Python integration testing (< 3 minutes)
+cd crates/python-bindings
+maturin build --release
+pip install target/wheels/*.whl
+cd tests && python3 -m pytest test_*.py -v
 ```
 
 ### **Developer Workflow**
 ```bash
+# Quick checks during development
+cargo check --workspace
+cargo test --workspace
+
+# Full test suite (recommended before commits)
+./build_and_test.sh
+
 # Daily development testing
-cargo test && python3 -m pytest tests/
+cargo test --workspace && cd crates/python-bindings/tests && python3 -m pytest
 
 # Before major commits - include manual stress tests
 python3 manual_stress_tests.py --light

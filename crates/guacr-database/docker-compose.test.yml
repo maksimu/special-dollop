@@ -1,0 +1,233 @@
+# Docker Compose for Database Integration Tests
+#
+# Usage:
+#   docker-compose -f docker-compose.test.yml up -d
+#   cargo test --package guacr-database --features integration-tests
+#   docker-compose -f docker-compose.test.yml down
+#
+# Individual databases can be started with:
+#   docker-compose -f docker-compose.test.yml up -d mysql postgres
+#
+services:
+  # MySQL 8.0
+  mysql:
+    image: mysql:8.0
+    container_name: guacr-test-mysql
+    restart: unless-stopped
+    ports:
+      - "13306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: testpassword
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpassword
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./tests/sql/mysql_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ptestpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # MariaDB 10.11 (for MariaDB-specific tests)
+  mariadb:
+    image: mariadb:10.11
+    container_name: guacr-test-mariadb
+    restart: unless-stopped
+    ports:
+      - "13307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: testpassword
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpassword
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # PostgreSQL 16
+  postgres:
+    image: postgres:16-alpine
+    container_name: guacr-test-postgres
+    restart: unless-stopped
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: testdb
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./tests/sql/postgres_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # SQL Server 2022 (requires accepting EULA)
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: guacr-test-sqlserver
+    restart: unless-stopped
+    ports:
+      - "11433:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "TestPassword123!"
+      MSSQL_PID: "Developer"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'TestPassword123!' -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - guacr-test-network
+
+  # MongoDB 7.0
+  mongodb:
+    image: mongo:7.0
+    container_name: guacr-test-mongodb
+    restart: unless-stopped
+    ports:
+      - "17017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: testuser
+      MONGO_INITDB_ROOT_PASSWORD: testpassword
+      MONGO_INITDB_DATABASE: testdb
+    volumes:
+      - mongodb-data:/data/db
+      - ./tests/sql/mongodb_init.js:/docker-entrypoint-initdb.d/init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # DynamoDB Local
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: guacr-test-dynamodb
+    restart: unless-stopped
+    ports:
+      - "18000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # Cassandra 4.1
+  cassandra:
+    image: cassandra:4.1
+    container_name: guacr-test-cassandra
+    restart: unless-stopped
+    ports:
+      - "19042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: "TestCluster"
+      HEAP_NEWSIZE: "128M"
+      MAX_HEAP_SIZE: "256M"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - guacr-test-network
+
+  # PostgreSQL 16 for ODBC integration tests
+  # Note: The ODBC driver (psqlodbc) must be installed on the test machine.
+  # macOS: brew install psqlodbc
+  # Ubuntu: apt-get install odbc-postgresql
+  # The database itself runs in Docker; only the driver is needed on the host.
+  odbc-postgres:
+    image: postgres:16-alpine
+    container_name: guacr-test-odbc-postgres
+    restart: unless-stopped
+    ports:
+      - "15433:5432"
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+  # Elasticsearch 8.12
+  elasticsearch:
+    image: elasticsearch:8.12.0
+    container_name: guacr-test-elasticsearch
+    restart: unless-stopped
+    ports:
+      - "19200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - guacr-test-network
+
+  # Redis 7.2
+  redis:
+    image: redis:7.2-alpine
+    container_name: guacr-test-redis
+    restart: unless-stopped
+    ports:
+      - "16379:6379"
+    command: redis-server --requirepass testpassword
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "testpassword", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guacr-test-network
+
+volumes:
+  mysql-data:
+  mariadb-data:
+  postgres-data:
+  sqlserver-data:
+  mongodb-data:
+  cassandra-data:
+  elasticsearch-data:
+  odbc-postgres-data:
+  redis-data:
+
+networks:
+  guacr-test-network:
+    driver: bridge

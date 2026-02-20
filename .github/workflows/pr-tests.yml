@@ -1,0 +1,317 @@
+name: PR Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ============================================================================
+  # Workspace-Wide Linting and Formatting
+  # ============================================================================
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+  # ============================================================================
+  # Rust Unit Tests (all workspace crates)
+  # ============================================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # stable
+        with:
+          toolchain: stable
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+
+      - name: Run workspace unit tests
+        run: |
+          # Test keeper-pam-webrtc-rs without Python support (pure Rust)
+          cargo test -p keeper-pam-webrtc-rs --lib --no-default-features
+          # Test all other workspace crates with all features (excluding python-bindings which needs maturin)
+          cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+  # ============================================================================
+  # Python Integration Tests
+  # ============================================================================
+  python-tests:
+    name: Python Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # stable
+        with:
+          toolchain: stable
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+        shell: bash
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev unixodbc-dev
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install openssl@3 unixodbc
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest pytest-asyncio
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: false
+
+      - name: Build and install package
+        run: |
+          cd crates/python-bindings
+          maturin build --release
+          
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            pip install $(ls ../../target/wheels/*.whl | head -1)
+          else
+            pip install $(find ../../target/wheels -name "*.whl" | head -1)
+          fi
+          
+          python -c "import keeper_pam_connections; print('Successfully imported keeper_pam_connections')"
+        shell: bash
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - name: Run Python tests
+        run: |
+          cd crates/python-bindings/tests
+          python -m pytest -v
+
+  # ============================================================================
+  # Build Check (ensure it compiles on multiple platforms)
+  # ============================================================================
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # stable
+        with:
+          toolchain: stable
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+        shell: bash
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: false
+
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install unixodbc
+
+      - name: Build all crates
+        run: |
+          # Build keeper-pam-webrtc-rs without Python support
+          cargo build -p keeper-pam-webrtc-rs --lib --no-default-features --release
+          # Build all other workspace crates (excluding python-bindings which needs maturin)
+          cargo build --workspace --all-targets --release --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # Override fat LTO for CI - production LTO is only needed for wheel builds
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+  # ============================================================================
+  # Security Audit
+  # ============================================================================
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        # RUSTSEC-2023-0071: rsa Marvin Attack - no upstream fix available.
+        # Ignored here because cargo audit cannot suppress per-advisory like cargo-deny.
+        # Full justification is documented in deny.toml.
+        # Remove this ignore once the rsa crate ships a fix.
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+  # ============================================================================
+  deny:
+    name: Dependency Policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo-deny
+        run: cargo deny check bans advisories sources
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+  # ============================================================================
+  # Documentation
+  # ============================================================================
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # stable
+        with:
+          toolchain: stable
+
+      - name: Configure git for private dependencies
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          mkdir -p ~/.cargo
+          echo '[net]' >> ~/.cargo/config.toml
+          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: false
+
+      - name: Check documentation
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"

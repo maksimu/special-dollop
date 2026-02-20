@@ -1,0 +1,17 @@
+[package]
+name = "guacr-guacd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guacd wire protocol compatibility layer - server-side handshake, protocol argument descriptors, and TCP listener for guacr"
+
+[dependencies]
+guacr-protocol = { path = "../guacr-protocol", version = "2.0.0" }
+guacr-handlers = { path = "../guacr-handlers", version = "2.0.0" }
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

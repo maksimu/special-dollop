@@ -1,0 +1,59 @@
+[package]
+name = "guacr-rbi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Browser Isolation (RBI) handler for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures = "0.3"
+thiserror.workspace = true
+log.workspace = true
+
+# Browser engine
+# Chrome CDP - uses installed Chrome via DevTools Protocol
+chromiumoxide = { version = "0.7", optional = true }
+
+# Protocol parsing
+guacr-protocol = { path = "../guacr-protocol" }
+
+# JSON for configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+base64.workspace = true
+reqwest = { workspace = true, optional = true }
+
+# Cryptography for secure TOTP implementation
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+
+
+# Secure temp directory creation for session isolation
+tempfile = "3"
+
+# Threat detection (optional)
+guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }
+
+# Unix system calls for profile locking and DBus isolation
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = ["chrome"]
+
+# Chrome CDP backend - uses installed Chrome via DevTools Protocol
+# Build with: cargo build --features chrome
+# Requires Chrome/Chromium installed on the system at runtime
+chrome = ["chromiumoxide", "reqwest"]
+threat-detection = ["guacr-threat-detection"]

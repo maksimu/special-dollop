@@ -1,16 +1,15 @@
-# HOW TO PUBLISH A NEW VERSION:
+# HOW TO RELEASE A NEW VERSION:
 # 1. Update the version in Cargo.toml (e.g., from 0.1.4 to 0.1.5)
-# 2. Commit and push the version change: 
+# 2. Commit and push the version change:
 #    git commit -am "Bump version to x.y.z" && git push origin main
 # 3. Create and push a tag for the new version:
 #    git tag -a vx.y.z -m "Release version x.y.z" && git push origin vx.y.z
 # 4. This workflow will automatically:
 #    - Build wheels for all supported platforms
 #    - Run tests to verify the build
-#    - Create a GitHub release with the tag
-#    - Publish the wheels to PyPI (if PYPI_API_TOKEN is configured)
+#    - Create a GitHub release with all wheels attached
 
-name: Build, Release and Publish 🛞Wheels🛞
+name: Build and Release Wheels
 
 on:
   push:
@@ -28,19 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -75,11 +61,8 @@ jobs:
 
           # Build the wheel inside the container (same approach as ARM64)
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_x86_64 bash -c "
-            # Install OpenSSL development packages
-            yum install -y openssl-devel
-
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
+            # Install system dependencies
+            yum install -y openssl-devel unixODBC-devel
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -89,9 +72,9 @@ jobs:
             /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
 
             # Build the wheel
-            cd /io
+            cd /io/crates/python-bindings
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
-            
+
             # Check if build succeeded
             if [ \$? -ne 0 ]; then
               echo \"ERROR: maturin build failed\"
@@ -153,13 +136,13 @@ jobs:
           
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
-          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
-          cd tests && python -m pytest -v
+          python -c "import keeper_pam_connections; print('Import successful')"
+          cd crates/python-bindings && python -m pytest -v
         shell: bash
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-linux-x86_64
+          name: keeper-pam-connections-linux-x86_64
           path: target/wheels/*.whl
 
   # Linux ARM64 build
@@ -168,19 +151,6 @@ jobs:
     runs-on: UbuntuArm64
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
       # Check system info before proceeding
       - name: Check host system info
@@ -234,11 +204,8 @@ jobs:
 
           # Build the wheel inside the container
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_aarch64 bash -c "
-            # Install OpenSSL development packages
-            yum install -y openssl-devel
-            
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
+            # Install system dependencies
+            yum install -y openssl-devel unixODBC-devel
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -248,9 +215,9 @@ jobs:
             /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
 
             # Build the wheel
-            cd /io
+            cd /io/crates/python-bindings
             /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
-            
+
             # Check if build succeeded
             if [ \$? -ne 0 ]; then
               echo \"ERROR: maturin build failed\"
@@ -315,8 +282,8 @@ jobs:
           
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
-          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
-          cd tests && python -m pytest -v
+          python -c "import keeper_pam_connections; print('Import successful')"
+          cd crates/python-bindings && python -m pytest -v
         shell: bash
 
       # Verify the wheel compatibility with glibc 2.28
@@ -340,7 +307,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-linux-arm64
+          name: keeper-pam-connections-linux-arm64
           path: target/wheels/*.whl
 
   # macOS builds (x86_64 and arm64)
@@ -349,19 +316,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -378,6 +332,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew list openssl@3 &>/dev/null || brew install openssl@3
+          brew list unixodbc &>/dev/null || brew install unixodbc
 
       - name: Install maturin
         run: |
@@ -388,25 +343,26 @@ jobs:
       - name: Build wheels (x86_64 and arm64)
         run: |
           export OPENSSL_DIR=$(brew --prefix openssl@3)
+          cd crates/python-bindings
 
           # Build x86_64 wheel
           echo "Building for macOS x86_64"
-          maturin build --release --target x86_64-apple-darwin
+          maturin build --release --target x86_64-apple-darwin --out ../../target/wheels
 
           # Build arm64 wheel
           echo "Building for macOS ARM64"
-          maturin build --release --target aarch64-apple-darwin
+          maturin build --release --target aarch64-apple-darwin --out ../../target/wheels
 
           # Debug - list the wheels that were built
           echo "Wheels built for macOS:"
-          find target/wheels -name "*.whl" -type f | sort
+          find ../../target/wheels -name "*.whl" -type f | sort
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-macos
+          name: keeper-pam-connections-macos
           path: target/wheels/*.whl
 
   # Windows build
@@ -415,20 +371,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config) instead of libgit2
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
-        shell: bash
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -452,12 +394,12 @@ jobs:
         run: |
           echo "Building for Windows x86_64"
           python -m pip show maturin
-          Get-ChildItem target -ErrorAction SilentlyContinue
-          maturin build --release --target x86_64-pc-windows-msvc
+          Set-Location crates/python-bindings
+          maturin build --release --target x86_64-pc-windows-msvc --out ../../target/wheels
 
           # Debug - list the wheels that were built
           echo "Wheels built for Windows x86_64:"
-          Get-ChildItem target/wheels -Filter "*.whl" -ErrorAction SilentlyContinue | Sort-Object Name
+          Get-ChildItem ../../target/wheels -Filter "*.whl" -ErrorAction SilentlyContinue | Sort-Object Name
         shell: pwsh
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -488,13 +430,13 @@ jobs:
           
           Write-Host "Installing wheel: $($wheel.FullName)"
           pip install $wheel.FullName
-          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
-          cd tests && python -m pytest -v
+          python -c "import keeper_pam_connections; print('Import successful')"
+          cd crates/python-bindings && python -m pytest -v
         shell: pwsh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-windows-x86_64
+          name: keeper-pam-connections-windows-x86_64
           path: target/wheels/*.whl
 
   # Alpine Linux build
@@ -503,19 +445,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -546,10 +475,7 @@ jobs:
           # Use root user inside the container but fix permissions after
           docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io alpine:3.16 sh -c "
             # Install build dependencies including patchelf, git, and OpenSSL
-            apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf git openssl-dev openssl-libs-static
-
-            # Configure git for private dependencies
-            git config --global url.\"https://x-access-token:\${GIT_TOKEN}@github.com/\".insteadOf \"https://github.com/\"
+            apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf git openssl-dev openssl-libs-static unixodbc-dev
 
             # Install Rust
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -560,7 +486,7 @@ jobs:
 
             # Build the wheel directly in a temporary directory within the container
             TEMP_DIR=\$(mktemp -d)
-            cd /io
+            cd /io/crates/python-bindings
 
             # Use maturin to build the wheel with explicit output location
             mkdir -p /io/target/wheels
@@ -640,19 +566,19 @@ jobs:
             pip install /io/$WHEEL_PATH
           
             # Verify import works
-            python -c 'import keeper_pam_webrtc_rs; print(\"Import successful\")'
+            python -c 'import keeper_pam_connections; print(\"Import successful\")'
           
             # Install test dependencies
             pip install pytest pytest-asyncio 
           
             # Run tests
-            cd /io/tests && python -m pytest -v
+            cd /io/crates/python-bindings/tests && python -m pytest -v
           "
         shell: bash
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-alpine-x86_64
+          name: keeper-pam-connections-alpine-x86_64
           path: target/wheels/*.whl
 
   # Build source distribution
@@ -661,19 +587,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Configure git to use ACCESS_TOKEN for private org dependencies (pam-guacr)
-      - name: Configure git for private dependencies
-        run: |
-          TOKEN="${{ secrets.ACCESS_TOKEN }}"
-          if [ -z "$TOKEN" ]; then
-            TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-          # Configure Cargo to use git CLI (respects git config)
-          mkdir -p ~/.cargo
-          echo '[net]' >> ~/.cargo/config.toml
-          echo 'git-fetch-with-cli = true' >> ~/.cargo/config.toml
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -693,12 +606,13 @@ jobs:
       - name: Build source distribution
         run: |
           echo "Building source distribution"
-          maturin sdist
-          ls -la target/wheels/
+          cd crates/python-bindings
+          maturin sdist --out ../../target/wheels
+          ls -la ../../target/wheels/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keeper-pam-webrtc-rs-sdist
+          name: keeper-pam-connections-sdist
           path: target/wheels/*.tar.gz
 
   # Create release with all wheels if on tag
@@ -725,7 +639,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist/
-          pattern: keeper-pam-webrtc-rs-*
+          pattern: keeper-pam-connections-*
           merge-multiple: true
 
       - name: Debug wheel and sdist files
@@ -738,7 +652,7 @@ jobs:
             ls -la "$dir"
           done
           
-          # Ensure wheels and sdist are in the correct location for twine
+          # Collect all wheels and sdist into a single directory for the release
           mkdir -p dist/wheels
           find dist -type f -name "*.whl" -exec cp {} dist/wheels/ \;
           find dist -type f -name "*.tar.gz" -exec cp {} dist/wheels/ \;
@@ -753,46 +667,45 @@ jobs:
           files: |
             dist/wheels/*.whl
             dist/wheels/*.tar.gz
-          name: keeper-pam-webrtc-rs ${{ env.VERSION }}
+          name: keeper-pam-connections ${{ env.VERSION }}
           body: |
             WebRTC Python extension module using Rust
 
             This release includes:
             - Wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64), Windows (x86_64), Alpine Linux (x86_64)
             - Source distribution (sdist) for building from source
-            
+
             Built with abi3 for maximum Python version compatibility (Python 3.7+).
-            
+
             **Note:** Building from source requires Rust toolchain to be installed.
           tag_name: v${{ env.VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check PyPI Secrets
-        id: check_secrets
-        run: |
-          if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
-            echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_OUTPUT
-            echo "PyPI secrets are available, will publish to PyPI"
-          else
-            echo "PYPI_SECRETS_AVAILABLE=false" >> $GITHUB_OUTPUT
-            echo "PyPI secrets are NOT available, skipping publishing"
-          fi
-        shell: bash
-
-        # https://stackoverflow.com/questions/79408101/what-is-the-correct-way-of-specifying-the-license-in-pyproject-toml-file-for-a-n
-      - name: Install PyPI tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install twine==6.0.1
-        shell: bash
-
-      - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags/v') && steps.check_secrets.outputs.PYPI_SECRETS_AVAILABLE == 'true'
+      - name: Delete existing latest release
+        run: gh release delete latest --yes || true
         env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          echo "Publishing wheels and source distribution to PyPI..."
-          twine upload dist/wheels/*
-        shell: bash
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete existing latest tag
+        run: git push origin :refs/tags/latest || true
+
+      - name: Create latest release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          tag_name: latest
+          name: "Latest (v${{ env.VERSION }})"
+          body: |
+            Points to: **v${{ env.VERSION }}**
+
+            This release includes:
+            - Wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64), Windows (x86_64), Alpine Linux (x86_64)
+            - Source distribution (sdist) for building from source
+          files: |
+            dist/wheels/*.whl
+            dist/wheels/*.tar.gz
+          prerelease: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

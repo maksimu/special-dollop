@@ -1,0 +1,16 @@
+[package]
+name = "guacr-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guacamole protocol instruction formatting and utilities"
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }

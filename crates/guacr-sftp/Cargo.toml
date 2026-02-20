@@ -1,0 +1,34 @@
+[package]
+name = "guacr-sftp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SFTP file transfer protocol handler for guacr"
+
+[dependencies]
+# Local dependencies
+guacr-handlers = { path = "../guacr-handlers" }
+guacr-protocol = { path = "../guacr-protocol" }
+guacr-terminal = { path = "../guacr-terminal" }
+
+# Workspace dependencies
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+# SSH/SFTP
+russh = "0.46"
+russh-keys = "0.46"
+russh-sftp = "2.1"
+ssh-key = "0.6"
+
+# Image for file browser rendering
+image = "0.25"
+
+# Utilities
+base64.workspace = true
+chrono = "0.4"
+futures = "0.3"

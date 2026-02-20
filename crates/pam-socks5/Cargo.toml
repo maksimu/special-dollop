@@ -1,0 +1,15 @@
+[package]
+name = "pam-socks5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SOCKS5 protocol handshake and payload parsing for keeper-pam tunneling"
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util", "net"] }
+bytes.workspace = true
+anyhow.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "rt-multi-thread", "macros"] }

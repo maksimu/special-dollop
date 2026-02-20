@@ -1,0 +1,56 @@
+[package]
+name = "guacr-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal emulation and rendering for guacr"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Terminal emulation
+vt100 = "0.15"
+unicode-width = "0.1"
+
+# Font rendering
+fontdue = "0.9"
+
+# Image processing
+image = "0.25"
+png = "0.17"  # Streaming PNG encoder for zero-copy encoding
+
+# Graphics protocols
+# Note: sixel 0.3 has outdated dependencies with security issues (regex 0.1.80)
+# Disabling sixel support until upstream updates or we find an alternative
+# sixel = { version = "0.3", optional = true }
+
+# Protocol support
+guacr-protocol = { path = "../guacr-protocol" }
+guacr-recording = { path = "../guacr-recording" }
+
+# Zero-copy buffer pooling
+crossbeam-queue = "0.3"
+
+# Lock primitives (no poisoning)
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+
+[features]
+default = []
+# sixel-support = ["sixel"]  # Disabled due to security vulnerabilities in sixel 0.3
+
+[[bench]]
+name = "alpha_fix_bench"
+harness = false

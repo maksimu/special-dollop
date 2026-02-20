@@ -96,7 +96,7 @@ jobs:
           # Test keeper-pam-webrtc-rs without Python support (pure Rust)
           cargo test -p keeper-pam-webrtc-rs --lib --no-default-features
           # Test all other workspace crates with all features (excluding python-bindings which needs maturin)
-          cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+          cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py --exclude keeper-pam-webrtc-rs-py
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
@@ -228,7 +228,7 @@ jobs:
           # Build keeper-pam-webrtc-rs without Python support
           cargo build -p keeper-pam-webrtc-rs --lib --no-default-features --release
           # Build all other workspace crates (excluding python-bindings which needs maturin)
-          cargo build --workspace --all-targets --release --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+          cargo build --workspace --all-targets --release --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py --exclude keeper-pam-webrtc-rs-py
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           # Override fat LTO for CI - production LTO is only needed for wheel builds

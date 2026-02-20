@@ -1,0 +1,387 @@
+# HOW TO RELEASE A NEW VERSION:
+# 1. Update the version in Cargo.toml (e.g., from 0.1.4 to 0.1.5)
+# 2. Commit and push the version change:
+#    git commit -am "Bump version to x.y.z" && git push origin main
+# 3. Create and push a tag for the new version:
+#    git tag -a vx.y.z -m "Release version x.y.z" && git push origin vx.y.z
+# 4. This workflow will automatically:
+#    - Build wheels for all supported platforms (WebRTC only, no guacr handlers)
+#    - Publish the wheels to PyPI (if PYPI_API_TOKEN is configured)
+
+name: Build and Publish WebRTC Wheel
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Linux x86_64 build
+  build_linux_x86_64:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install "maturin>=1.8"
+        shell: bash
+
+      - name: Build wheel
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          docker pull quay.io/pypa/manylinux_2_28_x86_64
+
+          docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_x86_64 bash -c "
+            yum install -y openssl-devel unixODBC-devel
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+            /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
+            cd /io/crates/webrtc-bindings
+            /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
+            mkdir -p /io/target/wheels
+            for wheel in \$(find /io/target -name '*.whl' -type f); do
+              if [[ \"\$wheel\" != \"/io/target/wheels/\"* ]]; then
+                cp \"\$wheel\" /io/target/wheels/
+              fi
+            done
+            WHEEL_COUNT=\$(find /io/target/wheels -name '*.whl' -type f | wc -l)
+            if [ \$WHEEL_COUNT -eq 0 ]; then
+              echo 'ERROR: No wheels found'
+              exit 1
+            fi
+          "
+        shell: bash
+
+      - name: Test wheel
+        run: |
+          pip install virtualenv
+          python -m virtualenv venv
+          . venv/bin/activate
+          WHEEL=$(find target/wheels -name "*.whl" -type f | head -1)
+          pip install "$WHEEL"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-linux-x86_64
+          path: target/wheels/*.whl
+
+  # Linux ARM64 build
+  build_linux_arm64:
+    name: Build Linux (ARM64)
+    runs-on: UbuntuArm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Docker availability
+        run: |
+          if command -v docker &> /dev/null; then
+            docker --version
+          else
+            sudo systemctl start docker || true
+          fi
+        shell: bash
+
+      - name: Build wheel in manylinux container
+        run: |
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          docker pull quay.io/pypa/manylinux_2_28_aarch64
+
+          docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io quay.io/pypa/manylinux_2_28_aarch64 bash -c "
+            yum install -y openssl-devel unixODBC-devel
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+            /opt/python/cp311-cp311/bin/pip install 'maturin>=1.8'
+            cd /io/crates/webrtc-bindings
+            /opt/python/cp311-cp311/bin/maturin build --release --manylinux 2_28
+            mkdir -p /io/target/wheels
+            for wheel in \$(find /io/target -name '*.whl' -type f); do
+              if [[ \"\$wheel\" != \"/io/target/wheels/\"* ]]; then
+                cp \"\$wheel\" /io/target/wheels/
+              fi
+            done
+            WHEEL_COUNT=\$(find /io/target/wheels -name '*.whl' -type f | wc -l)
+            if [ \$WHEEL_COUNT -eq 0 ]; then
+              echo 'ERROR: No wheels found'
+              exit 1
+            fi
+          "
+        shell: bash
+
+      - name: Test wheel
+        run: |
+          python -m pip install virtualenv
+          python -m virtualenv venv
+          . venv/bin/activate
+          WHEEL=$(find target/wheels -name "*.whl" -type f | head -1)
+          pip install "$WHEEL"
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-linux-arm64
+          path: target/wheels/*.whl
+
+  # macOS builds (x86_64 and arm64)
+  build_macos:
+    name: Build macOS (x86_64 and arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Install dependencies
+        run: |
+          brew list openssl@3 &>/dev/null || brew install openssl@3
+          brew list unixodbc &>/dev/null || brew install unixodbc
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install "maturin>=1.8"
+        shell: bash
+
+      - name: Build wheels (x86_64 and arm64)
+        run: |
+          export OPENSSL_DIR=$(brew --prefix openssl@3)
+          cd crates/webrtc-bindings
+          maturin build --release --target x86_64-apple-darwin --out ../../target/wheels
+          maturin build --release --target aarch64-apple-darwin --out ../../target/wheels
+        shell: bash
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-macos
+          path: target/wheels/*.whl
+
+  # Windows build
+  build_windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install "maturin>=1.8"
+        shell: bash
+
+      - name: Build wheel
+        run: |
+          Set-Location crates/webrtc-bindings
+          maturin build --release --target x86_64-pc-windows-msvc --out ../../target/wheels
+        shell: pwsh
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+      - name: Test wheel
+        run: |
+          $wheel = Get-ChildItem -Path "target/wheels/*.whl" -ErrorAction SilentlyContinue | Select-Object -First 1
+          pip install $wheel.FullName
+          python -c "import keeper_pam_webrtc_rs; print('Import successful')"
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-windows-x86_64
+          path: target/wheels/*.whl
+
+  # Alpine Linux build
+  build_alpine:
+    name: Build Alpine Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: 'x64'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build Alpine Linux wheel
+        run: |
+          mkdir -p target/wheels
+
+          TOKEN="${{ secrets.ACCESS_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          docker run --rm -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_TOKEN="${TOKEN}" -v "$(pwd)":/io alpine:3.16 sh -c "
+            apk add --no-cache python3 python3-dev py3-pip gcc g++ musl-dev curl patchelf git openssl-dev openssl-libs-static unixodbc-dev
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+            pip3 install 'maturin[patchelf]>=1.8'
+            mkdir -p /io/target/wheels
+            cd /io/crates/webrtc-bindings
+            maturin build --release --strip --out /io/target/wheels || \
+              maturin build --release --out /io/target/wheels
+            find /io/target -type d -exec chmod 777 {} \\;
+            find /io/target -type f -exec chmod 666 {} \\;
+          "
+        shell: bash
+
+      - name: Test Alpine wheel
+        run: |
+          WHEEL_PATH=$(find target -type f -name "*.whl" | head -1)
+          docker run --rm -v "$(pwd)":/io alpine:latest sh -c "
+            apk add --no-cache python3 py3-pip
+            python3 -m venv /tmp/venv
+            . /tmp/venv/bin/activate
+            pip install /io/$WHEEL_PATH
+            python -c 'import keeper_pam_webrtc_rs; print(\"Import successful\")'
+          "
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-alpine-x86_64
+          path: target/wheels/*.whl
+
+  # Build source distribution
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: stable
+
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install "maturin>=1.8"
+
+      - name: Build source distribution
+        run: |
+          cd crates/webrtc-bindings
+          maturin sdist --out ../../target/wheels
+          ls -la ../../target/wheels/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-pam-webrtc-rs-sdist
+          path: target/wheels/*.tar.gz
+
+  # Publish to PyPI
+  publish_to_pypi:
+    name: Publish to PyPI
+    environment: prod
+    permissions:
+      contents: read
+    needs: [build_linux_x86_64, build_linux_arm64, build_macos, build_windows, build_alpine, build_sdist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all wheels and source distribution
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: keeper-pam-webrtc-rs-*
+          merge-multiple: true
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist/wheels
+          find dist -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} dist/wheels/ \;
+          echo "Files to publish:"
+          ls -la dist/wheels/
+        shell: bash
+
+      - name: Check PyPI Secrets
+        id: check_secrets
+        run: |
+          if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
+            echo "PYPI_SECRETS_AVAILABLE=true" >> $GITHUB_OUTPUT
+            echo "PyPI secrets are available, will publish to PyPI"
+          else
+            echo "PYPI_SECRETS_AVAILABLE=false" >> $GITHUB_OUTPUT
+            echo "PyPI secrets are NOT available, skipping publishing"
+          fi
+        shell: bash
+
+      - name: Install PyPI tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install twine==6.0.1
+        shell: bash
+
+      - name: Publish to PyPI
+        if: steps.check_secrets.outputs.PYPI_SECRETS_AVAILABLE == 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          echo "Publishing wheels and source distribution to PyPI..."
+          twine upload dist/wheels/*
+        shell: bash

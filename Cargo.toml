@@ -2,6 +2,7 @@
 members = [
     "crates/keeper-pam-webrtc-rs",
     "crates/python-bindings",
+    "crates/webrtc-bindings",
     "crates/guacr",
     "crates/guacr-handlers",
     "crates/guacr-protocol",
@@ -23,7 +24,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 license = "MIT"
 authors = ["Keeper Security Engineering <engineering@keeper.io>"]
@@ -100,6 +101,8 @@ ironrdp-cliprdr = { git = "https://github.com/miroberts/IronRDP.git", branch = "
 ironrdp-svc = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 ironrdp-displaycontrol = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 ironrdp-dvc = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-rdpdr = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
+ironrdp-rdpdr-native = { git = "https://github.com/miroberts/IronRDP.git", branch = "feature/handle-update-pdu" }
 
 [profile.release]
 opt-level = 3

@@ -299,6 +299,12 @@ pub struct RdpSettings {
     pub cert_fingerprint: Option<String>,
     /// Recording configuration
     pub recording_config: RecordingConfig,
+    /// Drive redirection settings
+    pub enable_drive: bool,
+    pub drive_path: Option<String>,
+    pub drive_name: String,
+    pub disable_download: bool,
+    pub disable_upload: bool,
     #[cfg(feature = "sftp")]
     pub enable_sftp: bool,
     #[cfg(feature = "sftp")]
@@ -508,6 +514,24 @@ impl RdpSettings {
             }
         };
 
+        let enable_drive = params
+            .get("enable-drive")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let drive_path = params.get("drive-path").cloned();
+        let drive_name = params
+            .get("drive-name")
+            .cloned()
+            .unwrap_or_else(|| "KeeperShare".to_string());
+        let disable_download = params
+            .get("disable-download")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let disable_upload = params
+            .get("disable-upload")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         info!(
             "RDP Settings: {}@{}:{}, {}x{}, security: {}, clipboard: {} bytes, read_only: {}",
             username,
@@ -553,6 +577,11 @@ impl RdpSettings {
             ignore_cert,
             cert_fingerprint,
             recording_config,
+            enable_drive,
+            drive_path,
+            drive_name,
+            disable_download,
+            disable_upload,
             #[cfg(feature = "sftp")]
             enable_sftp,
             #[cfg(feature = "sftp")]
@@ -574,6 +603,76 @@ impl RdpSettings {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+// ============================================================================
+// RDPDR restriction wrapper (drive feature only)
+// ============================================================================
+
+/// Wraps any RdpdrBackend and enforces download/upload restrictions by returning
+/// ACCESS_DENIED for read (download) or write (upload) I/O requests.
+#[cfg(feature = "drive")]
+#[derive(Debug)]
+struct RestrictedRdpdrBackend {
+    inner: Box<dyn ironrdp_rdpdr::RdpdrBackend>,
+    disable_download: bool,
+    disable_upload: bool,
+}
+
+#[cfg(feature = "drive")]
+ironrdp_core::impl_as_any!(RestrictedRdpdrBackend);
+
+#[cfg(feature = "drive")]
+impl ironrdp_rdpdr::RdpdrBackend for RestrictedRdpdrBackend {
+    fn handle_server_device_announce_response(
+        &mut self,
+        pdu: ironrdp_rdpdr::pdu::efs::ServerDeviceAnnounceResponse,
+    ) -> ironrdp_pdu::PduResult<()> {
+        self.inner.handle_server_device_announce_response(pdu)
+    }
+
+    fn handle_scard_call(
+        &mut self,
+        req: ironrdp_rdpdr::pdu::efs::DeviceControlRequest<ironrdp_rdpdr::pdu::esc::ScardIoCtlCode>,
+        call: ironrdp_rdpdr::pdu::esc::ScardCall,
+    ) -> ironrdp_pdu::PduResult<()> {
+        self.inner.handle_scard_call(req, call)
+    }
+
+    fn handle_drive_io_request(
+        &mut self,
+        req: ironrdp_rdpdr::pdu::efs::ServerDriveIoRequest,
+    ) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+        use ironrdp_rdpdr::pdu::efs::*;
+        use ironrdp_rdpdr::pdu::RdpdrPdu;
+        use ironrdp_svc::SvcMessage;
+
+        match &req {
+            ServerDriveIoRequest::DeviceReadRequest(r) if self.disable_download => {
+                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
+                    DeviceReadResponse {
+                        device_io_reply: DeviceIoResponse::new(
+                            r.device_io_request.clone(),
+                            NtStatus::ACCESS_DENIED,
+                        ),
+                        read_data: Vec::new(),
+                    },
+                ))])
+            }
+            ServerDriveIoRequest::DeviceWriteRequest(r) if self.disable_upload => {
+                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
+                    DeviceWriteResponse {
+                        device_io_reply: DeviceIoResponse::new(
+                            r.device_io_request.clone(),
+                            NtStatus::ACCESS_DENIED,
+                        ),
+                        length: 0,
+                    },
+                ))])
+            }
+            _ => self.inner.handle_drive_io_request(req),
+        }
+    }
+}
 
 // ============================================================================
 // RDP Session - Complete connection and event loop
@@ -779,8 +878,20 @@ impl IronRdpSession {
         info!("RDP: TCP connection established");
 
         // Perform RDP handshake and authentication
+        let drive_args = if settings_ref.enable_drive {
+            settings_ref.drive_path.as_deref().map(|p| {
+                (
+                    p,
+                    settings_ref.drive_name.as_str(),
+                    settings_ref.disable_download,
+                    settings_ref.disable_upload,
+                )
+            })
+        } else {
+            None
+        };
         let (connection_result, framed) = match self
-            .perform_rdp_handshake(stream, config, hostname.to_string())
+            .perform_rdp_handshake(stream, config, hostname.to_string(), drive_args)
             .await
         {
             Ok(result) => result,
@@ -954,6 +1065,10 @@ impl IronRdpSession {
             hardware_id: None,
             license_cache: None,
             timezone_info: TimezoneInfo::default(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            compression_type: None,
+            multitransport_flags: None,
         }
     }
 
@@ -962,6 +1077,7 @@ impl IronRdpSession {
         stream: TcpStream,
         config: connector::Config,
         server_name: String,
+        drive_settings: Option<(&str, &str, bool, bool)>,
     ) -> Result<
         (
             ConnectionResult,
@@ -980,6 +1096,38 @@ impl IronRdpSession {
         // Note: xrdp doesn't support Dynamic Virtual Channels (DVC), so we don't add DisplayControl
         // guacd also doesn't use DVC with xrdp for this reason
         let mut connector = ClientConnector::new(config, client_addr);
+
+        // Register RDPDR for drive redirection
+        #[cfg(feature = "drive")]
+        if let Some((path, name, disable_download, disable_upload)) = drive_settings {
+            use ironrdp_rdpdr::Rdpdr;
+
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let platform_backend: Box<dyn ironrdp_rdpdr::RdpdrBackend> = {
+                use ironrdp_rdpdr_native::backend::NixRdpdrBackend;
+                Box::new(NixRdpdrBackend::new(path.to_string()))
+            };
+
+            #[cfg(target_os = "windows")]
+            let platform_backend: Box<dyn ironrdp_rdpdr::RdpdrBackend> = {
+                use ironrdp_rdpdr_native::backend::WinRdpdrBackend;
+                Box::new(WinRdpdrBackend::new(path.to_string()))
+            };
+
+            let backend: Box<dyn ironrdp_rdpdr::RdpdrBackend> = Box::new(RestrictedRdpdrBackend {
+                inner: platform_backend,
+                disable_download,
+                disable_upload,
+            });
+
+            let rdpdr = Rdpdr::new(backend, "KeeperGateway".to_owned())
+                .with_drives(Some(vec![(1u32, name.to_string())]));
+            connector.attach_static_channel(rdpdr);
+            info!(
+                "RDP: Drive redirection enabled: path={} name={} disable_download={} disable_upload={}",
+                path, name, disable_download, disable_upload
+            );
+        }
 
         // Begin RDP connection (X.224, MCS)
         let should_upgrade = connect_begin(&mut framed, &mut connector)

@@ -252,7 +252,27 @@ cargo test -p guacr-rdp --features sftp
 1. Complete hardware encoder implementations (NVENC, QuickSync, etc.)
 2. Complete RDPGFX channel integration
 3. Complete audio channel implementation
-4. Add compression support (RLE, etc.)
+4. Add RDP bulk compression (`compression_type` in `connector::Config` — already wired in as `None`).
+5. RemoteApp support (`alternate_shell` / `work_dir`) — launch a specific application instead of a full
+   desktop. The IronRDP `connector::Config` fields are already wired in (set to empty string today).
+   Plumbing needed: expose `alternate-shell` and `work-dir` as optional connection params, pass through
+   to `build_config()`. PAM use case: give a privileged user access to a single admin tool on a server
+   without granting full desktop access.
+6. Certificate validation — `ignore_cert` and `cert_fingerprint` fields exist in `HandlerSettings` and
+   are parsed from connection params, but TLS validation is not yet enforced. Currently all certs are
+   accepted. Wire these into the TLS connector configuration.
+7. Connection broker / load balancing — `load_balance_info` field exists in `HandlerSettings` but is
+   unused. RDP connection brokers use this token during the X.224 connect phase to route sessions to the
+   right host in a farm.
+8. Clipboard (CLIPRDR) — the `RdpClipboard` struct and channel handler framework are in place but
+   clipboard data is not yet forwarded. Wire up the CLIPRDR channel send path (currently has a TODO at
+   the point where clipboard content would be sent to the RDP server).
+9. Read-only mode keyboard passthrough — currently blocks all keyboard input in read-only mode.
+   Should allow Ctrl+C / Ctrl+Insert so users can still copy text while blocked from typing. Requires
+   tracking modifier key state to detect copy shortcuts.
+10. UDP multitransport / RDPUDP (`multitransport_flags` in `connector::Config` — already wired in as
+    `None`). Enabling this allows RDP to use UDP for bulk data, reducing latency and improving throughput
+    especially for graphics-heavy sessions.
 
 ## Troubleshooting
 

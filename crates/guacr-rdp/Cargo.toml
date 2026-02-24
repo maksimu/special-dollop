@@ -45,6 +45,12 @@ russh-sftp = { version = "2.1", optional = true }
 russh-keys = { version = "0.46", optional = true }
 guacr-threat-detection = { path = "../guacr-threat-detection", optional = true }
 
+# Drive redirection via IronRDP RDPDR
+ironrdp-rdpdr = { version = "0.5", optional = true }
+ironrdp-rdpdr-native = { version = "0.5", optional = true }
+ironrdp-svc = { version = "0.6", optional = true }
+ironrdp-core = { version = "0.1", optional = true }
+
 [features]
 default = []
 # Hardware encoding features temporarily disabled
@@ -55,3 +61,5 @@ default = []
 # SFTP integration feature
 sftp = ["guacr-sftp", "russh", "russh-sftp", "russh-keys"]
 threat-detection = ["guacr-threat-detection"]
+# RDP drive redirection (RDPDR) via IronRDP
+drive = ["ironrdp-rdpdr", "ironrdp-rdpdr-native", "ironrdp-svc", "ironrdp-core"]

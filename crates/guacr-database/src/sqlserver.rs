@@ -360,10 +360,13 @@ impl ProtocolHandler for SqlServerHandler {
                         record_query_input(&mut recorder, &recording_config, &query);
 
                         // Handle built-in commands
-                        if handle_builtin_command(&query, &mut executor, &to_client, &security)
-                            .await?
+                        match handle_builtin_command(&query, &mut executor, &to_client, &security)
+                            .await
                         {
-                            continue;
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(HandlerError::Disconnected(_)) => break 'outer,
+                            Err(e) => return Err(e),
                         }
 
                         // Check for export command: \e <query>

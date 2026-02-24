@@ -532,6 +532,7 @@ pub async fn setup_outbound_task(
         let mut clean_disconnect_received = false; // Track if disconnect opcode was seen
         let mut loop_iterations = 0;
 
+        let mut drain_mode = false; // Guacd: discard data after WebRTC close, wait for guacd EOF
         let mut main_read_buffer = buffer_pool.acquire();
         let mut encode_buffer = buffer_pool.acquire();
 
@@ -852,6 +853,13 @@ pub async fn setup_outbound_task(
                 }
                 _ => {
                     eof_sent = false;
+
+                    if drain_mode {
+                        // WebRTC is already closed; discard guacd data until it sends EOF
+                        main_read_buffer.clear();
+                        continue;
+                    }
+
                     let mut close_conn_and_break = false;
 
                     if active_protocol == ActiveProtocol::Guacd {
@@ -986,16 +994,18 @@ pub async fn setup_outbound_task(
                                                 }
                                             } else {
                                                 // Send CloseConnection control frame
-                                                // Use GuacdError reason for both error and disconnect opcodes
-                                                // (disconnect is a clean closure initiated by guacd)
+                                                // Use Normal for clean disconnect opcode, GuacdError for error opcode
+                                                let close_reason = if clean_disconnect_received {
+                                                    CloseConnectionReason::Normal
+                                                } else {
+                                                    CloseConnectionReason::GuacdError
+                                                };
                                                 let mut temp_buf_for_control =
                                                     buffer_pool.acquire();
                                                 temp_buf_for_control.clear();
                                                 temp_buf_for_control
                                                     .extend_from_slice(&conn_no.to_be_bytes());
-                                                temp_buf_for_control.put_u8(
-                                                    CloseConnectionReason::GuacdError as u8,
-                                                );
+                                                temp_buf_for_control.put_u8(close_reason as u8);
                                                 // Add error message (backward compatible extension)
                                                 if let Some(ref error_msg) = guacd_error_message {
                                                     let error_bytes = error_msg.as_bytes();
@@ -1448,8 +1458,14 @@ pub async fn setup_outbound_task(
                         }
 
                         if close_conn_and_break {
-                            // If Guacd processing decided to close
+                            // WebRTC send failed — enter drain mode: keep reading guacd TCP
+                            // until it sends EOF, so guacd can process disconnect cleanly
                             main_read_buffer.clear();
+                            if let Some(ref mut batch) = guacd_batch_buffer {
+                                batch.clear();
+                            }
+                            drain_mode = true;
+                            close_conn_and_break = false;
                         } else if consumed_offset > 0 {
                             main_read_buffer.advance(consumed_offset);
                         }

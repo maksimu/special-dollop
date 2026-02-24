@@ -439,8 +439,11 @@ impl OracleHandler {
                         record_query_input(recorder, recording_config, &query);
 
                         // Handle built-in commands
-                        if handle_builtin_command(&query, executor, to_client, security).await? {
-                            continue;
+                        match handle_builtin_command(&query, executor, to_client, security).await {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(HandlerError::Disconnected(_)) => break 'outer,
+                            Err(e) => return Err(e),
                         }
 
                         // Check for export command
@@ -663,8 +666,11 @@ impl OracleHandler {
                         record_query_input(recorder, recording_config, &query);
 
                         // Handle built-in commands
-                        if handle_builtin_command(&query, executor, to_client, security).await? {
-                            continue;
+                        match handle_builtin_command(&query, executor, to_client, security).await {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(HandlerError::Disconnected(_)) => break 'outer,
+                            Err(e) => return Err(e),
                         }
 
                         // Check for export command: \e <query>

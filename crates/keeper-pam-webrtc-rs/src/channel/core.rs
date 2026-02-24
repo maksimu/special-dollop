@@ -1308,27 +1308,29 @@ impl Channel {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
 
-            // CRITICAL: For Guacd sessions, wait for guacd to process disconnect and complete cleanup
-            // Guacd needs time to:
-            // 1. Receive the "10.disconnect;" instruction (already transmitted via conn.shutdown)
-            // 2. Parse the instruction
-            // 3. Execute session cleanup (close RDP/VNC/SSH, free resources, write audit logs)
-            // 4. Close the connection gracefully from its side
-            // Without this delay, we close TCP socket before guacd finishes cleanup
             if self.active_protocol == ActiveProtocol::Guacd {
-                debug!("Waiting 500ms for guacd to process disconnect and complete cleanup (channel_id: {}, conn_no: {})", self.channel_id, conn_no);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
+                // Take the to_webrtc handle before dropping the DashMap guard so we can .await it.
+                // to_webrtc exits naturally when guacd closes its side of TCP (EOF on read),
+                // which happens ~200ms after it processes the disconnect instruction.
+                let to_webrtc_handle = self
+                    .conns
+                    .get_mut(&conn_no)
+                    .and_then(|mut c| c.to_webrtc.take());
+                // DashMap guard dropped here
 
-            // Immediate removal using DashMap
-            if let Some(conn_ref) = self.conns.get(&conn_no) {
-                // CRITICAL: Cancel the read task FIRST to allow immediate exit
-                // This prevents the 15-second ICE timeout when guacd closes TCP without error opcode
-                conn_ref.cancel_read_task.cancel();
-                debug!(
-                    "Cancelled backend read task for immediate exit (channel_id: {}, conn_no: {})",
-                    self.channel_id, conn_no
-                );
+                if let Some(handle) = to_webrtc_handle {
+                    Self::wait_for_guacd_eof(handle, &self.conns, conn_no, &self.channel_id).await;
+                }
+            } else {
+                // Non-guacd (tunnel, DB proxy): target host may still be alive, don't wait for EOF
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if let Some(conn_ref) = self.conns.get(&conn_no) {
+                    conn_ref.cancel_read_task.cancel();
+                    debug!(
+                        "Cancelled backend read task for immediate exit (channel_id: {}, conn_no: {})",
+                        self.channel_id, conn_no
+                    );
+                }
             }
 
             if let Some((_, mut conn)) = self.conns.remove(&conn_no) {
@@ -1605,14 +1607,16 @@ impl Channel {
         self.internal_handle_connection_close(conn_no, reason)
             .await?;
 
-        // For Guacd, wait for server to process disconnect
         if !should_delay_removal && is_primary_guacd {
-            // Wait for guacd to process disconnect and complete cleanup
-            debug!(
-                "Waiting 500ms for guacd to process disconnect (channel_id: {}, conn_no: {})",
-                self.channel_id, conn_no
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Wait for guacd to close TCP from its side (~200ms after processing disconnect)
+            let to_webrtc_handle = self
+                .conns
+                .get_mut(&conn_no)
+                .and_then(|mut c| c.to_webrtc.take());
+
+            if let Some(handle) = to_webrtc_handle {
+                Self::wait_for_guacd_eof(handle, &self.conns, conn_no, &self.channel_id).await;
+            }
         }
 
         // ALWAYS remove connection from DashMap (don't skip based on primary status!)
@@ -1789,6 +1793,40 @@ impl Channel {
     /// Static helper to extract connection IDs from any DashMap reference
     fn extract_connection_ids(conns: &DashMap<u32, Conn>) -> Vec<u32> {
         conns.iter().map(|entry| *entry.key()).collect()
+    }
+
+    /// Wait for guacd's outbound task to finish (EOF on TCP read), with a 2s timeout.
+    /// If the task panics, errors, or times out, force-cancels the read task.
+    async fn wait_for_guacd_eof(
+        handle: tokio::task::JoinHandle<()>,
+        conns: &DashMap<u32, Conn>,
+        conn_no: u32,
+        channel_id: &str,
+    ) {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await {
+            Ok(Ok(_)) => debug!(
+                "guacd closed TCP cleanly after disconnect (channel_id: {}, conn_no: {})",
+                channel_id, conn_no
+            ),
+            Ok(Err(e)) => {
+                warn!(
+                    "guacd task panicked/was cancelled during teardown (channel_id: {}, conn_no: {}): {}",
+                    channel_id, conn_no, e
+                );
+                if let Some(conn_ref) = conns.get(&conn_no) {
+                    conn_ref.cancel_read_task.cancel();
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "guacd did not close TCP within 2s, forcing close (channel_id: {}, conn_no: {})",
+                    channel_id, conn_no
+                );
+                if let Some(conn_ref) = conns.get(&conn_no) {
+                    conn_ref.cancel_read_task.cancel();
+                }
+            }
+        }
     }
 
     /// Helper to extract host/port from guacd settings if not already set

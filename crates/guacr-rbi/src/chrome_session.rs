@@ -232,7 +232,11 @@ impl ChromeSession {
             use crate::profile_isolation::{ProfileCreationMode, ProfileLock};
 
             let lock = ProfileLock::acquire(profile_dir, ProfileCreationMode::CreateRecursive)
-                .map_err(|e| format!("Failed to lock profile directory: {}", e))?;
+                .map_err(|e| match e {
+                    crate::profile_isolation::ProfileLockError::ProfileInUse(_) =>
+                        "PROFILE_IN_USE: This browser profile is already in use by another active session.".to_string(),
+                    other => format!("Failed to lock profile directory: {}", other),
+                })?;
 
             args.push(format!("--user-data-dir={}", profile_dir));
             info!(

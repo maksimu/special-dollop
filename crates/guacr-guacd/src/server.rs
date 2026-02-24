@@ -595,15 +595,24 @@ pub async fn handle_guacd_connection_with_timeout(
     });
 
     // Run the handler
+    // Note: to_client_tx is consumed by connect() and dropped when it returns,
+    // which closes the channel and lets write_task drain naturally.
     let handler_result = handler
         .connect(connect.params, to_client_tx, from_client_rx)
         .await;
 
-    // Clean up
+    // Clean up: abort read_task immediately (no more input needed),
+    // but give write_task a short window to flush any pending instructions
+    // (e.g. the disconnect opcode sent by the handler before returning).
+    // Without this the WebRTC crate sees unexpected EOF instead of a clean disconnect.
     read_task.abort();
-    write_task.abort();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), write_task).await;
 
-    handler_result.map_err(HandshakeError::Handler)
+    match handler_result {
+        Ok(()) => Ok(()),
+        Err(HandlerError::Disconnected(_)) => Ok(()),
+        Err(e) => Err(HandshakeError::Handler(e)),
+    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,9 @@ keeper-pam-webrtc-rs = { path = "../keeper-pam-webrtc-rs", features = ["python-s
 # Python bindings
 pyo3.workspace = true
 
+# Database proxy
+keeperdb-proxy = { path = "../keeperdb-proxy", features = ["python"] }
+
 # Future crates can be added here:
 # keeper-pam-ssh-rs = { path = "../keeper-pam-ssh-rs", features = ["python-support"] }
 # keeper-pam-rdp-rs = { path = "../keeper-pam-rdp-rs", features = ["python-support"] }

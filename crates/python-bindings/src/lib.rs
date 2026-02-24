@@ -21,6 +21,9 @@ fn keeper_pam_connections(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<(
     // Register WebRTC functionality from keeper-pam-webrtc-rs
     keeper_pam_webrtc_rs::python::register_webrtc_module(py, m)?;
 
+    // Register keeperdb-proxy database proxy functionality
+    keeperdb_proxy::pyo3::register_keeperdb_proxy_module(py, m)?;
+
     // Future: Add other protocol-specific modules here
     // Example:
     // keeper_pam_ssh_rs::python::register_ssh_module(py, m)?;

@@ -1,8 +1,13 @@
-# Container Management Protocol (K8s/Docker)
+# Infrastructure Resource Browser (K8s / Docker / VMs / Bare Metal)
 
 ## Overview
 
-A new protocol handler for managing and accessing containerized environments through a browser-based interface. Similar to how database handlers provide spreadsheet-like views of database tables, this handler provides intuitive views of containers, pods, and their associated resources.
+A protocol handler for browsing and accessing infrastructure resources through a browser-based
+interface. Similar to how database handlers provide spreadsheet-like views of database tables,
+this handler provides intuitive views of containers, pods, VMs, and other compute resources.
+
+Covers: Kubernetes, Docker, Podman, Nomad, vSphere, Proxmox, AWS EC2, Azure VMs, GCP Compute,
+libvirt/KVM, and bare metal (IPMI/Redfish).
 
 **Key Architecture Decision:** Container management runs **through SSH/WinRM** to a bastion/jump host where `kubectl`/`docker` is installed, rather than direct Kubernetes API access. This matches real-world deployment patterns where:
 - Container management happens from specific bastion hosts
@@ -112,14 +117,40 @@ Spreadsheet-like interface showing containers/pods:
 - Memory Usage
 - Actions (Shell/Logs/Stop/Delete)
 
-**Rendering:** Use Guacamole drawing instructions (rect, text, line) like database spreadsheet
+**Rendering:** Use the Ratatui rendering pipeline from `guacr-terminal` (see
+`docs/RATATUI_RENDERING_PLAN.md`). A `ratatui::widgets::Table` with `TableState` renders the
+resource list into a `TestBackend` buffer, which is then converted to JPEG via
+`TerminalRenderer::render_ratatui_buffer`. This replaces the hand-built `SpreadsheetRenderer`
+(~1,600 lines of pixel math) with Ratatui's Table widget. The `SpreadsheetRenderer` can be
+retired once this is in place.
+
+Layout (3-zone vertical split):
+```
+┌─────────────────────────────────────────────┐
+│ Namespace: [default    ] Filter: [_         ] │  <- 3 rows, Paragraph widgets
+├─────────────────────────────────────────────┤
+│ NAMESPACE  │ POD              │ STATUS    │ S │
+│──────────────────────────────────────────│ c │
+│ default    │ web-app-7d9f5    │ Running   │ r │  <- Table + TableState, Scrollbar
+│ default    │ api-service-3a1  │ Running   │ o │
+│ kube-sys   │ coredns-8f7a2    │ Running   │ l │
+├─────────────────────────────────────────────┤
+│ [S]hell  [L]ogs  [D]escribe   3/47 pods       │  <- 1 row, status/action bar
+└─────────────────────────────────────────────┘
+```
+
+Status badges use color via `ratatui::style::Color`:
+- Running → `Color::Green`
+- Pending → `Color::Yellow`
+- Error / CrashLoopBackOff → `Color::Red`
+- Terminating → `Color::DarkGray`
 
 **Interactions:**
 - Click row → Select container
-- Double-click → Open shell
-- Right-click → Context menu (Logs/Shell/Delete)
-- Filter bar at top for search
-- Namespace/Context dropdown
+- Double-click / Enter → Open shell
+- [S] / [L] / [D] shortcuts → Shell / Logs / Describe
+- Filter bar at top for search (typed into a `Paragraph` input widget)
+- Namespace dropdown (cycle with Tab)
 
 ### 2. Shell Mode
 
@@ -218,14 +249,18 @@ Dirty region optimization:
 **Files:**
 - `crates/guacr-ssh/src/container_mode.rs` - Container mode logic
 - `crates/guacr-ssh/src/handler.rs` - Add mode parameter handling
-- `crates/guacr-terminal/src/spreadsheet.rs` - Reuse from database handlers
+
+**Prerequisite:** `docs/RATATUI_RENDERING_PLAN.md` Part 1 must land first
+(`RatatuiRenderer` in `guacr-terminal`). The list view is built on
+`ratatui::widgets::Table` + `TerminalRenderer::render_ratatui_buffer` — not
+`SpreadsheetRenderer`.
 
 **Tasks:**
 1. Add `mode` and `container_backend` parameters to SSH config
 2. Implement JSON parsing for `kubectl get pods -A -o json`
 3. Implement JSON parsing for `docker ps --format json`
-4. Render parsed data as spreadsheet (reuse database code)
-5. Handle mode switching (spreadsheet ↔ terminal)
+4. Render parsed data via Ratatui Table widget → `render_ratatui_buffer` → JPEG
+5. Handle mode switching (ratatui list view ↔ TerminalEmulator shell/logs)
 
 **Advantages of This Approach:**
 - Much smaller scope (~500 lines vs ~1900 lines)
@@ -379,13 +414,14 @@ User types `exit`, browser returns to container list view.
 
 ## Technical Notes
 
-### Why Spreadsheet View?
+### Why Ratatui for the list view?
 
-- Proven UI pattern (database handlers use this)
-- Efficient for many containers (100s of rows)
-- Sortable, filterable, searchable
-- Works well with Guacamole drawing instructions
-- Lower bandwidth than full HTML table
+- `Table` + `TableState` handles selection, scrolling, column constraints — no pixel math
+- Layout engine handles the filter bar, status bar, and action row at zero extra cost
+- Colored status badges (Running=green, Error=red) are a one-liner with `Style::fg`
+- Same fontdue JPEG output as existing terminal handlers — no new rendering infrastructure
+- `SpreadsheetRenderer` (~1,600 lines) can be retired once the Ratatui pipeline lands
+- Shell/Logs mode stays on the existing `TerminalEmulator` + vt100 JPEG path — unchanged
 
 ### Why Reuse Terminal Infrastructure?
 
@@ -412,6 +448,100 @@ User types `exit`, browser returns to container list view.
 - Full Docker API coverage
 - Active maintenance
 - TLS support built-in
+
+### Platform Coverage and "Entering" Resources
+
+The two mechanisms for getting a shell into a resource are fundamentally different depending on
+whether it's a container or a VM:
+
+**Containers (K8s, Docker, Podman, Nomad)** — use the orchestrator's exec API directly. No SSH
+needed. The API returns a WebSocket stream that pipes into `TerminalEmulator`. `ActionResult::Terminal`
+wraps this stream.
+
+**VMs (vSphere, EC2, Azure, Proxmox, KVM, bare metal)** — the PAM vault already holds credentials.
+"Entering" means: get the VM's IP from the platform API → pull credentials from vault params →
+open a standard SSH connection to that IP using the existing SSH handler. No new console protocols
+needed. SSH works for every VM platform.
+
+The only cases where SSH isn't an option are VMs with no SSH daemon (emergency console access,
+locked-out machines). These require VNC/SPICE (Proxmox), WMKS (vSphere), or SOL/Redfish (bare
+metal) — complex proprietary protocols that are out of scope for the initial implementation.
+
+**Rust crate status per platform:**
+
+| Platform | List crate | Enter (shell/desktop) | Notes |
+|---|---|---|---|
+| Kubernetes | `kube` (in codebase) | `kube` WebSocket exec → `ActionResult::Terminal` | `ws` feature required |
+| Docker | `bollard` (in codebase) | `bollard` exec + TTY + resize → `ActionResult::Terminal` | |
+| Podman | `podman-rest-client` or `podtender` | Same exec API as Docker | Do NOT use bollard — API compatibility issues |
+| Nomad | `nomad-client-rs` | WebSocket alloc exec → `ActionResult::Terminal` | May need `tokio-tungstenite` directly |
+| Active Directory | `ldap3` | RDP or SSH to selected computer → `ActionResult::NewSession` | See credentials section below |
+| vSphere | custom REST client (in codebase) | SSH or RDP to VM guest IP → `ActionResult::NewSession` | WMKS console out of scope |
+| Proxmox | `proxmox-api` | SSH or RDP to VM guest IP → `ActionResult::NewSession` | |
+| AWS EC2 | `aws-sdk-ec2` | SSH to instance IP → `ActionResult::NewSession`; SSM plugin protocol proprietary, no Rust crate | |
+| Azure VMs | `azure_mgmt_compute` | SSH or RDP to VM IP → `ActionResult::NewSession` | No Azure Bastion/Serial Console path in Rust |
+| GCP Compute | `google-cloud-compute-v1` or `gcloud-sdk` | SSH to VM IP → `ActionResult::NewSession` | No IAP tunnel or serial console in Rust |
+| libvirt/KVM | `virt` (FFI, requires `libvirt-dev`) | `open_console()` → serial console → `ActionResult::Terminal`; or SSH → `ActionResult::NewSession` | |
+| Bare metal | `ipmi-rs` / `rust-ipmi`; `reqwest` for Redfish | SSH to BMC if available; SOL not in any Rust crate | SOL = `ipmitool sol activate` equivalent |
+
+### ActionResult::NewSession — Spinning Off a Separate Session
+
+For resources where "entering" means opening a full RDP or SSH session rather than an exec
+stream within the current connection, a new `ActionResult` variant is needed:
+
+```rust
+pub enum ActionResult {
+    Terminal { reader, writer },  // existing — exec into container, virsh console, etc.
+    Status(String),               // existing
+    Refresh,                      // existing
+
+    /// Spin off a new independent session to a discovered resource.
+    ///
+    /// The resource browser stays open (user keeps the list view).
+    /// The gateway opens a parallel session using these params.
+    NewSession {
+        protocol: String,              // "ssh", "rdp", "vnc"
+        hostname: String,
+        port: u16,
+        params: HashMap<String, String>, // credential hints — see below
+    },
+}
+```
+
+Unlike `ActionResult::Terminal`, which hijacks the current connection's rendering pipeline,
+`ActionResult::NewSession` signals to the **gateway** to open a separate WebRTC tube for the
+new session. The user ends up with two concurrent sessions: the resource browser and the
+machine session. This mirrors how a user would manually open a separate SSH/RDP connection
+from a list.
+
+### Credentials for NewSession — the unsolved part
+
+When the resource browser discovers a machine (an AD computer, a vSphere VM, a Proxmox guest)
+and the user wants to connect, credentials for that specific machine are needed. There are
+three approaches:
+
+**Option A — Re-use the browser session's credentials (simplest, limited)**
+The domain admin or API credentials used to authenticate to AD/vSphere/Proxmox are passed
+through as the machine credentials. Works if the same account has RDP/SSH access to the
+discovered machines (e.g., domain admin can RDP anywhere). Does not work for least-privilege
+setups where machine credentials differ from the API credentials.
+
+**Option B — Gateway credential lookup by hostname (correct PAM approach)**
+When the resource browser returns `ActionResult::NewSession`, the gateway looks up a vault
+record for the discovered hostname before opening the new session. The handler only provides
+the hostname and protocol hint; the gateway injects the credentials.
+
+This is the proper PAM model — the handler never touches credentials for the target machine,
+and credential access is enforced by vault policy. The handler's `params` map would carry a
+`record_uid_hint` or `hostname` field that the gateway resolves against the vault.
+
+**Option C — Present a credential picker in the browser (most flexible)**
+If no vault record exists for the hostname, the gateway surfaces a picker to let the user
+select which vault record to use for the new session. Out of scope for initial implementation
+but the right long-term answer for machines not yet in the vault.
+
+**Initial implementation:** Option A for the first pass (re-use browser credentials). Option B
+wired in when the gateway's credential-lookup-by-hostname path is available.
 
 ## Development Estimate (Revised)
 

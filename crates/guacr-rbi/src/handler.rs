@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use guacr_handlers::{
+    // Error helpers
+    send_error_best_effort,
     EventBasedHandler,
     EventCallback,
     HandlerError,
@@ -12,6 +14,7 @@ use guacr_handlers::{
     // Recording
     RecordingConfig,
 };
+use guacr_protocol::STATUS_RESOURCE_CONFLICT;
 use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -454,10 +457,24 @@ impl ProtocolHandler for RbiHandler {
             );
 
             // Connect and handle session
-            browser_client
-                .connect(url, to_client, from_client)
-                .await
-                .map_err(HandlerError::ConnectionFailed)?;
+            // Clone sender so we can send an error message if the session fails to start
+            let error_sender = to_client.clone();
+            let connect_result = browser_client.connect(url, to_client, from_client).await;
+
+            if let Err(ref e) = connect_result {
+                if e.starts_with("PROFILE_IN_USE:") {
+                    send_error_best_effort(
+                        &error_sender,
+                        "This browser profile is already in use by another active session. \
+                         Please try again later, or ask your administrator to configure \
+                         'By User' persistence to allow concurrent access.",
+                        STATUS_RESOURCE_CONFLICT,
+                    )
+                    .await;
+                }
+            }
+
+            connect_result.map_err(HandlerError::ConnectionFailed)?;
 
             info!("RBI handler ended (Chrome/CDP)");
             Ok(())

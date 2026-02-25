@@ -421,7 +421,7 @@ impl Channel {
                                         }
                                         if let Some(val) = user_details.private_key_passphrase {
                                             guacd_params_locked
-                                                .insert("privatekeypassphrase".to_string(), val);
+                                                .insert("passphrase".to_string(), val);
                                         }
                                         if let Some(val) = user_details.passphrase {
                                             guacd_params_locked

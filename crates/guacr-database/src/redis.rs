@@ -278,10 +278,13 @@ impl ProtocolHandler for RedisHandler {
                         record_query_input(&mut recorder, &recording_config, &command);
 
                         // Handle built-in commands
-                        if handle_builtin_command(&command, &mut executor, &to_client, &security, &mut recorder)
-                            .await?
+                        match handle_builtin_command(&command, &mut executor, &to_client, &security, &mut recorder)
+                            .await
                         {
-                            continue;
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(HandlerError::Disconnected(_)) => break 'outer,
+                            Err(e) => return Err(e),
                         }
 
                         // Check for export command: \e <pattern>

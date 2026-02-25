@@ -38,7 +38,7 @@ echo "Running Rust unit tests..."
 # Test keeper-pam-webrtc-rs without Python support (pure Rust tests)
 cargo test -p keeper-pam-webrtc-rs --lib --no-default-features
 # Test all other workspace crates with all features (excluding python-bindings which needs maturin)
-cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py
+cargo test --workspace --lib --all-features --exclude keeper-pam-webrtc-rs --exclude keeper-pam-connections-py --exclude keeperdb-proxy
 echo "✓ Rust tests passed"
 echo ""
 

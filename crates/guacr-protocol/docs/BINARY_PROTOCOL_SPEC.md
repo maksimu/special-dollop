@@ -2,10 +2,22 @@
 
 ## Overview
 
-A high-performance binary protocol for remote desktop access over WebRTC, replacing the text-based Guacamole protocol with a zero-copy, SIMD-friendly binary format.
+A high-performance binary protocol for remote desktop access over WebRTC, replacing the text-based
+Guacamole protocol with a zero-copy, SIMD-friendly binary format.
+
+**Scope: control messages only.** This spec covers keyboard, mouse, cursor, clipboard, audio, sync,
+and disconnect. Screen content for graphical protocols (RDP, VNC, RBI) travels via RTCRtpSender as
+H.264 video — see `docs/VIDEO_TRANSPORT_PLAN.md`. Do not implement IMAGE or IMAGE_DELTA for those
+protocols. IMAGE/IMAGE_DELTA remain defined here for terminal protocols (SSH, Telnet, etc.) which
+still use JPEG dirty-rect rendering.
+
+**Prerequisite:** The existing `binary.rs` implementation uses different opcode values than this
+spec (Image=0x03 in code vs 0x10 here; several Guacamole streaming opcodes in code that don't exist
+here). `binary.rs` must be reconciled to match this spec's opcode table before either ships to the
+vault.
 
 **Goals:**
-- 5-10x lower latency than Guacamole text protocol
+- 40-60% smaller control messages than Guacamole text protocol
 - Zero-copy message passing
 - SIMD-friendly (aligned data structures)
 - Minimal parsing overhead
@@ -126,7 +138,10 @@ struct SizeMessage {
 
 ### IMAGE (0x10)
 
-**Server -> Client**
+**Server -> Client — terminal protocols only (SSH, Telnet, TN3270, TN5250, database)**
+
+For graphical protocols (RDP, VNC, RBI), screen content travels via RTCRtpSender H.264 video track,
+not this message. Do not implement IMAGE for those protocols.
 
 ```rust
 #[repr(C, packed)]
@@ -135,7 +150,7 @@ struct ImageHeader {
     y: u16,
     width: u16,
     height: u16,
-    format: u8,          // 0=RAW_RGBA, 1=PNG, 2=JPEG, 3=H264
+    format: u8,          // 0=RAW_RGBA, 1=PNG, 2=JPEG
     compression: u8,     // 0=none, 1=zstd
     _padding: u16,
 }
@@ -144,13 +159,14 @@ struct ImageHeader {
 
 **Formats:**
 - **RAW_RGBA** (format=0): Raw pixel data, 4 bytes per pixel, no encoding
-- **PNG** (format=1): PNG compressed (best for text)
-- **JPEG** (format=2): JPEG compressed (best for photos/video)
-- **H264** (format=3): H.264 video frame (best for continuous updates)
+- **PNG** (format=1): PNG compressed (best for text/terminal content)
+- **JPEG** (format=2): JPEG compressed
 
 ### IMAGE_DELTA (0x11)
 
-**Server -> Client** (dirty rectangle update)
+**Server -> Client — terminal protocols only (dirty rectangle update)**
+
+Same scope restriction as IMAGE above.
 
 ```rust
 #[repr(C, packed)]
@@ -212,29 +228,23 @@ Total: 16 bytes (33% smaller)
 Parsing: Single memcpy, zero allocations
 ```
 
-### Image Transfer
+### Image Transfer (terminal protocols only)
 
-**Guacamole (PNG via base64):**
+**Guacamole (JPEG via base64):**
 ```
-PNG data: 100KB
-Base64 encoded: 133KB (+33% overhead)
-Total: 133KB + instruction overhead
+JPEG data: 20KB (dirty rect)
+Base64 encoded: 27KB (+33% overhead)
+Total: 27KB + instruction overhead
 ```
 
-**Binary Protocol (raw PNG):**
+**Binary Protocol (raw JPEG):**
 ```
 Header: 8 bytes
-PNG data: 100KB
-Total: 100KB + 8 bytes (25% smaller)
+JPEG data: 20KB
+Total: 20KB + 8 bytes (25% smaller, no base64)
 ```
 
-**Binary Protocol (raw RGBA):**
-```
-Header: 8 bytes
-RGBA data: (1920 * 1080 * 4) = 8.3MB
-With zstd compression: ~500KB-2MB (depending on content)
-Total: Much faster for small updates (no PNG encoding)
-```
+For graphical protocols, screen content is H.264 over RTCRtpSender — not covered here.
 
 ## Implementation
 
@@ -345,7 +355,8 @@ pub enum ImageFormat {
     RawRGBA = 0,
     PNG = 1,
     JPEG = 2,
-    H264 = 3,
+    // H.264 is not an ImageFormat — it travels via RTCRtpSender, not IMAGE messages.
+    // See docs/VIDEO_TRANSPORT_PLAN.md.
 }
 ```
 
@@ -670,40 +681,16 @@ asciinema play session-12345.cast
 <asciinema-player src="session-12345.cast"></asciinema-player>
 ```
 
-## Recommendation
+## Implementation Order
 
-### Short Term (Instance 2-4)
+This work is independent of and follows `docs/VIDEO_TRANSPORT_PLAN.md`. Complete video transport
+first, then return here.
 
-**Continue with Guacamole text protocol for now:**
-- Get protocol handlers working first
-- Prove the architecture
-- Text protocol is well-understood
-
-### Medium Term (Instance 5)
-
-**Add binary protocol support:**
-- Create guacr-protocol crate with binary codec
-- Add dual-protocol detection
-- Benchmark performance gains
-
-### Long Term
-
-**Migrate to binary as default:**
-- asciinema recording format
-- Binary protocol for WebRTC
-- Keep text protocol for debugging/compatibility
-
-## Action Items
-
-1. **Document this spec** - DONE (this file)
-2. **Create guacr-protocol crate** - Binary codec implementation
-3. **Update browser client** - Support binary messages
-4. **Add asciinema recorder** - For session recording
-5. **Benchmark** - Measure actual performance gains
-6. **Migrate** - Switch default to binary
-
-**Note:** This can be done after protocol handlers are working with text protocol. Don't block on this.
-
----
-
-**Binary protocol: 5-10x faster, zero-copy friendly, perfect for WebRTC.**
+1. Reconcile `binary.rs` opcode values to match this spec (IMAGE=0x10, CURSOR=0x14, etc.)
+2. Remove Guacamole streaming opcodes from `binary.rs` (Blob=0x09, End=0x0A, Video=0x0C, File, Pipe) — those were wrapping Guacamole text protocol concepts that no longer apply
+3. Add missing encode functions: `encode_cursor`, `encode_audio`
+4. Add dual-protocol detection in the vault (`WebRTCGuacTunnel.ts`) — first byte < 0x30 means binary
+5. Add binary parser in vault alongside existing Guacamole text parser
+6. Add capability flag to session start (`transport.binary: true`)
+7. Switch guacr handlers to send binary control messages instead of Guacamole text
+8. Keep Guacamole text as fallback for old clients

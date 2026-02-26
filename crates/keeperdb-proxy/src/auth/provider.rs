@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::query_logging::config::ConnectionLoggingConfig;
 use crate::tls::TlsClientConfig;
 
 use super::{AuthCredentials, ConnectionContext, SessionConfig, TokenValidation};
@@ -100,6 +101,26 @@ pub trait AuthProvider: Send + Sync {
     /// * `Ok(TokenValidation)` - The validation result
     /// * `Err(_)` - If validation cannot be performed
     async fn validate_token(&self, token: &str) -> Result<TokenValidation>;
+
+    /// Retrieve per-connection logging configuration.
+    ///
+    /// Called to get logging settings for this connection. In handshake mode,
+    /// the Gateway provides these per-connection. Default returns disabled config.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - Information about the incoming connection
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(None)` - Logging not configured for this connection
+    /// * `Ok(Some(config))` - Per-connection logging configuration
+    async fn get_logging_config(
+        &self,
+        _context: &ConnectionContext,
+    ) -> Result<Option<ConnectionLoggingConfig>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

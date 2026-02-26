@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use crate::query_logging::QueryLoggingConfig;
 use crate::tls::{TlsClientConfig, TlsServerConfig};
 
 /// Root configuration structure
@@ -56,6 +57,10 @@ pub struct Config {
     /// Session security configuration
     #[serde(default)]
     pub session: SessionSecurityConfig,
+
+    /// Query logging and session recording configuration
+    #[serde(default)]
+    pub query_logging: QueryLoggingConfig,
 }
 
 impl Config {

@@ -9,6 +9,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::auth::{DatabaseType, SessionConfig};
+use crate::query_logging::config::ConnectionLoggingConfig;
 use crate::tls::TlsClientConfig;
 
 /// Credentials received via handshake.
@@ -32,6 +33,8 @@ pub struct HandshakeCredentials {
     pub session_config: SessionConfig,
     /// Gateway-provided session UID for correlation
     pub session_uid: Option<String>,
+    /// Per-connection logging configuration (from handshake)
+    pub logging_config: Option<ConnectionLoggingConfig>,
     /// When credentials were stored (for TTL cleanup)
     pub stored_at: Instant,
 }
@@ -55,6 +58,7 @@ impl HandshakeCredentials {
             tls_config: TlsClientConfig::default(),
             session_config: SessionConfig::default(),
             session_uid: None,
+            logging_config: None,
             stored_at: Instant::now(),
         }
     }
@@ -80,6 +84,12 @@ impl HandshakeCredentials {
     /// Set Gateway session UID.
     pub fn with_session_uid(mut self, uid: Option<String>) -> Self {
         self.session_uid = uid;
+        self
+    }
+
+    /// Set per-connection logging configuration.
+    pub fn with_logging_config(mut self, config: Option<ConnectionLoggingConfig>) -> Self {
+        self.logging_config = config;
         self
     }
 }
@@ -251,5 +261,29 @@ mod tests {
         assert_eq!(creds.database_type, DatabaseType::PostgreSQL);
         assert_eq!(creds.database, Some("mydb".into()));
         assert_eq!(creds.session_uid, Some("gateway-123".into()));
+        assert!(creds.logging_config.is_none());
+    }
+
+    #[test]
+    fn test_credentials_with_logging_config() {
+        let logging_config = ConnectionLoggingConfig {
+            query_logging_enabled: true,
+            include_query_text: true,
+            max_query_length: 5000,
+            pipe_path: Some("/tmp/query.pipe".into()),
+        };
+
+        let creds = HandshakeCredentials::new(
+            DatabaseType::MySQL,
+            "localhost".into(),
+            3306,
+            "user".into(),
+            "pass".into(),
+        )
+        .with_logging_config(Some(logging_config));
+
+        let config = creds.logging_config.unwrap();
+        assert!(config.query_logging_enabled);
+        assert_eq!(config.pipe_path.as_deref(), Some("/tmp/query.pipe"));
     }
 }

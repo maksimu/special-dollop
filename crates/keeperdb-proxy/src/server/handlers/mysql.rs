@@ -27,11 +27,12 @@ use tokio::time::timeout;
 use zeroize::Zeroize;
 
 use super::super::connection_tracker::{ConnectionTracker, TargetId, TunnelId};
-use super::super::session::{ManagedSession, Session, SessionManager};
+use super::super::session::{ManagedSession, QueryLogContext, Session, SessionManager};
 use super::super::stream::NetworkStream;
 use crate::auth::{AuthProvider, ConnectionContext, DatabaseType};
 use crate::config::{Config, TargetWithCredentials};
 use crate::error::{ProxyError, Result};
+
 use crate::protocol::mysql::{
     auth::{compute_auth_for_plugin, generate_scramble},
     packets::*,
@@ -556,6 +557,14 @@ impl MySQLHandler {
                 ProxyError::Config(e.to_string())
             })?;
 
+        // Retrieve logging config BEFORE get_auth(), which consumes credentials from the store
+        let logging_config = super::resolve_logging_config(
+            self.auth_provider.as_ref(),
+            &context,
+            &self.config.query_logging,
+        )
+        .await;
+
         debug!(
             "Session config: max_duration={:?}, idle_timeout={:?}, max_queries={:?}, max_connections={:?}, require_token={}",
             session_config.max_duration,
@@ -916,19 +925,42 @@ impl MySQLHandler {
                 // Start session timers (max_duration, etc.)
                 session_manager.start_timers();
 
-                // Use ManagedSession for security controls, or basic Session if no limits
+                // Set up query logging if configured
+                // (logging_config was retrieved before get_auth to avoid credential store consumption race)
+                let query_log_ctx = if let Some(ref log_config) = logging_config {
+                    let server_addr = format!("{}:{}", self.target.host, self.target.port);
+                    let session_id_str = session_id.to_string();
+                    QueryLogContext::create(
+                        "mysql",
+                        log_config,
+                        &session_id_str,
+                        &response.username,
+                        client_response.database.as_deref().unwrap_or(""),
+                        &self.client_addr.to_string(),
+                        &server_addr,
+                    )
+                } else {
+                    None
+                };
+
+                // Use ManagedSession for security controls, or basic Session if no limits.
+                // Also use ManagedSession when query logging is configured (it needs
+                // the managed relay loop's protocol-aware packet inspection).
                 let has_limits = session_config.max_duration.is_some()
                     || session_config.idle_timeout.is_some()
                     || session_config.max_queries.is_some();
 
-                if has_limits {
+                if has_limits || query_log_ctx.is_some() {
                     // Use ManagedSession with query counting and disconnect monitoring
-                    let managed = ManagedSession::new(
+                    let mut managed = ManagedSession::new(
                         client_stream,
                         server,
                         session_manager,
                         self.config.server.idle_timeout_secs,
                     );
+                    if let Some(ctx) = query_log_ctx {
+                        managed = managed.with_query_logging(ctx);
+                    }
                     let reason = managed.relay().await;
 
                     // Release connection guard if we have one

@@ -44,7 +44,7 @@ use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 use super::super::connection_tracker::ConnectionTracker;
-use super::super::session::{ManagedSession, Session, SessionManager};
+use super::super::session::{ManagedSession, QueryLogContext, Session, SessionManager};
 use super::super::stream::NetworkStream;
 use crate::auth::{AuthProvider, ConnectionContext, DatabaseType};
 use crate::config::{Config, TargetWithCredentials};
@@ -72,6 +72,7 @@ use crate::protocol::oracle::{
     RefusePacket,
     TNS_HEADER_SIZE,
 };
+use crate::query_logging::config::ConnectionLoggingConfig;
 use crate::tls::TlsConnector;
 
 // ============================================================================
@@ -444,6 +445,14 @@ impl OracleHandler {
             .await
             .unwrap_or_else(|_| crate::auth::SessionConfig::default());
 
+        // Retrieve logging config BEFORE get_auth(), which consumes credentials from the store
+        let logging_config = super::resolve_logging_config(
+            self.auth_provider.as_ref(),
+            &context,
+            &self.config.query_logging,
+        )
+        .await;
+
         // Get credentials for user injection (this consumes credentials from store)
         let auth_result = self.auth_provider.get_auth(&context).await;
 
@@ -633,8 +642,13 @@ impl OracleHandler {
 
                 // Handle authentication phase with credential injection
                 // Pass auth_result so we don't look up credentials twice (they're consumed on first lookup)
-                self.handle_post_accept(server, auth_result, session_config.clone())
-                    .await
+                self.handle_post_accept(
+                    server,
+                    auth_result,
+                    session_config.clone(),
+                    logging_config.clone(),
+                )
+                .await
             }
 
             packet_type::REFUSE => {
@@ -745,8 +759,13 @@ impl OracleHandler {
 
                         // Handle authentication phase with credential injection
                         // Pass auth_result so we don't look up credentials twice (they're consumed on first lookup)
-                        self.handle_post_accept(server, auth_result, session_config.clone())
-                            .await
+                        self.handle_post_accept(
+                            server,
+                            auth_result,
+                            session_config.clone(),
+                            logging_config.clone(),
+                        )
+                        .await
                     }
                     packet_type::REFUSE => {
                         let refuse = parse_refuse(&server_response2)?;
@@ -792,6 +811,7 @@ impl OracleHandler {
         mut server: NetworkStream,
         auth_result: Result<crate::auth::AuthCredentials>,
         session_config: crate::auth::SessionConfig,
+        logging_config: Option<ConnectionLoggingConfig>,
     ) -> Result<()> {
         self.state = HandlerState::Authenticating;
 
@@ -1296,19 +1316,43 @@ impl OracleHandler {
         let server_stream = server;
 
         let mut session_manager = SessionManager::new(session_config.clone());
+        let session_id = session_manager.session_id();
         session_manager.start_timers();
+
+        // Set up query logging if configured
+        // (logging_config was retrieved before get_auth to avoid credential store consumption race)
+        let query_log_ctx = if let Some(ref log_config) = logging_config {
+            let server_addr = format!("{}:{}", self.target.host, self.target.port);
+            let user = real_username.as_deref().unwrap_or("");
+            let db = self.target.database.as_deref().unwrap_or("");
+            let session_id_str = session_id.to_string();
+            QueryLogContext::create(
+                "oracle",
+                log_config,
+                &session_id_str,
+                user,
+                db,
+                &self.client_addr.to_string(),
+                &server_addr,
+            )
+        } else {
+            None
+        };
 
         let has_limits = session_config.max_duration.is_some()
             || session_config.idle_timeout.is_some()
             || session_config.max_queries.is_some();
 
-        if has_limits {
-            let managed = ManagedSession::with_network_server(
+        if has_limits || query_log_ctx.is_some() {
+            let mut managed = ManagedSession::with_network_server(
                 client_stream,
                 server_stream,
                 session_manager,
                 self.config.server.idle_timeout_secs,
             );
+            if let Some(ctx) = query_log_ctx {
+                managed = managed.with_query_logging(ctx);
+            }
             let reason = managed.relay().await;
             info!("Oracle session ended: {:?}", reason);
         } else {

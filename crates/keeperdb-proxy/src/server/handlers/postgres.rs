@@ -52,7 +52,7 @@ use crate::protocol::postgres::{
 use crate::tls::{TlsAcceptor, TlsConnector};
 
 use super::super::connection_tracker::{ConnectionGuard, ConnectionTracker, TargetId, TunnelId};
-use super::super::session::{ManagedSession, Session, SessionManager};
+use super::super::session::{ManagedSession, QueryLogContext, Session, SessionManager};
 use super::super::stream::NetworkStream;
 
 // ============================================================================
@@ -329,6 +329,14 @@ impl PostgresHandler {
                 ProxyError::Config(e.to_string())
             })?;
 
+        // Retrieve logging config BEFORE get_auth(), which consumes credentials from the store
+        let logging_config = super::resolve_logging_config(
+            self.auth_provider.as_ref(),
+            &context,
+            &self.config.query_logging,
+        )
+        .await;
+
         let credentials = self.auth_provider.get_auth(&context).await.map_err(|e| {
             error!("Failed to get credentials: {}", e);
             ProxyError::CredentialRetrieval(e.to_string())
@@ -408,10 +416,33 @@ impl PostgresHandler {
             self.client_addr, self.target.host
         );
 
-        // Step 9: Start relay
+        // Step 9: Set up query logging if configured
+        // (logging_config was retrieved before get_auth to avoid credential store consumption race)
+        let query_log_ctx = if let Some(ref log_config) = logging_config {
+            let server_addr = format!("{}:{}", self.target.host, self.target.port);
+            QueryLogContext::create(
+                "postgresql",
+                log_config,
+                &session_id,
+                &real_username,
+                startup.database().unwrap_or(""),
+                &self.client_addr.to_string(),
+                &server_addr,
+            )
+        } else {
+            None
+        };
+
+        // Step 10: Start relay
         self.state = HandlerState::Relaying;
-        self.start_relay(server, session_config, session_id, connection_guard)
-            .await
+        self.start_relay(
+            server,
+            session_config,
+            session_id,
+            connection_guard,
+            query_log_ctx,
+        )
+        .await
     }
 
     /// Check connection limits and enforce single-session-per-target security
@@ -931,6 +962,7 @@ impl PostgresHandler {
         session_config: crate::auth::SessionConfig,
         session_id: String,
         connection_guard: Option<(ConnectionGuard, Arc<ConnectionTracker>)>,
+        query_log_ctx: Option<QueryLogContext>,
     ) -> Result<()> {
         // Take the client stream - connection limits were already checked in handle()
         let client_stream = self.take_client()?;
@@ -942,18 +974,21 @@ impl PostgresHandler {
         // Start session timers
         session_manager.start_timers();
 
-        // Use ManagedSession if limits are configured
+        // Use ManagedSession if limits are configured or query logging is active
         let has_limits = session_config.max_duration.is_some()
             || session_config.idle_timeout.is_some()
             || session_config.max_queries.is_some();
 
-        if has_limits {
-            let managed = ManagedSession::with_network_server(
+        if has_limits || query_log_ctx.is_some() {
+            let mut managed = ManagedSession::with_network_server(
                 client_stream,
                 server,
                 session_manager,
                 self.config.server.idle_timeout_secs,
             );
+            if let Some(ctx) = query_log_ctx {
+                managed = managed.with_query_logging(ctx);
+            }
             let reason = managed.relay().await;
 
             if let Some((guard, tracker)) = connection_guard {

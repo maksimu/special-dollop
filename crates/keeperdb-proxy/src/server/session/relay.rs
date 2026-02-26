@@ -4,6 +4,7 @@
 //! - Basic bidirectional relay ([`Session`])
 //! - Managed relay with security controls ([`ManagedSession`])
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,6 +16,80 @@ use super::super::stream::NetworkStream;
 use super::manager::{DisconnectReason, SessionManager};
 use crate::error::Result;
 use crate::protocol::mysql::packets::{is_query_command, COM_QUIT};
+use crate::query_logging::config::ConnectionLoggingConfig;
+use crate::query_logging::extractor::{
+    MysqlQueryExtractor, OracleQueryExtractor, PostgresQueryExtractor, QueryExtractor, QueryInfo,
+    TdsQueryExtractor,
+};
+use crate::query_logging::log_entry::{QueryLog, SessionContext};
+use crate::query_logging::service::{QueryLogSender, QueryLoggingService};
+
+/// Context for query logging in the relay loop.
+///
+/// Bundles the protocol-specific query extractor, the log sender,
+/// and session metadata needed to create log entries.
+pub struct QueryLogContext {
+    /// Protocol-specific query/response extractor.
+    pub extractor: Box<dyn QueryExtractor>,
+    /// Sender for submitting log entries to the background service.
+    pub sender: QueryLogSender,
+    /// Session metadata for populating log entries.
+    pub session: SessionContext,
+}
+
+impl QueryLogContext {
+    /// Create a QueryLogContext for the given protocol and logging config.
+    ///
+    /// Returns `None` if logging is disabled or service creation fails.
+    /// This is the primary factory method used by protocol handlers to
+    /// wire up query logging.
+    pub fn create(
+        protocol: &str,
+        config: &ConnectionLoggingConfig,
+        session_id: &str,
+        user_id: &str,
+        database: &str,
+        client_addr: &str,
+        server_addr: &str,
+    ) -> Option<Self> {
+        let sender = QueryLoggingService::start(config)?;
+
+        let extractor: Box<dyn QueryExtractor> = match protocol {
+            "mysql" => Box::new(MysqlQueryExtractor::new(
+                config.include_query_text,
+                config.max_query_length,
+            )),
+            "postgresql" | "postgres" => Box::new(PostgresQueryExtractor::new(
+                config.include_query_text,
+                config.max_query_length,
+            )),
+            "sqlserver" | "mssql" => Box::new(TdsQueryExtractor::new(
+                config.include_query_text,
+                config.max_query_length,
+            )),
+            "oracle" => Box::new(OracleQueryExtractor::new()),
+            _ => {
+                warn!("No query extractor for protocol: {}", protocol);
+                return None;
+            }
+        };
+
+        let session = SessionContext {
+            session_id: session_id.to_string(),
+            user_id: user_id.to_string(),
+            database: database.to_string(),
+            protocol: protocol.to_string(),
+            client_addr: client_addr.to_string(),
+            server_addr: server_addr.to_string(),
+        };
+
+        Some(Self {
+            extractor,
+            sender,
+            session,
+        })
+    }
+}
 
 /// A relay session between client and server
 ///
@@ -206,6 +281,8 @@ pub struct ManagedSession<S = TcpStream> {
     session_manager: Arc<Mutex<SessionManager>>,
     /// Default idle timeout from config (used if session config doesn't override)
     default_idle_timeout: Duration,
+    /// Optional query logging context
+    query_log_ctx: Option<QueryLogContext>,
 }
 
 impl ManagedSession<TcpStream> {
@@ -228,6 +305,7 @@ impl ManagedSession<TcpStream> {
             server,
             session_manager: Arc::new(Mutex::new(session_manager)),
             default_idle_timeout: Duration::from_secs(default_idle_timeout_secs),
+            query_log_ctx: None,
         }
     }
 }
@@ -252,7 +330,19 @@ impl ManagedSession<NetworkStream> {
             server,
             session_manager: Arc::new(Mutex::new(session_manager)),
             default_idle_timeout: Duration::from_secs(default_idle_timeout_secs),
+            query_log_ctx: None,
         }
+    }
+}
+
+impl<S> ManagedSession<S> {
+    /// Enable query logging for this session.
+    ///
+    /// When set, the relay loop will extract queries and responses from
+    /// the protocol traffic and submit log entries to the background service.
+    pub fn with_query_logging(mut self, ctx: QueryLogContext) -> Self {
+        self.query_log_ctx = Some(ctx);
+        self
     }
 }
 
@@ -304,6 +394,7 @@ where
             self.session_manager,
             disconnect_rx,
             idle_timeout,
+            self.query_log_ctx,
         )
         .await;
 
@@ -317,7 +408,7 @@ where
     }
 }
 
-/// Internal relay loop with query counting and disconnect monitoring.
+/// Internal relay loop with query counting, disconnect monitoring, and query logging.
 ///
 /// # Query Counting Limitations
 ///
@@ -334,6 +425,14 @@ where
 /// This trade-off was chosen for simplicity and performance. The max_queries
 /// limit is a "best effort" security control. For strict query accounting,
 /// full MySQL packet parsing with buffering would be required.
+///
+/// # Query Logging
+///
+/// When `query_log_ctx` is provided, the relay loop will:
+/// 1. Extract query info from client-to-server traffic via the protocol extractor
+/// 2. Extract response info from server-to-client traffic
+/// 3. Create `QueryLog` entries with timing and submit via `try_send()` (non-blocking)
+#[allow(clippy::too_many_arguments)]
 async fn managed_relay_loop<CR, CW, SR, SW>(
     mut client_read: CR,
     mut client_write: CW,
@@ -342,6 +441,7 @@ async fn managed_relay_loop<CR, CW, SR, SW>(
     session_manager: Arc<Mutex<SessionManager>>,
     disconnect_rx: Option<tokio::sync::oneshot::Receiver<DisconnectReason>>,
     idle_timeout: Duration,
+    query_log_ctx: Option<QueryLogContext>,
 ) -> DisconnectReason
 where
     CR: AsyncRead + Unpin,
@@ -354,7 +454,16 @@ where
     let mut disconnect_rx = disconnect_rx;
     let mut pending_disconnect: Option<DisconnectReason> = None;
 
-    loop {
+    // Query logging state: VecDeque handles pipelined queries where multiple
+    // queries may be in-flight before responses arrive.
+    let mut pending_queries: VecDeque<(QueryInfo, std::time::Instant)> = VecDeque::new();
+    // Destructure the query log context for use in the loop
+    let (extractor, log_sender, session_ctx) = match query_log_ctx {
+        Some(ctx) => (Some(ctx.extractor), Some(ctx.sender), Some(ctx.session)),
+        None => (None, None, None),
+    };
+
+    let disconnect_reason = loop {
         tokio::select! {
             // Check for disconnect signal (if we have a receiver)
             reason = async {
@@ -369,7 +478,7 @@ where
                     if let Some(code) = reason.mysql_error_code() {
                         let _ = send_err_packet(&mut client_write, code, &reason.message()).await;
                     }
-                    return reason;
+                    break reason;
                 }
             }
 
@@ -379,7 +488,7 @@ where
                     Ok(Ok(0)) => {
                         // Client closed connection
                         debug!("Client EOF");
-                        return DisconnectReason::ClientDisconnect;
+                        break DisconnectReason::ClientDisconnect;
                     }
                     Ok(Ok(n)) => {
                         trace!("client->server: {} bytes", n);
@@ -395,7 +504,7 @@ where
                                 debug!("Client sent COM_QUIT");
                                 let _ = server_write.write_all(&client_buf[..n]).await;
                                 let _ = server_write.flush().await;
-                                return DisconnectReason::ClientDisconnect;
+                                break DisconnectReason::ClientDisconnect;
                             }
 
                             // Count query commands
@@ -409,14 +518,21 @@ where
                             }
                         }
 
+                        // Query logging: extract query info from client data
+                        if let Some(ref extractor) = extractor {
+                            if let Some(query_info) = extractor.extract_query(&client_buf[..n]) {
+                                pending_queries.push_back((query_info, std::time::Instant::now()));
+                            }
+                        }
+
                         // Forward to server
                         if let Err(e) = server_write.write_all(&client_buf[..n]).await {
                             warn!("Error writing to server: {}", e);
-                            return DisconnectReason::IoError(e.to_string());
+                            break DisconnectReason::IoError(e.to_string());
                         }
                         if let Err(e) = server_write.flush().await {
                             warn!("Error flushing to server: {}", e);
-                            return DisconnectReason::IoError(e.to_string());
+                            break DisconnectReason::IoError(e.to_string());
                         }
 
                         // If we have a pending disconnect, send ERR and exit
@@ -424,12 +540,12 @@ where
                             if let Some(code) = reason.mysql_error_code() {
                                 let _ = send_err_packet(&mut client_write, code, &reason.message()).await;
                             }
-                            return reason;
+                            break reason;
                         }
                     }
                     Ok(Err(e)) => {
                         warn!("Error reading from client: {}", e);
-                        return DisconnectReason::IoError(e.to_string());
+                        break DisconnectReason::IoError(e.to_string());
                     }
                     Err(_) => {
                         // Idle timeout
@@ -438,7 +554,7 @@ where
                         if let Some(code) = reason.mysql_error_code() {
                             let _ = send_err_packet(&mut client_write, code, &reason.message()).await;
                         }
-                        return reason;
+                        break reason;
                     }
                 }
             }
@@ -449,28 +565,73 @@ where
                     Ok(0) => {
                         // Server closed connection
                         debug!("Server EOF");
-                        return DisconnectReason::ServerDisconnect;
+                        break DisconnectReason::ServerDisconnect;
                     }
                     Ok(n) => {
                         trace!("server->client: {} bytes", n);
+
+                        // Query logging: extract response and create log entry
+                        if let (Some(ref extractor), Some(ref sender), Some(ref ctx)) =
+                            (&extractor, &log_sender, &session_ctx)
+                        {
+                            if let Some((query_info, start_time)) = pending_queries.pop_front() {
+                                if let Some(response_info) =
+                                    extractor.extract_response(&server_buf[..n])
+                                {
+                                    let duration_ms =
+                                        start_time.elapsed().as_millis() as u64;
+                                    let entry = QueryLog {
+                                        timestamp: chrono::Utc::now(),
+                                        session_id: ctx.session_id.clone(),
+                                        user_id: ctx.user_id.clone(),
+                                        database: ctx.database.clone(),
+                                        protocol: ctx.protocol.clone(),
+                                        command_type: query_info.command_type,
+                                        query_text: query_info.query_text,
+                                        duration_ms,
+                                        rows_affected: response_info.rows_affected,
+                                        success: response_info.success,
+                                        error_message: response_info.error_message,
+                                        client_addr: ctx.client_addr.clone(),
+                                        server_addr: ctx.server_addr.clone(),
+                                    };
+                                    if !sender.try_send(entry) {
+                                        debug!("Query log entry dropped (channel full or closed)");
+                                    }
+                                } else {
+                                    // Response didn't contain result metadata yet
+                                    // (e.g., intermediate result set packets).
+                                    // Put the pending query back at the front.
+                                    pending_queries.push_front((query_info, start_time));
+                                }
+                            }
+                        }
+
                         // Forward to client
                         if let Err(e) = client_write.write_all(&server_buf[..n]).await {
                             warn!("Error writing to client: {}", e);
-                            return DisconnectReason::IoError(e.to_string());
+                            break DisconnectReason::IoError(e.to_string());
                         }
                         if let Err(e) = client_write.flush().await {
                             warn!("Error flushing to client: {}", e);
-                            return DisconnectReason::IoError(e.to_string());
+                            break DisconnectReason::IoError(e.to_string());
                         }
                     }
                     Err(e) => {
                         warn!("Error reading from server: {}", e);
-                        return DisconnectReason::IoError(e.to_string());
+                        break DisconnectReason::IoError(e.to_string());
                     }
                 }
             }
         }
+    };
+
+    // Gracefully shut down query logging, ensuring all buffered entries are flushed.
+    if let Some(sender) = log_sender {
+        sender.shutdown().await;
     }
+
+    disconnect_reason
 }
 
 /// Send a MySQL ERR packet to the client.
@@ -604,6 +765,7 @@ mod tests {
             session_manager,
             disconnect_rx,
             Duration::from_millis(50), // Very short timeout
+            None,                      // No query logging
         )
         .await;
 
@@ -640,9 +802,129 @@ mod tests {
             session_manager,
             disconnect_rx,
             Duration::from_secs(30),
+            None, // No query logging
         )
         .await;
 
         assert!(matches!(reason, DisconnectReason::ClientDisconnect));
+    }
+
+    #[tokio::test]
+    async fn test_managed_relay_with_query_logging() {
+        use crate::auth::SessionConfig;
+        use crate::protocol::mysql::packets::COM_QUERY;
+        use crate::query_logging::config::ConnectionLoggingConfig;
+        use crate::query_logging::extractor::MysqlQueryExtractor;
+        use crate::query_logging::service::QueryLoggingService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pipe_path = dir.path().join("query.pipe");
+        std::fs::File::create(&pipe_path).unwrap();
+        let config = ConnectionLoggingConfig {
+            query_logging_enabled: true,
+            include_query_text: true,
+            max_query_length: 10_000,
+            pipe_path: Some(pipe_path.to_string_lossy().to_string()),
+        };
+
+        let sender = QueryLoggingService::start(&config).unwrap();
+        let extractor = MysqlQueryExtractor::new(true, 10_000);
+        let session_ctx = SessionContext {
+            session_id: "relay-test".to_string(),
+            user_id: "testuser".to_string(),
+            database: "testdb".to_string(),
+            protocol: "mysql".to_string(),
+            client_addr: "127.0.0.1:12345".to_string(),
+            server_addr: "10.0.0.1:3306".to_string(),
+        };
+        let query_log_ctx = QueryLogContext {
+            extractor: Box::new(extractor),
+            sender: sender.clone(),
+            session: session_ctx,
+        };
+
+        // Create duplex streams simulating client and server
+        let (mut client_writer, client_read_end) = duplex(4096);
+        let (server_write_end, mut server_reader) = duplex(4096);
+
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let session_manager = Arc::new(Mutex::new(session_manager));
+
+        let disconnect_rx = {
+            let mut mgr = session_manager.lock().await;
+            mgr.take_disconnect_rx()
+        };
+
+        let (client_read, client_write) = split(client_read_end);
+        let (server_read, server_write) = split(server_write_end);
+
+        // Spawn the relay loop
+        let relay_handle = tokio::spawn(async move {
+            managed_relay_loop(
+                client_read,
+                client_write,
+                server_read,
+                server_write,
+                session_manager,
+                disconnect_rx,
+                Duration::from_secs(5),
+                Some(query_log_ctx),
+            )
+            .await
+        });
+
+        // Send a MySQL COM_QUERY "SELECT 1"
+        let query = b"SELECT 1";
+        let payload_len = 1 + query.len(); // cmd byte + query
+        let mut pkt = vec![
+            (payload_len & 0xFF) as u8,
+            ((payload_len >> 8) & 0xFF) as u8,
+            0, // length high byte
+            0, // sequence id
+            COM_QUERY,
+        ];
+        pkt.extend_from_slice(query);
+        client_writer.write_all(&pkt).await.unwrap();
+
+        // Read the forwarded query from the "server" side
+        let mut buf = vec![0u8; 256];
+        let n = server_reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, pkt.len()); // Query was forwarded
+
+        // Send a MySQL OK response back from "server"
+        let ok_payload = [0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]; // OK + 0 affected
+        let ok_len = ok_payload.len() as u32;
+        let mut ok_pkt = vec![
+            (ok_len & 0xFF) as u8,
+            ((ok_len >> 8) & 0xFF) as u8,
+            0,
+            1, // sequence id
+        ];
+        ok_pkt.extend_from_slice(&ok_payload);
+        server_reader.write_all(&ok_pkt).await.unwrap();
+
+        // Give the relay loop time to process
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Close client to end the relay
+        drop(client_writer);
+        let reason = relay_handle.await.unwrap();
+        assert!(matches!(reason, DisconnectReason::ClientDisconnect));
+
+        // Shutdown the logging service
+        sender.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify that the query was logged to the pipe file
+        let content = std::fs::read_to_string(&pipe_path).unwrap();
+        assert!(
+            content.contains("SELECT 1"),
+            "Log should contain query text"
+        );
+        assert!(
+            content.contains("\"success\":true"),
+            "Log should show success"
+        );
     }
 }

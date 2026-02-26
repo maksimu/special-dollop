@@ -8,4 +8,4 @@ pub mod manager;
 pub mod relay;
 
 pub use manager::{DisconnectReason, SessionManager};
-pub use relay::{ManagedSession, Session};
+pub use relay::{ManagedSession, QueryLogContext, Session};

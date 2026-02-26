@@ -476,6 +476,7 @@ fn build_config(params: &PyDbParams) -> Config {
             protocol_debug: false,
         },
         session,
+        query_logging: params.query_logging.clone(),
     }
 }
 
@@ -510,6 +511,7 @@ mod tests {
             auth_method: None,
             session_config: SessionConfig::default(),
             tls_config: TlsClientConfig::default(),
+            query_logging: crate::query_logging::QueryLoggingConfig::default(),
             listen_host: "127.0.0.1".to_string(),
             listen_port: 13306,
         }
@@ -526,6 +528,7 @@ mod tests {
             auth_method: None,
             session_config: SessionConfig::default(),
             tls_config: TlsClientConfig::default(),
+            query_logging: crate::query_logging::QueryLoggingConfig::default(),
             listen_host: "127.0.0.1".to_string(),
             listen_port: 13307,
         }

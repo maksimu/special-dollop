@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod handshake;
 pub mod protocol;
+pub mod query_logging;
 pub mod server;
 pub mod tls;
 

@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::auth::{AuthMethod, DatabaseType, SessionConfig};
+use crate::query_logging::config::QueryLoggingConfig;
 use crate::tls::{TlsClientConfig, TlsVerifyMode};
 
 /// Parsed database parameters from Python.
@@ -45,6 +46,9 @@ pub struct PyDbParams {
 
     /// TLS configuration for backend connection
     pub tls_config: TlsClientConfig,
+
+    /// Query logging configuration (global defaults)
+    pub query_logging: QueryLoggingConfig,
 
     /// Proxy listen host (default: "127.0.0.1")
     pub listen_host: String,
@@ -153,6 +157,14 @@ impl PyDbParams {
             TlsClientConfig::default()
         };
 
+        // Parse nested query_logging config
+        let query_logging = if let Some(ql_dict) = dict.get_item("query_logging")? {
+            let ql_dict: &Bound<'_, PyDict> = ql_dict.cast()?;
+            parse_query_logging_config(ql_dict)?
+        } else {
+            QueryLoggingConfig::default()
+        };
+
         let params = Self {
             database_type,
             target_host,
@@ -163,6 +175,7 @@ impl PyDbParams {
             auth_method,
             session_config,
             tls_config,
+            query_logging,
             listen_host,
             listen_port,
         };
@@ -373,6 +386,33 @@ fn parse_tls_config(dict: &Bound<'_, PyDict>) -> PyResult<TlsClientConfig> {
     config.validate().map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("invalid tls_config: {}", e))
     })?;
+
+    Ok(config)
+}
+
+/// Parse query logging configuration from Python dict.
+///
+/// Supports the following keys:
+/// * `enabled` (bool) - Master enable/disable
+/// * `include_query_text` (bool) - Include SQL text in logs (default: true)
+/// * `max_query_length` (int) - Max query text length (default: 10000)
+/// * `pipe_path` (str) - Path to named pipe for log output (standalone mode)
+fn parse_query_logging_config(dict: &Bound<'_, PyDict>) -> PyResult<QueryLoggingConfig> {
+    let mut config = QueryLoggingConfig::default();
+
+    if let Some(val) = dict.get_item("enabled")? {
+        config.enabled = val.extract()?;
+    }
+    if let Some(val) = dict.get_item("include_query_text")? {
+        config.include_query_text = val.extract()?;
+    }
+    if let Some(val) = dict.get_item("max_query_length")? {
+        config.max_query_length = val.extract()?;
+    }
+    if let Some(val) = dict.get_item("pipe_path")? {
+        let path: String = val.extract()?;
+        config.pipe_path = Some(path);
+    }
 
     Ok(config)
 }

@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::auth::{DatabaseType, SessionConfig};
 use crate::config::SessionSecurityConfig;
 use crate::error::{ProxyError, Result};
+use crate::query_logging::config::ConnectionLoggingConfig;
 use crate::tls::{TlsClientConfig, TlsVerifyMode};
 
 use super::instruction::Instruction;
@@ -25,23 +26,30 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Read buffer size
 const READ_BUFFER_SIZE: usize = 4096;
 
-/// Required parameters for the handshake
-/// Note: "single_connection" (arg 12) is kept for backwards compatibility but ignored
+/// Required parameters for the handshake.
+///
+/// Note: "single_connection" (arg 12) is kept for backwards compatibility but ignored.
+/// Args 14-17 are optional logging configuration fields. Old Gateways that don't
+/// send them will simply not have logging enabled (safe default).
 const REQUIRED_ARGS: &[&str] = &[
-    "target_host",       // 0
-    "target_port",       // 1
-    "username",          // 2
-    "password",          // 3
-    "database",          // 4
-    "tls_enabled",       // 5
-    "tls_ca_path",       // 6
-    "tls_verify_mode",   // 7
-    "session_uid",       // 8
-    "max_duration_secs", // 9
-    "idle_timeout_secs", // 10
-    "max_queries",       // 11
-    "single_connection", // 12 - LEGACY: kept for Gateway backwards compatibility, value ignored
-    "require_token",     // 13
+    "target_host",           // 0
+    "target_port",           // 1
+    "username",              // 2
+    "password",              // 3
+    "database",              // 4
+    "tls_enabled",           // 5
+    "tls_ca_path",           // 6
+    "tls_verify_mode",       // 7
+    "session_uid",           // 8
+    "max_duration_secs",     // 9
+    "idle_timeout_secs",     // 10
+    "max_queries",           // 11
+    "single_connection",     // 12 - LEGACY: kept for backwards compatibility, value ignored
+    "require_token",         // 13
+    "query_logging_enabled", // 14 - Optional: enable query logging
+    "include_query_text",    // 15 - Optional: include SQL text in logs
+    "max_query_length",      // 16 - Optional: max query text length
+    "query_log_pipe_path",   // 17 - Optional: FIFO path for query log output
 ];
 
 /// Result of a successful handshake.
@@ -448,14 +456,99 @@ impl HandshakeHandler {
         }
         session_config.require_token = require_token;
 
+        // Parse optional logging configuration (args 14-17)
+        // These are optional - old Gateways that don't send them will default to disabled.
+        let logging_config = self.parse_logging_config(inst);
+
         Ok(
             HandshakeCredentials::new(database_type, target_host, target_port, username, password)
                 .with_database(database)
                 .with_tls_config(tls_config)
                 .with_session_config(session_config)
-                .with_session_uid(session_uid),
+                .with_session_uid(session_uid)
+                .with_logging_config(logging_config),
         )
     }
+
+    /// Parse optional logging configuration from connect instruction.
+    ///
+    /// Returns `Some(config)` if logging is enabled AND a pipe path is provided.
+    /// Returns `None` if logging is disabled or no pipe path is given.
+    fn parse_logging_config(&self, inst: &Instruction) -> Option<ConnectionLoggingConfig> {
+        let config = parse_logging_config_from_instruction(inst);
+        if let Some(ref cfg) = config {
+            debug!(
+                session_id = %self.session_id,
+                query_logging_enabled = cfg.query_logging_enabled,
+                include_query_text = cfg.include_query_text,
+                pipe_path = ?cfg.pipe_path,
+                "Logging config from handshake"
+            );
+        } else {
+            let enabled = inst
+                .arg(14)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if enabled {
+                debug!(
+                    session_id = %self.session_id,
+                    "Query logging enabled but no pipe path provided, disabling"
+                );
+            }
+        }
+        config
+    }
+}
+
+/// Parse logging configuration from a connect instruction's arguments.
+///
+/// Extracted as a free function for testability (HandshakeHandler requires TcpStream).
+///
+/// Expected arg positions:
+///   14 = query_logging_enabled ("true"/"false")
+///   15 = include_query_text ("true"/"false", default true)
+///   16 = max_query_length (integer, default 10_000)
+///   17 = query_log_pipe_path (string path to FIFO)
+fn parse_logging_config_from_instruction(inst: &Instruction) -> Option<ConnectionLoggingConfig> {
+    let query_logging_enabled = inst
+        .arg(14)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if !query_logging_enabled {
+        return None;
+    }
+
+    let include_query_text = inst
+        .arg(15)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    const MAX_QUERY_LENGTH_UPPER_BOUND: usize = 1_048_576; // 1 MB
+    let max_query_length = inst
+        .arg(16)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+        .min(MAX_QUERY_LENGTH_UPPER_BOUND);
+
+    let pipe_path = inst
+        .arg(17)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // No pipe path means logging cannot function (nowhere to write)
+    let pipe_path = pipe_path?;
+
+    Some(ConnectionLoggingConfig {
+        query_logging_enabled,
+        include_query_text,
+        max_query_length,
+        pipe_path: Some(pipe_path),
+    })
 }
 
 /// Parse TLS verify mode from string.
@@ -479,5 +572,127 @@ mod tests {
         assert_eq!(parse_verify_mode("verify_ca"), TlsVerifyMode::VerifyCa);
         assert_eq!(parse_verify_mode("verify"), TlsVerifyMode::Verify);
         assert_eq!(parse_verify_mode("full"), TlsVerifyMode::Verify);
+    }
+
+    #[test]
+    fn test_required_args_has_logging_fields() {
+        // Verify the logging args are in the expected positions
+        assert_eq!(REQUIRED_ARGS[14], "query_logging_enabled");
+        assert_eq!(REQUIRED_ARGS[15], "include_query_text");
+        assert_eq!(REQUIRED_ARGS[16], "max_query_length");
+        assert_eq!(REQUIRED_ARGS[17], "query_log_pipe_path");
+        assert_eq!(REQUIRED_ARGS.len(), 18);
+    }
+
+    /// Helper: build a connect instruction with 18 args (indices 0..17).
+    /// Fills args 0-13 with placeholder values; args 14-17 are logging config.
+    fn make_connect_instruction(
+        logging_enabled: &str,
+        include_text: &str,
+        max_length: &str,
+        pipe_path: &str,
+    ) -> Instruction {
+        let mut args: Vec<String> = (0..14).map(|i| format!("arg{}", i)).collect();
+        args.push(logging_enabled.to_string()); // 14
+        args.push(include_text.to_string()); // 15
+        args.push(max_length.to_string()); // 16
+        args.push(pipe_path.to_string()); // 17
+        Instruction::new("connect", args)
+    }
+
+    #[test]
+    fn test_parse_logging_config_all_fields() {
+        let inst = make_connect_instruction("true", "false", "5000", "/run/keeper/query.pipe");
+        let config = parse_logging_config_from_instruction(&inst).unwrap();
+        assert!(config.query_logging_enabled);
+        assert!(!config.include_query_text);
+        assert_eq!(config.max_query_length, 5000);
+        assert_eq!(config.pipe_path.as_deref(), Some("/run/keeper/query.pipe"));
+    }
+
+    #[test]
+    fn test_parse_logging_config_disabled() {
+        let inst = make_connect_instruction("false", "true", "10000", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_parse_logging_config_empty_enabled_field() {
+        let inst = make_connect_instruction("", "true", "10000", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst);
+        assert!(
+            config.is_none(),
+            "Empty enabled field should default to false"
+        );
+    }
+
+    #[test]
+    fn test_parse_logging_config_no_pipe_path_returns_none() {
+        let inst = make_connect_instruction("true", "true", "10000", "");
+        let config = parse_logging_config_from_instruction(&inst);
+        assert!(config.is_none(), "Empty pipe path should disable logging");
+    }
+
+    #[test]
+    fn test_parse_logging_config_defaults() {
+        // include_query_text defaults to true, max_query_length defaults to 10000
+        let inst = make_connect_instruction("true", "", "", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst).unwrap();
+        assert!(
+            config.include_query_text,
+            "include_query_text should default to true"
+        );
+        assert_eq!(
+            config.max_query_length, 10_000,
+            "max_query_length should default to 10000"
+        );
+    }
+
+    #[test]
+    fn test_parse_logging_config_case_insensitive() {
+        let inst = make_connect_instruction("TRUE", "FALSE", "1000", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst).unwrap();
+        assert!(config.query_logging_enabled);
+        assert!(!config.include_query_text);
+    }
+
+    #[test]
+    fn test_parse_logging_config_fewer_args() {
+        // Old Gateway sends only 14 args (0-13), no logging fields at all
+        let args: Vec<String> = (0..14).map(|i| format!("arg{}", i)).collect();
+        let inst = Instruction::new("connect", args);
+        let config = parse_logging_config_from_instruction(&inst);
+        assert!(config.is_none(), "Missing logging args should return None");
+    }
+
+    #[test]
+    fn test_parse_logging_config_invalid_max_length_uses_default() {
+        let inst = make_connect_instruction("true", "true", "not_a_number", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst).unwrap();
+        assert_eq!(
+            config.max_query_length, 10_000,
+            "Invalid number should fall back to default"
+        );
+    }
+
+    #[test]
+    fn test_parse_logging_config_max_length_capped_at_1mb() {
+        let inst = make_connect_instruction("true", "true", "999999999", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst).unwrap();
+        assert_eq!(
+            config.max_query_length, 1_048_576,
+            "max_query_length should be capped at 1 MB"
+        );
+    }
+
+    #[test]
+    fn test_parse_logging_config_max_length_within_bound_unchanged() {
+        let inst = make_connect_instruction("true", "true", "50000", "/tmp/pipe");
+        let config = parse_logging_config_from_instruction(&inst).unwrap();
+        assert_eq!(
+            config.max_query_length, 50_000,
+            "Value within bounds should be unchanged"
+        );
     }
 }

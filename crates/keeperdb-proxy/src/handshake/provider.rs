@@ -12,6 +12,7 @@ use crate::auth::{
     AuthCredentials, AuthMethod, AuthProvider, ConnectionContext, SessionConfig, TokenValidation,
 };
 use crate::error::{ProxyError, Result};
+use crate::query_logging::config::ConnectionLoggingConfig;
 use crate::tls::TlsClientConfig;
 
 use super::store::CredentialStore;
@@ -117,6 +118,22 @@ impl AuthProvider for HandshakeAuthProvider {
     async fn validate_token(&self, _token: &str) -> Result<TokenValidation> {
         // Gateway already authorized this connection via handshake
         Ok(TokenValidation::valid())
+    }
+
+    /// Retrieve per-connection logging configuration from handshake.
+    ///
+    /// Uses peek to avoid consuming credentials.
+    async fn get_logging_config(
+        &self,
+        context: &ConnectionContext,
+    ) -> Result<Option<ConnectionLoggingConfig>> {
+        let session_id = Self::parse_session_id(context)?;
+
+        let creds_ref = self.store.peek(&session_id).ok_or_else(|| {
+            ProxyError::Auth(format!("No credentials found for session: {}", session_id))
+        })?;
+
+        Ok(creds_ref.logging_config.clone())
     }
 }
 
@@ -226,5 +243,62 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result, Err(ProxyError::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_logging_config_none_by_default() {
+        let store = Arc::new(CredentialStore::default());
+        let provider = HandshakeAuthProvider::new(Arc::clone(&store));
+
+        let session_id = Uuid::new_v4();
+        let creds = super::super::store::HandshakeCredentials::new(
+            DatabaseType::MySQL,
+            "localhost".into(),
+            3306,
+            "testuser".into(),
+            "testpass".into(),
+        );
+        // No logging_config set - should return None
+
+        store.store(session_id, creds);
+        let context = test_context(&session_id.to_string());
+        let config = provider.get_logging_config(&context).await.unwrap();
+        assert!(config.is_none());
+
+        // Should not consume credentials
+        assert!(store.contains(&session_id));
+    }
+
+    #[tokio::test]
+    async fn test_get_logging_config_with_config() {
+        use crate::query_logging::config::ConnectionLoggingConfig;
+
+        let store = Arc::new(CredentialStore::default());
+        let provider = HandshakeAuthProvider::new(Arc::clone(&store));
+
+        let session_id = Uuid::new_v4();
+        let creds = super::super::store::HandshakeCredentials::new(
+            DatabaseType::MySQL,
+            "localhost".into(),
+            3306,
+            "testuser".into(),
+            "testpass".into(),
+        )
+        .with_logging_config(Some(ConnectionLoggingConfig {
+            query_logging_enabled: true,
+            include_query_text: true,
+            max_query_length: 5000,
+            pipe_path: Some("/tmp/query.pipe".into()),
+        }));
+
+        store.store(session_id, creds);
+        let context = test_context(&session_id.to_string());
+        let config = provider.get_logging_config(&context).await.unwrap();
+
+        let config = config.unwrap();
+        assert!(config.query_logging_enabled);
+        assert!(config.include_query_text);
+        assert_eq!(config.max_query_length, 5000);
+        assert_eq!(config.pipe_path.as_deref(), Some("/tmp/query.pipe"));
     }
 }

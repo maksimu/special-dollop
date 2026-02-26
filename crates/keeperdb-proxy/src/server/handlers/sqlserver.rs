@@ -21,8 +21,9 @@ use tokio::time::{sleep, timeout};
 use zeroize::Zeroize;
 
 use super::super::connection_tracker::{ConnectionTracker, TargetId, TunnelId};
-use super::super::session::{ManagedSession, Session, SessionManager};
+use super::super::session::{ManagedSession, QueryLogContext, Session, SessionManager};
 use super::super::stream::NetworkStream;
+
 use crate::auth::{AuthProvider, ConnectionContext, DatabaseType};
 use crate::config::{Config, TargetWithCredentials};
 use crate::error::{ProxyError, Result};
@@ -596,6 +597,14 @@ impl SqlServerHandler {
                 ProxyError::Config(e.to_string())
             })?;
 
+        // Retrieve logging config BEFORE get_auth(), which consumes credentials from the store
+        let logging_config = super::resolve_logging_config(
+            self.auth_provider.as_ref(),
+            &context,
+            &self.config.query_logging,
+        )
+        .await;
+
         // Get real credentials
         let auth_credentials = self.auth_provider.get_auth(&context).await.map_err(|e| {
             error!("Failed to get credentials: {}", e);
@@ -637,6 +646,12 @@ impl SqlServerHandler {
             client_login7_raw.len(),
             login7_packet.len()
         );
+
+        // Resolve database name to owned String before we take mutable borrows on self.
+        // target_database borrows self.target.database, so we must release it here.
+        let resolved_database = target_database
+            .unwrap_or(&client_login7.database)
+            .to_string();
 
         // Show full LOGIN7 packet for debugging
         let hex_dump: String = login7_packet
@@ -884,19 +899,41 @@ impl SqlServerHandler {
         };
 
         let mut session_manager = SessionManager::new(session_config.clone());
+        let session_id = session_manager.session_id();
         session_manager.start_timers();
+
+        // Set up query logging if configured
+        // (logging_config was retrieved before get_auth to avoid credential store consumption race)
+        let query_log_ctx = if let Some(ref log_config) = logging_config {
+            let server_addr = format!("{}:{}", self.target.host, self.target.port);
+            let session_id_str = session_id.to_string();
+            QueryLogContext::create(
+                "sqlserver",
+                log_config,
+                &session_id_str,
+                &username,
+                &resolved_database,
+                &self.client_addr.to_string(),
+                &server_addr,
+            )
+        } else {
+            None
+        };
 
         let has_limits = session_config.max_duration.is_some()
             || session_config.idle_timeout.is_some()
             || session_config.max_queries.is_some();
 
-        if has_limits {
-            let managed = ManagedSession::with_network_server(
+        if has_limits || query_log_ctx.is_some() {
+            let mut managed = ManagedSession::with_network_server(
                 client_stream,
                 server,
                 session_manager,
                 self.config.server.idle_timeout_secs,
             );
+            if let Some(ctx) = query_log_ctx {
+                managed = managed.with_query_logging(ctx);
+            }
             let reason = managed.relay().await;
 
             // Release connection guard after relay completes

@@ -1261,7 +1261,8 @@ pub fn get_registry() -> &'static RegistryHandle {
 }
 
 // Global registry handle - initialized once
-static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
+// pub(crate) for internal access; external consumers use get_registry()
+pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     // Get max concurrent from environment or default to 100

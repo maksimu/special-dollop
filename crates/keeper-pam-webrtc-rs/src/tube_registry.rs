@@ -1243,8 +1243,25 @@ impl RegistryHandle {
     }
 }
 
+/// Get a reference to the global tube registry.
+///
+/// This is the primary entry point for external Rust consumers.
+/// The registry is lazily initialized on first access.
+///
+/// # Example
+///
+/// ```ignore
+/// use keeper_pam_webrtc_rs::tube_registry::get_registry;
+///
+/// let registry = get_registry();
+/// let info = registry.create_tube(request).await?;
+/// ```
+pub fn get_registry() -> &'static RegistryHandle {
+    &REGISTRY
+}
+
 // Global registry handle - initialized once
-pub(crate) static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
+static REGISTRY: Lazy<RegistryHandle> = Lazy::new(|| {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     // Get max concurrent from environment or default to 100

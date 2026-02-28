@@ -13,15 +13,15 @@ mod error;
 mod handler_integration;
 pub mod hot_path_macros;
 mod metrics;
-mod models;
+pub mod models;
 #[cfg(feature = "python-support")]
 pub mod python;
 mod router_helpers;
 mod runtime;
 mod tube;
 mod tube_and_channel_helpers;
-mod tube_protocol;
-mod tube_registry;
+pub mod tube_protocol;
+pub mod tube_registry;
 mod webrtc_circuit_breaker;
 mod webrtc_data_channel;
 mod webrtc_errors;
@@ -29,6 +29,11 @@ mod webrtc_network_monitor;
 mod webrtc_quality_manager;
 
 pub use tube::*;
+pub use tube_registry::{
+    get_registry, CreateTubeRequest, RegistryHandle, RegistryMetrics, SignalMessage,
+};
+pub use models::ConversationType;
+pub use tube_protocol::{CloseConnectionReason, ControlMessage};
 pub use webrtc_core::*;
 pub use webrtc_errors::*;
 pub use webrtc_network_monitor::{ConnectionMigrator, NetworkMonitor};

@@ -33,6 +33,8 @@ pub use tube_registry::{
     get_registry, CreateTubeRequest, RegistryHandle, RegistryMetrics, SignalMessage,
 };
 pub use models::ConversationType;
+// Guacamole handler types for Rust consumers
+pub use channel::core::PythonHandlerMessage;
 pub use tube_protocol::{CloseConnectionReason, ControlMessage};
 pub use webrtc_core::*;
 pub use webrtc_errors::*;

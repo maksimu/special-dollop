@@ -1203,6 +1203,44 @@ impl RegistryHandle {
             .map_err(|e| anyhow!("Failed to add ICE candidate: {}", e))
     }
 
+    /// Open a handler connection on a tube (sends OpenConnection control frame).
+    ///
+    /// Used by Rust consumers to initiate a Guacamole session.
+    /// The Gateway starts guacd, connects to the target, and sends back ConnectionOpened.
+    pub async fn open_handler_connection(&self, conversation_id: &str, conn_no: u32) -> Result<()> {
+        let tube = self
+            .get_by_conversation_fast(conversation_id)
+            .ok_or_else(|| anyhow!("Tube not found for conversation: {}", conversation_id))?;
+        tube.open_handler_connection(conversation_id, conn_no).await
+    }
+
+    /// Send data back through a handler connection (Rust consumer → WebRTC → Gateway).
+    ///
+    /// Used to send Guacamole protocol responses (connect, sync, blob, etc.)
+    /// through the WebRTC data channel to the Gateway/guacd.
+    pub async fn send_handler_data(&self, conversation_id: &str, conn_no: u32, data: &[u8]) -> Result<()> {
+        let tube = self
+            .get_by_conversation_fast(conversation_id)
+            .ok_or_else(|| anyhow!("Tube not found for conversation: {}", conversation_id))?;
+
+        let data_channels = tube.data_channels.read().await;
+        let channel = data_channels
+            .get(conversation_id)
+            .ok_or_else(|| anyhow!("Channel not found: {}", conversation_id))?;
+
+        let buffer_pool = crate::buffer_pool::BufferPool::default();
+        let frame = crate::tube_protocol::Frame::new_data_with_pool(
+            conn_no,
+            data,
+            &buffer_pool,
+        );
+        let encoded = frame.encode_with_pool(&buffer_pool);
+        channel
+            .send(encoded)
+            .await
+            .map_err(|e| anyhow!("Failed to send handler data: {}", e))
+    }
+
     /// Check server mode (queries actor for authoritative state)
     #[allow(dead_code)] // Used by Python bindings
     pub async fn is_server_mode(&self) -> Result<bool> {

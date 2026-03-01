@@ -2321,7 +2321,7 @@ impl Tube {
     /// Sends an OpenConnection control message to the remote peer
     /// This is used when Python wants to initiate a connection (e.g., guacd tunnel)
     #[allow(dead_code)] // Used by Python bindings
-    pub(crate) async fn open_handler_connection(
+    pub async fn open_handler_connection(
         &self,
         channel_name: &str,
         conn_no: u32,

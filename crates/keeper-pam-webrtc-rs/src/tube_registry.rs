@@ -1183,8 +1183,17 @@ impl RegistryHandle {
         Ok(status.to_string())
     }
 
+    /// Set remote SDP description on a tube (for feeding SDP answers from gateway)
+    pub async fn set_remote_description(&self, tube_id: &str, sdp: &str, is_answer: bool) -> Result<()> {
+        let tube = self
+            .get_tube_fast(tube_id)
+            .ok_or_else(|| anyhow!("Tube not found: {}", tube_id))?;
+        tube.set_remote_description(sdp.to_string(), is_answer)
+            .await
+            .map_err(|e| anyhow!("Failed to set remote description: {}", e))
+    }
+
     /// Add external ICE candidate to a tube
-    #[allow(dead_code)] // Used by Python bindings
     pub async fn add_external_ice_candidate(&self, tube_id: &str, candidate: &str) -> Result<()> {
         let tube = self
             .get_tube_fast(tube_id)

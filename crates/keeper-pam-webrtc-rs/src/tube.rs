@@ -545,6 +545,11 @@ impl Tube {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
+                log::info!(
+                    "on_data_channel FIRED: remote created data channel '{}' (tube_id: {})",
+                    rtc_data_channel_label, tube.id
+                );
+
                 // Determine server_mode for the new channel based on the Tube's context
                 let current_server_mode = tube.is_server_mode_context;
                 if unlikely!(crate::logger::is_verbose_logging()) {

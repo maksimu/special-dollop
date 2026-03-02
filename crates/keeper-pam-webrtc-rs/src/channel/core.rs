@@ -935,6 +935,12 @@ impl Channel {
                 maybe_chunk = self.rx_from_dc.recv() => {
                     match tokio::time::timeout(self.timeouts.read, async { maybe_chunk }).await { // Wrap future for timeout
                         Ok(Some(chunk)) => {
+                            if self.active_protocol == super::types::ActiveProtocol::PythonHandler {
+                                debug!(
+                                    "DC CHUNK: {} bytes received (channel_id: {}, buf_before: {})",
+                                    chunk.len(), self.channel_id, buf.len()
+                                );
+                            }
                             // Check if this is a fragment that needs reassembly
                             if self.capabilities.contains(Capabilities::FRAGMENTATION)
                                 && has_fragment_header(&chunk)

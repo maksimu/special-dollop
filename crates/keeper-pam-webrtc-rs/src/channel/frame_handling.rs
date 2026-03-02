@@ -85,6 +85,14 @@ fn unlikely(condition: bool) -> bool {
 // **BOLD WARNING: HOT PATH - CALLED FOR EVERY INCOMING FRAME**
 // **NO STRING ALLOCATIONS IN DEBUG LOGS UNLESS ENABLED**
 pub async fn handle_incoming_frame(channel: &mut Channel, frame: Frame) -> Result<()> {
+    // Temporary debug logging for handler data flow investigation
+    if channel.active_protocol == ActiveProtocol::PythonHandler {
+        debug!(
+            "HANDLER FRAME: conn_no={}, payload_len={}, channel_id={}",
+            frame.connection_no, frame.payload.len(), channel.channel_id
+        );
+    }
+
     // **BRANCH PREDICTION OPTIMIZATION**: Connection 1 is ULTRA HOT PATH (90%+ of data)
     if likely(frame.connection_no == 1) {
         // **ULTRA HOT PATH**: Connection 1 - main data traffic (most optimized)

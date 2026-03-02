@@ -1221,17 +1221,34 @@ impl RegistryHandle {
     pub async fn send_handler_data(&self, conversation_id: &str, conn_no: u32, data: &[u8]) -> Result<()> {
         let tube = self
             .get_by_conversation_fast(conversation_id)
-            .ok_or_else(|| anyhow!("Tube not found for conversation: {}", conversation_id))?;
+            .ok_or_else(|| {
+                // Debug: list all conversation IDs in registry
+                let conv_keys: Vec<_> = self.conversations.iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                log::error!(
+                    "send_handler_data: Tube not found for '{}'. Registry has {} conversations: {:?}",
+                    conversation_id, conv_keys.len(),
+                    conv_keys.iter().take(5).collect::<Vec<_>>()
+                );
+                anyhow!("Tube not found for conversation: {}", conversation_id)
+            })?;
 
         let data_channels = tube.data_channels.read().await;
-        // Try conversation_id first, then fall back to "control" channel.
-        // When control_channel_label="control" is set, the data channel is stored
-        // under "control", not under conversation_id. send_handler_data needs to
-        // find it regardless of the label used during creation.
+        let channel_keys: Vec<_> = data_channels.keys().cloned().collect();
+        // Try conversation_id first, then fall back to "control" channel,
+        // then try first available channel as last resort.
         let channel = data_channels
             .get(conversation_id)
             .or_else(|| data_channels.get("control"))
-            .ok_or_else(|| anyhow!("Channel not found: {} (also tried 'control')", conversation_id))?;
+            .or_else(|| data_channels.values().next())
+            .ok_or_else(|| {
+                log::error!(
+                    "send_handler_data: No channels found. Keys: {:?}, conversation_id: {}",
+                    channel_keys, conversation_id
+                );
+                anyhow!("Channel not found: {} (keys: {:?})", conversation_id, channel_keys)
+            })?;
 
         let buffer_pool = crate::buffer_pool::BufferPool::default();
         let frame = crate::tube_protocol::Frame::new_data_with_pool(

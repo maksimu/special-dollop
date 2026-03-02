@@ -319,15 +319,26 @@ async fn forward_to_python_handler(
     };
 
     if !is_registered {
-        // Data arrived for unregistered connection - this can happen if:
-        // 1. Data arrives before ConnectionOpened (race condition)
-        // 2. Connection was never opened or was closed
-        // Log and drop the data rather than crashing
-        warn!(
-            "Data received for unregistered PythonHandler connection (channel_id: {}, conn_no: {}), dropping {} bytes",
+        // Data arrived before ConnectionOpened — auto-register and forward.
+        // This is a known race condition: the gateway starts guacd immediately
+        // after processing OpenConnection, and guacd sends the initial `args`
+        // instruction before the ConnectionOpened control frame arrives at
+        // the client. Dropping data here causes guacd to timeout with
+        // "User is not responding".
+        info!(
+            "Auto-registering handler connection (data arrived before ConnectionOpened) \
+             (channel_id: {}, conn_no: {}, payload_len: {})",
             channel.channel_id, conn_no, payload.len()
         );
-        return Ok(());
+        if let ProtocolLogicState::PythonHandler(ref mut state) = channel.protocol_state {
+            state.active_connections.insert(conn_no);
+        }
+        // Also send ConnectionOpened to the handler so it knows the connection is live
+        if let Some(ref tx) = channel.python_handler_tx {
+            let _ = tx
+                .send(PythonHandlerMessage::ConnectionOpened { conn_no })
+                .await;
+        }
     }
 
     if let Some(ref tx) = channel.python_handler_tx {

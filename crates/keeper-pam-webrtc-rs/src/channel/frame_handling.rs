@@ -6,7 +6,7 @@ use crate::tube_protocol::{CloseConnectionReason, ControlMessage, Frame, CTRL_NO
 use crate::unlikely; // Branch prediction optimization
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 
 // Memory prefetching optimizations
 #[cfg(target_arch = "x86_64")]

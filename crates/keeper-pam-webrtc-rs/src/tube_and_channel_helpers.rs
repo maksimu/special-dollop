@@ -109,6 +109,12 @@ pub(crate) async fn setup_channel_for_data_channel(
             let message_bytes = buffer_pool_clone.create_bytes(data);
             let message_len = message_bytes.len();
 
+            // DEBUG: Log EVERY message received at the raw WebRTC level
+            log::info!(
+                "RAW DC on_message: {} bytes (channel: {})",
+                message_len, label_clone
+            );
+
             // Record metrics for message received (non-blocking, minimal performance impact)
             crate::metrics::METRICS_COLLECTOR.record_message_received(
                 &label_clone, // using label as conversation_id
